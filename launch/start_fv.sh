@@ -99,6 +99,10 @@ ros2 launch fv_recorder fv_recorder_launch.py \
     node_name:=fv_recorder \
     config_file:="$SCRIPT_DIR/fv_recorder.yaml" &
 
+# トピックリレー起動（ソース→プレイヤートピック転写）
+echo "🔄 Starting Topic Relay (Source -> Player topics)..."
+python3 "$SCRIPT_DIR/topic_relay.py" &
+
 echo "✅ All Fluent Vision nodes started!"
 echo "📊 Use 'ros2 node list' to check running nodes"
 echo "🛑 Use './stop_fv.sh' to stop all nodes" 

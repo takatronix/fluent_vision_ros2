@@ -266,6 +266,7 @@ cv::Mat FVObjectMaskGeneratorNode::drawSegmentationResult(const cv::Mat& image, 
   std::vector<std::string> text_lines = {
     "Model: " + model_type_,
     "File: " + model_filename,
+    "Device: " + device_,
     "Inference: " + std::to_string(static_cast<int>(inference_time_ms + 0.5)) + "ms"
   };
   

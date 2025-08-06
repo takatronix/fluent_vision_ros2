@@ -10,10 +10,15 @@ pkill -9 -f "fv_object_detector" || true
 pkill -9 -f "fv_object_mask_generator" || true
 pkill -9 -f "fv_recorder" || true
 
+# Kill topic relay processes
+echo "🔧 Killing topic relay processes..."
+pkill -9 -f "topic_relay.py" || true
+
 # Also kill ros2 launch processes that might be running fv_ nodes
 echo "🔧 Killing ros2 launch processes for fv_ nodes..."
 pkill -9 -f "ros2 launch.*fv_" || true
 pkill -9 -f "ros2 run.*fv_" || true
+pkill -9 -f "ros2 run topic_tools relay" || true
 
 # Wait a moment and check
 sleep 1

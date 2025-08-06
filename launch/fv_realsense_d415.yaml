@@ -58,4 +58,8 @@
       depth_colormap: "fv/d415/depth/colormap"
       pointcloud: "fv/d415/points"
       color_camera_info: "fv/d415/color/camera_info"
-      depth_camera_info: "fv/d415/depth/camera_info" 
+      depth_camera_info: "fv/d415/depth/camera_info"
+      # Disable default topics
+      enable_default_topics: false
+      default_color_topic: ""
+      default_depth_topic: "" 

@@ -1,5 +1,5 @@
 # FV Recorder Configuration (D415 + D405)
-fv_recorder:
+/**:
   ros__parameters:
     # 録画設定
     recording:
@@ -28,6 +28,17 @@ fv_recorder:
         - "/fv/recorder/d405/depth/image_rect_raw"
       playback_speed: 1.0    # 1.0 = 実時間
       loop_playback: true   # ループ再生
+
+    # パススルー設定（ソーストピック → 再生トピック転写）
+    passthrough:
+      enable_passthrough: true  # パススルー有効
+      topic_mapping:
+        # D415 mapping
+        "/fv/d415/color/image_raw": "/fv/recorder/d415/color/image_raw"
+        "/fv/d415/depth/image_rect_raw": "/fv/recorder/d415/depth/image_rect_raw"
+        # D405 mapping  
+        "/fv/d405/color/image_raw": "/fv/recorder/d405/color/image_raw"
+        "/fv/d405/depth/image_rect_raw": "/fv/recorder/d405/depth/image_rect_raw"
 
     # 外部制御設定
     control:
