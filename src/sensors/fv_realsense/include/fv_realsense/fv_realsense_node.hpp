@@ -8,6 +8,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include <geometry_msgs/msg/point.hpp>
 
 #include <librealsense2/rs.hpp>
 #include <cv_bridge/cv_bridge.h>
@@ -22,6 +23,7 @@
 // Include service headers
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
+#include "fv_realsense/srv/set_mode.hpp"
 
 class FVDepthCameraNode : public rclcpp::Node
 {
@@ -75,6 +77,7 @@ private:
     {
         bool get_distance_enabled = true;
         bool get_camera_info_enabled = true;
+        bool set_mode_enabled = true;
     };
 
     struct TFConfig
@@ -128,6 +131,10 @@ private:
     // Services
     rclcpp::Service<fv_realsense::srv::GetDistance>::SharedPtr get_distance_service_;
     rclcpp::Service<fv_realsense::srv::GetCameraInfo>::SharedPtr get_camera_info_service_;
+    rclcpp::Service<fv_realsense::srv::SetMode>::SharedPtr set_mode_service_;
+
+    // Subscribers
+    rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr click_event_sub_;
 
     // TF
     std::unique_ptr<tf2_ros::StaticTransformBroadcaster> tf_static_broadcaster_;
@@ -137,6 +144,19 @@ private:
     std::thread processing_thread_;
     std::atomic<bool> running_;
     std::mutex frame_mutex_;
+    
+    // Mode control
+    std::atomic<int> current_mode_{1};  // デフォルトは基本動作モード
+
+    // Point marker for display modes
+    struct PointMarker {
+        cv::Point point;
+        rclcpp::Time start_time;
+        bool active;
+        int mode;  // 0: 表示なし, 1: カーソルのみ, 2: カーソル+座標+距離
+        float x, y, z;  // 3D座標
+    };
+    mutable PointMarker point_marker_;
 
     // Camera intrinsics
     rs2_intrinsics color_intrinsics_;
@@ -165,9 +185,18 @@ private:
         const std::shared_ptr<fv_realsense::srv::GetCameraInfo::Request> request,
         std::shared_ptr<fv_realsense::srv::GetCameraInfo::Response> response);
 
+    void handleSetMode(
+        const std::shared_ptr<fv_realsense::srv::SetMode::Request> request,
+        std::shared_ptr<fv_realsense::srv::SetMode::Response> response);
+
     // Utility methods
     bool get3DCoordinate(int x, int y, float& world_x, float& world_y, float& world_z);
     std::vector<rs2::device> getAvailableDevices();
+    
+    // Display methods
+    void clickEventCallback(const geometry_msgs::msg::Point::SharedPtr msg);
+    void drawMarker(cv::Mat& frame) const;
+    void initializeSubscribers();
 };
 
 #endif // FV_DEPTH_CAMERA_NODE_HPP 

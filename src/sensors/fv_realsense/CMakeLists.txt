@@ -42,6 +42,7 @@ find_package(rosidl_default_generators REQUIRED)      # ROS2インターフェ�
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetDistance.srv"      # 距離取得サービス
   "srv/GetCameraInfo.srv"    # カメラ情報取得サービス
+  "srv/SetMode.srv"          # モード設定サービス
   DEPENDENCIES geometry_msgs std_srvs
 )
 

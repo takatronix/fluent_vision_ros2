@@ -1,0 +1,8 @@
+# Request
+int32 mode                    # モード設定 (0: 停止, 1: 基本動作, 2: フル機能)
+
+---
+# Response
+bool success                  # 操作が成功したかどうか
+string message               # 結果メッセージ
+int32 current_mode           # 現在のモード 

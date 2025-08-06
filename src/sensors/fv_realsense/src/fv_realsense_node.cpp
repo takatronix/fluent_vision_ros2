@@ -10,6 +10,7 @@
 #include "fv_realsense/fv_realsense_node.hpp"
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
+#include "fv_realsense/srv/set_mode.hpp"
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
@@ -555,6 +556,17 @@ void FVDepthCameraNode::initializeServices()
                 std::placeholders::_1, std::placeholders::_2));
         RCLCPP_INFO(this->get_logger(), "📋 GetCameraInfo service initialized");
     }
+    
+    if (services_config_.set_mode_enabled) {
+        set_mode_service_ = this->create_service<fv_realsense::srv::SetMode>(
+            "set_mode",
+            std::bind(&FVDepthCameraNode::handleSetMode, this, 
+                std::placeholders::_1, std::placeholders::_2));
+        RCLCPP_INFO(this->get_logger(), "🎛️ SetMode service initialized");
+    }
+    
+    // Initialize subscribers
+    initializeSubscribers();
 }
 
 void FVDepthCameraNode::initializeTF()
@@ -573,6 +585,18 @@ void FVDepthCameraNode::initializeTF()
     RCLCPP_INFO(this->get_logger(), "✅ TF initialized");
 }
 
+void FVDepthCameraNode::initializeSubscribers()
+{
+    RCLCPP_INFO(this->get_logger(), "📥 Initializing subscribers...");
+    
+    // Click event subscriber for point marker
+    click_event_sub_ = this->create_subscription<geometry_msgs::msg::Point>(
+        "click_event", 10,
+        std::bind(&FVDepthCameraNode::clickEventCallback, this, std::placeholders::_1));
+    
+    RCLCPP_INFO(this->get_logger(), "🖱️ Click event subscriber initialized");
+}
+
 void FVDepthCameraNode::processingLoop()
 {
     RCLCPP_INFO(this->get_logger(), "🔄 Starting processing loop...");
@@ -582,30 +606,64 @@ void FVDepthCameraNode::processingLoop()
     
     while (running_ && rclcpp::ok()) {
         try {
-            // Wait for frames with timeout
-            rs2::frameset frames = pipe_.wait_for_frames(1000);  // 1 second timeout
+            // モードに応じた処理
+            int current_mode = current_mode_.load();
             
-            auto color_frame = frames.get_color_frame();
-            auto depth_frame = frames.get_depth_frame();
-            
-            // Process frames if at least one is available
-            if (color_frame || depth_frame) {
-                frame_count++;
-                publishFrames(color_frame, depth_frame);
-                
-                // Log every second
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
-                    RCLCPP_INFO(this->get_logger(), "📊 Processing: %d frames, Color: %s, Depth: %s", 
-                        frame_count, 
-                        color_frame ? "✅" : "❌",
-                        depth_frame ? "✅" : "❌");
-                    frame_count = 0;
-                    last_log_time = now;
+            switch (current_mode) {
+                case 0: {  // 停止モード
+                    // フレーム取得のみ（配信なし）
+                    pipe_.wait_for_frames(1000);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    break;
                 }
-                
-                if (stream_config_.pointcloud_enabled) {
-                    publishPointCloud(color_frame, depth_frame);
+                    
+                case 1: {  // 基本動作モード
+                    // カラー画像のみ配信
+                    rs2::frameset frames = pipe_.wait_for_frames(1000);
+                    auto color_frame = frames.get_color_frame();
+                    
+                    if (color_frame) {
+                        frame_count++;
+                        publishFrames(color_frame, rs2::frame());  // 深度は配信しない
+                        
+                        // Log every second
+                        auto now = std::chrono::steady_clock::now();
+                        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
+                            RCLCPP_INFO(this->get_logger(), "📊 Mode 1: %d frames, Color: %s", 
+                                frame_count, color_frame ? "✅" : "❌");
+                            frame_count = 0;
+                            last_log_time = now;
+                        }
+                    }
+                    break;
+                }
+                    
+                case 2: {  // フル機能モード
+                    // 全機能配信
+                    rs2::frameset frames_full = pipe_.wait_for_frames(1000);
+                    auto color_frame_full = frames_full.get_color_frame();
+                    auto depth_frame_full = frames_full.get_depth_frame();
+                    
+                    if (color_frame_full || depth_frame_full) {
+                        frame_count++;
+                        publishFrames(color_frame_full, depth_frame_full);
+                        
+                        // Log every second
+                        auto now = std::chrono::steady_clock::now();
+                        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
+                            RCLCPP_INFO(this->get_logger(), "📊 Mode 2: %d frames, Color: %s, Depth: %s", 
+                                frame_count, 
+                                color_frame_full ? "✅" : "❌",
+                                depth_frame_full ? "✅" : "❌");
+                            frame_count = 0;
+                            last_log_time = now;
+                        }
+                        
+                        if (stream_config_.pointcloud_enabled) {
+                            publishPointCloud(color_frame_full, depth_frame_full);
+                        }
+                    }
+                    break;
                 }
             }
             
@@ -623,10 +681,20 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
     static int publish_count = 0;
     static auto last_publish_log = std::chrono::steady_clock::now();
     
-    // Publish color frame
+    int current_mode = current_mode_.load();
+    
+    // モード0（停止）の場合は何も配信しない
+    if (current_mode == 0) {
+        return;
+    }
+    
+    // Publish color frame (モード1と2で配信)
     if (stream_config_.color_enabled && color_frame && color_pub_) {
         cv::Mat color_image(cv::Size(color_intrinsics_.width, color_intrinsics_.height), 
                            CV_8UC3, (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
+        
+        // マーカーを描画
+        drawMarker(color_image);
         
         auto color_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", color_image).toImageMsg();
         color_msg->header.stamp = now;
@@ -659,8 +727,8 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
         }
     }
     
-    // Publish depth frame
-    if (stream_config_.depth_enabled && depth_frame && depth_pub_) {
+    // Publish depth frame (モード2のみ配信)
+    if (current_mode == 2 && stream_config_.depth_enabled && depth_frame && depth_pub_) {
         cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), 
                            CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
         
@@ -670,8 +738,8 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
         depth_pub_->publish(*depth_msg);
     }
     
-    // Publish depth colormap
-    if (stream_config_.depth_colormap_enabled && depth_frame && depth_colormap_pub_) {
+    // Publish depth colormap (モード2のみ配信)
+    if (current_mode == 2 && stream_config_.depth_colormap_enabled && depth_frame && depth_colormap_pub_) {
         cv::Mat colormap = createDepthColormap(depth_frame);
         auto colormap_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", colormap).toImageMsg();
         colormap_msg->header.stamp = now;
@@ -924,6 +992,82 @@ void FVDepthCameraNode::handleGetCameraInfo(
     }
 }
 
+void FVDepthCameraNode::handleSetMode(
+    const std::shared_ptr<fv_realsense::srv::SetMode::Request> request,
+    std::shared_ptr<fv_realsense::srv::SetMode::Response> response)
+{
+    try {
+        int requested_mode = request->mode;
+        
+        // モード値の検証
+        if (requested_mode < 0 || requested_mode > 2) {
+            response->success = false;
+            response->message = "Invalid mode. Must be 0, 1, or 2";
+            response->current_mode = current_mode_.load();
+            return;
+        }
+        
+        // モードの設定
+        current_mode_.store(requested_mode);
+        
+        // モード別の処理
+        switch (requested_mode) {
+            case 0:  // 表示なし
+                RCLCPP_INFO(this->get_logger(), "🛑 Mode set to 0: NO DISPLAY");
+                response->message = "Mode set to NO DISPLAY (0) - No marker shown";
+                break;
+                
+            case 1:  // カーソルのみ
+                RCLCPP_INFO(this->get_logger(), "🟢 Mode set to 1: CURSOR ONLY");
+                response->message = "Mode set to CURSOR ONLY (1) - Green cursor for 10 seconds";
+                break;
+                
+            case 2:  // カーソル + 座標 + 距離
+                RCLCPP_INFO(this->get_logger(), "🔵 Mode set to 2: CURSOR + COORDINATES + DISTANCE");
+                response->message = "Mode set to CURSOR + COORDINATES + DISTANCE (2) - Full info for 10 seconds";
+                break;
+        }
+        
+        response->success = true;
+        response->current_mode = current_mode_.load();
+        
+    } catch (const std::exception& e) {
+        response->success = false;
+        response->message = std::string("Error setting mode: ") + e.what();
+        response->current_mode = current_mode_.load();
+    }
+}
+
+void FVDepthCameraNode::clickEventCallback(const geometry_msgs::msg::Point::SharedPtr msg)
+{
+    try {
+        // クリック座標を取得
+        int x = static_cast<int>(msg->x);
+        int y = static_cast<int>(msg->y);
+        
+        // 3D座標を取得
+        float world_x, world_y, world_z;
+        if (get3DCoordinate(x, y, world_x, world_y, world_z)) {
+            // ポイントマーカーを更新
+            point_marker_.point = cv::Point(x, y);
+            point_marker_.start_time = this->now();
+            point_marker_.active = true;
+            point_marker_.mode = current_mode_.load();
+            point_marker_.x = world_x;
+            point_marker_.y = world_y;
+            point_marker_.z = world_z;
+            
+            RCLCPP_INFO(this->get_logger(), "🖱️ Click at (%d, %d) -> 3D: (%.3f, %.3f, %.3f)", 
+                x, y, world_x, world_y, world_z);
+        } else {
+            RCLCPP_WARN(this->get_logger(), "⚠️ Failed to get 3D coordinate for click at (%d, %d)", x, y);
+        }
+        
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(this->get_logger(), "❌ Error in click event callback: %s", e.what());
+    }
+}
+
 bool FVDepthCameraNode::get3DCoordinate(int x, int y, float& world_x, float& world_y, float& world_z)
 {
     try {
@@ -957,6 +1101,54 @@ bool FVDepthCameraNode::get3DCoordinate(int x, int y, float& world_x, float& wor
     } catch (const rs2::error& e) {
         RCLCPP_WARN(this->get_logger(), "⚠️ Error getting 3D coordinate: %s", e.what());
         return false;
+    }
+}
+
+void FVDepthCameraNode::drawMarker(cv::Mat& frame) const
+{
+    if (!point_marker_.active) {
+        return;
+    }
+    
+    // 10秒経過したら非アクティブにする
+    auto now = this->now();
+    auto elapsed = now - point_marker_.start_time;
+    if (elapsed.seconds() > 10.0) {
+        point_marker_.active = false;
+        return;
+    }
+    
+    // モードに応じて表示
+    switch (point_marker_.mode) {
+        case 0:  // 表示なし
+            return;
+            
+        case 1: {  // カーソルのみ
+            cv::circle(frame, point_marker_.point, 10, cv::Scalar(0, 255, 0), 2);
+            cv::circle(frame, point_marker_.point, 2, cv::Scalar(0, 255, 0), -1);
+            break;
+        }
+            
+        case 2: {  // カーソル + 座標 + 距離
+            // カーソル描画
+            cv::circle(frame, point_marker_.point, 10, cv::Scalar(0, 255, 0), 2);
+            cv::circle(frame, point_marker_.point, 2, cv::Scalar(0, 255, 0), -1);
+            
+            // 座標テキスト
+            std::string coord_text = cv::format("XY: (%d, %d)", 
+                point_marker_.point.x, point_marker_.point.y);
+            cv::putText(frame, coord_text, 
+                cv::Point(point_marker_.point.x + 15, point_marker_.point.y - 15),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+            
+            // 3D座標テキスト
+            std::string xyz_text = cv::format("XYZ: (%.2f, %.2f, %.2f)m", 
+                point_marker_.x, point_marker_.y, point_marker_.z);
+            cv::putText(frame, xyz_text, 
+                cv::Point(point_marker_.point.x + 15, point_marker_.point.y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+            break;
+        }
     }
 }
 

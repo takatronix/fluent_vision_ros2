@@ -99,9 +99,12 @@ ros2 launch fv_recorder fv_recorder_launch.py \
     node_name:=fv_recorder \
     config_file:="$SCRIPT_DIR/fv_recorder.yaml" &
 
-# トピックリレー起動（ソース→プレイヤートピック転写）
-echo "🔄 Starting Topic Relay (Source -> Player topics)..."
-python3 "$SCRIPT_DIR/topic_relay.py" &
+# トピックリレー起動（/fv/* -> /vision_ai/* 転送）
+echo "🔄 Starting Topic Relay (/fv/* -> /vision_ai/*)..."
+echo "📁 Config file: $SCRIPT_DIR/relay_vision_ai.yaml"
+ros2 run fv_topic_relay fv_topic_relay_node \
+    --ros-args \
+    --params-file "$SCRIPT_DIR/relay_vision_ai.yaml" &
 
 # アスパラ分析 D415 ノード起動
 echo "🌾 Starting Aspara Analyzer D415 node..."

@@ -28,13 +28,9 @@ sudo apt install libopencv-dev
 
 ```bash
 # fluent_visionディレクトリで
-cd /home/ros2/fluent_vision
-
-# ROS2ワークスペースにコピー
-cp -r fv_camera /home/ros2/ros2_ws/src/
+cd /home/aspara/seedbox-r1/fluent_vision_ros2
 
 # ビルド
-cd /home/ros2/ros2_ws
 colcon build --packages-select fv_camera
 source install/setup.bash
 ```
@@ -60,8 +56,6 @@ ros2 launch fv_camera fv_camera_launch.py \
     node_name:=my_camera \
     config_file:=/path/to/custom_config.yaml
 ```
-
-
 
 ## 設定
 
@@ -93,7 +87,7 @@ ros2 launch fv_camera fv_camera_launch.py \
 ### カメラ情報取得サービス
 
 ```bash
-ros2 service call /fv_camera_node/get_camera_info \
+ros2 service call /fv_camera/get_camera_info \
     fv_camera/srv/GetCameraInfo \
     "{camera_name: ''}"
 ```
@@ -101,7 +95,7 @@ ros2 service call /fv_camera_node/get_camera_info \
 ### カメラ設定変更サービス
 
 ```bash
-ros2 service call /fv_camera_node/set_camera_settings \
+ros2 service call /fv_camera/set_camera_settings \
     fv_camera/srv/SetCameraSettings \
     "{width: 1280, height: 720, fps: 30, brightness: 50, contrast: 60}"
 ```

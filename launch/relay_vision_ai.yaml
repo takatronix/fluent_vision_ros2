@@ -1,0 +1,13 @@
+# Topic Relay Configuration
+fv_topic_relay:
+  ros__parameters:
+    # フォーマット: "from_topic:to_topic"
+    relay_mappings:
+      - "/fv/d415/depth/colormap:/vision_ai/d415/depth/colormap"
+      - "/fv/d415/object_detection/annotated_image:/vision_ai/d415/object_detection/annotated_image"
+      - "/fv/d415/object_detection/annotated_image_mouse_left:/vision_ai/d415/object_detection/annotated_image_mouse_left"
+      - "/fv/d415/segmentation_mask/colored:/vision_ai/d415/segmentation_mask/colored"
+      - "/fv/d415/segmentation_mask/colored_mouse_left:/vision_ai/d415/segmentation_mask/colored_mouse_left"
+      # D405用（必要に応じて追加）
+      # - "/fv/d405/depth/colormap:/vision_ai/d405/depth/colormap"
+      # - "/fv/d405/object_detection/annotated_image:/vision_ai/d405/object_detection/annotated_image"
