@@ -18,8 +18,7 @@
 #include <chrono>
 #include <string>
 #include <vector>
-#include <unistd.h>
-#include <linux/limits.h>
+
 
 class FVObjectDetectorNode : public rclcpp::Node
 {
@@ -108,16 +107,7 @@ private:
             // ROS2パラメータからモデル設定を取得
             auto model_type = this->declare_parameter("model.type", "yolov10");
             auto model_path = this->declare_parameter("model.model_path", "/home/takatronix/FluentVision/models/v2_nano_best_fp16_dynamic.xml");
-            auto device = this->declare_parameter("model.device", "GPU");
-            
-            // 相対パスを絶対パスに変換
-            if (model_path[0] != '/') {
-                // カレントディレクトリを取得
-                char cwd[PATH_MAX];
-                if (getcwd(cwd, sizeof(cwd)) != NULL) {
-                    model_path = std::string(cwd) + "/" + model_path;
-                }
-            }
+            auto device = this->declare_parameter("model.device", "");
             auto input_width = this->declare_parameter("model.input_width", 640);
             auto input_height = this->declare_parameter("model.input_height", 640);
             auto confidence_threshold = this->declare_parameter("model.confidence_threshold", 0.5);

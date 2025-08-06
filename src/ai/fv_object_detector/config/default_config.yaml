@@ -17,7 +17,7 @@ object_detection_service:
     model:
       type: "yolov10"
       model_path: "/home/takatronix/FluentVision/models/v2_nano_best_fp16_dynamic.xml"
-      device: "GPU"
+      device: ""
       input_width: 640
       input_height: 640
       confidence_threshold: 0.5

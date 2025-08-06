@@ -35,7 +35,22 @@ void YoloV10Model::initialize(const nlohmann::json& model_cfg) {
         
         ov::Core core;
         auto model = core.read_model(model_path_);
-        compiled_model_ = core.compile_model(model, device_);
+        
+        // デバイス名が空の場合はCPUを使用
+        std::string device = device_;
+        if (device.empty()) {
+            device = "CPU";
+            RCLCPP_INFO(rclcpp::get_logger("YoloV10Model"), "デフォルトデバイスを使用: %s", device.c_str());
+        }
+        
+        try {
+            compiled_model_ = core.compile_model(model, device);
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(rclcpp::get_logger("YoloV10Model"), "デバイス %s でのコンパイルに失敗: %s", device.c_str(), e.what());
+            // CPUで再試行
+            RCLCPP_INFO(rclcpp::get_logger("YoloV10Model"), "CPUで再試行");
+            compiled_model_ = core.compile_model(model, "CPU");
+        }
         infer_request_ = compiled_model_.create_infer_request();
         
         // モデル情報を表示
