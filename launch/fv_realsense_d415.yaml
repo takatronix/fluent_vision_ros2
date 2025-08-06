@@ -1,0 +1,61 @@
+# FV Depth Camera - D415 Configuration
+# Optimized for Intel RealSense D415
+
+/**:
+  ros__parameters:
+    # Camera selection
+    camera_selection:
+      selection_method: "serial"    # "auto", "serial", "name", "index"
+      serial_number: "237322061056" # D415 serial number (correct)
+      device_name: "D415"           # Device name (partial match)
+    
+    # Power management
+    power_management:
+      startup_delay: 1.0            # Delay before starting streams (seconds)
+    
+    # Camera settings - D415 optimized (640x480, 15FPS)
+    camera:
+      color_width: 640
+      color_height: 480
+      color_fps: 15
+      depth_width: 640
+      depth_height: 480
+      depth_fps: 15
+    
+    # Stream settings - D415 full capabilities
+    streams:
+      color_enabled: true
+      depth_enabled: true
+      infrared_enabled: false
+      pointcloud_enabled: true
+      depth_colormap_enabled: true
+    
+    # Camera info and compression
+    camera_info:
+      enable_camera_info: true
+      enable_compressed_topics: true
+      compressed_quality: 85
+      enable_depth_compressed: true
+    
+    # Services
+    services:
+      get_distance_enabled: true
+      get_camera_info_enabled: true
+    
+    # TF settings
+    tf:
+      enabled: true
+      base_frame: "base_link"
+      camera_frame: "fv/d415/camera_link"
+      color_optical_frame: "fv/d415/color_optical_frame"
+      depth_optical_frame: "fv/d415/depth_optical_frame"
+    
+    # Topics - D415 specific
+    topics:
+      color: "fv/d415/color/image_raw"
+      depth: "fv/d415/depth/image_rect_raw"
+      color_compressed: "fv/d415/color/image_raw/compressed"
+      depth_colormap: "fv/d415/depth/colormap"
+      pointcloud: "fv/d415/points"
+      color_camera_info: "fv/d415/color/camera_info"
+      depth_camera_info: "fv/d415/depth/camera_info" 

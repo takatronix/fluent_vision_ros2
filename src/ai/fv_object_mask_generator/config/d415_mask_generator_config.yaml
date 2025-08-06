@@ -1,0 +1,19 @@
+fv_object_mask_generator_d415:
+  ros__parameters:
+    # Input topics
+    input_image_topic: "/fv/d415/color/image_raw"
+    input_detections_topic: "/fv/d415/object_detection/detections"
+    
+    # Output topics
+    output_composite_mask_topic: "/fv/d415/object_mask/composite"
+    output_pattern_mask_topic: "/fv/d415/object_mask/pattern"
+    
+    # Processing parameters
+    processing_frequency: 10.0  # Hz
+    enable_visualization: true
+    
+    # Pattern mask parameters
+    pattern_type: 0  # 0: stripes, 1: dots, 2: checkerboard
+    pattern_size: 10
+    pattern_color: [255, 255, 255]  # White
+    background_color: [0, 0, 0]      # Black
