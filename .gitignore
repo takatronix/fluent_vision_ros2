@@ -1,0 +1,51 @@
+# ROS2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Test coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# Documentation build
+docs/build/
+docs/_build/
+
+# Cache
+.cache/
+.pytest_cache/
+
+# Config files with sensitive data
+.env
+.env.local
+config/secrets.yaml

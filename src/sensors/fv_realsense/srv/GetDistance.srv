@@ -1,0 +1,13 @@
+# Request
+int32 x                    # Pixel X coordinate
+int32 y                    # Pixel Y coordinate
+string frame_id           # Camera frame ID (optional, defaults to color_optical_frame)
+
+---
+# Response
+bool success              # Success status
+float64 x                 # 3D X coordinate (meters)
+float64 y                 # 3D Y coordinate (meters)
+float64 z                 # 3D Z coordinate (meters)
+string message            # Status message
+string frame_id           # Frame ID of the result 

@@ -1,0 +1,13 @@
+# 録画開始リクエスト
+string recording_directory    # 録画保存ディレクトリ
+string date_format           # 日付形式 (YYYYMMDD)
+int32 segment_duration       # セグメント時間（秒）
+int32 retention_days         # 保持日数（0=無制限）
+string[] input_topics        # 録画対象トピックリスト（空の場合は設定ファイルの値を使用）
+string output_format         # 出力フォーマット ("rosbag", "json", "yaml", "csv", "mp4", "avi")
+
+---
+# 録画開始レスポンス
+bool success                 # 成功フラグ
+string message              # メッセージ
+string recording_id         # 録画ID 

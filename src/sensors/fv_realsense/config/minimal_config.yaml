@@ -1,0 +1,60 @@
+# FV Depth Camera - Minimal Configuration
+# Minimal configuration to avoid memory issues
+
+fv_realsense:
+  ros__parameters:
+    # Camera selection
+    camera_selection:
+      selection_method: "auto"
+      serial_number: ""
+      device_name: ""
+      device_index: 0
+    
+    # Power management
+    power_management:
+      startup_delay: 1.0
+    
+    # Camera settings - minimal resolution
+    camera:
+      color_width: 320
+      color_height: 240
+      color_fps: 15
+      depth_width: 320
+      depth_height: 240
+      depth_fps: 15
+    
+    # Stream settings - color only
+    streams:
+      color_enabled: true
+      depth_enabled: false
+      infrared_enabled: false
+      pointcloud_enabled: false
+      depth_colormap_enabled: false
+    
+    # Camera info and compression - disabled
+    camera_info:
+      enable_camera_info: false
+      enable_compressed_topics: false
+      compressed_quality: 85
+      enable_depth_compressed: false
+    
+    # Services - disabled
+    services:
+      get_distance_enabled: false
+      get_camera_info_enabled: false
+    
+    # TF settings - disabled
+    tf:
+      enabled: false
+      base_frame: "base_link"
+      camera_frame: "camera_link"
+      color_optical_frame: "color_optical_frame"
+      depth_optical_frame: "depth_optical_frame"
+    
+    # Topics
+    topics:
+      color: "color/image_raw"
+      depth: "depth/image_rect_raw"
+      color_compressed: "color/image_raw/compressed"
+      depth_colormap: "depth/colormap"
+      pointcloud: "depth/color/points" 

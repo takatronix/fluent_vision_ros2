@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fv_rtmp_server</name>
+  <version>1.0.0</version>
+  <description>FluentVision RTMP server with ROS2 Image bridge for DJI Fly compatibility</description>
+  <maintainer email="takatronix@gmail.com">Takashi Otsuka</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+  <depend>ament_index_cpp</depend>
+
+  <!-- FFmpeg dependencies -->
+  <depend>libavcodec-dev</depend>
+  <depend>libavformat-dev</depend>
+  <depend>libavutil-dev</depend>
+  <depend>libswscale-dev</depend>
+
+  <!-- OpenCV -->
+  <depend>libopencv-dev</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
