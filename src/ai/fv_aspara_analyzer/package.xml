@@ -1,12 +1,11 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypesign="xml"?>
 <!-- ============================================================================= -->
-<!-- Fluent Vision - 物体検出ノード package.xml -->
+<!-- Fluent Vision - アスパラガス解析ノード package.xml -->
 <!-- ============================================================================= -->
 <!-- 
 概要：
-  - YOLOv10を使用したリアルタイム物体検出ノードのパッケージ定義
-  - OpenVINOによる高速推論対応
+  - アスパラガス3D点群解析ノードのパッケージ定義
   - ROS2 Humble対応の依存関係管理
   - ビルド設定とメタデータの定義
 
@@ -16,26 +15,35 @@
 -->
 <package format="3">
   <!-- ===== パッケージ基本情報 ===== -->
-  <name>fv_object_detector</name>
+  <name>fv_aspara_analyzer</name>
   <version>1.0.0</version>
-  <description>FluentVision用の物体検出マイクロサービス</description>
-  <maintainer email="takatronix@gmail.com">Takashi Otsuka</maintainer>
+  <description>アスパラガス3D点群解析と品質評価システム</description>
+  <maintainer email="aspara@example.com">Takashi Otsuka</maintainer>
   <license>MIT</license>
 
   <!-- ===== ビルドツール依存関係 ===== -->
-  <buildtool_depend>ament_cmake</buildtool_depend>  <!-- CMakeビルドシステム -->
-  <buildtool_depend>ament_cmake_auto</buildtool_depend>  <!-- ROS2自動ビルド支援 -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
   <!-- ===== コアROS2依存関係 ===== -->
   <depend>rclcpp</depend>  <!-- ROS2 C++クライアントライブラリ -->
+  <depend>std_msgs</depend>  <!-- 標準メッセージ型 -->
   <depend>sensor_msgs</depend>  <!-- センサーメッセージ型 -->
+  <depend>geometry_msgs</depend>  <!-- 幾何学メッセージ型 -->
   <depend>cv_bridge</depend>  <!-- OpenCV-ROS2橋渡し -->
   <depend>image_transport</depend>  <!-- 画像転送ライブラリ -->
-  <depend>std_msgs</depend>  <!-- 標準メッセージ型 -->
-  <depend>geometry_msgs</depend>  <!-- 幾何学メッセージ型 -->
-  <depend>visualization_msgs</depend>  <!-- 可視化メッセージ型 -->
+  <depend>tf2</depend>  <!-- TF2座標変換ライブラリ -->
+  <depend>tf2_ros</depend>  <!-- TF2 ROS2統合 -->
+  <depend>tf2_geometry_msgs</depend>  <!-- TF2幾何学メッセージ -->
+
+  <!-- ===== 点群処理依存関係 ===== -->
+  <depend>pcl_conversions</depend>  <!-- PCL-ROS2変換 -->
+  <depend>pcl_ros</depend>  <!-- PCL ROS2統合 -->
+
+  <!-- ===== コンピュータビジョン依存関係 ===== -->
+  <depend>opencv2</depend>  <!-- OpenCVコンピュータビジョン -->
+
+  <!-- ===== AI/検出メッセージ依存関係 ===== -->
   <depend>vision_msgs</depend>  <!-- コンピュータビジョンメッセージ -->
-  <depend>std_srvs</depend>  <!-- 標準サービス型 -->
 
   <!-- ===== テスト依存関係 ===== -->
   <test_depend>ament_lint_auto</test_depend>  <!-- 自動リントツール -->
@@ -44,6 +52,5 @@
   <!-- ===== エクスポート設定 ===== -->
   <export>
     <build_type>ament_cmake</build_type>    <!-- CMakeビルドシステム -->
-    <member_of_group>rosidl_interface_packages</member_of_group>    <!-- インターフェースパッケージグループ -->
   </export>
-</package> 
+</package>

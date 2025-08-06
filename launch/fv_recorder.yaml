@@ -1,70 +1,148 @@
-# FV Recorder Configuration (D415 + D405)
+# =============================================================================
+# Fluent Vision - データレコーダー設定ファイル
+# =============================================================================
+# 
+# 概要：
+#   - D415/D405カメラのリアルタイムデータ録画・再生システム
+#   - 複数フォーマット対応（rosbag, JSON, YAML, CSV, MP4, AVI）
+#   - 自動録画・再生・パススルー機能
+#   - データ保持期間管理と自動クリーンアップ
+#
+# 作者：Takashi Otsuka
+# 作成日：2024年
+# バージョン：1.0
+#
+# 対応データ：
+#   - カラー画像（D415/D405）
+#   - 深度画像（D415/D405）
+#   - 点群データ
+#   - 検出結果
+#   - セグメンテーションマスク
+# =============================================================================
+
 /**:
   ros__parameters:
-    # 録画設定
+    # ===== 録画設定 =====
     recording:
+      # 録画対象トピック
       input_topics:
-        # D415 topics
-        - "/fv/d415/color/image_raw"
-        - "/fv/d415/depth/image_rect_raw"
-        # D405 topics
-        - "/fv/d405/color/image_raw"
-        - "/fv/d405/depth/image_rect_raw"
-      output_directory: "/recordings"
-      segment_duration: 300  # 5分
-      retention_days: 7      # 7日間保持
-      date_format: "YYYYMMDD_HHMMSS"
-      auto_recording: true  # 自動録画フラグ
-      default_format: "rosbag"  # デフォルト出力フォーマット
+        # D415カメラトピック
+        - "/fv/d415/color/image_raw"        # D415カラー画像
+        - "/fv/d415/depth/image_rect_raw"   # D415深度画像
+        # D405カメラトピック
+        - "/fv/d405/color/image_raw"        # D405カラー画像
+        - "/fv/d405/depth/image_rect_raw"   # D405深度画像
+      
+      # 録画設定
+      output_directory: "/recordings"        # 録画ファイル保存ディレクトリ
+      segment_duration: 300                  # セグメント長（秒）- 5分間
+      retention_days: 7                      # データ保持期間（日）- 7日間
+      date_format: "YYYYMMDD_HHMMSS"        # ファイル名日時フォーマット
+      auto_recording: true                   # 自動録画有効
+      default_format: "rosbag"               # デフォルト出力フォーマット
 
-    # 再生設定
+    # ===== 再生設定 =====
     playback:
+      # 再生出力トピック
       output_topics:
-        # D415 playback topics
-        - "/fv/recorder/d415/color/image_raw"
-        - "/fv/recorder/d415/depth/image_rect_raw"
-        # D405 playback topics
-        - "/fv/recorder/d405/color/image_raw"
-        - "/fv/recorder/d405/depth/image_rect_raw"
-      playback_speed: 1.0    # 1.0 = 実時間
-      loop_playback: true   # ループ再生
+        # D415再生トピック
+        - "/fv/recorder/d415/color/image_raw"      # D415カラー画像再生
+        - "/fv/recorder/d415/depth/image_rect_raw" # D415深度画像再生
+        # D405再生トピック
+        - "/fv/recorder/d405/color/image_raw"      # D405カラー画像再生
+        - "/fv/recorder/d405/depth/image_rect_raw" # D405深度画像再生
+      
+      # 再生設定
+      playback_speed: 1.0    # 再生速度（1.0 = 実時間再生）
+      loop_playback: true    # ループ再生有効
 
-    # パススルー設定（ソーストピック → 再生トピック転写）
+    # ===== パススルー設定（ソーストピック → 再生トピック転写） =====
     passthrough:
-      enable_passthrough: true  # パススルー有効
+      enable_passthrough: true  # パススルー有効（リアルタイム転写）
+      
+      # トピックマッピング設定
       topic_mapping:
-        # D415 mapping
-        "/fv/d415/color/image_raw": "/fv/recorder/d415/color/image_raw"
-        "/fv/d415/depth/image_rect_raw": "/fv/recorder/d415/depth/image_rect_raw"
-        # D405 mapping  
-        "/fv/d405/color/image_raw": "/fv/recorder/d405/color/image_raw"
-        "/fv/d405/depth/image_rect_raw": "/fv/recorder/d405/depth/image_rect_raw"
+        # D415マッピング
+        "/fv/d415/color/image_raw": "/fv/recorder/d415/color/image_raw"           # カラー画像
+        "/fv/d415/depth/image_rect_raw": "/fv/recorder/d415/depth/image_rect_raw" # 深度画像
+        # D405マッピング
+        "/fv/d405/color/image_raw": "/fv/recorder/d405/color/image_raw"           # カラー画像
+        "/fv/d405/depth/image_rect_raw": "/fv/recorder/d405/depth/image_rect_raw" # 深度画像
 
-    # 外部制御設定
+    # ===== 外部制御設定 =====
     control:
-      enable_topic_control: true    # トピック制御有効
-      enable_service_control: true  # サービス制御有効
+      enable_topic_control: true    # トピック制御有効（録画開始/停止）
+      enable_service_control: true  # サービス制御有効（詳細制御）
+      
+      # 制御トピック
       control_topics:
-        recording_control: "/fv/recorder/recording_control"
-        recording_command: "/fv/recorder/recording_command"
+        recording_control: "/fv/recorder/recording_control"   # 録画制御トピック
+        recording_command: "/fv/recorder/recording_command"   # 録画コマンドトピック
 
-    # フォーマット設定
+    # ===== フォーマット設定 =====
     formats:
+      # 対応フォーマット
       supported_formats:
-        - "rosbag"  # ROS2 Bag形式（.db3）
-        - "json"    # JSON形式（.json）
-        - "yaml"    # YAML形式（.yaml）
-        - "csv"     # CSV形式（.csv）
-        - "mp4"     # MP4動画形式（.mp4）
-        - "avi"     # AVI動画形式（.avi）
+        - "rosbag"  # ROS2 Bag形式（.db3）- 推奨
+        - "json"    # JSON形式（.json）- 構造化データ
+        - "yaml"    # YAML形式（.yaml）- 設定データ
+        - "csv"     # CSV形式（.csv）- 数値データ
+        - "mp4"     # MP4動画形式（.mp4）- 動画データ
+        - "avi"     # AVI動画形式（.avi）- 動画データ
+      
+      # 動画設定
       video_settings:
-        fps: 15.0           # フレームレート
-        width: 640          # 解像度
-        height: 480         # 解像度
+        fps: 15.0           # フレームレート（FPS）
+        width: 640          # 動画幅（ピクセル）
+        height: 480         # 動画高さ（ピクセル）
         codec: "mp4v"       # 動画コーデック
 
-    # システム設定
+    # ===== システム設定 =====
     system:
-      status_publish_rate: 1.0  # 状態公開頻度（Hz）
-      cleanup_interval: 3600    # クリーンアップ間隔（秒）
-      max_file_size_mb: 1024    # 最大ファイルサイズ（MB） 
+      status_publish_rate: 1.0  # 状態公開頻度（Hz）- 1秒間隔
+      cleanup_interval: 3600    # クリーンアップ間隔（秒）- 1時間
+      max_file_size_mb: 1024    # 最大ファイルサイズ（MB）- 1GB
+
+# =============================================================================
+# パラメータ調整ガイド
+# =============================================================================
+#
+# 【録画設定の調整】
+# - segment_duration: 300秒（5分）- ファイル分割間隔
+#   - 長時間録画: 600秒（10分）
+#   - 短時間録画: 60秒（1分）
+# - retention_days: 7日間 - データ保持期間
+#   - 長期保存: 30日間
+#   - 短期保存: 1日間
+#
+# 【再生設定の調整】
+# - playback_speed: 1.0（実時間再生）
+#   - 高速再生: 2.0（2倍速）
+#   - 低速再生: 0.5（0.5倍速）
+# - loop_playback: true（ループ再生）
+#   - 単発再生: false
+#
+# 【パススルー設定】
+# - enable_passthrough: true（リアルタイム転写）
+#   - 録画のみ: false
+#   - 再生のみ: false
+#
+# 【動画設定の調整】
+# - fps: 15.0（フレームレート）
+#   - 高品質: 30.0
+#   - 省容量: 10.0
+# - codec: "mp4v"（コーデック）
+#   - 高圧縮: "h264"
+#   - 無圧縮: "raw"
+#
+# 【システム設定の調整】
+# - status_publish_rate: 1.0Hz（状態公開頻度）
+#   - 高頻度監視: 5.0Hz
+#   - 低頻度監視: 0.2Hz
+# - cleanup_interval: 3600秒（クリーンアップ間隔）
+#   - 頻繁なクリーンアップ: 1800秒（30分）
+#   - 少ないクリーンアップ: 7200秒（2時間）
+# - max_file_size_mb: 1024MB（最大ファイルサイズ）
+#   - 大容量: 2048MB（2GB）
+#   - 小容量: 512MB（0.5GB）
+# ============================================================================= 

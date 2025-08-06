@@ -1,3 +1,12 @@
+/**
+ * @file fv_realsense_node.cpp
+ * @brief Fluent Vision RealSenseカメラノードのメイン実装ファイル
+ * @details Intel RealSenseカメラ（D415/D405）のカラー、深度、点群データ取得と配信
+ * @author Takashi Otsuka
+ * @date 2024
+ * @version 1.0
+ */
+
 #include "fv_realsense/fv_realsense_node.hpp"
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
@@ -11,6 +20,19 @@
 #include <chrono>
 #include <thread>
 
+/**
+ * @brief コンストラクタ
+ * @param node_name ノード名
+ * @details RealSenseカメラノードの初期化と設定
+ * 
+ * 初期化内容：
+ * - パラメータの読み込み
+ * - RealSenseカメラの初期化
+ * - パブリッシャーの初期化
+ * - サービスの初期化
+ * - TF2座標変換の初期化
+ * - 処理スレッドの開始
+ */
 FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
     : Node(node_name), running_(false)
 {
@@ -18,30 +40,30 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
     RCLCPP_INFO(this->get_logger(), "📁 Node name: %s", node_name.c_str());
     
     try {
-        // Step 1: Load parameters
+        // ===== Step 1: パラメータの読み込み =====
         RCLCPP_INFO(this->get_logger(), "📋 Step 1: Loading parameters...");
         loadParameters();
         
-        // Step 2: Initialize RealSense first (before shared_from_this)
+        // ===== Step 2: RealSenseの初期化（shared_from_thisより前） =====
         RCLCPP_INFO(this->get_logger(), "📷 Step 2: Initializing RealSense...");
         if (!initializeRealSense()) {
             RCLCPP_ERROR(this->get_logger(), "❌ Failed to initialize RealSense");
             return;
         }
         
-        // Step 3: Initialize publishers (after RealSense)
+        // ===== Step 3: パブリッシャーの初期化（RealSenseの後） =====
         RCLCPP_INFO(this->get_logger(), "📤 Step 3: Initializing publishers...");
         initializePublishers();
         
-        // Step 4: Initialize services
+        // ===== Step 4: サービスの初期化 =====
         RCLCPP_INFO(this->get_logger(), "🔧 Step 4: Initializing services...");
         initializeServices();
         
-        // Step 5: Initialize TF
+        // ===== Step 5: TFの初期化 =====
         RCLCPP_INFO(this->get_logger(), "🔄 Step 5: Initializing TF...");
         initializeTF();
         
-        // Step 6: Start processing thread
+        // ===== Step 6: 処理スレッドの開始 =====
         RCLCPP_INFO(this->get_logger(), "🔄 Step 6: Starting processing thread...");
         running_ = true;
         processing_thread_ = std::thread(&FVDepthCameraNode::processingLoop, this);
@@ -53,38 +75,58 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
     }
 }
 
+/**
+ * @brief デストラクタ
+ * @details RealSenseカメラノードの適切な終了処理
+ * 
+ * 終了処理：
+ * - 処理スレッドの停止
+ * - スレッドの結合
+ * - リソースの解放
+ */
 FVDepthCameraNode::~FVDepthCameraNode()
 {
     RCLCPP_INFO(this->get_logger(), "🛑 Shutting down FV Depth Camera...");
     
+    // ===== 処理スレッドの停止 =====
     running_ = false;
     if (processing_thread_.joinable()) {
         processing_thread_.join();
     }
 }
 
+/**
+ * @brief パラメータの読み込み
+ * @details ROS2パラメータを読み込み、カメラ設定を初期化
+ * 
+ * 読み込み内容：
+ * - 設定ファイルパスの確認
+ * - ノード名とネームスペースの確認
+ * - 利用可能パラメータのデバッグ出力
+ * - カメラ選択設定の読み込み
+ */
 void FVDepthCameraNode::loadParameters()
 {
     RCLCPP_INFO(this->get_logger(), "📋 Loading parameters...");
     
-    // Log config file path at startup
+    // ===== 設定ファイルパスの確認 =====
     RCLCPP_INFO(this->get_logger(), "📁 Loading config file...");
     
-    // Get command line arguments to find config file path
+    // コマンドライン引数から設定ファイルパスを取得
     auto args = this->get_node_options().arguments();
     std::string config_file_path = "Unknown";
     
-    // Check for parameter file in node options
+    // ノードオプションでパラメータファイルをチェック
     auto param_file_args = this->get_node_options().parameter_overrides();
     if (!param_file_args.empty()) {
         RCLCPP_INFO(this->get_logger(), "📁 Parameter overrides detected: %zu", param_file_args.size());
     }
     
-    // Log the node name to verify correct configuration is loaded
+    // ===== ノード名とネームスペースの確認 =====
     RCLCPP_INFO(this->get_logger(), "🏷️  Node name: %s", this->get_name());
     RCLCPP_INFO(this->get_logger(), "🏷️  Namespace: %s", this->get_namespace());
     
-    // Log all available parameters for debugging
+    // ===== 利用可能パラメータのデバッグ出力 =====
     RCLCPP_INFO(this->get_logger(), "🔍 All available parameters:");
     auto param_names = this->list_parameters({}, 10);
     for (const auto& name : param_names.names) {
@@ -96,7 +138,7 @@ void FVDepthCameraNode::loadParameters()
         }
     }
     
-    // Camera selection
+    // ===== カメラ選択設定の読み込み =====
     camera_selection_config_.selection_method = 
         this->declare_parameter("camera_selection.selection_method", "auto");
     camera_selection_config_.serial_number = 
@@ -974,6 +1016,19 @@ std::vector<rs2::device> FVDepthCameraNode::getAvailableDevices()
     return devices;
 }
 
+/**
+ * @brief メイン関数
+ * @param argc コマンドライン引数の数
+ * @param argv コマンドライン引数の配列
+ * @return int 終了コード
+ * @details RealSenseカメラノードの初期化と実行
+ * 
+ * 実行内容：
+ * - ROS2の初期化
+ * - RealSenseカメラノードの作成
+ * - ノードの実行（スピン）
+ * - 適切な終了処理
+ */
 int main(int argc, char** argv)
 {
     try {
@@ -981,7 +1036,7 @@ int main(int argc, char** argv)
         
         RCLCPP_INFO(rclcpp::get_logger("fv_realsense"), "🚀 Starting FV RealSense Node...");
         
-        // Create node with default name (will be remapped by launch file if needed)
+        // ===== デフォルト名でノードを作成（launchファイルで必要に応じてリマップ） =====
         auto node = std::make_shared<FVDepthCameraNode>("fv_realsense");
         
         if (node) {

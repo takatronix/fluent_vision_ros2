@@ -1,28 +1,47 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<!-- ============================================================================= -->
+<!-- Fluent Vision - オブジェクトマスク生成ノード package.xml -->
+<!-- ============================================================================= -->
+<!-- 
+概要：
+  - UNetを使用したセグメンテーションマスク生成ノードのパッケージ定義
+  - OpenVINOによる高速推論対応
+  - ROS2 Humble対応の依存関係管理
+  - ビルド設定とメタデータの定義
+
+作者：Takashi Otsuka
+作成日：2024年
+バージョン：1.0
+-->
 <package format="3">
+  <!-- ===== パッケージ基本情報 ===== -->
   <name>fv_object_mask_generator</name>
-  <version>0.0.1</version>
-  <description>ROS2 object detection mask generator for FluentVision</description>
-  <maintainer email="fv@example.com">FluentVision Team</maintainer>
+  <version>1.0.0</version>
+  <description>FluentVision用のセグメンテーションマスク生成ノード</description>
+  <maintainer email="fv@example.com">Takashi Otsuka</maintainer>
   <license>Apache-2.0</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+  <!-- ===== ビルドツール依存関係 ===== -->
+  <buildtool_depend>ament_cmake</buildtool_depend>  <!-- CMakeビルドシステム -->
 
-  <depend>rclcpp</depend>
-  <depend>rclcpp_components</depend>
-  <depend>sensor_msgs</depend>
-  <depend>std_msgs</depend>
-  <depend>cv_bridge</depend>
-  <depend>tf2</depend>
-  <depend>tf2_ros</depend>
-  <depend>vision_msgs</depend>
-  <depend>OpenCV</depend>
+  <!-- ===== コアROS2依存関係 ===== -->
+  <depend>rclcpp</depend>  <!-- ROS2 C++クライアントライブラリ -->
+  <depend>rclcpp_components</depend>  <!-- ROS2コンポーネント -->
+  <depend>sensor_msgs</depend>  <!-- センサーメッセージ型 -->
+  <depend>std_msgs</depend>  <!-- 標準メッセージ型 -->
+  <depend>cv_bridge</depend>  <!-- OpenCV-ROS2橋渡し -->
+  <depend>tf2</depend>  <!-- TF2座標変換ライブラリ -->
+  <depend>tf2_ros</depend>  <!-- TF2 ROS2統合 -->
+  <depend>vision_msgs</depend>  <!-- コンピュータビジョンメッセージ -->
+  <depend>OpenCV</depend>  <!-- OpenCVコンピュータビジョン -->
 
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
+  <!-- ===== テスト依存関係 ===== -->
+  <test_depend>ament_lint_auto</test_depend>  <!-- 自動リントツール -->
+  <test_depend>ament_lint_common</test_depend>  <!-- 共通リントツール -->
 
+  <!-- ===== エクスポート設定 ===== -->
   <export>
-    <build_type>ament_cmake</build_type>
+    <build_type>ament_cmake</build_type>  <!-- CMakeビルドシステム -->
   </export>
 </package>

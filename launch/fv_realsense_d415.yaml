@@ -1,65 +1,137 @@
-# FV Depth Camera - D415 Configuration
-# Optimized for Intel RealSense D415
+# =============================================================================
+# Fluent Vision - RealSense D415カメラ設定ファイル
+# =============================================================================
+# 
+# 概要：
+#   - Intel RealSense D415カメラの最適化設定
+#   - アスパラガス収穫用途に特化したパラメータ
+#   - 高品質な3D点群生成とノイズ除去機能
+#
+# 作者：Takashi Otsuka
+# 作成日：2024年
+# バージョン：1.0
+#
+# カメラ仕様：
+#   - 解像度：640x480（最適化済み）
+#   - フレームレート：15FPS（安定性重視）
+#   - 深度精度：±2mm（近距離）
+#   - 視野角：65°×40°
+# =============================================================================
 
 /**:
   ros__parameters:
-    # Camera selection
+    # ===== カメラ選択設定 =====
     camera_selection:
-      selection_method: "serial"    # "auto", "serial", "name", "index"
-      serial_number: "237322061056" # D415 serial number (correct)
-      device_name: "D415"           # Device name (partial match)
+      selection_method: "serial"    # 選択方法："auto", "serial", "name", "index"
+      serial_number: "237322061056" # D415シリアル番号（要確認）
+      device_name: "D415"           # デバイス名（部分一致）
     
-    # Power management
+    # ===== 電源管理 =====
     power_management:
-      startup_delay: 1.0            # Delay before starting streams (seconds)
+      startup_delay: 1.0            # ストリーム開始前の待機時間（秒）
     
-    # Camera settings - D415 optimized (640x480, 15FPS)
+    # ===== カメラ設定（D415最適化） =====
     camera:
-      color_width: 640
-      color_height: 480
-      color_fps: 15
-      depth_width: 640
-      depth_height: 480
-      depth_fps: 15
+      color_width: 640              # カラー画像幅（ピクセル）
+      color_height: 480             # カラー画像高さ（ピクセル）
+      color_fps: 15                 # カラー画像フレームレート
+      depth_width: 640              # 深度画像幅（ピクセル）
+      depth_height: 480             # 深度画像高さ（ピクセル）
+      depth_fps: 15                 # 深度画像フレームレート
     
-    # Stream settings - D415 full capabilities
+    # ===== ストリーム設定（D415全機能） =====
     streams:
-      color_enabled: true
-      depth_enabled: true
-      infrared_enabled: false
-      pointcloud_enabled: true
-      depth_colormap_enabled: true
+      color_enabled: true           # カラーストリーム有効
+      depth_enabled: true           # 深度ストリーム有効
+      infrared_enabled: false       # 赤外線ストリーム無効（省電力）
+      pointcloud_enabled: true      # 点群生成有効
+      depth_colormap_enabled: true  # 深度カラーマップ有効
     
-    # Camera info and compression
+    # ===== 点群処理パラメータ =====
+    pointcloud:
+      # 距離フィルタリング（メートル）
+      min_distance: 0.1             # 最小距離 10cm（近すぎるノイズ除去）
+      max_distance: 3.0             # 最大距離 3m（遠くのノイズ除去）
+      
+      # 空間フィルタリング
+      spatial_filter_enabled: true     # 空間フィルタ有効
+      spatial_smooth_alpha: 0.5        # 平滑化係数（0.25-1.0、高値=強力な平滑化）
+      spatial_smooth_delta: 20         # エッジ保持閾値（1-50、高値=エッジ保持）
+      spatial_holes_fill: 3            # 穴埋めレベル（0-5、高値=積極的な穴埋め）
+      
+      # 時間フィルタリング
+      temporal_filter_enabled: true    # 時間フィルタ有効（フレーム間の平滑化）
+      temporal_smooth_alpha: 0.4       # 時間平滑化係数（0-1.0、高値=強力な平滑化）
+      temporal_smooth_delta: 20        # 差分閾値（1-100、高値=変化検出感度低下）
+      temporal_persistence_control: 3  # 持続性制御（0-8、高値=安定性向上）
+      
+      # 穴埋め処理
+      hole_filling_enabled: true       # 穴埋め有効
+      hole_filling_mode: 1             # 穴埋めモード（0:無効, 1:左から埋める, 2:周囲から最遠点）
+      
+      # ダウンサンプリング
+      decimation_enabled: false        # ダウンサンプリング無効（品質重視）
+      decimation_scale: 2              # ダウンサンプル率（2,3,4,5,8、有効時のみ使用）
+      
+      # 点群品質設定
+      organized: true                  # 組織化点群（Rviz等での表示品質向上）
+      remove_invalid_points: true      # 無効点除去（NaN、無限大値等）
+    
+    # ===== カメラ情報と圧縮設定 =====
     camera_info:
-      enable_camera_info: true
-      enable_compressed_topics: true
-      compressed_quality: 85
-      enable_depth_compressed: true
+      enable_camera_info: true         # カメラ情報有効
+      enable_compressed_topics: true   # 圧縮トピック有効
+      compressed_quality: 85           # 圧縮品質（0-100、高値=高品質）
+      enable_depth_compressed: true    # 深度圧縮有効
     
-    # Services
+    # ===== サービス設定 =====
     services:
-      get_distance_enabled: true
-      get_camera_info_enabled: true
+      get_distance_enabled: true       # 距離取得サービス有効
+      get_camera_info_enabled: true    # カメラ情報取得サービス有効
     
-    # TF settings
+    # ===== TF（座標変換）設定 =====
     tf:
-      enabled: true
-      base_frame: "base_link"
-      camera_frame: "fv/d415/camera_link"
-      color_optical_frame: "fv/d415/color_optical_frame"
-      depth_optical_frame: "fv/d415/depth_optical_frame"
+      enabled: true                    # TF有効
+      base_frame: "map"                # 基準座標系（地面水平、デバッグしやすい）
+      camera_frame: "fv/d415/camera_link"           # カメラ座標系
+      color_optical_frame: "fv/d415/color_optical_frame"   # カラー光学座標系
+      depth_optical_frame: "fv/d415/depth_optical_frame"   # 深度光学座標系
     
-    # Topics - D415 specific
+    # ===== トピック設定（D415専用） =====
     topics:
-      color: "fv/d415/color/image_raw"
-      depth: "fv/d415/depth/image_rect_raw"
-      color_compressed: "fv/d415/color/image_raw/compressed"
-      depth_colormap: "fv/d415/depth/colormap"
-      pointcloud: "fv/d415/points"
-      color_camera_info: "fv/d415/color/camera_info"
-      depth_camera_info: "fv/d415/depth/camera_info"
-      # Disable default topics
-      enable_default_topics: false
-      default_color_topic: ""
-      default_depth_topic: "" 
+      color: "fv/d415/color/image_raw"                    # カラー画像トピック
+      depth: "fv/d415/depth/image_rect_raw"               # 深度画像トピック
+      color_compressed: "fv/d415/color/image_raw/compressed"  # 圧縮カラー画像トピック
+      depth_colormap: "fv/d415/depth/colormap"            # 深度カラーマップトピック
+      pointcloud: "fv/d415/points"                        # 点群トピック
+      color_camera_info: "fv/d415/color/camera_info"      # カラーカメラ情報トピック
+      depth_camera_info: "fv/d415/depth/camera_info"      # 深度カメラ情報トピック
+      
+      # デフォルトトピック無効化（名前空間競合回避）
+      enable_default_topics: false     # デフォルトトピック無効
+      default_color_topic: ""          # デフォルトカラートピック（空）
+      default_depth_topic: ""          # デフォルト深度トピック（空）
+
+# =============================================================================
+# パラメータ調整ガイド
+# =============================================================================
+#
+# 【フィルタリング調整】
+# - spatial_smooth_alpha: ノイズが多い場合は増加（0.5→0.7）
+# - temporal_smooth_alpha: 動きが激しい場合は減少（0.4→0.2）
+# - hole_filling_mode: 穴が多い場合は2に変更
+#
+# 【距離設定】
+# - min_distance: カメラ設置高さに応じて調整（0.1-0.3m）
+# - max_distance: 作業範囲に応じて調整（2.0-5.0m）
+#
+# 【品質vs速度】
+# - decimation_enabled: 処理速度重視の場合はtrue
+# - compressed_quality: ネットワーク負荷軽減の場合は減少（85→70）
+#
+# 【座標系設定】
+# - base_frame: "map"（推奨）- 地面水平、デバッグしやすい
+# - base_frame: "base_link" - ロボットベース（上向き）
+# - base_frame: "odom" - オドメトリ座標系
+# =============================================================================
+# ============================================================================= 

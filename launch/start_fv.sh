@@ -103,6 +103,20 @@ ros2 launch fv_recorder fv_recorder_launch.py \
 echo "🔄 Starting Topic Relay (Source -> Player topics)..."
 python3 "$SCRIPT_DIR/topic_relay.py" &
 
+# アスパラ分析 D415 ノード起動
+echo "🌾 Starting Aspara Analyzer D415 node..."
+ros2 run fv_aspara_analyzer fv_aspara_analyzer_node \
+    --ros-args \
+    --params-file "$SCRIPT_DIR/fv_aspara_analyzer_d415.yaml" \
+    -r __node:=fv_aspara_analyzer_d415 &
+
+# アスパラ分析 D405 ノード起動
+echo "🌾 Starting Aspara Analyzer D405 node..."
+ros2 run fv_aspara_analyzer fv_aspara_analyzer_node \
+    --ros-args \
+    --params-file "$SCRIPT_DIR/fv_aspara_analyzer_d405.yaml" \
+    -r __node:=fv_aspara_analyzer_d405 &
+
 echo "✅ All Fluent Vision nodes started!"
 echo "📊 Use 'ros2 node list' to check running nodes"
 echo "🛑 Use './stop_fv.sh' to stop all nodes" 

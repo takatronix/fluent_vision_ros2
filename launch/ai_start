@@ -1,0 +1,155 @@
+#!/bin/bash
+
+# =============================================================================
+# Fluent Vision - AIノード開始コマンド
+# =============================================================================
+# 
+# 概要：
+#   - 指定カメラのAIノード（UNet + YOLO）を開始
+#   - 重い処理を開始してAI機能を有効化
+#
+# 使用方法：
+#   ./ai_start [d415|d405|both]
+#   
+#   例：
+#   ./ai_start d415    # D415のAIノードを開始
+#   ./ai_start d405    # D405のAIノードを開始
+#   ./ai_start both    # 全AIノードを開始
+#
+# 作者：Takashi Otsuka
+# 作成日：2024年
+# バージョン：1.0
+# =============================================================================
+
+# 色付きログ出力関数
+log_info() {
+    echo -e "\033[32m[INFO]\033[0m $1"
+}
+
+log_warn() {
+    echo -e "\033[33m[WARN]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[31m[ERROR]\033[0m $1"
+}
+
+# ヘルプ表示
+show_help() {
+    echo "Fluent Vision AIノード開始コマンド"
+    echo ""
+    echo "使用方法:"
+    echo "  $0 [d415|d405|both]"
+    echo ""
+    echo "カメラ:"
+    echo "  d415     - RealSense D415のAIノードを開始"
+    echo "  d405     - RealSense D405のAIノードを開始"
+    echo "  both     - 全AIノードを開始"
+    echo ""
+    echo "例:"
+    echo "  $0 d415     # D415のAIノードを開始"
+    echo "  $0 d405     # D405のAIノードを開始"
+    echo "  $0 both     # 全AIノードを開始"
+}
+
+# ノード開始関数
+start_ai_nodes() {
+    local camera=$1
+    
+    case $camera in
+        "d415")
+            log_info "D415のAIノードを開始中..."
+            # UNet（セグメンテーション）
+            ros2 run fv_object_mask_generator fv_object_mask_generator_node \
+                --ros-args --params-file fv_object_mask_generator_d415.yaml \
+                -r __node:=fv_object_mask_generator_d415 &
+            sleep 2
+            
+            # YOLO（物体検出）
+            ros2 run fv_object_detector fv_object_detector_node \
+                --ros-args --params-file fv_object_detector_d415.yaml \
+                -r __node:=fv_object_detector_d415 &
+            sleep 2
+            
+            log_info "D415のAIノード開始完了"
+            ;;
+        "d405")
+            log_info "D405のAIノードを開始中..."
+            # UNet（セグメンテーション）
+            ros2 run fv_object_mask_generator fv_object_mask_generator_node \
+                --ros-args --params-file fv_object_mask_generator_d405.yaml \
+                -r __node:=fv_object_mask_generator_d405 &
+            sleep 2
+            
+            # YOLO（物体検出）
+            ros2 run fv_object_detector fv_object_detector_node \
+                --ros-args --params-file fv_object_detector_d405.yaml \
+                -r __node:=fv_object_detector_d405 &
+            sleep 2
+            
+            log_info "D405のAIノード開始完了"
+            ;;
+        "both")
+            log_info "全AIノードを開始中..."
+            # D415のAIノード
+            ros2 run fv_object_mask_generator fv_object_mask_generator_node \
+                --ros-args --params-file fv_object_mask_generator_d415.yaml \
+                -r __node:=fv_object_mask_generator_d415 &
+            sleep 2
+            
+            ros2 run fv_object_detector fv_object_detector_node \
+                --ros-args --params-file fv_object_detector_d415.yaml \
+                -r __node:=fv_object_detector_d415 &
+            sleep 2
+            
+            # D405のAIノード
+            ros2 run fv_object_mask_generator fv_object_mask_generator_node \
+                --ros-args --params-file fv_object_mask_generator_d405.yaml \
+                -r __node:=fv_object_mask_generator_d405 &
+            sleep 2
+            
+            ros2 run fv_object_detector fv_object_detector_node \
+                --ros-args --params-file fv_object_detector_d405.yaml \
+                -r __node:=fv_object_detector_d405 &
+            sleep 2
+            
+            log_info "全AIノード開始完了"
+            ;;
+        *)
+            log_error "無効なカメラ: $camera"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# メイン処理
+main() {
+    local camera=${1:-"both"}
+    
+    # 引数チェック
+    if [[ $# -gt 1 ]]; then
+        log_error "引数が多すぎます"
+        show_help
+        exit 1
+    fi
+    
+    # カメラの検証
+    case $camera in
+        "d415"|"d405"|"both") ;;
+        *)
+            log_error "無効なカメラ: $camera"
+            show_help
+            exit 1
+            ;;
+    esac
+    
+    log_info "AIノード開始開始: $camera"
+    start_ai_nodes "$camera"
+    log_info "AIノード開始完了"
+}
+
+# スクリプト実行
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi 

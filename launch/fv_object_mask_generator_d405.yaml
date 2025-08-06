@@ -1,25 +1,82 @@
+# =============================================================================
+# Fluent Vision - UNetセグメンテーション設定ファイル (D405カメラ用)
+# =============================================================================
+# 
+# 概要：
+#   - UNet深層学習モデルによるアスパラガスセグメンテーション
+#   - リアルタイムでのアスパラガス領域の高精度検出
+#   - 2クラス分類：背景 vs アスパラガス
+#   - D405カメラの高精度深度情報と連携
+#
+# 作者：Takashi Otsuka
+# 作成日：2024年
+# バージョン：1.0
+#
+# モデル仕様：
+#   - アーキテクチャ：UNet
+#   - 入力サイズ：256x256ピクセル
+#   - 出力：セグメンテーションマスク
+#   - 推論デバイス：GPU（OpenVINO最適化）
+#   - D405特化：近距離高精度セグメンテーション
+# =============================================================================
+
 /**:
   ros__parameters:
-    # Input topics
-    input_image_topic: "/fv/d405/color/image_raw"
+    # ===== 入力トピック設定 =====
+    input_image_topic: "/fv/d405/color/image_raw"    # 入力カラー画像トピック（D405）
     
-    # Output topics  
-    output_segmentation_mask_topic: "/fv/d405/segmentation_mask/image"
-    output_colored_mask_topic: "/fv/d405/segmentation_mask/colored"
+    # ===== 出力トピック設定 =====
+    output_segmentation_mask_topic: "/fv/d405/segmentation_mask/image"  # セグメンテーションマスク（グレースケール）
+    output_colored_mask_topic: "/fv/d405/segmentation_mask/colored"     # カラーセグメンテーションマスク
     
-    # Processing parameters
-    processing_frequency: 10.0  # Hz
-    enable_visualization: true
+    # ===== 処理パラメータ =====
+    processing_frequency: 10.0  # 処理頻度（Hz）- 10FPSで安定動作
+    enable_visualization: true  # 可視化有効（デバッグ用）
     
-    # UNet Model parameters
+    # ===== UNetモデルパラメータ =====
     model:
-      type: "unet"
-      model_path: "/models/unet_asparagus_ch16_256_v1.0_ep20.xml"
-      device: "GPU"
-      input_width: 256
-      input_height: 256
-      confidence_threshold: 0.5
+      type: "unet"                                    # モデルタイプ：UNet
+      model_path: "/models/unet_asparagus_ch16_256_v1.0_ep20.xml"  # モデルファイルパス
+      device: "GPU"                                   # 推論デバイス（GPU/CPU/MYRIAD）
+      input_width: 256                               # 入力画像幅（ピクセル）
+      input_height: 256                              # 入力画像高さ（ピクセル）
+      confidence_threshold: 0.5                      # 信頼度閾値（0.0-1.0）
     
-    # Class configuration
-    class_names: ["Background", "Asparagus"]
-    class_colors: [0, 0, 0, 0, 255, 0]  # BGR: Background=Black, Asparagus=Green
+    # ===== クラス設定 =====
+    class_names: ["Background", "Asparagus"]         # クラス名（背景、アスパラガス）
+    class_colors: [0, 0, 0, 0, 255, 0]              # BGR色設定：背景=黒、アスパラガス=緑
+
+# =============================================================================
+# D405 vs D415 の違いとパラメータ調整ガイド
+# =============================================================================
+#
+# 【D405の特徴】
+# - より高精度な深度測定（±2mm精度）
+# - より広い視野角（87° vs 65°）
+# - 近距離特化（5cm-1.5m）
+# - より高密度な点群データ
+#
+# 【D405専用調整】
+# - confidence_threshold: 0.5（D415と同じ）- 近距離での高精度検出
+# - processing_frequency: 10.0Hz（推奨）- リアルタイム性と精度のバランス
+# - 可視化: 近距離での詳細なセグメンテーション確認が可能
+#
+# 【処理頻度の調整】
+# - processing_frequency: 10.0Hz（推奨）- リアルタイム性と精度のバランス
+# - 高精度重視: 5.0Hz（処理時間増加）
+# - 高速処理重視: 15.0Hz（精度低下の可能性）
+#
+# 【信頼度閾値の調整】
+# - confidence_threshold: 0.5（推奨）- 精度と検出率のバランス
+# - 高精度重視: 0.7（検出率低下）
+# - 高検出率重視: 0.3（誤検出増加）
+#
+# 【推論デバイスの選択】
+# - GPU: 高速推論（推奨）
+# - CPU: 安定動作（GPU未搭載時）
+# - MYRIAD: 省電力推論（Intel Neural Compute Stick）
+#
+# 【可視化設定】
+# - enable_visualization: true（デバッグ時）
+# - enable_visualization: false（本番環境時、処理負荷軽減）
+# =============================================================================

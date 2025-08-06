@@ -1,34 +1,54 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<!-- ============================================================================= -->
+<!-- Fluent Vision - RealSenseカメラノード package.xml -->
+<!-- ============================================================================= -->
+<!-- 
+概要：
+  - Intel RealSenseカメラ（D415/D405）のROS2ノードのパッケージ定義
+  - カラー、深度、点群データの取得と配信
+  - TF2座標変換とサービス提供
+  - 汎用カメラノードとしてUSBカメラ、ネットワークカメラにも対応
+
+作者：Takashi Otsuka
+作成日：2024年
+バージョン：1.0
+-->
 <package format="3">
+  <!-- ===== パッケージ基本情報 ===== -->
   <name>fv_realsense</name>
   <version>1.0.0</version>
-  <description>Universal camera node for ROS2 supporting RealSense, USB cameras, and network cameras</description>
-  <maintainer email="ros2@todo.todo">ros2</maintainer>
+  <description>FluentVision用の汎用カメラノード（RealSense、USBカメラ、ネットワークカメラ対応）</description>
+  <maintainer email="ros2@todo.todo">Takashi Otsuka</maintainer>
   <license>MIT</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+  <!-- ===== ビルドツール依存関係 ===== -->
+  <buildtool_depend>ament_cmake</buildtool_depend>  <!-- CMakeビルドシステム -->
 
-  <depend>rclcpp</depend>
-  <depend>sensor_msgs</depend>
-  <depend>cv_bridge</depend>
-  <depend>tf2_ros</depend>
-  <depend>librealsense2</depend>
-  <depend>pcl_conversions</depend>
-  <depend>pcl_ros</depend>
-  <depend>image_transport</depend>
-  <depend>compressed_image_transport</depend>
-  <depend>geometry_msgs</depend>
-  <depend>std_srvs</depend>
+  <!-- ===== コアROS2依存関係 ===== -->
+  <depend>rclcpp</depend>  <!-- ROS2 C++クライアントライブラリ -->
+  <depend>sensor_msgs</depend>  <!-- センサーメッセージ型 -->
+  <depend>cv_bridge</depend>  <!-- OpenCV-ROS2橋渡し -->
+  <depend>tf2_ros</depend>  <!-- TF2 ROS2統合 -->
+  <depend>librealsense2</depend>  <!-- Intel RealSense SDK -->
+  <depend>pcl_conversions</depend>  <!-- PCL-ROS2変換 -->
+  <depend>pcl_ros</depend>  <!-- PCL ROS2統合 -->
+  <depend>image_transport</depend>  <!-- 画像転送ライブラリ -->
+  <depend>compressed_image_transport</depend>  <!-- 圧縮画像転送 -->
+  <depend>geometry_msgs</depend>  <!-- 幾何学メッセージ型 -->
+  <depend>std_srvs</depend>  <!-- 標準サービス型 -->
 
-  <build_depend>rosidl_default_generators</build_depend>
-  <exec_depend>rosidl_default_runtime</exec_depend>
-  <member_of_group>rosidl_interface_packages</member_of_group>
+  <!-- ===== インターフェース生成依存関係 ===== -->
+  <build_depend>rosidl_default_generators</build_depend>  <!-- インターフェース生成 -->
+  <exec_depend>rosidl_default_runtime</exec_depend>  <!-- ランタイム依存関係 -->
+  <member_of_group>rosidl_interface_packages</member_of_group>  <!-- インターフェースパッケージグループ -->
 
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
+  <!-- ===== テスト依存関係 ===== -->
+  <test_depend>ament_lint_auto</test_depend>  <!-- 自動リントツール -->
+  <test_depend>ament_lint_common</test_depend>  <!-- 共通リントツール -->
 
+  <!-- ===== エクスポート設定 ===== -->
   <export>
-    <build_type>ament_cmake</build_type>
+    <build_type>ament_cmake</build_type>    <!-- CMakeビルドシステム -->
   </export>
 </package> 

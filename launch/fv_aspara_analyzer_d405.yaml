@@ -1,0 +1,90 @@
+# =============================================================================
+# Fluent Vision - アスパラガス解析ノード設定ファイル (D405カメラ用)
+# =============================================================================
+# 
+# 概要：
+#   - Intel RealSense D405カメラを使用したアスパラガス品質解析システム
+#   - 3D点群データと2D検出結果を統合して収穫適性を判定
+#   - 長さ、真っ直ぐ度、根元位置の自動測定機能
+#   - D405はD415より高精度な深度測定が可能
+#
+# 作者：Takashi Otsuka
+# 作成日：2024年
+# バージョン：1.0
+#
+# 使用方法：
+#   ros2 run fv_aspara_analyzer fv_aspara_analyzer_node \
+#       --ros-args \
+#       --params-file fv_aspara_analyzer_d405.yaml \
+#       -r __node:=fv_aspara_analyzer_d405
+# =============================================================================
+
+fv_aspara_analyzer:
+  ros__parameters:
+    # ===== トピック設定（D405カメラ用） =====
+    
+    # 入力トピック（Fluent Vision AIシステムから）
+    detection_topic: "/fv/d405/object_detection/detections"      # YOLO検出結果
+    pointcloud_topic: "/fv/d405/points"                          # 3D点群データ
+    camera_info_topic: "/fv/d405/color/camera_info"              # カメラキャリブレーション情報
+    camera_topic: "/fv/d405/color/image_raw"                     # カラー画像
+    mask_topic: "/fv/d405/segmentation_mask/image"               # セグメンテーションマスク
+
+    # 出力トピック（解析結果）
+    output_filtered_pointcloud_topic: "/fv/d405/aspara_analysis/filtered_pointcloud"  # フィルタリング済み点群
+    output_annotated_image_topic: "/fv/d405/aspara_analysis/result"          # 注釈付き可視化画像
+
+    # ===== 基本処理パラメータ =====
+    
+    # 検出・フィルタリング設定
+    min_confidence: 0.3                   # 最小検出信頼度（0.0-1.0）
+    pointcloud_distance_min: 0.1           # 点群処理最小距離（10cm）
+    pointcloud_distance_max: 2.0           # 点群処理最大距離（2m）
+    aspara_filter_distance: 0.05           # アスパラガス根元からのフィルタ距離（5cm）
+
+    # ===== ノイズ除去パラメータ =====
+    
+    # 統計的外れ値除去フィルタ
+    noise_reduction_neighbors: 50          # 統計フィルタの近傍点数（推奨：30-100）
+    noise_reduction_std_dev: 1.0           # 標準偏差倍率（推奨：0.5-2.0）
+    
+    # ボクセルグリッドフィルタ（ダウンサンプリング）
+    voxel_leaf_size: 0.010                 # ボクセルサイズ（10mm、推奨：3-10mm）
+
+    # ===== アスパラガス品質評価パラメータ =====
+    
+    # 収穫適性判定基準
+    harvest_min_length: 0.23               # 収穫最小長さ（23cm）
+    harvest_max_length: 0.50               # 収穫最大長さ（50cm）
+    straightness_threshold: 0.7            # 真っ直ぐ度閾値（70%以上で収穫可能）
+
+# =============================================================================
+# D405 vs D415 の違い
+# =============================================================================
+#
+# 【D405の特徴】
+# - より高精度な深度測定（±2mm精度）
+# - より狭い視野角（87° vs 65°）
+# - より高密度な点群データ
+# - より高価格（産業用途向け）
+#
+# 【パラメータ調整の違い】
+# - voxel_leaf_size: D405はより小さく設定可能（0.003-0.008）
+# - noise_reduction_neighbors: D405はより多く設定可能（50-150）
+# - pointcloud_distance_max: D405はより遠距離まで測定可能（2.5m）
+# =============================================================================
+#
+# 【ノイズ除去の調整】
+# - noise_reduction_neighbors: 点群密度が高い場合は増加（50→100）
+# - noise_reduction_std_dev: ノイズが多い場合は減少（1.0→0.5）
+# - voxel_leaf_size: 処理速度を上げたい場合は増加（0.005→0.01）
+#
+# 【品質評価の調整】
+# - harvest_min_length: 市場要求に応じて調整（0.20-0.30）
+# - harvest_max_length: 収穫機の制約に応じて調整（0.40-0.60）
+# - straightness_threshold: 品質基準に応じて調整（0.6-0.8）
+#
+# 【距離設定の調整】
+# - pointcloud_distance_max: カメラ設置高さに応じて調整
+# - aspara_filter_distance: アスパラガス密度に応じて調整
+# =============================================================================

@@ -1,36 +1,96 @@
-# D415 Object Detector Configuration
+# =============================================================================
+# Fluent Vision - 物体検出設定ファイル (D415カメラ用)
+# =============================================================================
+# 
+# 概要：
+#   - YOLOv10深層学習モデルによるアスパラガス物体検出
+#   - リアルタイムでのアスパラガス位置・サイズの高精度検出
+#   - オブジェクトトラッキング機能付き
+#   - アノテーション付き可視化画像の生成
+#
+# 作者：Takashi Otsuka
+# 作成日：2024年
+# バージョン：1.0
+#
+# モデル仕様：
+#   - アーキテクチャ：YOLOv10 Nano
+#   - 入力サイズ：640x640ピクセル
+#   - 出力：バウンディングボックス + クラス + 信頼度
+#   - 推論デバイス：GPU（OpenVINO最適化）
+#   - 精度：FP16（高速推論）
+# =============================================================================
+
 fv_object_detector_d415:
   ros__parameters:
-    # Input/Output topics for D415
-    input_image_topic: "/fv/d415/color/image_raw"
-    output_image_topic: "/fv/d415/object_detection/annotated_image"
-    output_detections_topic: "/fv/d415/object_detection/detections"
+    # ===== トピック設定（D415専用） =====
+    input_image_topic: "/fv/d415/color/image_raw"                    # 入力カラー画像トピック
+    output_image_topic: "/fv/d415/object_detection/annotated_image"  # アノテーション付き出力画像
+    output_detections_topic: "/fv/d415/object_detection/detections"  # 検出結果トピック
     
-    # Processing parameters
-    processing_frequency: 10.0  # Hz
-    enable_tracking: true
-    enable_visualization: true
-    show_stats_on_image: true
-    publish_annotated_image: true
+    # ===== 処理パラメータ =====
+    processing_frequency: 15.0  # 処理頻度（Hz）- 15FPSで安定動作
+    enable_tracking: true       # オブジェクトトラッキング有効
+    enable_visualization: true  # 可視化有効（デバッグ用）
+    show_stats_on_image: true   # 画像上に統計情報表示
+    publish_annotated_image: true  # アノテーション付き画像パブリッシュ
     
-    # Model configuration
+    # ===== YOLOv10モデル設定 =====
     model:
-      type: "yolov10"
-      model_path: "/models/v2_nano_best_fp16_dynamic.xml"
-      device: "GPU"
-      input_width: 640
-      input_height: 640
-      confidence_threshold: 0.5
-      nms_threshold: 0.45
-      min_area: 100.0
+      type: "yolov10"                               # モデルタイプ：YOLOv10
+      model_path: "/models/v2_nano_best_fp16_dynamic.xml"  # モデルファイルパス
+      device: "GPU"                                 # 推論デバイス（GPU/CPU/MYRIAD）
+      input_width: 640                             # 入力画像幅（ピクセル）
+      input_height: 640                            # 入力画像高さ（ピクセル）
+      confidence_threshold: 0.3                    # 信頼度閾値（0.0-1.0）
+      nms_threshold: 0.45                          # NMS閾値（重複検出除去）
+      min_area: 100.0                              # 最小検出面積（ピクセル²）
       
-    # Class names (Asparagus detection)
+    # ===== クラス名設定（アスパラガス検出） =====
     class_names:
-      - "Asparagus"
-      - "Spear"
+      - "Asparagus"  # アスパラガス（メインクラス）
+      - "Spear"      # アスパラガスの穂先
     
-    # D415 specific settings
+    # ===== D415カメラ固有設定 =====
     camera:
-      name: "D415"
-      resolution: "640x480"
-      fps: 15 
+      name: "D415"           # カメラ名
+      resolution: "640x480"  # 解像度
+      fps: 15               # フレームレート
+
+# =============================================================================
+# パラメータ調整ガイド
+# =============================================================================
+#
+# 【処理頻度の調整】
+# - processing_frequency: 10.0Hz（推奨）- リアルタイム性と精度のバランス
+# - 高精度重視: 5.0Hz（処理時間増加）
+# - 高速処理重視: 15.0Hz（精度低下の可能性）
+#
+# 【信頼度閾値の調整】
+# - confidence_threshold: 0.5（推奨）- 精度と検出率のバランス
+# - 高精度重視: 0.7（検出率低下、誤検出減少）
+# - 高検出率重視: 0.3（誤検出増加、検出率向上）
+#
+# 【NMS閾値の調整】
+# - nms_threshold: 0.45（推奨）- 重複検出除去の強度
+# - 重複検出が多い場合: 0.3（より強力な除去）
+# - 検出が少なすぎる場合: 0.6（より緩い除去）
+#
+# 【最小面積の調整】
+# - min_area: 100.0（推奨）- 小さすぎる検出を除外
+# - 小さなアスパラガスも検出: 50.0
+# - 大きなアスパラガスのみ: 200.0
+#
+# 【トラッキング設定】
+# - enable_tracking: true（推奨）- フレーム間での追跡
+# - トラッキング無効: false（処理負荷軽減）
+#
+# 【可視化設定】
+# - enable_visualization: true（デバッグ時）
+# - show_stats_on_image: true（統計情報表示）
+# - 本番環境時: 両方falseで処理負荷軽減
+#
+# 【推論デバイスの選択】
+# - GPU: 高速推論（推奨）
+# - CPU: 安定動作（GPU未搭載時）
+# - MYRIAD: 省電力推論（Intel Neural Compute Stick）
+# ============================================================================= 

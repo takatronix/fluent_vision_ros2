@@ -1,0 +1,163 @@
+#!/bin/bash
+
+# =============================================================================
+# Fluent Vision - AIノード停止コマンド
+# =============================================================================
+# 
+# 概要：
+#   - 指定カメラのAIノード（UNet + YOLO）を停止
+#   - 重い処理を停止してリソース節約
+#
+# 使用方法：
+#   ./ai_stop [d415|d405|both]
+#   
+#   例：
+#   ./ai_stop d415    # D415のAIノードを停止
+#   ./ai_stop d405    # D405のAIノードを停止
+#   ./ai_stop both    # 全AIノードを停止
+#
+# 作者：Takashi Otsuka
+# 作成日：2024年
+# バージョン：1.0
+# =============================================================================
+
+# 色付きログ出力関数
+log_info() {
+    echo -e "\033[32m[INFO]\033[0m $1"
+}
+
+log_warn() {
+    echo -e "\033[33m[WARN]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[31m[ERROR]\033[0m $1"
+}
+
+# ヘルプ表示
+show_help() {
+    echo "Fluent Vision AIノード停止コマンド"
+    echo ""
+    echo "使用方法:"
+    echo "  $0 [d415|d405|both]"
+    echo ""
+    echo "カメラ:"
+    echo "  d415     - RealSense D415のAIノードを停止"
+    echo "  d405     - RealSense D405のAIノードを停止"
+    echo "  both     - 全AIノードを停止"
+    echo ""
+    echo "例:"
+    echo "  $0 d415     # D415のAIノードを停止"
+    echo "  $0 d405     # D405のAIノードを停止"
+    echo "  $0 both     # 全AIノードを停止"
+}
+
+# ノード停止関数
+stop_ai_nodes() {
+    local camera=$1
+    
+    case $camera in
+        "d415")
+            log_info "D415のAIノードを停止中..."
+            # SIGTERMで適切に停止を試行
+            pkill -TERM -f "fv_object_mask_generator_d415" || true
+            pkill -TERM -f "fv_object_detector_d415" || true
+            sleep 2
+            
+            # まだ動いている場合はSIGKILLで強制終了
+            if pgrep -f "fv_object_mask_generator_d415" > /dev/null; then
+                log_warn "UNetノードが応答しないため強制終了します"
+                pkill -KILL -f "fv_object_mask_generator_d415" || true
+            fi
+            if pgrep -f "fv_object_detector_d415" > /dev/null; then
+                log_warn "YOLOノードが応答しないため強制終了します"
+                pkill -KILL -f "fv_object_detector_d415" || true
+            fi
+            log_info "D415のAIノード停止完了"
+            ;;
+        "d405")
+            log_info "D405のAIノードを停止中..."
+            # SIGTERMで適切に停止を試行
+            pkill -TERM -f "fv_object_mask_generator_d405" || true
+            pkill -TERM -f "fv_object_detector_d405" || true
+            sleep 2
+            
+            # まだ動いている場合はSIGKILLで強制終了
+            if pgrep -f "fv_object_mask_generator_d405" > /dev/null; then
+                log_warn "UNetノードが応答しないため強制終了します"
+                pkill -KILL -f "fv_object_mask_generator_d405" || true
+            fi
+            if pgrep -f "fv_object_detector_d405" > /dev/null; then
+                log_warn "YOLOノードが応答しないため強制終了します"
+                pkill -KILL -f "fv_object_detector_d405" || true
+            fi
+            log_info "D405のAIノード停止完了"
+            ;;
+        "both")
+            log_info "全AIノードを停止中..."
+            # SIGTERMで適切に停止を試行
+            pkill -TERM -f "fv_object_mask_generator_d415" || true
+            pkill -TERM -f "fv_object_detector_d415" || true
+            pkill -TERM -f "fv_object_mask_generator_d405" || true
+            pkill -TERM -f "fv_object_detector_d405" || true
+            sleep 2
+            
+            # まだ動いている場合はSIGKILLで強制終了
+            if pgrep -f "fv_object_mask_generator_d415" > /dev/null; then
+                log_warn "D415 UNetノードが応答しないため強制終了します"
+                pkill -KILL -f "fv_object_mask_generator_d415" || true
+            fi
+            if pgrep -f "fv_object_detector_d415" > /dev/null; then
+                log_warn "D415 YOLOノードが応答しないため強制終了します"
+                pkill -KILL -f "fv_object_detector_d415" || true
+            fi
+            if pgrep -f "fv_object_mask_generator_d405" > /dev/null; then
+                log_warn "D405 UNetノードが応答しないため強制終了します"
+                pkill -KILL -f "fv_object_mask_generator_d405" || true
+            fi
+            if pgrep -f "fv_object_detector_d405" > /dev/null; then
+                log_warn "D405 YOLOノードが応答しないため強制終了します"
+                pkill -KILL -f "fv_object_detector_d405" || true
+            fi
+            log_info "全AIノード停止完了"
+            ;;
+        *)
+            log_error "無効なカメラ: $camera"
+            show_help
+            exit 1
+            ;;
+    esac
+    
+    sleep 1
+}
+
+# メイン処理
+main() {
+    local camera=${1:-"both"}
+    
+    # 引数チェック
+    if [[ $# -gt 1 ]]; then
+        log_error "引数が多すぎます"
+        show_help
+        exit 1
+    fi
+    
+    # カメラの検証
+    case $camera in
+        "d415"|"d405"|"both") ;;
+        *)
+            log_error "無効なカメラ: $camera"
+            show_help
+            exit 1
+            ;;
+    esac
+    
+    log_info "AIノード停止開始: $camera"
+    stop_ai_nodes "$camera"
+    log_info "AIノード停止完了"
+}
+
+# スクリプト実行
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi 

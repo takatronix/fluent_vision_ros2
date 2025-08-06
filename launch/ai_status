@@ -1,0 +1,130 @@
+#!/bin/bash
+
+# =============================================================================
+# Fluent Vision - AIノード状態確認コマンド
+# =============================================================================
+# 
+# 概要：
+#   - AIノード（UNet + YOLO）の実行状態を確認
+#   - カメラ別のノード状態を表示
+#
+# 使用方法：
+#   ./ai_status [d415|d405|both]
+#   
+#   例：
+#   ./ai_status d415    # D415のAIノード状態を確認
+#   ./ai_status d405    # D405のAIノード状態を確認
+#   ./ai_status both    # 全AIノード状態を確認
+#
+# 作者：Takashi Otsuka
+# 作成日：2024年
+# バージョン：1.0
+# =============================================================================
+
+# 色付きログ出力関数
+log_info() {
+    echo -e "\033[32m[INFO]\033[0m $1"
+}
+
+log_warn() {
+    echo -e "\033[33m[WARN]\033[0m $1"
+}
+
+log_error() {
+    echo -e "\033[31m[ERROR]\033[0m $1"
+}
+
+# ヘルプ表示
+show_help() {
+    echo "Fluent Vision AIノード状態確認コマンド"
+    echo ""
+    echo "使用方法:"
+    echo "  $0 [d415|d405|both]"
+    echo ""
+    echo "カメラ:"
+    echo "  d415     - RealSense D415のAIノード状態を確認"
+    echo "  d405     - RealSense D405のAIノード状態を確認"
+    echo "  both     - 全AIノード状態を確認"
+    echo ""
+    echo "例:"
+    echo "  $0 d415     # D415のAIノード状態を確認"
+    echo "  $0 d405     # D405のAIノード状態を確認"
+    echo "  $0 both     # 全AIノード状態を確認"
+}
+
+# ノード状態確認関数
+check_node_status() {
+    local node_name=$1
+    local node_display_name=$2
+    
+    if pgrep -f "$node_name" > /dev/null; then
+        echo -e "  ✅ $node_display_name: \033[32m実行中\033[0m"
+        return 0
+    else
+        echo -e "  ❌ $node_display_name: \033[31m停止中\033[0m"
+        return 1
+    fi
+}
+
+# カメラ別状態確認
+check_camera_status() {
+    local camera=$1
+    
+    case $camera in
+        "d415")
+            echo "📷 D415 AIノード状態:"
+            check_node_status "fv_object_mask_generator_d415" "UNet (セグメンテーション)"
+            check_node_status "fv_object_detector_d415" "YOLO (物体検出)"
+            ;;
+        "d405")
+            echo "📷 D405 AIノード状態:"
+            check_node_status "fv_object_mask_generator_d405" "UNet (セグメンテーション)"
+            check_node_status "fv_object_detector_d405" "YOLO (物体検出)"
+            ;;
+        "both")
+            echo "📷 D415 AIノード状態:"
+            check_node_status "fv_object_mask_generator_d415" "UNet (セグメンテーション)"
+            check_node_status "fv_object_detector_d415" "YOLO (物体検出)"
+            echo ""
+            echo "📷 D405 AIノード状態:"
+            check_node_status "fv_object_mask_generator_d405" "UNet (セグメンテーション)"
+            check_node_status "fv_object_detector_d405" "YOLO (物体検出)"
+            ;;
+        *)
+            log_error "無効なカメラ: $camera"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# メイン処理
+main() {
+    local camera=${1:-"both"}
+    
+    # 引数チェック
+    if [[ $# -gt 1 ]]; then
+        log_error "引数が多すぎます"
+        show_help
+        exit 1
+    fi
+    
+    # カメラの検証
+    case $camera in
+        "d415"|"d405"|"both") ;;
+        *)
+            log_error "無効なカメラ: $camera"
+            show_help
+            exit 1
+            ;;
+    esac
+    
+    log_info "AIノード状態確認開始: $camera"
+    check_camera_status "$camera"
+    log_info "AIノード状態確認完了"
+}
+
+# スクリプト実行
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi 
