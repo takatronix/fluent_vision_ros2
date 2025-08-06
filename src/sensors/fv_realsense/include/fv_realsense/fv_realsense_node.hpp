@@ -3,6 +3,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -12,8 +13,6 @@
 #include <cv_bridge/cv_bridge.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
-#include <image_transport/image_transport.hpp>
-#include <image_transport/publisher.hpp>
 
 #include <memory>
 #include <string>
@@ -27,7 +26,7 @@
 class FVDepthCameraNode : public rclcpp::Node
 {
 public:
-    explicit FVDepthCameraNode();
+    explicit FVDepthCameraNode(const std::string& node_name = "fv_realsense");
     ~FVDepthCameraNode();
 
 private:
@@ -94,6 +93,8 @@ private:
         std::string color_compressed = "color/image_raw/compressed";
         std::string depth_colormap = "depth/colormap";
         std::string pointcloud = "depth/color/points";
+        std::string color_camera_info = "color/camera_info";
+        std::string depth_camera_info = "depth/camera_info";
     };
 
     // Configuration members
@@ -121,9 +122,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr color_info_pub_;
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr depth_info_pub_;
 
-    // Image transport for compressed topics
-    std::unique_ptr<image_transport::ImageTransport> image_transport_;
-    image_transport::Publisher color_compressed_pub_;
+    // Compressed image publisher
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr color_compressed_pub_;
 
     // Services
     rclcpp::Service<fv_realsense::srv::GetDistance>::SharedPtr get_distance_service_;

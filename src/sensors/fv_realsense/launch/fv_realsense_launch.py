@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -13,11 +12,11 @@ def generate_launch_description():
     pkg_share = FindPackageShare('fv_realsense')
     
     # Launch arguments
-                node_name_arg = DeclareLaunchArgument(
-                'node_name',
-                default_value='fv_realsense',
-                description='Node name'
-            )
+    node_name_arg = DeclareLaunchArgument(
+        'node_name',
+        default_value='fv_realsense',
+        description='Node name'
+    )
     
     config_file_arg = DeclareLaunchArgument(
         'config_file',
@@ -35,7 +34,9 @@ def generate_launch_description():
         executable='fv_realsense_node',
         name=node_name,
         output='screen',
-        parameters=[config_file]
+        parameters=[config_file],
+        # Force separate process to avoid device conflicts
+        emulate_tty=True
     )
     
     return LaunchDescription([

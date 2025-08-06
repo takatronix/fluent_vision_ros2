@@ -11,10 +11,11 @@
 #include <chrono>
 #include <thread>
 
-FVDepthCameraNode::FVDepthCameraNode()
-    : Node("fv_realsense"), running_(false)
+FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
+    : Node(node_name), running_(false)
 {
     RCLCPP_INFO(this->get_logger(), "🚀 FV Depth Camera starting...");
+    RCLCPP_INFO(this->get_logger(), "📁 Node name: %s", node_name.c_str());
     
     try {
         // Step 1: Load parameters
@@ -66,6 +67,35 @@ void FVDepthCameraNode::loadParameters()
 {
     RCLCPP_INFO(this->get_logger(), "📋 Loading parameters...");
     
+    // Log config file path at startup
+    RCLCPP_INFO(this->get_logger(), "📁 Loading config file...");
+    
+    // Get command line arguments to find config file path
+    auto args = this->get_node_options().arguments();
+    std::string config_file_path = "Unknown";
+    
+    // Check for parameter file in node options
+    auto param_file_args = this->get_node_options().parameter_overrides();
+    if (!param_file_args.empty()) {
+        RCLCPP_INFO(this->get_logger(), "📁 Parameter overrides detected: %zu", param_file_args.size());
+    }
+    
+    // Log the node name to verify correct configuration is loaded
+    RCLCPP_INFO(this->get_logger(), "🏷️  Node name: %s", this->get_name());
+    RCLCPP_INFO(this->get_logger(), "🏷️  Namespace: %s", this->get_namespace());
+    
+    // Log all available parameters for debugging
+    RCLCPP_INFO(this->get_logger(), "🔍 All available parameters:");
+    auto param_names = this->list_parameters({}, 10);
+    for (const auto& name : param_names.names) {
+        try {
+            auto param = this->get_parameter(name);
+            RCLCPP_INFO(this->get_logger(), "   - %s: %s", name.c_str(), param.value_to_string().c_str());
+        } catch (...) {
+            RCLCPP_WARN(this->get_logger(), "   - %s: <error reading>", name.c_str());
+        }
+    }
+    
     // Camera selection
     camera_selection_config_.selection_method = 
         this->declare_parameter("camera_selection.selection_method", "auto");
@@ -75,6 +105,28 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("camera_selection.device_name", "");
     camera_selection_config_.device_index = 
         this->declare_parameter("camera_selection.device_index", 0);
+    
+    // Debug: Print camera selection parameters
+    RCLCPP_INFO(this->get_logger(), "🔍 Camera selection config:");
+    RCLCPP_INFO(this->get_logger(), "   - Method: %s", camera_selection_config_.selection_method.c_str());
+    RCLCPP_INFO(this->get_logger(), "   - Serial: %s", camera_selection_config_.serial_number.c_str());
+    RCLCPP_INFO(this->get_logger(), "   - Name: %s", camera_selection_config_.device_name.c_str());
+    RCLCPP_INFO(this->get_logger(), "   - Index: %d", camera_selection_config_.device_index);
+    
+    // Debug: Print all loaded parameters
+    RCLCPP_INFO(this->get_logger(), "🔍 All loaded parameters:");
+    RCLCPP_INFO(this->get_logger(), "   - Camera selection method: '%s'", camera_selection_config_.selection_method.c_str());
+    RCLCPP_INFO(this->get_logger(), "   - Camera selection name: '%s'", camera_selection_config_.device_name.c_str());
+    RCLCPP_INFO(this->get_logger(), "   - Camera selection serial: '%s'", camera_selection_config_.serial_number.c_str());
+    RCLCPP_INFO(this->get_logger(), "   - Camera selection index: %d", camera_selection_config_.device_index);
+    RCLCPP_INFO(this->get_logger(), "   - Color width: %d", camera_config_.color_width);
+    RCLCPP_INFO(this->get_logger(), "   - Color height: %d", camera_config_.color_height);
+    RCLCPP_INFO(this->get_logger(), "   - Color fps: %d", camera_config_.color_fps);
+    RCLCPP_INFO(this->get_logger(), "   - Depth width: %d", camera_config_.depth_width);
+    RCLCPP_INFO(this->get_logger(), "   - Depth height: %d", camera_config_.depth_height);
+    RCLCPP_INFO(this->get_logger(), "   - Depth fps: %d", camera_config_.depth_fps);
+    RCLCPP_INFO(this->get_logger(), "   - Color topic: %s", topic_config_.color.c_str());
+    RCLCPP_INFO(this->get_logger(), "   - Depth topic: %s", topic_config_.depth.c_str());
     
     // Power management settings
     power_management_config_.startup_delay = 
@@ -145,8 +197,14 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("topics.depth_colormap", "depth/colormap");
     topic_config_.pointcloud = 
         this->declare_parameter("topics.pointcloud", "depth/color/points");
+    topic_config_.color_camera_info = 
+        this->declare_parameter("topics.color_camera_info", "color/camera_info");
+    topic_config_.depth_camera_info = 
+        this->declare_parameter("topics.depth_camera_info", "depth/camera_info");
     
     RCLCPP_INFO(this->get_logger(), "✅ Parameters loaded successfully");
+    RCLCPP_INFO(this->get_logger(), "📺 Color topic: %s", topic_config_.color.c_str());
+    RCLCPP_INFO(this->get_logger(), "📺 Depth topic: %s", topic_config_.depth.c_str());
 }
 
 bool FVDepthCameraNode::initializeRealSense()
@@ -158,27 +216,14 @@ bool FVDepthCameraNode::initializeRealSense()
         RCLCPP_INFO(this->get_logger(), "📋 Creating RealSense context...");
         ctx_ = rs2::context();
         
-        // Simple device detection without complex querying
-        RCLCPP_INFO(this->get_logger(), "🔍 Simple device detection...");
-        try {
-            auto device_list = ctx_.query_devices();
-            if (device_list.size() == 0) {
-                RCLCPP_ERROR(this->get_logger(), "❌ No RealSense devices found");
-                return false;
-            }
-            
-            // Use first device directly
-            device_ = device_list[0];
-            std::string name = device_.get_info(RS2_CAMERA_INFO_NAME);
-            std::string serial = device_.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
-            RCLCPP_INFO(this->get_logger(), "📷 Using device: %s (SN: %s)", name.c_str(), serial.c_str());
-            
-        } catch (const rs2::error& e) {
-            RCLCPP_ERROR(this->get_logger(), "❌ Error detecting devices: %s", e.what());
+        // Device selection based on configuration
+        RCLCPP_INFO(this->get_logger(), "🔍 Device selection...");
+        if (!selectCamera()) {
+            RCLCPP_ERROR(this->get_logger(), "❌ Failed to select camera");
             return false;
         }
         
-        // Configure pipeline with minimal settings
+        // Configure pipeline with minimal settings FIRST
         if (stream_config_.color_enabled) {
             cfg_.enable_stream(RS2_STREAM_COLOR, 
                 camera_config_.color_width, camera_config_.color_height, 
@@ -186,6 +231,10 @@ bool FVDepthCameraNode::initializeRealSense()
             RCLCPP_INFO(this->get_logger(), "📹 Enabled color stream: %dx%d @ %dfps", 
                 camera_config_.color_width, camera_config_.color_height, camera_config_.color_fps);
         }
+        
+        // Wait 2 seconds like vision_ai does
+        RCLCPP_INFO(this->get_logger(), "⏳ Waiting 2 seconds before enabling depth stream...");
+        std::this_thread::sleep_for(std::chrono::seconds(2));
         
         // Enable depth stream if configured
         if (stream_config_.depth_enabled) {
@@ -204,9 +253,30 @@ bool FVDepthCameraNode::initializeRealSense()
                 std::chrono::milliseconds(static_cast<int>(power_management_config_.startup_delay * 1000)));
         }
         
-        // Start pipeline with timeout
+        // Configure specific device AFTER stream configuration (like vision_ai)
+        if (device_) {
+            std::string serial = device_.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
+            cfg_.enable_device(serial);
+            RCLCPP_INFO(this->get_logger(), "📷 Pipeline configured for device: %s (SN: %s)", 
+                device_.get_info(RS2_CAMERA_INFO_NAME), serial.c_str());
+        }
+        
+        // Start pipeline with detailed error handling
         RCLCPP_INFO(this->get_logger(), "🚀 Starting RealSense pipeline...");
-        profile_ = pipe_.start(cfg_);
+        try {
+            profile_ = pipe_.start(cfg_);
+            RCLCPP_INFO(this->get_logger(), "✅ Pipeline started successfully");
+        } catch (const rs2::backend_error& e) {
+            RCLCPP_ERROR(this->get_logger(), "❌ Backend error: %s", e.what());
+            RCLCPP_ERROR(this->get_logger(), "📝 Device may be in use by another process");
+            return false;
+        } catch (const rs2::error& e) {
+            RCLCPP_ERROR(this->get_logger(), "❌ RealSense error: %s", e.what());
+            return false;
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "❌ Exception: %s", e.what());
+            return false;
+        }
         
         if (!profile_) {
             RCLCPP_ERROR(this->get_logger(), "❌ Failed to start pipeline");
@@ -240,14 +310,35 @@ bool FVDepthCameraNode::initializeRealSense()
         
         // Get depth scale with error handling
         try {
-            auto sensors = device_.query_sensors();
-            for (auto sensor : sensors) {
-                if (sensor.supports(RS2_OPTION_DEPTH_UNITS)) {
-                    depth_scale_ = sensor.get_option(RS2_OPTION_DEPTH_UNITS);
+            // Log device info before getting depth scale
+            RCLCPP_INFO(this->get_logger(), "🔍 Getting depth scale from device: %s (SN: %s)",
+                device_.get_info(RS2_CAMERA_INFO_NAME),
+                device_.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER));
+            
+            // Get depth scale from depth sensor
+            for (auto sensor : device_.query_sensors()) {
+                if (sensor.is<rs2::depth_sensor>()) {
+                    rs2::depth_sensor depth_sensor = sensor.as<rs2::depth_sensor>();
+                    depth_scale_ = depth_sensor.get_depth_scale();
+                    RCLCPP_INFO(this->get_logger(), "📏 Depth scale: %f", depth_scale_);
+                    
+                    // Double check with manual depth scale based on device model
+                    std::string device_name = device_.get_info(RS2_CAMERA_INFO_NAME);
+                    if (device_name.find("D415") != std::string::npos) {
+                        if (std::abs(depth_scale_ - 0.001f) > 0.0001f) {
+                            RCLCPP_WARN(this->get_logger(), "⚠️ D415 depth scale mismatch: got %f, expected 0.001", depth_scale_);
+                            depth_scale_ = 0.001f;  // Force correct value for D415
+                        }
+                    } else if (device_name.find("D405") != std::string::npos) {
+                        if (std::abs(depth_scale_ - 0.0001f) > 0.00001f) {
+                            RCLCPP_WARN(this->get_logger(), "⚠️ D405 depth scale mismatch: got %f, expected 0.0001", depth_scale_);
+                            depth_scale_ = 0.0001f;  // Force correct value for D405
+                        }
+                    }
                     break;
                 }
             }
-            RCLCPP_INFO(this->get_logger(), "📏 Depth scale: %f", depth_scale_);
+            RCLCPP_INFO(this->get_logger(), "📏 Final depth scale: %f", depth_scale_);
         } catch (const rs2::error& e) {
             RCLCPP_WARN(this->get_logger(), "⚠️ Could not get depth scale: %s", e.what());
             depth_scale_ = 0.001f; // Default value
@@ -288,6 +379,10 @@ bool FVDepthCameraNode::selectCamera()
 {
     auto devices = getAvailableDevices();
     
+    RCLCPP_INFO(this->get_logger(), "🔍 selectCamera() - Method: %s, Name: %s", 
+        camera_selection_config_.selection_method.c_str(), 
+        camera_selection_config_.device_name.c_str());
+    
     if (camera_selection_config_.selection_method == "serial" && 
         !camera_selection_config_.serial_number.empty()) {
         
@@ -296,6 +391,7 @@ bool FVDepthCameraNode::selectCamera()
             if (serial == camera_selection_config_.serial_number) {
                 device_ = device;
                 RCLCPP_INFO(this->get_logger(), "📷 Selected camera by serial: %s", serial.c_str());
+                // No need to call enable_device here - it's already called after selectCamera
                 return true;
             }
         }
@@ -308,9 +404,12 @@ bool FVDepthCameraNode::selectCamera()
         
         for (const auto& device : devices) {
             std::string name = device.get_info(RS2_CAMERA_INFO_NAME);
+            std::string serial = device.get_info(RS2_CAMERA_INFO_SERIAL_NUMBER);
+            RCLCPP_INFO(this->get_logger(), "🔍 Checking device: %s (SN: %s) against target: %s", 
+                name.c_str(), serial.c_str(), camera_selection_config_.device_name.c_str());
             if (name.find(camera_selection_config_.device_name) != std::string::npos) {
                 device_ = device;
-                RCLCPP_INFO(this->get_logger(), "📷 Selected camera by name: %s", name.c_str());
+                RCLCPP_INFO(this->get_logger(), "📷 Selected camera by name: %s (SN: %s)", name.c_str(), serial.c_str());
                 return true;
             }
         }
@@ -346,8 +445,8 @@ void FVDepthCameraNode::initializePublishers()
 {
     RCLCPP_INFO(this->get_logger(), "📤 Initializing publishers...");
     
-    // Create image transport - use shared_ptr (delayed initialization)
-    // image_transport_ = std::make_unique<image_transport::ImageTransport>(this->shared_from_this());
+    // Create image transport for compressed images
+    // Note: ImageTransport will be created after the node is fully initialized
     
     // Basic publishers
     if (stream_config_.color_enabled) {
@@ -356,10 +455,14 @@ void FVDepthCameraNode::initializePublishers()
         RCLCPP_INFO(this->get_logger(), "📷 Color publisher created: %s, ptr: %p", 
             topic_config_.color.c_str(), color_pub_.get());
         
-        // if (camera_info_config_.enable_compressed_topics) {
-        //     color_compressed_pub_ = image_transport_->advertise(
-        //         topic_config_.color_compressed, 10);
-        // }
+        if (camera_info_config_.enable_compressed_topics) {
+            // Create compressed image publisher directly
+            std::string compressed_topic = topic_config_.color + "/compressed";
+            color_compressed_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
+                compressed_topic, 10);
+            RCLCPP_INFO(this->get_logger(), "📷 Compressed publisher created: %s", 
+                compressed_topic.c_str());
+        }
     }
     
     if (stream_config_.depth_enabled) {
@@ -380,9 +483,12 @@ void FVDepthCameraNode::initializePublishers()
     // Camera info publishers
     if (camera_info_config_.enable_camera_info) {
         color_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            "color/camera_info", 10);
+            topic_config_.color_camera_info, 10);
         depth_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            "depth/camera_info", 10);
+            topic_config_.depth_camera_info, 10);
+        RCLCPP_INFO(this->get_logger(), "📋 Camera info publishers created: %s, %s", 
+            topic_config_.color_camera_info.c_str(), 
+            topic_config_.depth_camera_info.c_str());
     }
     
     RCLCPP_INFO(this->get_logger(), "✅ Publishers initialized");
@@ -493,10 +599,22 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
                 topic_config_.color.c_str());
         }
         
-        // Publish compressed color (disabled for now)
-        // if (camera_info_config_.enable_compressed_topics && color_compressed_pub_.getNumSubscribers() > 0) {
-        //     color_compressed_pub_.publish(color_msg);
-        // }
+        // Publish compressed color
+        if (camera_info_config_.enable_compressed_topics && color_compressed_pub_) {
+            // Create compressed image message
+            auto compressed_msg = std::make_unique<sensor_msgs::msg::CompressedImage>();
+            compressed_msg->header = color_msg->header;
+            compressed_msg->format = "jpeg";
+            
+            // Compress the image
+            std::vector<int> compression_params;
+            compression_params.push_back(cv::IMWRITE_JPEG_QUALITY);
+            compression_params.push_back(camera_info_config_.compressed_quality);
+            
+            cv::imencode(".jpg", color_image, compressed_msg->data, compression_params);
+            
+            color_compressed_pub_->publish(std::move(compressed_msg));
+        }
     }
     
     // Publish depth frame
@@ -517,6 +635,71 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
         colormap_msg->header.stamp = now;
         colormap_msg->header.frame_id = tf_config_.depth_optical_frame;
         depth_colormap_pub_->publish(*colormap_msg);
+    }
+    
+    // Publish camera info
+    if (camera_info_config_.enable_camera_info) {
+        if (color_info_pub_) {
+            sensor_msgs::msg::CameraInfo color_info;
+            color_info.header.stamp = now;
+            color_info.header.frame_id = tf_config_.color_optical_frame;
+            color_info.width = color_intrinsics_.width;
+            color_info.height = color_intrinsics_.height;
+            color_info.distortion_model = "plumb_bob";
+            
+            // Set intrinsic matrix
+            color_info.k[0] = color_intrinsics_.fx;
+            color_info.k[2] = color_intrinsics_.ppx;
+            color_info.k[4] = color_intrinsics_.fy;
+            color_info.k[5] = color_intrinsics_.ppy;
+            color_info.k[8] = 1.0;
+            
+            // Set projection matrix
+            color_info.p[0] = color_intrinsics_.fx;
+            color_info.p[2] = color_intrinsics_.ppx;
+            color_info.p[5] = color_intrinsics_.fy;
+            color_info.p[6] = color_intrinsics_.ppy;
+            color_info.p[10] = 1.0;
+            
+            // Set distortion coefficients
+            color_info.d.resize(5);
+            for (int i = 0; i < 5; i++) {
+                color_info.d[i] = color_intrinsics_.coeffs[i];
+            }
+            
+            color_info_pub_->publish(color_info);
+        }
+        
+        if (depth_info_pub_) {
+            sensor_msgs::msg::CameraInfo depth_info;
+            depth_info.header.stamp = now;
+            depth_info.header.frame_id = tf_config_.depth_optical_frame;
+            depth_info.width = depth_intrinsics_.width;
+            depth_info.height = depth_intrinsics_.height;
+            depth_info.distortion_model = "plumb_bob";
+            
+            // Set intrinsic matrix
+            depth_info.k[0] = depth_intrinsics_.fx;
+            depth_info.k[2] = depth_intrinsics_.ppx;
+            depth_info.k[4] = depth_intrinsics_.fy;
+            depth_info.k[5] = depth_intrinsics_.ppy;
+            depth_info.k[8] = 1.0;
+            
+            // Set projection matrix
+            depth_info.p[0] = depth_intrinsics_.fx;
+            depth_info.p[2] = depth_intrinsics_.ppx;
+            depth_info.p[5] = depth_intrinsics_.fy;
+            depth_info.p[6] = depth_intrinsics_.ppy;
+            depth_info.p[10] = 1.0;
+            
+            // Set distortion coefficients
+            depth_info.d.resize(5);
+            for (int i = 0; i < 5; i++) {
+                depth_info.d[i] = depth_intrinsics_.coeffs[i];
+            }
+            
+            depth_info_pub_->publish(depth_info);
+        }
     }
     
     // Log publishing status
@@ -798,7 +981,8 @@ int main(int argc, char** argv)
         
         RCLCPP_INFO(rclcpp::get_logger("fv_realsense"), "🚀 Starting FV RealSense Node...");
         
-        auto node = std::make_shared<FVDepthCameraNode>();
+        // Create node with default name (will be remapped by launch file if needed)
+        auto node = std::make_shared<FVDepthCameraNode>("fv_realsense");
         
         if (node) {
             RCLCPP_INFO(rclcpp::get_logger("fv_realsense"), "✅ Node created successfully");
