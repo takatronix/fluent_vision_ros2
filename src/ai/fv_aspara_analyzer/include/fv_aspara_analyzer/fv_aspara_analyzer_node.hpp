@@ -308,6 +308,7 @@ private:
      * @note 問題点：描画処理が重い、フレームレート低下の原因
      * @note 改良点：描画処理の最適化、条件付き描画が必要
      */
+    void publishCurrentImage();
     void publishAnnotatedImage(
         const cv::Mat& image,
         const AsparaInfo& aspara_info,

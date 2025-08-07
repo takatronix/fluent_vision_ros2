@@ -232,6 +232,10 @@ void FvAsparaAnalyzerNode::imageCallback(const sensor_msgs::msg::Image::SharedPt
 {
     RCLCPP_WARN_ONCE(this->get_logger(), "Image callback received first image");
     latest_color_image_ = msg;
+    
+    // 常に画像を出力する
+    // 検出結果がある場合はオーバーレイ付き、ない場合は元画像をそのまま出力
+    publishCurrentImage();
 }
 
 /**
@@ -707,6 +711,63 @@ void FvAsparaAnalyzerNode::publishRootTF(
     transform_stamped.transform.rotation.w = 1.0;
     
     tf_broadcaster_->sendTransform(transform_stamped);
+}
+
+/**
+ * @brief 現在の画像を出力（検出結果がある場合はオーバーレイ付き）
+ * @details 常に画像を出力し、検出結果がある場合はオーバーレイを追加
+ */
+void FvAsparaAnalyzerNode::publishCurrentImage()
+{
+    if (!latest_color_image_) {
+        return;
+    }
+    
+    // カラー画像をcv::Matに変換
+    cv::Mat color_image;
+    try {
+        cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(latest_color_image_, sensor_msgs::image_encodings::BGR8);
+        color_image = cv_ptr->image;
+    } catch (cv_bridge::Exception& e) {
+        RCLCPP_ERROR(this->get_logger(), "CV bridge exception: %s", e.what());
+        return;
+    }
+    
+    cv::Mat output_image = color_image.clone();
+    
+    // 検出結果がある場合はオーバーレイを追加
+    if (!aspara_list_.empty() && latest_camera_info_) {
+        // 各検出されたアスパラガスを描画
+        for (const auto& aspara_info : aspara_list_) {
+            // バウンディングボックスを描画（検出あり：黄色）
+            cv::Scalar bbox_color(0, 255, 255); // 黄色
+            cv::rectangle(output_image, aspara_info.bounding_box_2d, bbox_color, 2);
+            
+            // 検出情報を表示
+            int y_offset = aspara_info.bounding_box_2d.y - 10;
+            if (y_offset < 30) {
+                y_offset = aspara_info.bounding_box_2d.y + aspara_info.bounding_box_2d.height + 30;
+            }
+            
+            // ID と信頼度を表示
+            cv::putText(output_image, 
+                       cv::format("ID:%d %.2f", aspara_info.id, aspara_info.confidence),
+                       cv::Point(aspara_info.bounding_box_2d.x, y_offset), 
+                       cv::FONT_HERSHEY_SIMPLEX, 0.5, bbox_color, 2);
+        }
+    }
+    
+    // 画像をパブリッシュ
+    try {
+        sensor_msgs::msg::Image::SharedPtr msg = cv_bridge::CvImage(
+            latest_color_image_->header,
+            sensor_msgs::image_encodings::BGR8,
+            output_image).toImageMsg();
+        
+        annotated_image_pub_->publish(*msg);
+    } catch (cv_bridge::Exception& e) {
+        RCLCPP_ERROR(this->get_logger(), "CV bridge exception in publishCurrentImage: %s", e.what());
+    }
 }
 
 /**

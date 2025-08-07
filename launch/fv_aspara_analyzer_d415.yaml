@@ -18,7 +18,7 @@
 #       -r __node:=fv_aspara_analyzer_d415
 # =============================================================================
 
-fv_aspara_analyzer:
+fv_aspara_analyzer_d415:
   ros__parameters:
     # ===== トピック設定（D415カメラ用） =====
     

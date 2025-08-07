@@ -117,9 +117,10 @@ cd launch
 - **品質分析**: `/fv/aspara_analysis/result`
 
 ### サービス
-- **モード設定**: `/fv_realsense/set_mode`
-- **距離取得**: `/fv_realsense/get_distance`
-- **カメラ情報**: `/fv_realsense/get_camera_info`
+- **モード設定**: `/fv_realsense/set_mode` - 表示モード切り替え（0: 表示なし, 1: カーソルのみ, 2: カーソル+座標+距離）
+- **距離取得**: `/fv_realsense/get_distance` - ピクセル座標から3D距離を取得
+- **カメラ情報**: `/fv_realsense/get_camera_info` - カメラ設定・仕様情報を取得
+- **ポイントクラウド**: `/fv_realsense/get_point_cloud` - 3Dポイントクラウドデータを取得
 
 ## ⚙️ 設定
 

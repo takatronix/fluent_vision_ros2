@@ -19,7 +19,7 @@
 #       -r __node:=fv_aspara_analyzer_d405
 # =============================================================================
 
-fv_aspara_analyzer:
+fv_aspara_analyzer_d405:
   ros__parameters:
     # ===== トピック設定（D405カメラ用） =====
     

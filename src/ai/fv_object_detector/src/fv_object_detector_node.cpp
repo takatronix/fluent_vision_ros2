@@ -151,7 +151,7 @@ private:
         try {
             // ===== ROS2パラメータからモデル設定を取得 =====
             auto model_type = this->declare_parameter("model.type", "yolov10");                    // モデルタイプ
-            auto model_path = this->declare_parameter("model.model_path", "/home/takatronix/FluentVision/models/v2_nano_best_fp16_dynamic.xml"); // モデルファイルパス
+            auto model_path = this->declare_parameter("model.model_path", "/models/v2_nano_best_fp16_dynamic.xml"); // モデルファイルパス
             auto device = this->declare_parameter("model.device", "");                             // 推論デバイス
             auto input_width = this->declare_parameter("model.input_width", 640);                  // 入力画像幅
             auto input_height = this->declare_parameter("model.input_height", 640);                // 入力画像高さ
