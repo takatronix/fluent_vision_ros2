@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FluentVision - Multi-Stream Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+        <!-- ヘッダー -->
+        <header class="header">
+            <div class="header-left">
+                <h1 class="logo">
+                    <span class="logo-icon">📺</span>
+                    FluentVision
+                </h1>
+                <span class="version">v1.0.0</span>
+            </div>
+            
+            <div class="header-center">
+                <div class="layout-selector">
+                    <button class="layout-btn" data-layout="single">1画面</button>
+                    <button class="layout-btn active" data-layout="quad">4分割</button>
+                    <button class="layout-btn" data-layout="six">6分割</button>
+                    <button class="layout-btn" data-layout="custom">カスタム</button>
+                </div>
+            </div>
+            
+            <div class="header-right">
+                <button id="addStreamBtn" class="btn-primary">+ ストリーム追加</button>
+                <button id="saveLayoutBtn" class="btn-icon" title="レイアウト保存">💾</button>
+                <button id="fullscreenBtn" class="btn-icon" title="フルスクリーン">🔳</button>
+                <button id="settingsBtn" class="btn-icon" title="設定">⚙️</button>
+            </div>
+        </header>
+
+        <!-- メインコンテナ -->
+        <main class="main-container">
+            <div id="streamGrid" class="stream-grid layout-quad">
+                <!-- ストリームタイルがここに動的に追加されます -->
+            </div>
+        </main>
+
+        <!-- サイドパネル（ストリーム追加用） -->
+        <div id="sidePanel" class="side-panel">
+            <div class="panel-header">
+                <h2>ストリーム追加</h2>
+                <button class="close-btn">&times;</button>
+            </div>
+            
+            <div class="panel-content">
+                <div class="form-group">
+                    <label>ストリーム名</label>
+                    <input type="text" id="streamName" placeholder="Camera 1" />
+                </div>
+                
+                <div class="form-group">
+                    <label>ストリームタイプ</label>
+                    <select id="streamType">
+                        <option value="mjpeg">MJPEG</option>
+                        <option value="websocket">WebSocket</option>
+                        <option value="webrtc">WebRTC</option>
+                        <option value="rtmp">RTMP/HLS</option>
+                        <option value="ros">ROS Topic</option>
+                        <option value="pointcloud">ROS PointCloud</option>
+                        <option value="iframe">Webページ</option>
+                    </select>
+                </div>
+                
+                <!-- 通常のストリーム用URL（ROS以外） -->
+                <div class="form-group" id="urlGroup">
+                    <label>URL / エンドポイント</label>
+                    <input type="text" id="streamUrl" placeholder="http://localhost:8080/stream" />
+                </div>
+                
+                <!-- ROS専用：ROSBridge URL -->
+                <div class="form-group" id="rosbridgeGroup" style="display: none;">
+                    <label>ROSBridge WebSocket URL</label>
+                    <input type="text" id="rosbridgeUrl" value="ws://localhost:9090" />
+                </div>
+                
+                <!-- ROS専用：Topic名 -->
+                <div class="form-group" id="rosTopicGroup" style="display: none;">
+                    <label>ROS Topic</label>
+                    <input type="text" id="rosTopic" placeholder="/camera/image_raw" />
+                </div>
+                
+                <button id="addStreamConfirm" class="btn-primary full-width">追加</button>
+            </div>
+        </div>
+
+        <!-- ストリームテンプレート -->
+        <template id="streamTileTemplate">
+            <div class="stream-tile" draggable="true">
+                <div class="tile-header">
+                    <span class="tile-title"></span>
+                    <div class="tile-controls">
+                        <button class="tile-btn" title="録画">⏺️</button>
+                        <button class="tile-btn" title="スクリーンショット">📷</button>
+                        <button class="tile-btn fullscreen-tile" title="最大化">⬜</button>
+                        <button class="tile-btn close-tile" title="閉じる">✖️</button>
+                    </div>
+                </div>
+                <div class="tile-content">
+                    <div class="stream-container"></div>
+                    <div class="tile-status">
+                        <span class="status-indicator"></span>
+                        <span class="status-text">接続中...</span>
+                    </div>
+                </div>
+                <div class="tile-resize-handle"></div>
+            </div>
+        </template>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>
