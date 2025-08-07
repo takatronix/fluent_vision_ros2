@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FluentVision - Free Layout Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-color: #000000;
+            --panel-bg: rgba(20, 20, 20, 0.8);
+            --border-color: rgba(255, 255, 255, 0.1);
+            --text-color: #ffffff;
+            --accent-color: #6366f1;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg-color);
+            color: var(--text-color);
+            height: 100vh;
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* ヘッダー */
+        .header {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 50px;
+            background: var(--panel-bg);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 1rem;
+            z-index: 10000;
+        }
+
+        .logo {
+            font-size: 1.2rem;
+            font-weight: bold;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .controls {
+            display: flex;
+            gap: 0.5rem;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 0.5rem 1rem;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 6px;
+            color: white;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.875rem;
+        }
+
+        .btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: translateY(-1px);
+        }
+
+        .btn.primary {
+            background: var(--accent-color);
+            border-color: var(--accent-color);
+        }
+
+        /* ワークスペース */
+        .workspace {
+            position: absolute;
+            top: 50px;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            overflow: hidden;
+        }
+
+        /* ストリームタイル */
+        .stream-tile {
+            position: absolute;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+            transition: opacity 0.2s;
+        }
+
+        .stream-tile.active {
+            box-shadow: 0 0 0 2px var(--accent-color);
+        }
+
+        .tile-header {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 32px;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(10px);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 0.5rem;
+            cursor: move;
+            user-select: none;
+            z-index: 10;
+            opacity: 0;
+            transform: translateY(-100%);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        /* タイル全体にホバーした時にヘッダーを表示 */
+        .stream-tile:hover .tile-header {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        /* ヘッダーが表示されている間は表示を維持 */
+        .tile-header:hover {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        /* フォーカス時も表示 */
+        .stream-tile.focused .tile-header {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .tile-title {
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+
+        .tile-controls {
+            display: flex;
+            gap: 0.25rem;
+            align-items: center;
+        }
+
+        .tile-btn {
+            width: 20px;
+            height: 20px;
+            background: transparent;
+            border: none;
+            color: rgba(255, 255, 255, 0.6);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 3px;
+            font-size: 12px;
+        }
+
+        .tile-btn:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+
+        /* 個別透過率スライダー */
+        .tile-opacity-control {
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+            margin-right: 0.5rem;
+        }
+
+        .tile-opacity-slider {
+            width: 60px;
+            height: 3px;
+            -webkit-appearance: none;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 2px;
+            outline: none;
+            cursor: pointer;
+        }
+
+        .tile-opacity-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 12px;
+            height: 12px;
+            background: var(--accent-color);
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
+        .tile-opacity-value {
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.5);
+            min-width: 30px;
+            text-align: right;
+        }
+
+        .tile-content {
+            position: absolute;
+            top: 0;  /* ヘッダーがオーバーレイなので0から */
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: black;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .tile-content img,
+        .tile-content video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        /* リサイズハンドル */
+        .resize-handle {
+            position: absolute;
+            background: transparent;
+            z-index: 11;  /* ヘッダーより上に */
+        }
+
+        .resize-se {
+            bottom: 0;
+            right: 0;
+            width: 10px;
+            height: 10px;
+            cursor: nwse-resize;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        /* ホバー時にリサイズハンドルも表示 */
+        .stream-tile:hover .resize-se {
+            opacity: 1;
+        }
+
+        .resize-se::after {
+            content: '';
+            position: absolute;
+            bottom: 2px;
+            right: 2px;
+            width: 0;
+            height: 0;
+            border-style: solid;
+            border-width: 0 0 6px 6px;
+            border-color: transparent transparent rgba(255, 255, 255, 0.3) transparent;
+        }
+        
+        /* 最小表示 - コンパクトインジケーター */
+        .tile-mini-indicator {
+            position: absolute;
+            top: 4px;
+            left: 4px;
+            padding: 2px 6px;
+            background: rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(5px);
+            border-radius: 4px;
+            font-size: 10px;
+            color: rgba(255, 255, 255, 0.7);
+            opacity: 0;
+            transition: opacity 0.3s;
+            z-index: 5;
+            pointer-events: none;
+        }
+        
+        /* ヘッダーが非表示の時だけインジケーターを表示 */
+        .stream-tile:not(:hover) .tile-mini-indicator {
+            opacity: 1;
+        }
+
+        /* サイドパネル */
+        .side-panel {
+            position: fixed;
+            top: 50px;
+            right: -350px;
+            width: 350px;
+            bottom: 0;
+            background: var(--panel-bg);
+            backdrop-filter: blur(20px);
+            border-left: 1px solid var(--border-color);
+            transition: right 0.3s;
+            z-index: 9999;
+            padding: 1.5rem;
+            overflow-y: auto;
+        }
+
+        .side-panel.open {
+            right: 0;
+        }
+
+        .panel-section {
+            margin-bottom: 2rem;
+        }
+
+        .panel-title {
+            font-size: 0.875rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            color: rgba(255, 255, 255, 0.6);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.875rem;
+            color: rgba(255, 255, 255, 0.8);
+        }
+
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 0.5rem;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            color: white;
+        }
+
+        .slider-group {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .slider {
+            flex: 1;
+            -webkit-appearance: none;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            outline: none;
+        }
+
+        .slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            background: var(--accent-color);
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
+        .slider-value {
+            min-width: 40px;
+            text-align: right;
+            font-size: 0.875rem;
+        }
+
+        /* レイアウトプリセット */
+        .layout-presets {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 0.5rem;
+        }
+
+        .preset-card {
+            padding: 0.75rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: center;
+        }
+
+        .preset-card:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: var(--accent-color);
+        }
+
+        .preset-card.active {
+            background: var(--accent-color);
+            border-color: var(--accent-color);
+        }
+
+        /* クイック追加メニュー */
+        .quick-add {
+            position: fixed;
+            top: 60px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--panel-bg);
+            backdrop-filter: blur(20px);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1rem;
+            display: none;
+            z-index: 9998;
+            min-width: 300px;
+        }
+
+        .quick-add.show {
+            display: block;
+        }
+
+        .quick-items {
+            display: grid;
+            gap: 0.5rem;
+        }
+
+        .quick-item {
+            padding: 0.75rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .quick-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+            transform: translateX(4px);
+        }
+
+        /* テーマ */
+        body.theme-dark {
+            --bg-color: #000000;
+            --panel-bg: rgba(20, 20, 20, 0.8);
+        }
+
+        body.theme-light {
+            --bg-color: #f5f5f5;
+            --panel-bg: rgba(255, 255, 255, 0.9);
+            --text-color: #333333;
+            --border-color: rgba(0, 0, 0, 0.1);
+        }
+
+        body.theme-ar {
+            --bg-color: transparent;
+            --panel-bg: rgba(0, 0, 0, 0.3);
+        }
+
+        /* 最小化状態のスタイル */
+        .stream-tile.minimized .tile-header {
+            opacity: 1 !important;
+            transform: translateY(0) !important;
+        }
+        
+        .stream-tile.minimized .tile-mini-indicator {
+            display: none;
+        }
+        
+        /* モバイル/タッチデバイス対応 */
+        @media (hover: none) {
+            .tile-header {
+                opacity: 0.7;
+                transform: translateY(0);
+            }
+            
+            .resize-se {
+                opacity: 0.5;
+            }
+        }
+    </style>
+</head>
+<body class="theme-dark">
+    <!-- ヘッダー -->
+    <header class="header">
+        <div class="logo">FluentVision</div>
+        
+        <div class="controls">
+            <!-- レイアウト選択 -->
+            <select id="layoutSelector" class="btn" style="min-width: 150px; padding: 0.5rem;" 
+                    onchange="app.loadLayoutFromSelector(this.value)">
+                <option value="">-- Select Layout --</option>
+            </select>
+            <button class="btn" onclick="app.saveCurrentLayoutWithPrompt()">Save</button>
+            <button class="btn" onclick="app.deleteCurrentLayout()">Delete</button>
+            
+            <div style="border-left: 1px solid rgba(255,255,255,0.2); height: 24px; margin: 0 0.5rem;"></div>
+            
+            <button class="btn primary" onclick="app.addCustomStream()">+ Add Stream</button>
+            <button class="btn" onclick="app.toggleSettings()">Settings</button>
+        </div>
+    </header>
+
+    <!-- ワークスペース -->
+    <div class="workspace" id="workspace"></div>
+
+
+    <!-- 設定パネル -->
+    <div class="side-panel" id="settingsPanel">
+        <div class="panel-section">
+            <div class="panel-title">Display Settings</div>
+            
+            <div class="form-group">
+                <label>Tile Opacity</label>
+                <div class="slider-group">
+                    <input type="range" class="slider" id="opacitySlider" 
+                           min="10" max="100" value="80" 
+                           oninput="app.updateOpacity(this.value)">
+                    <span class="slider-value" id="opacityValue">80%</span>
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label>Theme</label>
+                <select onchange="app.changeTheme(this.value)">
+                    <option value="dark">Dark (Default)</option>
+                    <option value="light">Light</option>
+                    <option value="ar">AR (Transparent)</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="panel-section">
+            <div class="panel-title">Layout Presets</div>
+            <div class="layout-presets">
+                <div class="preset-card" onclick="app.applyPreset('grid')">
+                    Grid
+                </div>
+                <div class="preset-card" onclick="app.applyPreset('cascade')">
+                    Cascade
+                </div>
+                <div class="preset-card" onclick="app.applyPreset('focus')">
+                    Focus
+                </div>
+                <div class="preset-card" onclick="app.applyPreset('stack')">
+                    Stack
+                </div>
+            </div>
+        </div>
+
+        <div class="panel-section">
+            <div class="panel-title">Layout Export/Import</div>
+            <button class="btn" style="width: 100%; margin-bottom: 0.5rem" 
+                    onclick="app.exportLayout()">
+                Export JSON
+            </button>
+            <button class="btn" style="width: 100%" 
+                    onclick="app.importLayout()">
+                Import JSON
+            </button>
+        </div>
+    </div>
+
+    <script>
+        class FluentVisionApp {
+            constructor() {
+                this.tiles = new Map();
+                this.nextZ = 1000;
+                this.draggedTile = null;
+                this.resizingTile = null;
+                this.opacity = 80;
+                this.layouts = this.loadAllLayouts();
+                this.currentLayoutName = null;
+                
+                this.init();
+            }
+
+            init() {
+                this.setupEventListeners();
+                this.updateLayoutSelector();
+                
+                // 最後に使用したレイアウトを読み込む
+                const lastLayout = localStorage.getItem('fluentvision-last-layout');
+                if (lastLayout && this.layouts[lastLayout]) {
+                    this.loadLayoutByName(lastLayout);
+                } else {
+                    // 後方互換性のため古い形式も読み込む
+                    this.loadSavedLayout();
+                }
+            }
+
+            addTile(config) {
+                const tile = document.createElement('div');
+                tile.className = 'stream-tile';
+                tile.id = config.id || `tile-${Date.now()}`;
+                tile.style.left = `${config.x || 100}px`;
+                tile.style.top = `${config.y || 100}px`;
+                tile.style.width = `${config.width || 400}px`;
+                tile.style.height = `${config.height || 300}px`;
+                tile.style.zIndex = this.nextZ++;
+                
+                // 個別の透過率（デフォルトは全体設定を使用）
+                const tileOpacity = config.opacity || this.opacity;
+                tile.style.opacity = tileOpacity / 100;
+
+                tile.innerHTML = `
+                    <div class="tile-mini-indicator">${config.title || 'New Stream'}</div>
+                    <div class="tile-header">
+                        <input class="tile-title-input" type="text" value="${config.title || 'New Stream'}" 
+                               onchange="app.updateTileTitle('${tile.id}', this.value)"
+                               onclick="event.stopPropagation()" 
+                               style="background: transparent; border: none; color: white; font-size: 0.875rem; width: 150px;">
+                        <div class="tile-controls">
+                            <div class="tile-opacity-control">
+                                <input type="range" class="tile-opacity-slider" 
+                                       min="10" max="100" value="${tileOpacity}"
+                                       oninput="app.updateTileOpacity('${tile.id}', this.value)"
+                                       onclick="event.stopPropagation()">
+                                <span class="tile-opacity-value">${tileOpacity}%</span>
+                            </div>
+                            <button class="tile-btn" onclick="app.editTileSettings('${tile.id}')" title="Edit">⚙</button>
+                            <button class="tile-btn" onclick="app.duplicateTile('${tile.id}')" title="Duplicate">⊕</button>
+                            <button class="tile-btn" onclick="app.minimizeTile('${tile.id}')" title="Minimize">－</button>
+                            <button class="tile-btn" onclick="app.maximizeTile('${tile.id}')" title="Maximize">□</button>
+                            <button class="tile-btn" onclick="app.closeTile('${tile.id}')" title="Close">✕</button>
+                        </div>
+                    </div>
+                    <div class="tile-content" id="content-${tile.id}">
+                        ${config.editing ? this.createEditForm(config) : this.createContent(config)}
+                    </div>
+                    <div class="resize-handle resize-se"></div>
+                `;
+
+                document.getElementById('workspace').appendChild(tile);
+                
+                this.tiles.set(tile.id, {
+                    ...config,
+                    opacity: tileOpacity,
+                    element: tile
+                });
+
+                this.setupTileEvents(tile);
+            }
+
+            updateTileOpacity(tileId, value) {
+                const tile = document.getElementById(tileId);
+                if (tile) {
+                    tile.style.opacity = value / 100;
+                    
+                    // 表示を更新
+                    const valueDisplay = tile.querySelector('.tile-opacity-value');
+                    if (valueDisplay) {
+                        valueDisplay.textContent = `${value}%`;
+                    }
+                    
+                    // データを更新
+                    const tileData = this.tiles.get(tileId);
+                    if (tileData) {
+                        tileData.opacity = parseInt(value);
+                    }
+                    
+                    // 保存
+                    this.saveCurrentLayout();
+                }
+            }
+
+            createContent(config) {
+                if (!config.url && config.type !== 'demo') {
+                    return this.createEditForm(config);
+                }
+                
+                switch(config.type) {
+                    case 'mjpeg':
+                        return `<img src="${config.url}" alt="${config.title}">`;
+                    case 'iframe':
+                        // Simplified iframe without sandbox for local testing
+                        return `<iframe src="${config.url}" 
+                                frameborder="0" 
+                                style="width:100%;height:100%"
+                                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                                allowfullscreen></iframe>`;
+                    case 'demo':
+                        return `<div style="color: #666; font-size: 2rem;">Configure Stream</div>`;
+                    default:
+                        return `<div>Loading...</div>`;
+                }
+            }
+            
+            createEditForm(config) {
+                return `
+                    <div style="padding: 20px; color: white;">
+                        <div style="margin-bottom: 15px;">
+                            <label style="display: block; margin-bottom: 5px; font-size: 0.875rem;">Type</label>
+                            <select id="type-${config.id}" style="width: 100%; padding: 8px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 4px; color: white;">
+                                <option value="mjpeg" ${config.type === 'mjpeg' ? 'selected' : ''}>MJPEG Stream</option>
+                                <option value="iframe" ${config.type === 'iframe' ? 'selected' : ''}>Web Page (iframe)</option>
+                                <option value="websocket" ${config.type === 'websocket' ? 'selected' : ''}>WebSocket</option>
+                                <option value="webrtc" ${config.type === 'webrtc' ? 'selected' : ''}>WebRTC</option>
+                                <option value="ros" ${config.type === 'ros' ? 'selected' : ''}>ROS Topic</option>
+                            </select>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                            <label style="display: block; margin-bottom: 5px; font-size: 0.875rem;">URL / Endpoint</label>
+                            <input type="text" id="url-${config.id}" value="${config.url || ''}" 
+                                   placeholder="http://example.com/stream"
+                                   style="width: 100%; padding: 8px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 4px; color: white;">
+                        </div>
+                        <button onclick="app.saveTileSettings('${config.id}')" 
+                                style="padding: 8px 16px; background: #6366f1; border: none; border-radius: 4px; color: white; cursor: pointer;">
+                            Apply
+                        </button>
+                    </div>
+                `;
+            }
+
+            setupTileEvents(tile) {
+                // ドラッグ
+                const header = tile.querySelector('.tile-header');
+                header.addEventListener('mousedown', (e) => {
+                    if (e.target.closest('.tile-controls')) return;
+                    this.startDrag(tile, e);
+                });
+
+                // リサイズ
+                const resizeHandle = tile.querySelector('.resize-se');
+                resizeHandle.addEventListener('mousedown', (e) => {
+                    this.startResize(tile, e);
+                    e.stopPropagation();
+                });
+
+                // クリックで最前面に＆フォーカス状態を管理
+                tile.addEventListener('mousedown', () => {
+                    // 既存のフォーカスをクリア
+                    document.querySelectorAll('.stream-tile').forEach(t => {
+                        t.classList.remove('focused');
+                        // フォーカス解除タイマーをセット
+                        this.setAutoHideTimer(t);
+                    });
+                    
+                    // このタイルにフォーカス
+                    tile.classList.add('focused');
+                    tile.style.zIndex = this.nextZ++;
+                    
+                    // このタイルのタイマーをクリア
+                    if (tile.hideTimer) {
+                        clearTimeout(tile.hideTimer);
+                    }
+                });
+
+                // マウスがタイルから離れた時
+                tile.addEventListener('mouseleave', () => {
+                    if (!tile.classList.contains('focused')) return;
+                    this.setAutoHideTimer(tile);
+                });
+
+                // マウスがタイルに入った時
+                tile.addEventListener('mouseenter', () => {
+                    if (tile.hideTimer) {
+                        clearTimeout(tile.hideTimer);
+                    }
+                });
+
+                // タッチデバイス対応
+                tile.addEventListener('touchstart', () => {
+                    tile.classList.add('focused');
+                }, { passive: true });
+            }
+
+            // 自動非表示タイマー設定（3秒後にフォーカス解除）
+            setAutoHideTimer(tile) {
+                if (tile.hideTimer) {
+                    clearTimeout(tile.hideTimer);
+                }
+                
+                tile.hideTimer = setTimeout(() => {
+                    tile.classList.remove('focused');
+                }, 3000); // 3秒後に自動で隠す
+            }
+
+            startDrag(tile, e) {
+                this.draggedTile = tile;
+                this.dragOffset = {
+                    x: e.clientX - tile.offsetLeft,
+                    y: e.clientY - tile.offsetTop
+                };
+                
+                document.addEventListener('mousemove', this.handleDrag);
+                document.addEventListener('mouseup', this.endDrag);
+            }
+
+            handleDrag = (e) => {
+                if (!this.draggedTile) return;
+                
+                const x = e.clientX - this.dragOffset.x;
+                const y = e.clientY - this.dragOffset.y;
+                
+                this.draggedTile.style.left = `${Math.max(0, x)}px`;
+                this.draggedTile.style.top = `${Math.max(50, y)}px`;
+            }
+
+            endDrag = () => {
+                this.draggedTile = null;
+                document.removeEventListener('mousemove', this.handleDrag);
+                document.removeEventListener('mouseup', this.endDrag);
+                this.saveCurrentLayout();
+            }
+
+            startResize(tile, e) {
+                this.resizingTile = tile;
+                this.resizeStart = {
+                    x: e.clientX,
+                    y: e.clientY,
+                    width: tile.offsetWidth,
+                    height: tile.offsetHeight
+                };
+                
+                document.addEventListener('mousemove', this.handleResize);
+                document.addEventListener('mouseup', this.endResize);
+            }
+
+            handleResize = (e) => {
+                if (!this.resizingTile) return;
+                
+                const dx = e.clientX - this.resizeStart.x;
+                const dy = e.clientY - this.resizeStart.y;
+                
+                this.resizingTile.style.width = `${Math.max(200, this.resizeStart.width + dx)}px`;
+                this.resizingTile.style.height = `${Math.max(150, this.resizeStart.height + dy)}px`;
+            }
+
+            endResize = () => {
+                this.resizingTile = null;
+                document.removeEventListener('mousemove', this.handleResize);
+                document.removeEventListener('mouseup', this.endResize);
+                this.saveCurrentLayout();
+            }
+
+            closeTile(id) {
+                const tile = document.getElementById(id);
+                if (tile) {
+                    tile.remove();
+                    this.tiles.delete(id);
+                    this.saveCurrentLayout();
+                }
+            }
+
+            minimizeTile(id) {
+                const tile = document.getElementById(id);
+                if (tile) {
+                    const content = tile.querySelector('.tile-content');
+                    const isMinimized = tile.classList.contains('minimized');
+                    
+                    if (isMinimized) {
+                        // 元のサイズに戻す
+                        tile.classList.remove('minimized');
+                        content.style.display = '';
+                        tile.style.height = tile.dataset.originalHeight || '300px';
+                    } else {
+                        // 最小化
+                        tile.classList.add('minimized');
+                        tile.dataset.originalHeight = tile.style.height;
+                        content.style.display = 'none';
+                        tile.style.height = '32px';
+                        // 最小化時はヘッダーを常に表示
+                        tile.querySelector('.tile-header').style.opacity = '1';
+                        tile.querySelector('.tile-header').style.transform = 'translateY(0)';
+                    }
+                }
+            }
+
+            maximizeTile(id) {
+                const tile = document.getElementById(id);
+                if (tile) {
+                    if (tile.classList.contains('maximized')) {
+                        // 元に戻す
+                        tile.style.left = tile.dataset.originalLeft;
+                        tile.style.top = tile.dataset.originalTop;
+                        tile.style.width = tile.dataset.originalWidth;
+                        tile.style.height = tile.dataset.originalHeight;
+                        tile.classList.remove('maximized');
+                    } else {
+                        // 最大化
+                        tile.dataset.originalLeft = tile.style.left;
+                        tile.dataset.originalTop = tile.style.top;
+                        tile.dataset.originalWidth = tile.style.width;
+                        tile.dataset.originalHeight = tile.style.height;
+                        
+                        tile.style.left = '0';
+                        tile.style.top = '50px';
+                        tile.style.width = '100%';
+                        tile.style.height = 'calc(100% - 50px)';
+                        tile.classList.add('maximized');
+                    }
+                }
+            }
+
+            updateOpacity(value) {
+                this.opacity = value;
+                document.getElementById('opacityValue').textContent = `${value}%`;
+                
+                // 新しいタイルのデフォルト値として使用（既存タイルの個別設定は変更しない）
+            }
+
+            changeTheme(theme) {
+                document.body.className = `theme-${theme}`;
+            }
+
+            toggleSettings() {
+                const panel = document.getElementById('settingsPanel');
+                panel.classList.toggle('open');
+            }
+
+
+
+            applyPreset(preset) {
+                const workspace = document.getElementById('workspace');
+                const tiles = Array.from(document.querySelectorAll('.stream-tile'));
+                
+                switch(preset) {
+                    case 'grid':
+                        const cols = Math.ceil(Math.sqrt(tiles.length));
+                        const tileWidth = workspace.offsetWidth / cols;
+                        const tileHeight = (workspace.offsetHeight - 50) / Math.ceil(tiles.length / cols);
+                        
+                        tiles.forEach((tile, i) => {
+                            const col = i % cols;
+                            const row = Math.floor(i / cols);
+                            tile.style.left = `${col * tileWidth}px`;
+                            tile.style.top = `${50 + row * tileHeight}px`;
+                            tile.style.width = `${tileWidth - 10}px`;
+                            tile.style.height = `${tileHeight - 10}px`;
+                        });
+                        break;
+                        
+                    case 'cascade':
+                        tiles.forEach((tile, i) => {
+                            tile.style.left = `${50 + i * 30}px`;
+                            tile.style.top = `${80 + i * 30}px`;
+                            tile.style.width = '400px';
+                            tile.style.height = '300px';
+                            tile.style.zIndex = 1000 + i;
+                        });
+                        break;
+                        
+                    case 'focus':
+                        if (tiles.length > 0) {
+                            tiles[0].style.left = '10%';
+                            tiles[0].style.top = '60px';
+                            tiles[0].style.width = '60%';
+                            tiles[0].style.height = '70%';
+                            tiles[0].style.zIndex = 2000;
+                            
+                            tiles.slice(1).forEach((tile, i) => {
+                                tile.style.left = `${70 + (i % 2) * 210}%`;
+                                tile.style.top = `${60 + Math.floor(i / 2) * 160}px`;
+                                tile.style.width = '200px';
+                                tile.style.height = '150px';
+                            });
+                        }
+                        break;
+                        
+                    case 'stack':
+                        tiles.forEach((tile, i) => {
+                            tile.style.left = '25%';
+                            tile.style.top = '100px';
+                            tile.style.width = '50%';
+                            tile.style.height = '60%';
+                            tile.style.zIndex = 1000 + i;
+                        });
+                        break;
+                }
+                
+                this.saveCurrentLayout();
+            }
+
+            saveCurrentLayout() {
+                const layout = {
+                    tiles: [],
+                    opacity: this.opacity,
+                    theme: document.body.className
+                };
+                
+                document.querySelectorAll('.stream-tile').forEach(tile => {
+                    const tileData = this.tiles.get(tile.id);
+                    layout.tiles.push({
+                        id: tile.id,
+                        title: tileData?.title || 'Unknown',
+                        type: tileData?.type || 'demo',
+                        url: tileData?.url || '',
+                        x: tile.offsetLeft,
+                        y: tile.offsetTop,
+                        width: tile.offsetWidth,
+                        height: tile.offsetHeight,
+                        zIndex: tile.style.zIndex,
+                        opacity: tileData?.opacity || this.opacity  // 個別の透過率を保存
+                    });
+                });
+                
+                localStorage.setItem('fluentvision-layout', JSON.stringify(layout));
+            }
+
+            loadSavedLayout() {
+                const saved = localStorage.getItem('fluentvision-layout');
+                if (saved) {
+                    try {
+                        const layout = JSON.parse(saved);
+                        
+                        // 設定を復元
+                        if (layout.opacity) {
+                            this.updateOpacity(layout.opacity);
+                            document.getElementById('opacitySlider').value = layout.opacity;
+                        }
+                        
+                        if (layout.theme) {
+                            document.body.className = layout.theme;
+                        }
+                        
+                        // タイルを復元
+                        layout.tiles?.forEach(tileData => {
+                            this.addTile(tileData);
+                        });
+                        
+                        return true; // レイアウトが読み込まれた
+                    } catch (e) {
+                        console.error('Failed to load layout:', e);
+                        return false;
+                    }
+                }
+                return false; // 保存されたレイアウトがない
+            }
+
+            exportLayout() {
+                const layoutName = document.getElementById('layoutName').value || 'layout';
+                const layout = localStorage.getItem('fluentvision-layout');
+                
+                if (layout) {
+                    const blob = new Blob([layout], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${layoutName}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                }
+            }
+
+            importLayout() {
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = '.json';
+                
+                input.onchange = (e) => {
+                    const file = e.target.files[0];
+                    if (file) {
+                        const reader = new FileReader();
+                        reader.onload = (e) => {
+                            try {
+                                const layout = JSON.parse(e.target.result);
+                                
+                                // 既存のタイルをクリア
+                                document.querySelectorAll('.stream-tile').forEach(tile => tile.remove());
+                                this.tiles.clear();
+                                
+                                // 新しいレイアウトを適用
+                                localStorage.setItem('fluentvision-layout', JSON.stringify(layout));
+                                this.loadSavedLayout();
+                            } catch (error) {
+                                alert('Failed to load layout file');
+                            }
+                        };
+                        reader.readAsText(file);
+                    }
+                };
+                
+                input.click();
+            }
+
+            saveLayout() {
+                this.saveCurrentLayout();
+                alert('Layout saved');
+            }
+
+            loadLayout() {
+                if (confirm('Load saved layout?')) {
+                    location.reload();
+                }
+            }
+
+            addCustomStream() {
+                // 即座に空のタイルを追加
+                const config = {
+                    id: `tile-${Date.now()}`,
+                    title: 'New Stream',
+                    type: 'mjpeg',
+                    url: '',
+                    x: 100 + Math.random() * 200,
+                    y: 100 + Math.random() * 200,
+                    width: 400,
+                    height: 300,
+                    editing: true
+                };
+                this.addTile(config);
+            }
+            
+            updateTileTitle(tileId, newTitle) {
+                const tileData = this.tiles.get(tileId);
+                if (tileData) {
+                    tileData.title = newTitle;
+                    // ミニインジケーターも更新
+                    const tile = document.getElementById(tileId);
+                    const indicator = tile.querySelector('.tile-mini-indicator');
+                    if (indicator) {
+                        indicator.textContent = newTitle;
+                    }
+                    this.saveCurrentLayout();
+                }
+            }
+            
+            editTileSettings(tileId) {
+                const tileData = this.tiles.get(tileId);
+                if (tileData) {
+                    const contentDiv = document.getElementById(`content-${tileId}`);
+                    contentDiv.innerHTML = this.createEditForm(tileData);
+                }
+            }
+            
+            saveTileSettings(tileId) {
+                const tileData = this.tiles.get(tileId);
+                if (tileData) {
+                    // フォームから値を取得
+                    const typeSelect = document.getElementById(`type-${tileId}`);
+                    const urlInput = document.getElementById(`url-${tileId}`);
+                    
+                    tileData.type = typeSelect.value;
+                    tileData.url = urlInput.value;
+                    tileData.editing = false;
+                    
+                    // コンテンツを更新
+                    const contentDiv = document.getElementById(`content-${tileId}`);
+                    contentDiv.innerHTML = this.createContent(tileData);
+                    
+                    this.saveCurrentLayout();
+                }
+            }
+            
+            duplicateTile(tileId) {
+                const originalData = this.tiles.get(tileId);
+                if (originalData) {
+                    const newConfig = {
+                        ...originalData,
+                        id: `tile-${Date.now()}`,
+                        title: originalData.title + ' (Copy)',
+                        x: (originalData.x || 0) + 30,
+                        y: (originalData.y || 0) + 30
+                    };
+                    this.addTile(newConfig);
+                }
+            }
+
+            quickAddWebURL() {
+                const predefinedSites = [
+                    { name: 'Google', url: 'https://www.google.com' },
+                    { name: 'YouTube', url: 'https://www.youtube.com' },
+                    { name: 'GitHub', url: 'https://github.com' },
+                    { name: 'ChatGPT', url: 'https://chat.openai.com' },
+                    { name: 'Claude', url: 'https://claude.ai' },
+                    { name: 'Google Maps', url: 'https://maps.google.com' },
+                    { name: 'Weather', url: 'https://weather.com' },
+                    { name: 'Wikipedia', url: 'https://wikipedia.org' },
+                    { name: 'Stack Overflow', url: 'https://stackoverflow.com' },
+                    { name: 'Reddit', url: 'https://reddit.com' }
+                ];
+
+                // プリセットリストを作成
+                let message = 'WebページのURLを入力してください:\n\n';
+                message += '📌 よく使うサイト:\n';
+                predefinedSites.forEach((site, index) => {
+                    message += `${index + 1}. ${site.name}\n`;
+                });
+                message += '\n番号を入力するか、URLを直接入力してください:';
+
+                const input = prompt(message);
+                if (!input) return;
+
+                let url, title;
+                
+                // 番号が入力された場合
+                const num = parseInt(input);
+                if (num && num > 0 && num <= predefinedSites.length) {
+                    const site = predefinedSites[num - 1];
+                    url = site.url;
+                    title = site.name;
+                } else {
+                    // URL直接入力
+                    url = input;
+                    
+                    // httpがない場合は追加
+                    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                        url = 'https://' + url;
+                    }
+                    
+                    // タイトルを取得
+                    title = prompt('タイトル (空欄でURL表示):') || new URL(url).hostname;
+                }
+
+                // タイルを追加
+                this.quickAddStream('iframe', '🌐 ' + title, url);
+                document.getElementById('quickAdd').classList.remove('show');
+            }
+
+            setupEventListeners() {
+                // ESCキーで設定パネルを閉じる
+                document.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') {
+                        document.getElementById('settingsPanel').classList.remove('open');
+                        document.getElementById('quickAdd').classList.remove('show');
+                    }
+                });
+            }
+
+            // === 新しいレイアウト管理機能 ===
+            
+            loadAllLayouts() {
+                const layoutsJson = localStorage.getItem('fluentvision-layouts');
+                return layoutsJson ? JSON.parse(layoutsJson) : {};
+            }
+
+            saveAllLayouts() {
+                localStorage.setItem('fluentvision-layouts', JSON.stringify(this.layouts));
+            }
+
+            updateLayoutSelector() {
+                const select = document.getElementById('layoutSelector');
+                // 最初のオプション以外を削除
+                while (select.options.length > 1) {
+                    select.remove(1);
+                }
+                
+                Object.keys(this.layouts).forEach(name => {
+                    const option = document.createElement('option');
+                    option.value = name;
+                    option.textContent = name;
+                    select.appendChild(option);
+                });
+                
+                // 現在のレイアウトを選択
+                if (this.currentLayoutName) {
+                    select.value = this.currentLayoutName;
+                }
+            }
+            
+            loadLayoutFromSelector(name) {
+                if (name && this.layouts[name]) {
+                    this.loadLayoutByName(name);
+                }
+            }
+            
+            saveCurrentLayoutWithPrompt() {
+                const name = this.currentLayoutName || prompt('Layout name:');
+                if (name) {
+                    this.saveLayoutWithName(name);
+                }
+            }
+            
+            saveLayoutWithName(name) {
+                const layout = this.getCurrentLayoutData();
+                this.layouts[name] = layout;
+                this.currentLayoutName = name;
+                this.saveAllLayouts();
+                this.updateLayoutSelector();
+                alert(`Layout "${name}" saved`);
+            }
+            
+            deleteCurrentLayout() {
+                if (!this.currentLayoutName) {
+                    alert('No layout selected');
+                    return;
+                }
+                
+                if (confirm(`Delete layout "${this.currentLayoutName}"?`)) {
+                    delete this.layouts[this.currentLayoutName];
+                    this.saveAllLayouts();
+                    this.currentLayoutName = null;
+                    document.getElementById('layoutSelector').value = '';
+                    this.updateLayoutSelector();
+                    
+                    // Clear workspace
+                    document.querySelectorAll('.stream-tile').forEach(tile => tile.remove());
+                    this.tiles.clear();
+                }
+            }
+
+            saveNewLayout() {
+                const nameInput = document.getElementById('newLayoutName');
+                const name = nameInput.value.trim();
+                
+                if (!name) {
+                    alert('レイアウト名を入力してください');
+                    return;
+                }
+                
+                if (this.layouts[name]) {
+                    if (!confirm(`"${name}" は既に存在します。上書きしますか？`)) {
+                        return;
+                    }
+                }
+                
+                // 現在のレイアウトを保存
+                const layout = this.getCurrentLayoutData();
+                this.layouts[name] = layout;
+                this.currentLayoutName = name;
+                this.saveAllLayouts();
+                
+                // UIを更新
+                this.updateLayoutsList();
+                nameInput.value = '';
+                alert(`レイアウト "${name}" を保存しました`);
+            }
+
+            getCurrentLayoutData() {
+                const layout = {
+                    tiles: [],
+                    opacity: this.opacity,
+                    theme: document.body.className,
+                    savedAt: new Date().toISOString()
+                };
+                
+                document.querySelectorAll('.stream-tile').forEach(tile => {
+                    const tileData = this.tiles.get(tile.id);
+                    layout.tiles.push({
+                        id: tile.id,
+                        title: tileData?.title || 'Unknown',
+                        type: tileData?.type || 'demo',
+                        url: tileData?.url || '',
+                        x: tile.offsetLeft,
+                        y: tile.offsetTop,
+                        width: tile.offsetWidth,
+                        height: tile.offsetHeight,
+                        zIndex: tile.style.zIndex,
+                        opacity: tileData?.opacity || this.opacity
+                    });
+                });
+                
+                return layout;
+            }
+
+            loadSelectedLayout() {
+                const select = document.getElementById('savedLayoutsList');
+                const selectedName = select.value;
+                
+                if (selectedName && this.layouts[selectedName]) {
+                    this.loadLayoutByName(selectedName);
+                }
+            }
+
+            loadLayoutByName(name) {
+                const layout = this.layouts[name];
+                if (!layout) return;
+                
+                // 既存のタイルをクリア
+                document.querySelectorAll('.stream-tile').forEach(tile => tile.remove());
+                this.tiles.clear();
+                
+                // 設定を復元
+                if (layout.opacity) {
+                    this.updateOpacity(layout.opacity);
+                    document.getElementById('opacitySlider').value = layout.opacity;
+                }
+                
+                if (layout.theme) {
+                    document.body.className = layout.theme;
+                }
+                
+                // タイルを復元
+                layout.tiles?.forEach(tileData => {
+                    this.addTile(tileData);
+                });
+                
+                this.currentLayoutName = name;
+                this.updateLayoutSelector();
+                
+                // 最後に使用したレイアウトとして記録
+                localStorage.setItem('fluentvision-last-layout', name);
+            }
+
+            deleteSelectedLayout() {
+                const select = document.getElementById('savedLayoutsList');
+                const selectedName = select.value;
+                
+                if (!selectedName) {
+                    alert('削除するレイアウトを選択してください');
+                    return;
+                }
+                
+                if (!confirm(`レイアウト "${selectedName}" を削除しますか？`)) {
+                    return;
+                }
+                
+                delete this.layouts[selectedName];
+                this.saveAllLayouts();
+                
+                // デフォルトだった場合は解除
+                if (localStorage.getItem('fluentvision-default-layout') === selectedName) {
+                    localStorage.removeItem('fluentvision-default-layout');
+                }
+                
+                // 現在のレイアウトだった場合はリセット
+                if (this.currentLayoutName === selectedName) {
+                    this.currentLayoutName = null;
+                }
+                
+                this.updateLayoutsList();
+                alert(`レイアウト "${selectedName}" を削除しました`);
+            }
+
+            setAsDefaultLayout() {
+                const select = document.getElementById('savedLayoutsList');
+                const selectedName = select.value;
+                
+                if (!selectedName) {
+                    alert('デフォルトにするレイアウトを選択してください');
+                    return;
+                }
+                
+                localStorage.setItem('fluentvision-default-layout', selectedName);
+                this.updateLayoutsList();
+                alert(`"${selectedName}" を起動時のデフォルトレイアウトに設定しました`);
+            }
+
+            clearDefaultLayout() {
+                localStorage.removeItem('fluentvision-default-layout');
+                this.updateLayoutsList();
+                alert('デフォルトレイアウト設定を解除しました');
+            }
+
+            // 既存の関数を更新（後方互換性のため残す）
+            saveCurrentLayout() {
+                // 自動保存: 現在のレイアウト名があれば上書き保存
+                if (this.currentLayoutName) {
+                    this.layouts[this.currentLayoutName] = this.getCurrentLayoutData();
+                    this.saveAllLayouts();
+                }
+                
+                // 後方互換性のため古い形式でも保存
+                const layout = this.getCurrentLayoutData();
+                localStorage.setItem('fluentvision-layout', JSON.stringify(layout));
+            }
+
+            saveLayout() {
+                // 現在のレイアウト名があれば上書き、なければ新規保存を促す
+                if (this.currentLayoutName) {
+                    this.saveCurrentLayout();
+                    alert(`Layout "${this.currentLayoutName}" saved`);
+                } else {
+                    const name = prompt('Enter layout name:');
+                    if (name) {
+                        document.getElementById('newLayoutName').value = name;
+                        this.saveNewLayout();
+                    }
+                }
+            }
+
+            loadLayout() {
+                // 設定パネルを開いてレイアウト一覧を表示
+                document.getElementById('settingsPanel').classList.add('open');
+                document.getElementById('savedLayoutsList').focus();
+            }
+        }
+
+        // アプリケーション起動
+        const app = new FluentVisionApp();
+    </script>
+</body>
+</html>

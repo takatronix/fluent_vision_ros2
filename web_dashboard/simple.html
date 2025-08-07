@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Simple Test</title>
+</head>
+<body style="background: black; color: white; font-family: monospace; padding: 50px;">
+    <h1>Simple Test Page</h1>
+    <p>Server is working!</p>
+    <p>Current time: <span id="time"></span></p>
+    <script>
+        document.getElementById('time').textContent = new Date().toLocaleTimeString();
+        console.log('JavaScript is working!');
+    </script>
+</body>
+</html>

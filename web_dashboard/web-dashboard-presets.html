@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FluentVision - Web Dashboard Gallery</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #000;
+            color: white;
+            padding: 20px;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .category {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .category-title {
+            font-size: 1.2rem;
+            margin-bottom: 15px;
+            color: #fbbf24;
+        }
+
+        .dashboard-item {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 12px;
+            margin-bottom: 10px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .dashboard-item:hover {
+            background: rgba(99, 102, 241, 0.2);
+            transform: translateX(5px);
+        }
+
+        .dashboard-info {
+            flex: 1;
+        }
+
+        .dashboard-name {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .dashboard-url {
+            font-size: 0.85rem;
+            color: rgba(255, 255, 255, 0.5);
+            word-break: break-all;
+        }
+
+        .add-btn {
+            padding: 6px 12px;
+            background: #6366f1;
+            border: none;
+            border-radius: 6px;
+            color: white;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+
+        .add-btn:hover {
+            background: #7c3aed;
+            transform: scale(1.05);
+        }
+
+        .custom-add {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            margin-bottom: 30px;
+            max-width: 600px;
+            margin: 0 auto 30px;
+        }
+
+        .custom-add input {
+            width: 100%;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 6px;
+            color: white;
+            margin-bottom: 10px;
+        }
+
+        .instructions {
+            text-align: center;
+            margin-bottom: 30px;
+            opacity: 0.8;
+        }
+    </style>
+</head>
+<body>
+    <h1>🌐 FluentVision Web Dashboard Gallery</h1>
+    
+    <div class="instructions">
+        任意のWebページをFluentVisionのダッシュボードとして追加できます
+    </div>
+
+    <div class="custom-add">
+        <h3 style="margin-bottom: 15px;">カスタムURL追加</h3>
+        <input type="text" id="customUrl" placeholder="https://example.com">
+        <input type="text" id="customTitle" placeholder="タイトル（オプション）">
+        <button class="add-btn" style="width: 100%; padding: 12px;" onclick="addCustomURL()">
+            + カスタムURLを追加
+        </button>
+    </div>
+
+    <div class="dashboard-grid">
+        <!-- 開発ツール -->
+        <div class="category">
+            <h3 class="category-title">👨‍💻 開発ツール</h3>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">GitHub</div>
+                    <div class="dashboard-url">github.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('GitHub', 'https://github.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">GitLab</div>
+                    <div class="dashboard-url">gitlab.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('GitLab', 'https://gitlab.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Stack Overflow</div>
+                    <div class="dashboard-url">stackoverflow.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Stack Overflow', 'https://stackoverflow.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">CodePen</div>
+                    <div class="dashboard-url">codepen.io</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('CodePen', 'https://codepen.io')">追加</button>
+            </div>
+        </div>
+
+        <!-- AI/チャット -->
+        <div class="category">
+            <h3 class="category-title">🤖 AI/チャット</h3>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">ChatGPT</div>
+                    <div class="dashboard-url">chat.openai.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('ChatGPT', 'https://chat.openai.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Claude</div>
+                    <div class="dashboard-url">claude.ai</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Claude', 'https://claude.ai')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Google Gemini</div>
+                    <div class="dashboard-url">gemini.google.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Gemini', 'https://gemini.google.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Perplexity</div>
+                    <div class="dashboard-url">perplexity.ai</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Perplexity', 'https://perplexity.ai')">追加</button>
+            </div>
+        </div>
+
+        <!-- 監視/分析 -->
+        <div class="category">
+            <h3 class="category-title">📊 監視/分析</h3>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Google Analytics</div>
+                    <div class="dashboard-url">analytics.google.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Analytics', 'https://analytics.google.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Grafana Cloud</div>
+                    <div class="dashboard-url">grafana.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Grafana', 'https://grafana.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Datadog</div>
+                    <div class="dashboard-url">datadoghq.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Datadog', 'https://app.datadoghq.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">New Relic</div>
+                    <div class="dashboard-url">newrelic.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('New Relic', 'https://one.newrelic.com')">追加</button>
+            </div>
+        </div>
+
+        <!-- 地図/天気 -->
+        <div class="category">
+            <h3 class="category-title">🗺️ 地図/天気</h3>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Google Maps</div>
+                    <div class="dashboard-url">maps.google.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Google Maps', 'https://maps.google.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">OpenStreetMap</div>
+                    <div class="dashboard-url">openstreetmap.org</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('OpenStreetMap', 'https://www.openstreetmap.org')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Windy</div>
+                    <div class="dashboard-url">windy.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Windy', 'https://www.windy.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Weather.com</div>
+                    <div class="dashboard-url">weather.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Weather', 'https://weather.com')">追加</button>
+            </div>
+        </div>
+
+        <!-- ソーシャル/ニュース -->
+        <div class="category">
+            <h3 class="category-title">📰 ソーシャル/ニュース</h3>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">X (Twitter)</div>
+                    <div class="dashboard-url">x.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('X', 'https://x.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Reddit</div>
+                    <div class="dashboard-url">reddit.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Reddit', 'https://reddit.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Hacker News</div>
+                    <div class="dashboard-url">news.ycombinator.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Hacker News', 'https://news.ycombinator.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">TechCrunch</div>
+                    <div class="dashboard-url">techcrunch.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('TechCrunch', 'https://techcrunch.com')">追加</button>
+            </div>
+        </div>
+
+        <!-- 動画/メディア -->
+        <div class="category">
+            <h3 class="category-title">🎥 動画/メディア</h3>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">YouTube</div>
+                    <div class="dashboard-url">youtube.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('YouTube', 'https://youtube.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Twitch</div>
+                    <div class="dashboard-url">twitch.tv</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Twitch', 'https://twitch.tv')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Netflix</div>
+                    <div class="dashboard-url">netflix.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Netflix', 'https://netflix.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Spotify Web</div>
+                    <div class="dashboard-url">open.spotify.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Spotify', 'https://open.spotify.com')">追加</button>
+            </div>
+        </div>
+
+        <!-- 生産性ツール -->
+        <div class="category">
+            <h3 class="category-title">📝 生産性ツール</h3>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Notion</div>
+                    <div class="dashboard-url">notion.so</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Notion', 'https://notion.so')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Google Drive</div>
+                    <div class="dashboard-url">drive.google.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Google Drive', 'https://drive.google.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Trello</div>
+                    <div class="dashboard-url">trello.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Trello', 'https://trello.com')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Figma</div>
+                    <div class="dashboard-url">figma.com</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Figma', 'https://figma.com')">追加</button>
+            </div>
+        </div>
+
+        <!-- IoT/スマートホーム -->
+        <div class="category">
+            <h3 class="category-title">🏠 IoT/スマートホーム</h3>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Home Assistant</div>
+                    <div class="dashboard-url">ローカル:8123</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Home Assistant', 'http://localhost:8123')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Node-RED</div>
+                    <div class="dashboard-url">ローカル:1880</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Node-RED', 'http://localhost:1880')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">Blynk</div>
+                    <div class="dashboard-url">blynk.cloud</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('Blynk', 'https://blynk.cloud')">追加</button>
+            </div>
+            
+            <div class="dashboard-item">
+                <div class="dashboard-info">
+                    <div class="dashboard-name">ThingsBoard</div>
+                    <div class="dashboard-url">demo.thingsboard.io</div>
+                </div>
+                <button class="add-btn" onclick="addDashboard('ThingsBoard', 'https://demo.thingsboard.io')">追加</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // FluentVisionのindex.htmlと通信
+        function addDashboard(title, url) {
+            // 親ウィンドウにメッセージを送信
+            if (window.opener && window.opener.app) {
+                window.opener.app.quickAddStream('iframe', '🌐 ' + title, url);
+                alert(`${title} を追加しました！`);
+            } else {
+                // スタンドアロンで開いた場合
+                const config = {
+                    type: 'iframe',
+                    title: '🌐 ' + title,
+                    url: url
+                };
+                
+                // LocalStorageに保存
+                const dashboards = JSON.parse(localStorage.getItem('pending-dashboards') || '[]');
+                dashboards.push(config);
+                localStorage.setItem('pending-dashboards', JSON.stringify(dashboards));
+                
+                alert(`${title} を追加リストに保存しました。\nFluentVisionを開いて反映してください。`);
+            }
+        }
+
+        function addCustomURL() {
+            const url = document.getElementById('customUrl').value;
+            const title = document.getElementById('customTitle').value || new URL(url).hostname;
+            
+            if (!url) {
+                alert('URLを入力してください');
+                return;
+            }
+            
+            let finalUrl = url;
+            if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                finalUrl = 'https://' + url;
+            }
+            
+            addDashboard(title, finalUrl);
+            
+            // フォームをクリア
+            document.getElementById('customUrl').value = '';
+            document.getElementById('customTitle').value = '';
+        }
+
+        // Enterキーでも追加できるように
+        document.getElementById('customUrl').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                addCustomURL();
+            }
+        });
+        
+        document.getElementById('customTitle').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                addCustomURL();
+            }
+        });
+    </script>
+</body>
+</html>

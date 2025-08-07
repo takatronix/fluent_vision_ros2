@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Clear Storage</title>
+    <style>
+        body {
+            background: #000;
+            color: white;
+            font-family: monospace;
+            padding: 50px;
+            text-align: center;
+        }
+        button {
+            padding: 20px 40px;
+            font-size: 18px;
+            background: #6366f1;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin: 10px;
+        }
+        button:hover {
+            background: #7c3aed;
+        }
+        .info {
+            margin: 20px;
+            padding: 20px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+    <h1>FluentVision Storage Manager</h1>
+    
+    <div class="info">
+        <h2>Current Storage Data:</h2>
+        <pre id="storageInfo"></pre>
+    </div>
+    
+    <button onclick="clearAll()">Clear All Storage</button>
+    <button onclick="clearOldLayout()">Clear Old Layout Only</button>
+    <button onclick="window.location.href='index.html'">Go to Dashboard</button>
+    
+    <script>
+        // Show current storage
+        function showStorage() {
+            const info = document.getElementById('storageInfo');
+            let data = '';
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                const value = localStorage.getItem(key);
+                data += `${key}: ${value ? value.substring(0, 100) + '...' : 'empty'}\n`;
+            }
+            info.textContent = data || 'No data in LocalStorage';
+        }
+        
+        function clearAll() {
+            if (confirm('Clear all saved layouts and settings?')) {
+                localStorage.clear();
+                alert('All storage cleared!');
+                showStorage();
+            }
+        }
+        
+        function clearOldLayout() {
+            localStorage.removeItem('fluentvision-layout');
+            localStorage.removeItem('fluentvision-default-layout');
+            alert('Old layout data cleared!');
+            showStorage();
+        }
+        
+        showStorage();
+    </script>
+</body>
+</html>
