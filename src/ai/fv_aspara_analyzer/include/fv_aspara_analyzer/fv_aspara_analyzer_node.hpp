@@ -165,6 +165,20 @@ private:
      * @details 可視化用のカラー画像を受信
      */
     void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg);
+    
+    /**
+     * @brief 深度画像のコールバック関数
+     * @param msg 深度画像メッセージ
+     */
+    void depthCallback(const sensor_msgs::msg::Image::SharedPtr msg);
+    
+    /**
+     * @brief 深度画像から効率的に点群を生成
+     * @param bbox 2Dバウンディングボックス
+     * @return フィルタリング済み点群
+     */
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr extractPointCloudFromDepth(
+        const cv::Rect& bbox);
 
     // ===== コア処理関数群 =====
     
@@ -324,6 +338,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;          ///< カメラ情報サブスクライバー
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr mask_sub_;                      ///< マスク画像サブスクライバー
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;                     ///< カラー画像サブスクライバー
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;                     ///< 深度画像サブスクライバー
 
     // ===== ROS2 パブリッシャー =====
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_pointcloud_pub_;    ///< フィルタリング済み点群パブリッシャー
@@ -337,6 +352,7 @@ private:
     // ===== データストレージ =====
     std::vector<AsparaInfo> aspara_list_;                                                    ///< アスパラガス情報リスト
     sensor_msgs::msg::PointCloud2::SharedPtr latest_pointcloud_;                             ///< 最新の点群データ
+    sensor_msgs::msg::Image::SharedPtr latest_depth_image_;                                  ///< 最新の深度画像
     sensor_msgs::msg::CameraInfo::SharedPtr latest_camera_info_;                             ///< 最新のカメラ情報
     sensor_msgs::msg::Image::SharedPtr latest_color_image_;                                  ///< 最新のカラー画像
     cv::Mat latest_mask_;                                                                    ///< 最新のマスク画像

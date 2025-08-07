@@ -27,6 +27,7 @@ fv_aspara_analyzer_d415:
     pointcloud_topic: "/fv/d415/asparagus/points"                # 3D点群データ
     camera_info_topic: "/fv/d415/color/camera_info"              # カメラキャリブレーション情報
     camera_topic: "/fv/d415/color/image_raw"                     # カラー画像
+    depth_topic: "/fv/d415/depth/image_rect_raw"                 # 深度画像
     mask_topic: "/fv/d415/segmentation_mask/image"               # セグメンテーションマスク
 
     # 出力トピック（解析結果）

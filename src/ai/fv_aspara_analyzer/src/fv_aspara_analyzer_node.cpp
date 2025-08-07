@@ -57,6 +57,7 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<std::string>("camera_info_topic", "");
     this->declare_parameter<std::string>("mask_topic", "");
     this->declare_parameter<std::string>("camera_topic", "");
+    this->declare_parameter<std::string>("depth_topic", "");
     this->declare_parameter<std::string>("output_filtered_pointcloud_topic", "");
     this->declare_parameter<std::string>("output_annotated_image_topic", "");
 
@@ -66,6 +67,7 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     std::string camera_info_topic = this->get_parameter("camera_info_topic").as_string();
     std::string mask_topic = this->get_parameter("mask_topic").as_string();
     std::string camera_topic = this->get_parameter("camera_topic").as_string();
+    std::string depth_topic = this->get_parameter("depth_topic").as_string();
     std::string output_filtered_pointcloud_topic = this->get_parameter("output_filtered_pointcloud_topic").as_string();
     std::string output_annotated_image_topic = this->get_parameter("output_annotated_image_topic").as_string();
 
@@ -97,6 +99,10 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
         camera_topic, 10,
         std::bind(&FvAsparaAnalyzerNode::imageCallback, this, std::placeholders::_1));
+
+    depth_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+        depth_topic, 10,
+        std::bind(&FvAsparaAnalyzerNode::depthCallback, this, std::placeholders::_1));
 
     // ===== パブリッシャー初期化 =====
     filtered_pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -138,10 +144,10 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
 {
     RCLCPP_WARN(this->get_logger(), "Detection callback received %zu detections", msg->detections.size());
     
-    // 点群とカメラ情報の可用性チェック
-    if (!latest_pointcloud_ || !latest_camera_info_) {
-        RCLCPP_WARN(this->get_logger(), "Point cloud or camera info not available yet. PC:%s, CI:%s", 
-                   latest_pointcloud_ ? "OK" : "NULL", latest_camera_info_ ? "OK" : "NULL");
+    // 深度画像とカメラ情報の可用性チェック
+    if (!latest_depth_image_ || !latest_camera_info_) {
+        RCLCPP_WARN(this->get_logger(), "Depth image or camera info not available yet. Depth:%s, CI:%s", 
+                   latest_depth_image_ ? "OK" : "NULL", latest_camera_info_ ? "OK" : "NULL");
         return;
     }
 
@@ -236,6 +242,114 @@ void FvAsparaAnalyzerNode::imageCallback(const sensor_msgs::msg::Image::SharedPt
     // 常に画像を出力する
     // 検出結果がある場合はオーバーレイ付き、ない場合は元画像をそのまま出力
     publishCurrentImage();
+}
+
+/**
+ * @brief 深度画像のコールバック関数
+ * @param msg 深度画像メッセージ
+ * @details 深度画像を保存して効率的な処理に使用
+ */
+void FvAsparaAnalyzerNode::depthCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+{
+    RCLCPP_WARN_ONCE(this->get_logger(), "Depth callback received first depth image");
+    latest_depth_image_ = msg;
+}
+
+/**
+ * @brief 深度画像から効率的に点群を生成
+ * @param bbox 2Dバウンディングボックス
+ * @return フィルタリング済み点群
+ * @details バウンディングボックス内の深度ピクセルのみを3D点に変換
+ */
+pcl::PointCloud<pcl::PointXYZRGB>::Ptr FvAsparaAnalyzerNode::extractPointCloudFromDepth(
+    const cv::Rect& bbox)
+{
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    
+    if (!latest_depth_image_ || !latest_camera_info_ || !latest_color_image_) {
+        return cloud;
+    }
+    
+    // 深度画像とカラー画像をOpenCV形式に変換
+    cv::Mat depth_image;
+    cv::Mat color_image;
+    
+    try {
+        // 深度画像の変換
+        cv_bridge::CvImagePtr depth_ptr;
+        if (latest_depth_image_->encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
+            depth_ptr = cv_bridge::toCvCopy(latest_depth_image_, sensor_msgs::image_encodings::TYPE_16UC1);
+            depth_image = depth_ptr->image;
+        } else if (latest_depth_image_->encoding == sensor_msgs::image_encodings::TYPE_32FC1) {
+            depth_ptr = cv_bridge::toCvCopy(latest_depth_image_, sensor_msgs::image_encodings::TYPE_32FC1);
+            depth_ptr->image.convertTo(depth_image, CV_16UC1, 1000.0); // メートルをミリメートルに変換
+        } else {
+            RCLCPP_WARN(this->get_logger(), "Unsupported depth encoding: %s", latest_depth_image_->encoding.c_str());
+            return cloud;
+        }
+        
+        // カラー画像の変換
+        cv_bridge::CvImagePtr color_ptr = cv_bridge::toCvCopy(latest_color_image_, sensor_msgs::image_encodings::BGR8);
+        color_image = color_ptr->image;
+        
+    } catch (cv_bridge::Exception& e) {
+        RCLCPP_ERROR(this->get_logger(), "CV bridge exception in extractPointCloudFromDepth: %s", e.what());
+        return cloud;
+    }
+    
+    // カメラパラメータ
+    double fx = latest_camera_info_->k[0];
+    double fy = latest_camera_info_->k[4];
+    double cx = latest_camera_info_->k[2];
+    double cy = latest_camera_info_->k[5];
+    
+    // バウンディングボックスの範囲をクリップ
+    int x_start = std::max(0, bbox.x);
+    int y_start = std::max(0, bbox.y);
+    int x_end = std::min(depth_image.cols, bbox.x + bbox.width);
+    int y_end = std::min(depth_image.rows, bbox.y + bbox.height);
+    
+    // バウンディングボックス内のピクセルのみを処理
+    for (int v = y_start; v < y_end; v++) {
+        for (int u = x_start; u < x_end; u++) {
+            // 深度値を取得（単位：mm）
+            uint16_t depth_mm = depth_image.at<uint16_t>(v, u);
+            
+            // 無効な深度値をスキップ
+            if (depth_mm == 0) continue;
+            
+            // メートルに変換
+            float depth_m = depth_mm / 1000.0f;
+            
+            // 距離フィルタリング
+            if (depth_m < pointcloud_distance_min_ || depth_m > pointcloud_distance_max_) {
+                continue;
+            }
+            
+            // 3D座標を計算（カメラ座標系）
+            pcl::PointXYZRGB point;
+            point.z = depth_m;
+            point.x = (u - cx) * depth_m / fx;
+            point.y = (v - cy) * depth_m / fy;
+            
+            // カラー情報を追加
+            cv::Vec3b color = color_image.at<cv::Vec3b>(v, u);
+            point.b = color[0];
+            point.g = color[1];
+            point.r = color[2];
+            
+            cloud->points.push_back(point);
+        }
+    }
+    
+    // 点群のメタデータを設定
+    cloud->width = cloud->points.size();
+    cloud->height = 1;
+    cloud->is_dense = false;
+    
+    RCLCPP_DEBUG(this->get_logger(), "Extracted %zu points from depth image bbox", cloud->points.size());
+    
+    return cloud;
 }
 
 /**
@@ -590,13 +704,9 @@ void FvAsparaAnalyzerNode::processAsparagus(const AsparaInfo& aspara_info)
         return;
     }
 
-    // ROS点群をPCL形式に変換
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-    pcl::fromROSMsg(*latest_pointcloud_, *pcl_cloud);
-
-    // バウンディングボックスで点群フィルタリング
+    // 深度画像から効率的に点群を抽出（バウンディングボックス内のみ）
     Stopwatch filter_stopwatch;
-    auto filtered_cloud = filterPointCloudByBoundingBox(pcl_cloud, aspara_info.bounding_box_2d, *latest_camera_info_);
+    auto filtered_cloud = extractPointCloudFromDepth(aspara_info.bounding_box_2d);
     mutable_aspara_info.processing_times.filter_bbox_ms = filter_stopwatch.elapsed_ms();
     
     if (filtered_cloud->points.empty()) {

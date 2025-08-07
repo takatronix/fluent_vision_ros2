@@ -28,6 +28,7 @@ fv_aspara_analyzer_d405:
     pointcloud_topic: "/fv/d405/points"                          # 3D点群データ
     camera_info_topic: "/fv/d405/color/camera_info"              # カメラキャリブレーション情報
     camera_topic: "/fv/d405/color/image_raw"                     # カラー画像
+    depth_topic: "/fv/d405/depth/image_rect_raw"                 # 深度画像
     mask_topic: "/fv/d405/segmentation_mask/image"               # セグメンテーションマスク
 
     # 出力トピック（解析結果）
