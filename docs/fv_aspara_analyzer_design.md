@@ -284,26 +284,26 @@ rotation_matrix = rotation_matrix.normalized();
 - 古いデータの自動削除（5 秒以上更新なし）
 - メモリ使用量の監視
 
-### 12. rtabmap DB登録
+### 12. rtabmap DB登録（予定）
 
-- **判定済みアスパラ**: 品質判定完了後、rtabmap DBに登録
-- **収穫済みアスパラ**: カット完了後、rtabmap DBに登録
-- **位置情報保存**: 3D座標とTF情報をDBに保存
-- **品質情報保存**: グレード、曲がり度、長さなどの品質データを保存
-- **収穫情報保存**: 収穫時刻、収穫位置、収穫者情報を保存
+- **判定済みアスパラ**: 品質判定完了後、rtabmap DBに登録（予定）
+- **収穫済みアスパラ**: カット完了後、rtabmap DBに登録（予定）
+- **位置情報保存**: 3D座標とTF情報をDBに保存（予定）
+- **品質情報保存**: グレード、曲がり度、長さなどの品質データを保存（予定）
+- **収穫情報保存**: 収穫時刻、収穫位置、収穫者情報を保存（予定）
 
 ## 出力データ仕様
 
 ### トピック出力
 
 ```yaml
-# 点群データ
+# 点群データ（予定）
 aspara_[id]_pointcloud: sensor_msgs/PointCloud2
 
-# PCA結果
+# PCA結果（予定）
 aspara_[id]_pca: sensor_msgs/PointCloud2
 
-# TF出力
+# TF出力（予定）
 aspara_[id]_pca_tf: geometry_msgs/TransformStamped
 aspara_[id]_root_tf: geometry_msgs/TransformStamped
 ```
@@ -311,19 +311,19 @@ aspara_[id]_root_tf: geometry_msgs/TransformStamped
 ### サービス
 
 ```yaml
-# 次のアスパラ選択
+# 次のアスパラ選択（予定）
 select_next_aspara: std_srvs/Trigger
 
-# 前のアスパラ選択
+# 前のアスパラ選択（予定）
 select_prev_aspara: std_srvs/Trigger
 
-# アスパラ判定完了
+# アスパラ判定完了（予定）
 mark_aspara_judged: std_srvs/Trigger
 
-# アスパラ収穫完了
+# アスパラ収穫完了（予定）
 mark_aspara_harvested: std_srvs/Trigger
 
-# 収穫可能アスパラ一覧取得
+# 収穫可能アスパラ一覧取得（予定）
 get_harvestable_aspara: std_srvs/Trigger
 ```
 
@@ -372,12 +372,12 @@ struct AsparaInfo {
     // 検出情報
     geometry_msgs::TransformStamped tf_detection; // 検出したアスパラのTF
     
-    // rtabmap DB情報
-    bool is_registered_to_db;     // DB登録済みフラグ
-    std::string db_node_id;       // rtabmap DBのノードID
-    ros::Time db_registration_time; // DB登録時刻
-    bool is_harvested;            // 収穫済みフラグ
-    ros::Time harvest_time;       // 収穫時刻
+    // rtabmap DB情報（予定）
+    bool is_registered_to_db;     // DB登録済みフラグ（予定）
+    std::string db_node_id;       // rtabmap DBのノードID（予定）
+    ros::Time db_registration_time; // DB登録時刻（予定）
+    bool is_harvested;            // 収穫済みフラグ（予定）
+    ros::Time harvest_time;       // 収穫時刻（予定）
 };
 ```
 
@@ -393,8 +393,8 @@ struct AsparaInfo {
 6. **セグメンテーション失敗**: マスクが全く生成されない場合
 7. **ID 追跡失敗**: 同一アスパラガスの追跡が困難
 8. **メモリ不足**: アスパラガス数が上限を超過
-9. **rtabmap DB接続失敗**: DBへの登録が失敗
-10. **DB登録重複**: 同一アスパラガスの重複登録
+9. **rtabmap DB接続失敗**: DBへの登録が失敗（予定）
+10. **DB登録重複**: 同一アスパラガスの重複登録（予定）
 
 ### エラー対応
 
@@ -406,8 +406,8 @@ struct AsparaInfo {
 - **PCA 失敗時の対応**: デフォルト座標系で処理継続
 - **ID 追跡失敗時の対応**: 新しい ID として処理継続
 - **メモリ不足時の対応**: 古いデータを強制削除
-- **rtabmap DB失敗時の対応**: ローカルキャッシュに保存、後で再試行
-- **収穫判定失敗時の対応**: デフォルトで収穫不可として処理
+- **rtabmap DB失敗時の対応**: ローカルキャッシュに保存、後で再試行（予定）
+- **収穫判定失敗時の対応**: デフォルトで収穫不可として処理（予定）
 
 ## パフォーマンス要件
 

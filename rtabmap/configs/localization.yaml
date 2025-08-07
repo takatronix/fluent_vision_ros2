@@ -1,0 +1,91 @@
+# RTABMap ローカライゼーション用設定
+# 既存のマップを使用した自己位置推定専用設定
+
+rtabmap:
+  ros__parameters:
+    # === essential_params.yaml を継承 ===
+    
+    # === ローカライゼーション専用設定 ===
+    # 重要：マッピングモードを無効化
+    Mem/IncrementalMemory: "false"    # ローカライゼーションモード（マップ更新なし）
+    
+    # 既存マップの読み込み
+    database_path: "rtabmap.db"       # 既存のマップデータベース
+    Mem/InitWMWithAllNodes: "true"    # 全ノードでワーキングメモリ初期化
+    
+    # === ローカライゼーション性能設定 ===
+    # 高速位置推定
+    Rtabmap/DetectionRate: "3.0"      # 検出レート高め（リアルタイム位置推定）
+    Rtabmap/LoopThr: "0.20"           # ループ閾値緩め（既知環境での位置推定）
+    Rtabmap/LoopRatio: "0.8"          # ループ比率
+    
+    # === メモリ設定（ローカライゼーション向け） ===
+    # ワーキングメモリ設定
+    Mem/WorkingMemorySize: "30"       # ワーキングメモリ大きめ
+    Mem/STMSize: "10"                 # 短期メモリは小さめ（新規学習なし）
+    Mem/RehearsalSimilarity: "0.6"    # 標準的な類似度閾値
+    
+    # 既存マップとの整合性重視
+    Mem/RehearsalIdUpdatedToNewOne: "false"  # 既存ノード更新を抑制
+    
+    # === 視覚オドメトリ設定（ローカライゼーション向け） ===
+    # 安定した位置推定のための設定
+    Vis/MinInliers: "15"              # インライア数（安定性重視）
+    Vis/InlierDistance: "0.03"        # インライア距離
+    
+    # 特徴点設定
+    Kp/MaxFeatures: "800"             # 特徴点数（精度と処理速度のバランス）
+    Vis/MaxFeatures: "800"            # 視覚特徴数
+    
+    # === グローバルローカライゼーション設定 ===
+    # ロボットがロストした場合の復旧設定
+    Rtabmap/StartNewMapOnLoopClosure: "false"  # 新マップ作成無効
+    Rtabmap/StartNewMapOnGoodSignature: "false"  # 新マップ作成無効
+    
+    # === 位置推定精度向上設定 ===
+    # マップマッチング強化
+    Reg/Strategy: "0"                 # 0=Vis, 1=Icp, 2=VisIcp
+    Reg/Force3DoF: "true"             # 地面移動制約（移動ロボット用）
+    
+    # === パフォーマンス設定（リアルタイム重視） ===
+    # 処理速度優先設定
+    Mem/ImagePreDecimation: "2"       # 画像前処理縮小
+    Mem/ImagePostDecimation: "1"      # 後処理縮小は最小限
+    
+    # === 安全設定 ===
+    # データベース保護
+    Db/ReadOnly: "true"               # データベース読み取り専用（変更防止）
+    
+    # === 出力設定（ナビゲーション用） ===
+    # TF発行設定
+    publish_tf: true                  # 位置情報のTF発行
+    publish_null_when_lost: true      # ロスト時のnull発行
+    
+    # === グリッドマップ設定（ローカライゼーション用） ===
+    # リアルタイム占有格子地図更新
+    Grid/FromDepth: "true"            # 深度からリアルタイム更新
+    Grid/3D: "false"                  # 2D占有格子地図
+    Grid/RangeMax: "8.0"              # 範囲（ナビゲーション用）
+    Grid/CellSize: "0.05"             # セルサイズ（ナビゲーション精度）
+    
+    # === 動的環境対応 ===
+    # 環境変化への適応設定
+    Grid/GroundIsObstacle: "false"    # 地面は障害物ではない
+    Grid/MaxObstacleHeight: "2.0"     # 障害物高さ上限
+    Grid/NoiseFilteringRadius: "0.02" # ノイズ除去
+    Grid/NoiseFilteringMinNeighbors: "3"  # 最小近傍数
+    
+    # === センサー統合設定 ===
+    # 複数センサーの統合（可用性向上）
+    subscribe_depth: true             # RGB-D使用
+    subscribe_scan: true              # LiDAR使用
+    subscribe_rgb: true               # RGB画像使用
+    
+    # === モニタリング設定 ===
+    # 位置推定品質監視
+    Odom/ResetCountdown: "1"          # オドメトリリセット（品質低下時）
+    
+    # === フェイルセーフ設定 ===
+    # ローカライゼーション失敗時の対応
+    Rtabmap/VhStrategy: "1"           # 視覚的語彙戦略維持
+    Rtabmap/TimeThr: "0"              # 時間制限なし（継続的位置推定）

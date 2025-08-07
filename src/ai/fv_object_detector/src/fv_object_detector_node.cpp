@@ -397,7 +397,7 @@ private:
             
             // クラス情報と信頼度設定
             detection_msg.results.resize(1);
-            detection_msg.results[0].hypothesis.class_id = det.class_id;
+            detection_msg.results[0].hypothesis.class_id = std::to_string(det.class_id);
             detection_msg.results[0].hypothesis.score = det.confidence;
             
             detections_msg.detections.push_back(detection_msg);

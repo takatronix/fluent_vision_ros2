@@ -1,0 +1,83 @@
+# RTABMap 屋内マッピング用設定
+# 屋内環境での高精度マッピングに最適化された設定
+
+rtabmap:
+  ros__parameters:
+    # === essential_params.yaml を継承 ===
+    # 基本設定は essential_params.yaml から継承される想定
+    
+    # === 屋内環境特化設定 ===
+    
+    # RGB-D カメラ設定（D415遠距離 + D405近距離）
+    # メインカメラ：D415（遠距離・横）
+    rgb_topic: "/fv/d415/color/image_raw"
+    depth_topic: "/fv/d415/depth/image_rect_raw"
+    camera_info_topic: "/fv/d415/color/camera_info"
+    
+    # サブカメラ：D405（近距離）- 必要に応じて追加設定
+    # マルチカメラ構成の場合は別途設定が必要
+    
+    # === 屋内向け視覚オドメトリ設定 ===
+    # 特徴点検出・抽出
+    Kp/DetectorStrategy: "6"           # 0=SURF, 1=SIFT, 2=ORB, 6=GFTT, 8=FAST
+    Kp/MaxFeatures: "1000"            # 最大特徴点数（屋内では多め）
+    Kp/MinDepth: "0.3"                # 最小深度（m）- D405の近距離対応
+    Kp/MaxDepth: "8.0"                # 最大深度（m）- D415の遠距離活用
+    
+    # 特徴点マッチング
+    Vis/CorType: "1"                  # 0=Features Matching, 1=Optical Flow
+    Vis/MaxFeatures: "1000"           # 視覚的特徴の最大数
+    Vis/MinInliers: "12"              # 最小インライア数（屋内では少なめ）
+    Vis/InlierDistance: "0.02"        # インライア距離閾値（m）
+    
+    # === 屋内向けループクロージャ設定 ===
+    Rtabmap/DetectionRate: "2.0"      # 検出レート（屋内では高頻度）
+    Rtabmap/LoopThr: "0.15"           # ループ閾値（屋内では少し緩く）
+    Rtabmap/LoopRatio: "0.9"          # ループ比率閾値
+    
+    # === メモリ管理（屋内向け） ===
+    Mem/RehearsalSimilarity: "0.4"    # 類似度閾値（屋内では厳しめ）
+    Mem/WorkingMemorySize: "12"       # ワーキングメモリサイズ
+    Mem/STMSize: "30"                 # 短期メモリサイズ
+    Mem/RecentWmRatio: "0.2"          # 最近のワーキングメモリ比率
+    
+    # === グリッドマップ設定（屋内向け） ===
+    Grid/FromDepth: "true"            # 深度からグリッド生成
+    Grid/DepthDecimation: "1"         # 深度画像の間引き（1=間引きなし）
+    Grid/RangeMax: "5.0"              # グリッド生成の最大範囲（m）
+    Grid/RangeMin: "0.1"              # グリッド生成の最小範囲（m）
+    Grid/CellSize: "0.05"             # セルサイズ（m）- 屋内では細かく
+    Grid/ClusterRadius: "0.02"        # クラスタ半径（m）
+    Grid/GroundIsObstacle: "false"    # 地面を障害物として扱わない
+    Grid/MaxGroundHeight: "0.10"      # 地面とみなす最大高さ（m）
+    Grid/MaxObstacleHeight: "2.5"     # 障害物とみなす最大高さ（m）- 天井高考慮
+    
+    # === 最適化設定（屋内向け） ===
+    Optimizer/Strategy: "1"           # g2o使用（推奨）
+    Optimizer/Iterations: "30"        # 反復回数（屋内では多め）
+    Optimizer/Epsilon: "0.00001"      # 収束判定値
+    Optimizer/GravitySigma: "0.3"     # 重力制約の標準偏差
+    
+    # === ノイズフィルタリング（屋内向け） ===
+    # 点群ノイズ除去
+    Grid/NoiseFilteringRadius: "0.02" # ノイズフィルタ半径（m）
+    Grid/NoiseFilteringMinNeighbors: "2"  # 最小近傍数
+    
+    # === パフォーマンス調整（屋内向け） ===
+    # 画像処理
+    Mem/ImagePreDecimation: "1"       # 前処理縮小なし（屋内では品質重視）
+    Mem/ImagePostDecimation: "2"      # 後処理で2倍縮小（メモリ節約）
+    
+    # === 特殊設定 ===
+    # 狭い空間での設定
+    Rtabmap/CreateIntermediateNodes: "false"  # 中間ノード無効
+    Reg/Force3DoF: "false"            # 3DoF制約なし（全6DoF使用）
+    
+    # === アスパラガス検出用カスタム設定 ===
+    # 近距離詳細観察用（D405活用想定）
+    Kp/RoiRatios: "0.0 0.0 1.0 0.6"  # 関心領域（下部60%に注目）
+    
+    # === IMU統合設定 ===
+    # IMUがある場合の設定
+    Odom/AlignWithGround: "true"      # 地面との整列
+    Mem/UseOdomGravity: "true"        # オドメトリ重力情報使用

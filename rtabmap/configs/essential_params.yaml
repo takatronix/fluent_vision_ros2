@@ -1,0 +1,91 @@
+# RTABMap 必須パラメータ設定
+# 必ず設定しないといけない項目と重要な項目をまとめたもの
+
+rtabmap:
+  ros__parameters:
+    # === 必須フレーム設定 ===
+    frame_id: "base_link"              # ロボットのベースフレーム
+    map_frame_id: "map"               # マップフレーム
+    odom_frame_id: "odom"             # オドメトリフレーム
+    
+    # === 必須入力設定 ===
+    # センサー入力の種類を指定（必ず1つは有効化）
+    subscribe_depth: true              # RGB-D カメラの深度データを使用
+    subscribe_stereo: false           # ステレオカメラを使用（depth と排他）
+    subscribe_scan: true              # 2D/3D LiDAR を使用
+    subscribe_rgb: true               # RGB 画像を使用
+    
+    # === 重要な基本設定 ===
+    # マッピング vs ローカライゼーション
+    Mem/IncrementalMemory: "true"     # true=マッピングモード, false=ローカライゼーションモード
+    
+    # データベース管理
+    database_path: "rtabmap.db"       # データベースファイルのパス
+    Db/TargetVersion: "0.21.4"        # データベースバージョン（互換性確保）
+    
+    # === トピック設定 ===
+    # RGB-D カメラトピック
+    rgb_topic: "/fv/d415/color/image_raw"
+    depth_topic: "/fv/d415/depth/image_rect_raw"
+    camera_info_topic: "/fv/d415/color/camera_info"
+    
+    # LiDAR トピック
+    scan_topic: "/livox/lidar"
+    
+    # IMU トピック（オプション、あると精度向上）
+    imu_topic: "/livox/imu"
+    
+    # オドメトリトピック（ホイールオドメトリなど）
+    odom_topic: "/odom"
+    
+    # === 同期設定 ===
+    approx_sync: true                 # 時刻同期の近似許可（センサータイムスタンプのずれ対応）
+    queue_size: 30                    # メッセージキューサイズ
+    qos_image: 1                      # 画像QoS設定
+    qos_scan: 1                       # スキャンQoS設定
+    
+    # === 変換待機設定 ===
+    wait_for_transform: 0.2           # 座標変換待機時間（秒）
+    tf_timeout: 30.0                  # TF タイムアウト（秒）
+    
+    # === メモリ・パフォーマンス設定 ===
+    # メモリ制限
+    Mem/RehearsalSimilarity: "0.6"    # メモリ管理のための類似度閾値
+    Mem/WorkingMemorySize: "12"       # ワーキングメモリサイズ（ノード数）
+    Mem/STMSize: "30"                 # 短期メモリサイズ（ノード数）
+    
+    # === 視覚オドメトリ基本設定 ===
+    Odom/Strategy: "0"                # 0=Frame-to-Map, 1=Frame-to-Frame
+    Odom/GuessMotion: "true"          # モーション予測を使用
+    Odom/ResetCountdown: "0"          # オドメトリリセットカウント（0=無効）
+    
+    # === SLAM 基本設定 ===
+    SLAM/2D: "false"                  # true=2D SLAM, false=3D SLAM
+    Optimizer/Strategy: "1"           # 0=TORO, 1=g2o, 2=GTSAM（g2o推奨）
+    Optimizer/Iterations: "20"        # 最適化反復回数
+    
+    # === ループクロージャ基本設定 ===
+    Rtabmap/DetectionRate: "1.0"      # 検出レート（Hz）
+    Rtabmap/TimeThr: "0"              # 時間閾値（秒、0=無制限）
+    Rtabmap/LoopThr: "0.11"           # ループクロージャ閾値（低いほど厳しい）
+    
+    # === グリッドマップ基本設定 ===
+    Grid/FromDepth: "true"            # 深度画像から格子地図生成
+    Grid/3D: "false"                  # 2D占有格子地図を生成
+    GridGlobal/MinSize: "20.0"        # グローバルマップ最小サイズ（m）
+    
+    # === 処理品質設定 ===
+    # 画像前処理
+    Mem/ImagePreDecimation: "1"       # 画像の前処理時縮小（1=縮小なし）
+    Mem/ImagePostDecimation: "1"      # 画像の後処理時縮小（1=縮小なし）
+    
+    # === 出力設定 ===
+    publish_tf: true                  # TF発行の有効化
+    publish_null_when_lost: false     # ロスト時のnull発行
+    
+    # === ログ・デバッグ設定 ===
+    Rtabmap/VhStrategy: "1"           # 視覚的語彙戦略（1=SURF）
+    Rtabmap/CreateIntermediateNodes: "false"  # 中間ノード作成無効化
+    
+    # === ROS2固有設定 ===
+    use_sim_time: false               # シミュレーション時間使用（実機では false）

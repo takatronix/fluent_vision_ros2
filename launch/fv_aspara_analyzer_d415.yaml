@@ -24,7 +24,7 @@ fv_aspara_analyzer:
     
     # 入力トピック（Fluent Vision AIシステムから）
     detection_topic: "/fv/d415/object_detection/detections"      # YOLO検出結果
-    pointcloud_topic: "/fv/d415/points"                          # 3D点群データ
+    pointcloud_topic: "/fv/d415/asparagus/points"                # 3D点群データ
     camera_info_topic: "/fv/d415/color/camera_info"              # カメラキャリブレーション情報
     camera_topic: "/fv/d415/color/image_raw"                     # カラー画像
     mask_topic: "/fv/d415/segmentation_mask/image"               # セグメンテーションマスク

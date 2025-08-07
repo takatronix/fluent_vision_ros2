@@ -106,6 +106,32 @@ ros2 run fv_topic_relay fv_topic_relay_node \
     --ros-args \
     --params-file "$SCRIPT_DIR/relay_vision_ai.yaml" &
 
+# Foxglove Bridge起動
+echo "🦊 Starting Foxglove Bridge..."
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml &
+
+# 点群生成 D415 ノード起動
+echo "☁️ Starting Simple PointCloud Generator D415 node..."
+ros2 run fv_aspara_analyzer simple_pointcloud_generator \
+    --ros-args \
+    -r __node:=simple_pointcloud_generator_d415 \
+    -r __ns:=/fv/d415 \
+    -r /fv/d415/depth/image_rect_raw:=/fv/d415/depth/image_rect_raw \
+    -r /fv/d415/color/image_raw:=/fv/d415/color/image_raw \
+    -r /fv/d415/object_detection/detections:=/fv/d415/object_detection/detections \
+    -r /asparagus/points:=/fv/d415/asparagus/points &
+
+# 点群生成 D405 ノード起動
+echo "☁️ Starting Simple PointCloud Generator D405 node..."
+ros2 run fv_aspara_analyzer simple_pointcloud_generator \
+    --ros-args \
+    -r __node:=simple_pointcloud_generator_d405 \
+    -r __ns:=/fv/d405 \
+    -r /fv/d405/depth/image_rect_raw:=/fv/d405/depth/image_rect_raw \
+    -r /fv/d405/color/image_raw:=/fv/d405/color/image_raw \
+    -r /fv/d405/object_detection/detections:=/fv/d405/object_detection/detections \
+    -r /asparagus/points:=/fv/d405/asparagus/points &
+
 # アスパラ分析 D415 ノード起動
 echo "🌾 Starting Aspara Analyzer D415 node..."
 ros2 run fv_aspara_analyzer fv_aspara_analyzer_node \

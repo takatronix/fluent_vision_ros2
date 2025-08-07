@@ -1,0 +1,93 @@
+# RTABMap パフォーマンス調整用設定
+# 処理負荷軽減とリアルタイム性能向上のための設定
+
+rtabmap:
+  ros__parameters:
+    # === essential_params.yaml を継承 ===
+    
+    # === 処理負荷軽減設定 ===
+    
+    # 画像処理軽減
+    Mem/ImagePreDecimation: "4"       # 前処理で4倍縮小（大幅軽減）
+    Mem/ImagePostDecimation: "2"      # 後処理で2倍縮小
+    Mem/CompressionParallelized: "true"  # 並列圧縮処理
+    
+    # 特徴点処理軽減
+    Kp/MaxFeatures: "300"             # 特徴点数を制限（処理軽減）
+    Vis/MaxFeatures: "300"            # 視覚特徴数制限
+    Kp/WordsPerImage: "200"           # 画像あたり語彙数制限
+    
+    # === フレームレート調整 ===
+    Rtabmap/DetectionRate: "0.5"      # 検出レート低下（0.5Hz）
+    Rtabmap/CreateIntermediateNodes: "false"  # 中間ノード無効
+    
+    # === メモリ使用量最適化 ===
+    # メモリサイズ制限
+    Mem/WorkingMemorySize: "8"        # ワーキングメモリ縮小
+    Mem/STMSize: "15"                 # 短期メモリ縮小
+    Mem/RecentWmRatio: "0.1"          # 最近のメモリ比率縮小
+    
+    # グラフ最適化
+    Mem/ReduceGraph: "true"           # グラフ簡約化
+    Mem/LazyCreation: "true"          # 遅延作成
+    
+    # === 処理品質vs速度調整 ===
+    # 最適化反復数削減
+    Optimizer/Iterations: "10"        # 最適化反復数削減
+    Optimizer/Epsilon: "0.001"        # 収束判定緩く（早期終了）
+    
+    # レジストレーション軽減
+    Reg/Strategy: "0"                 # Visual only（ICP無効で軽量化）
+    
+    # === 点群処理軽減 ===
+    # グリッドマップ処理軽減
+    Grid/DepthDecimation: "4"         # 深度間引き大幅増加
+    Grid/RangeMax: "5.0"              # 処理範囲縮小
+    Grid/CellSize: "0.1"              # セルサイズ大きく（粗い処理）
+    Grid/3D: "false"                  # 2Dマップのみ（3D無効）
+    
+    # ノイズフィルタリング軽減
+    Grid/NoiseFilteringRadius: "0.1"  # フィルタ範囲大きく（粗い処理）
+    Grid/NoiseFilteringMinNeighbors: "2"  # 近傍数削減
+    
+    # === 同期設定（処理遅延許容） ===
+    approx_sync: true                 # 近似同期許可
+    queue_size: 10                    # キューサイズ削減
+    
+    # === バンドル調整無効化 ===
+    Optimizer/VarianceIgnored: "true" # バンドル調整無効（軽量化）
+    
+    # === ログ・デバッグ無効化 ===
+    Rtabmap/PublishStats: "false"     # 統計発行無効
+    Rtabmap/StatisticLogsBufferedSize: "0"  # ログバッファ無効
+    
+    # === センサーデータ削減 ===
+    # 不要なデータストリーム無効化（必要に応じて）
+    subscribe_odom_info: false        # オドメトリ情報無効
+    subscribe_user_data: false        # ユーザーデータ無効
+    
+    # === リソース使用量制限 ===
+    # CPU使用率制限的な効果
+    Rtabmap/VhStrategy: "0"           # 語彙戦略簡略化
+    
+    # === 軽量モードでのループクロージャ ===
+    Rtabmap/LoopThr: "0.25"           # ループ閾値緩く（処理軽減）
+    Rtabmap/LoopRatio: "0.6"          # ループ比率緩く
+    
+    # === 並列処理設定 ===
+    Rtabmap/TimeThr: "0"              # 時間制限なし
+    Mem/MapLabelsAdded: "false"       # マップラベル無効
+    
+    # === 特殊軽量化設定 ===
+    # データベース軽量化
+    Db/TargetVersion: ""              # バージョン制限なし
+    
+    # === パフォーマンス監視用設定 ===
+    # 必要最小限の出力
+    publish_tf: true                  # TFは必須
+    publish_null_when_lost: false     # null発行無効（負荷軽減）
+    
+    # === 備考 ===
+    # この設定は精度よりも処理速度を優先
+    # リアルタイム性能が必要で、多少の精度低下を許容できる場合に使用
+    # ハードウェア性能が低い環境での動作に適している

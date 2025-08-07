@@ -1,0 +1,114 @@
+# =============================================================================
+# Fluent Vision - RealSense D415カメラ設定ファイル（最適化版）
+# =============================================================================
+# 
+# 最適化内容：
+#   - ポイントクラウド生成の負荷軽減
+#   - 不要なフィルタの無効化
+#   - 解像度とFPSの最適化
+# =============================================================================
+
+/**:
+  ros__parameters:
+    # ===== カメラ選択設定 =====
+    camera_selection:
+      selection_method: "serial"
+      serial_number: "237322061056"
+      device_name: "D415"
+    
+    # ===== 電源管理 =====
+    power_management:
+      startup_delay: 1.0
+    
+    # ===== カメラ設定（性能最適化） =====
+    camera:
+      # 解像度を下げて高速化（640x480 → 424x240）
+      color_width: 424              # 最適化：解像度削減
+      color_height: 240             # 最適化：解像度削減
+      color_fps: 6                  # 最適化：FPS削減（15→6）
+      depth_width: 424              # 最適化：解像度削減
+      depth_height: 240             # 最適化：解像度削減
+      depth_fps: 6                  # 最適化：FPS削減（15→6）
+    
+    # ===== ストリーム設定（軽量化） =====
+    streams:
+      color_enabled: true
+      depth_enabled: true
+      infrared_enabled: false       # 不要
+      pointcloud_enabled: false     # 最適化：RealSenseでの生成を無効化
+      depth_colormap_enabled: false # 最適化：表示用のみなので無効化
+    
+    # ===== 点群処理パラメータ（外部で処理） =====
+    # 注意：pointcloud_enabled: falseの場合、これらは無視される
+    pointcloud:
+      # 距離フィルタリング
+      min_distance: 0.1
+      max_distance: 2.0             # 最適化：3m→2mに短縮
+      
+      # フィルタを最小限に
+      spatial_filter_enabled: false     # 最適化：無効化
+      temporal_filter_enabled: false    # 最適化：無効化
+      hole_filling_enabled: false       # 最適化：無効化
+      decimation_enabled: true          # 最適化：有効化
+      decimation_scale: 2               # 最適化：ダウンサンプル
+      
+      # 点群品質設定
+      organized: true
+      remove_invalid_points: true
+    
+    # ===== カメラ情報と圧縮設定 =====
+    camera_info:
+      enable_camera_info: true
+      enable_compressed_topics: false    # 最適化：圧縮処理を無効化
+      enable_depth_compressed: false     # 最適化：圧縮処理を無効化
+    
+    # ===== サービス設定 =====
+    services:
+      get_distance_enabled: false        # 最適化：不要なサービス無効化
+      get_camera_info_enabled: true
+    
+    # ===== TF設定 =====
+    tf:
+      enabled: true
+      base_frame: "map"
+      camera_frame: "fv/d415/camera_link"
+      color_optical_frame: "fv/d415/color_optical_frame"
+      depth_optical_frame: "fv/d415/depth_optical_frame"
+    
+    # ===== トピック設定 =====
+    topics:
+      color: "fv/d415/color/image_raw"
+      depth: "fv/d415/depth/image_rect_raw"
+      color_camera_info: "fv/d415/color/camera_info"
+      depth_camera_info: "fv/d415/depth/camera_info"
+      
+      # 無効化されたトピック
+      pointcloud: ""                    # 外部で生成
+      depth_colormap: ""                # 不要
+      
+      enable_default_topics: false
+
+# =============================================================================
+# 最適化のポイント
+# =============================================================================
+#
+# 1. **解像度とFPSの削減**
+#    - 640x480 15fps → 424x240 6fps
+#    - 約75%の処理量削減
+#
+# 2. **ポイントクラウド生成の外部化**
+#    - RealSenseノード内での生成を無効化
+#    - depth_image_proc等の外部ノードで生成
+#
+# 3. **不要なフィルタの無効化**
+#    - spatial_filter, temporal_filter → false
+#    - 必要に応じて後段で処理
+#
+# 4. **圧縮処理の無効化**
+#    - compressed_topics → false
+#    - CPU負荷の大幅削減
+#
+# 5. **深度カラーマップの無効化**
+#    - 可視化用のみなので無効化
+#    - 必要時は別ノードで生成
+# =============================================================================

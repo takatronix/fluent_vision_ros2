@@ -1,0 +1,97 @@
+# RTABMap 屋外マッピング用設定
+# 屋外環境（農場・畑など）での使用に最適化された設定
+
+rtabmap:
+  ros__parameters:
+    # === essential_params.yaml を継承 ===
+    
+    # === 屋外環境特化設定 ===
+    
+    # センサー構成（屋外向け）
+    # 3D LiDAR + RGB-D カメラ + IMU
+    rgb_topic: "/fv/d415/color/image_raw"
+    depth_topic: "/fv/d415/depth/image_rect_raw"
+    camera_info_topic: "/fv/d415/color/camera_info"
+    scan_topic: "/livox/lidar"        # 3D LiDAR（主センサー）
+    imu_topic: "/livox/imu"           # IMU（姿勢安定化）
+    
+    # === 屋外向け視覚オドメトリ設定 ===
+    # 特徴点検出（屋外の明るい環境対応）
+    Kp/DetectorStrategy: "8"           # 8=FAST（高速処理、屋外向け）
+    Kp/MaxFeatures: "500"             # 特徴点数控えめ（処理負荷軽減）
+    Kp/MinDepth: "0.5"                # 最小深度（m）- 屋外では少し遠く
+    Kp/MaxDepth: "20.0"               # 最大深度（m）- 屋外長距離対応
+    
+    # 特徴点マッチング（屋外向け）
+    Vis/CorType: "0"                  # Features Matching（光学的変化に強い）
+    Vis/MaxFeatures: "500"            # 視覚特徴数制限
+    Vis/MinInliers: "20"              # インライア数多め（屋外では厳しく）
+    Vis/InlierDistance: "0.05"        # インライア距離緩く（屋外の不確実性対応）
+    
+    # === 屋外向けループクロージャ設定 ===
+    Rtabmap/DetectionRate: "1.0"      # 検出レート（屋外では標準）
+    Rtabmap/LoopThr: "0.08"           # ループ閾値（屋外では厳しく）
+    Rtabmap/LoopRatio: "0.7"          # ループ比率閾値
+    Rtabmap/TimeThr: "30"             # 時間閾値（秒）- 屋外では長めの軌道
+    
+    # === メモリ管理（屋外長距離移動向け） ===
+    Mem/RehearsalSimilarity: "0.6"    # 類似度閾値（屋外では標準）
+    Mem/WorkingMemorySize: "20"       # ワーキングメモリサイズ大きめ
+    Mem/STMSize: "50"                 # 短期メモリサイズ大きめ
+    Mem/RecentWmRatio: "0.3"          # 最近のワーキングメモリ比率
+    
+    # === グリッドマップ設定（屋外向け） ===
+    Grid/FromDepth: "true"            # 深度からグリッド生成
+    Grid/DepthDecimation: "2"         # 深度画像を2倍間引き（処理軽減）
+    Grid/RangeMax: "15.0"             # グリッド生成の最大範囲（m）- 屋外長距離
+    Grid/RangeMin: "0.5"              # グリッド生成の最小範囲（m）
+    Grid/CellSize: "0.1"              # セルサイズ（m）- 屋外では粗く
+    Grid/ClusterRadius: "0.05"        # クラスタ半径（m）
+    Grid/GroundIsObstacle: "false"    # 地面は障害物ではない
+    Grid/MaxGroundHeight: "0.2"       # 地面高さ（凹凸考慮）
+    Grid/MaxObstacleHeight: "3.0"     # 障害物最大高さ（m）- 樹木等考慮
+    
+    # 地形対応設定
+    Grid/MaxGroundAngle: "30"         # 地面角度最大値（度）- 傾斜地対応
+    proj_max_ground_angle: "30.0"     # 投影最大地面角度
+    proj_min_cluster_size: "5"        # 最小クラスタサイズ
+    
+    # === 最適化設定（屋外大規模環境向け） ===
+    Optimizer/Strategy: "1"           # g2o使用
+    Optimizer/Iterations: "20"        # 反復回数（処理時間とのバランス）
+    Optimizer/Epsilon: "0.0001"       # 収束判定値
+    Optimizer/GravitySigma: "0.1"     # 重力制約強め（IMU活用）
+    
+    # === 大規模環境対応 ===
+    Reg/Force3DoF: "true"             # 3DoF制約（地面移動想定）
+    SLAM/2D: "false"                  # 3D SLAM維持（地形変化対応）
+    
+    # === パフォーマンス調整（屋外処理負荷対応） ===
+    # 画像処理軽減
+    Mem/ImagePreDecimation: "2"       # 前処理で2倍縮小
+    Mem/ImagePostDecimation: "2"      # 後処理でさらに2倍縮小
+    
+    # === ノイズ対策（屋外環境） ===
+    # 点群ノイズ除去（土埃、葉っぱ等）
+    Grid/NoiseFilteringRadius: "0.05" # ノイズフィルタ半径大きめ
+    Grid/NoiseFilteringMinNeighbors: "5"  # 最小近傍数多め
+    
+    # === IMU統合設定（屋外移動向け） ===
+    Odom/AlignWithGround: "true"      # 地面との整列
+    Mem/UseOdomGravity: "true"        # 重力情報活用
+    Odom/GuessMotion: "true"          # モーション予測活用
+    
+    # === LiDAR特化設定 ===
+    # 3D点群処理
+    Icp/MaxCorrespondenceDistance: "0.2"  # ICP対応距離
+    Icp/MaxTranslation: "3.0"         # ICP最大並進
+    Icp/MaxRotation: "1.57"           # ICP最大回転（90度）
+    
+    # === 農業用途カスタム設定 ===
+    # 作物検出・記録用
+    Kp/RoiRatios: "0.0 0.2 1.0 0.8"  # 関心領域（中央部60%、作物エリア）
+    
+    # === 長時間動作設定 ===
+    # バッテリー・処理能力考慮
+    Rtabmap/CreateIntermediateNodes: "true"   # 中間ノード作成（長距離軌道対応）
+    Mem/ReduceGraph: "true"           # グラフ簡約化（メモリ節約）
