@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCH_DIR="$ROOT_DIR/launch"
+
+# Helper: print usage
+usage() {
+  cat <<'EOF'
+FluentVision CLI
+
+Usage:
+  fv start                      Start all FV nodes
+  fv stop                       Stop all FV nodes
+  fv status                     Show core node status (basic)
+
+  fv ai start [d415|d405|both]  Start AI nodes (default: both)
+  fv ai stop  [d415|d405|both]  Stop AI nodes (default: both)
+  fv ai status [d415|d405|both] Show AI nodes status (default: both)
+
+  fv cameras list               List available cameras/serials
+  fv serials update             Update camera serial mappings
+
+  fv help                       Show this help
+
+Examples:
+  fv start
+  fv ai start d415
+  fv ai status
+  fv stop
+EOF
+}
+
+# Ensure expected scripts exist
+need() {
+  local path="$1"
+  if [[ ! -x "$path" && ! -f "$path" ]]; then
+    echo "Error: required script not found: $path" >&2
+    exit 1
+  fi
+}
+
+# Try to source ROS2 env if available (useful for status)
+maybe_source_ros2() {
+  if [[ -f "$ROOT_DIR/install/setup.bash" ]]; then
+    # shellcheck source=/dev/null
+    source "$ROOT_DIR/install/setup.bash"
+  fi
+}
+
+cmd_start() {
+  need "$LAUNCH_DIR/start_fv.sh"
+  (cd "$LAUNCH_DIR" && ./start_fv.sh)
+}
+
+cmd_stop() {
+  need "$LAUNCH_DIR/stop_fv.sh"
+  (cd "$LAUNCH_DIR" && ./stop_fv.sh)
+}
+
+cmd_ai() {
+  local action="${1:-status}"; shift || true
+  local camera="${1:-both}"
+  case "$action" in
+    start)
+      need "$LAUNCH_DIR/ai_start"
+      (cd "$LAUNCH_DIR" && ./ai_start "$camera")
+      ;;
+    stop)
+      need "$LAUNCH_DIR/ai_stop"
+      (cd "$LAUNCH_DIR" && ./ai_stop "$camera")
+      ;;
+    status)
+      need "$LAUNCH_DIR/ai_status"
+      (cd "$LAUNCH_DIR" && ./ai_status "$camera")
+      ;;
+    *)
+      echo "Unknown ai subcommand: $action" >&2
+      echo "Valid: start|stop|status" >&2
+      exit 1
+      ;;
+  esac
+}
+
+cmd_status() {
+  maybe_source_ros2 || true
+  # Basic status by checking known node names via ros2 if available; fallback to process grep
+  if command -v ros2 >/dev/null 2>&1; then
+    echo "ROS2 nodes containing 'fv_':"
+    ros2 node list 2>/dev/null | grep -E "fv_" || echo "(none)"
+  else
+    echo "ros2 not found; showing process-based status"
+    ps aux | grep -E "fv_|foxglove_bridge" | grep -v grep || echo "(none)"
+  fi
+}
+
+cmd_cameras_list() {
+  if [[ -x "$LAUNCH_DIR/check_camera_serials.py" ]]; then
+    (cd "$LAUNCH_DIR" && ./check_camera_serials.py)
+  elif [[ -f "$ROOT_DIR/src/sensors/fv_realsense/scripts/list_cameras.py" ]]; then
+    (cd "$ROOT_DIR/src/sensors/fv_realsense/scripts" && python3 list_cameras.py)
+  else
+    echo "No camera listing script found." >&2
+    exit 1
+  fi
+}
+
+cmd_serials_update() {
+  need "$LAUNCH_DIR/update_camera_serials.sh"
+  (cd "$LAUNCH_DIR" && ./update_camera_serials.sh)
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    status)  cmd_status ;;
+    ai)      cmd_ai "$@" ;;
+    cameras)
+      local sub="${1:-list}"; shift || true
+      case "$sub" in
+        list) cmd_cameras_list ;;
+        *) echo "Unknown cameras subcommand: $sub" >&2; exit 1 ;;
+      esac
+      ;;
+    serials)
+      local sub2="${1:-update}"; shift || true
+      case "$sub2" in
+        update) cmd_serials_update ;;
+        *) echo "Unknown serials subcommand: $sub2" >&2; exit 1 ;;
+      esac
+      ;;
+    help|-h|--help) usage ;;
+    *)
+      echo "Unknown command: $cmd" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
+

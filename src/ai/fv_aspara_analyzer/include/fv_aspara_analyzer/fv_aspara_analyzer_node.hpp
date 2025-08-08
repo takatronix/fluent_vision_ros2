@@ -14,6 +14,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <vision_msgs/msg/detection2_d_array.hpp>
@@ -148,6 +149,7 @@ public:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_pointcloud_pub_;    ///< フィルタリング済み点群パブリッシャー
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr selected_pointcloud_pub_;    ///< 選択中のアスパラガス点群パブリッシャー
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr annotated_image_pub_;              ///< 注釈付き画像パブリッシャー
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr annotated_image_compressed_pub_;  ///< 注釈付き圧縮画像パブリッシャー
     
     // ===== ROS2 サービス =====
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr next_asparagus_service_;              ///< 次のアスパラガス選択サービス

@@ -65,6 +65,7 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<std::string>("output_filtered_pointcloud_topic", "");
     this->declare_parameter<std::string>("output_selected_pointcloud_topic", "");
     this->declare_parameter<std::string>("output_annotated_image_topic", "");
+    this->declare_parameter<double>("detection_timeout_seconds", 3.0);  // デフォルト3秒
 
     // ===== トピック名取得 =====
     std::string detection_topic = this->get_parameter("detection_topic").as_string();
@@ -182,6 +183,10 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     
     annotated_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
         output_annotated_image_topic, 10);
+    
+    // 圧縮画像パブリッシャー
+    annotated_image_compressed_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
+        output_annotated_image_topic + "/compressed", 10);
 
     // ===== サービス初期化 =====
     next_asparagus_service_ = this->create_service<std_srvs::srv::Trigger>(
@@ -716,10 +721,11 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     snapshot_list = persistent_list;
     snapshot_selected_id = persistent_selected_id;
     
-    // タイムアウト処理（3秒後に自動的に消去）
+    // タイムアウト処理（設定値後に自動的に消去）
+    static double detection_timeout = this->get_parameter("detection_timeout_seconds").as_double();
     auto time_now = std::chrono::steady_clock::now();
     auto time_since_update = std::chrono::duration<double>(time_now - last_detection_update).count();
-    if (time_since_update > 3.0 && !persistent_list.empty()) {
+    if (time_since_update > detection_timeout && !persistent_list.empty()) {
         // 3秒後に検出結果をクリア
         persistent_list.clear();
         persistent_selected_id = -1;
@@ -754,13 +760,15 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             aspara_info.smooth_bbox = aspara_info.bounding_box_2d;
             aspara_info.animation_alpha = 0.0f;
         } else {
-            // 既存 - スムージング
+            // 既存 - スムージング（より滑らかに）
             auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
             cv::Rect& smooth = smooth_bbox_map[aspara_info.id];
-            smooth.x = lerp(smooth.x, aspara_info.bounding_box_2d.x, animation_speed);
-            smooth.y = lerp(smooth.y, aspara_info.bounding_box_2d.y, animation_speed);
-            smooth.width = lerp(smooth.width, aspara_info.bounding_box_2d.width, animation_speed);
-            smooth.height = lerp(smooth.height, aspara_info.bounding_box_2d.height, animation_speed);
+            // スムージング係数を調整（より滑らかに）
+            float smooth_factor = std::min(1.0f, animation_speed * 0.5f);  // 半分の速度でより滑らかに
+            smooth.x = lerp(smooth.x, aspara_info.bounding_box_2d.x, smooth_factor);
+            smooth.y = lerp(smooth.y, aspara_info.bounding_box_2d.y, smooth_factor);
+            smooth.width = lerp(smooth.width, aspara_info.bounding_box_2d.width, smooth_factor);
+            smooth.height = lerp(smooth.height, aspara_info.bounding_box_2d.height, smooth_factor);
             aspara_info.smooth_bbox = smooth;
             
             float& alpha = animation_alpha_map[aspara_info.id];
@@ -785,7 +793,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             cv::rectangle(output_image, aspara_info.smooth_bbox, color, thickness);
             
             // ラベル描画
-            std::string label = cv::format("Asparagus #%d (%.0f%%)", aspara_info.id, aspara_info.confidence * 100);
+            std::string label = cv::format("アスパラガス #%d (%.0f%%)", aspara_info.id, aspara_info.confidence * 100);
             int baseline;
             cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
             
@@ -795,9 +803,9 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 cv::Rect(text_pos.x, text_pos.y - text_size.height - 3, text_size.width + 6, text_size.height + 6),
                 color, -1);
             
-            // テキスト
+            // テキスト（黒文字）
             cv::putText(output_image, label, cv::Point(text_pos.x + 3, text_pos.y), 
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
         }
     } else {
         // 未検出の場合 - 日本語テキストは現在未実装
@@ -881,6 +889,14 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             output_image).toImageMsg();
         
         annotated_image_pub_->publish(*msg);
+        
+        // 圧縮画像もパブリッシュ
+        auto compressed_msg = std::make_shared<sensor_msgs::msg::CompressedImage>();
+        compressed_msg->header = latest_color_image_->header;
+        compressed_msg->format = "jpeg";
+        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};  // JPEG品質85%
+        cv::imencode(".jpg", output_image, compressed_msg->data, params);
+        annotated_image_compressed_pub_->publish(*compressed_msg);
     } catch (cv_bridge::Exception& e) {
         RCLCPP_ERROR(this->get_logger(), "CV bridge exception in publishCurrentImage: %s", e.what());
     }
