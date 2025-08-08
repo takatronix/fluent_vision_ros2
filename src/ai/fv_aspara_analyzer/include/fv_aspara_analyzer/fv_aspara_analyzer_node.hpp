@@ -205,13 +205,16 @@ public:
     std::unique_ptr<fluent::utils::FPSMeter> color_fps_meter_;                              ///< カラー画像FPS計測
     std::unique_ptr<fluent::utils::FPSMeter> depth_fps_meter_;                              ///< 深度画像FPS計測  
     std::unique_ptr<fluent::utils::FPSMeter> detection_fps_meter_;                          ///< 検出FPS計測
+    std::unique_ptr<fluent::utils::FPSMeter> segmentation_fps_meter_;                       ///< セグメンテーションFPS計測
     
     // ===== 検出処理時間計測用 =====
     fluent::utils::Stopwatch detection_stopwatch_;                                          ///< 検出処理時間計測
     
     // ===== 非同期点群処理用 =====
-    std::unique_ptr<class AnalyzerThread> analyzer_thread_;                                  ///< 点群解析専用スレッド                                               ///< 処理待ちキュー
+    std::unique_ptr<class AnalyzerThread> analyzer_thread_;                                  ///< 点群解析専用スレッド
     
+    // ===== 高頻度出力タイマー =====
+    rclcpp::TimerBase::SharedPtr animation_timer_;                                          ///< アニメーション用30FPSタイマー
 
 };
 

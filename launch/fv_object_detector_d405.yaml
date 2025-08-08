@@ -31,7 +31,7 @@ fv_object_detector_d405:
     output_detections_topic: "/fv/d405/object_detection/detections"  # 検出結果トピック
     
     # ===== 処理パラメータ =====
-    processing_frequency: 15.0  # 処理頻度（Hz）- 15FPSで安定動作
+    processing_frequency: 10.0  # 処理頻度（Hz）- 10FPSで安定動作
     enable_tracking: true       # オブジェクトトラッキング有効
     enable_visualization: true  # 可視化有効（デバッグ用）
     show_stats_on_image: true   # 画像上に統計情報表示
@@ -57,7 +57,7 @@ fv_object_detector_d405:
     camera:
       name: "D405"           # カメラ名
       resolution: "640x480"  # 解像度
-      fps: 15               # フレームレート
+      fps: 10               # フレームレート
 
 # =============================================================================
 # D405 vs D415 の違いとパラメータ調整ガイド
