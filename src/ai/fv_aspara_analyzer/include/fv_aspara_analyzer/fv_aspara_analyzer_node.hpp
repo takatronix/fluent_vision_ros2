@@ -30,6 +30,7 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/common/pca.h>
+#include <pcl/exceptions.h>
 
 // TF2（座標変換）関連のインクルード
 #include <tf2_ros/buffer.h>
@@ -48,125 +49,14 @@
 
 // ===== Fluent Library =====
 #include <fluent.hpp>
+#include "aspara_selection.hpp"
+#include "aspara_info.hpp"
 
 namespace fv_aspara_analyzer
 {
 
+// AsparaInfo関連構造体は aspara_info.hpp に移動済み
 
-
-/**
- * @struct ProcessingTimes
- * @brief 各処理ステップの実行時間を記録する構造体
- */
-struct ProcessingTimes
-{
-    double total_ms = 0.0;                     ///< 全体処理時間（ミリ秒）
-    double filter_bbox_ms = 0.0;               ///< バウンディングボックスフィルタリング時間
-    double noise_reduction_ms = 0.0;           ///< ノイズ除去処理時間
-    double pca_calculation_ms = 0.0;           ///< PCA計算時間
-    double measurement_ms = 0.0;               ///< 測定処理時間（長さ、真っ直ぐ度）
-    double visualization_ms = 0.0;             ///< 可視化処理時間
-};
-
-/**
- * @struct AsparaInfo
- * @brief アスパラガス1本の解析情報を格納する構造体
- * @details 検出から収穫判定までの全情報を統合管理
- */
-struct AsparaInfo
-{
-    int id;                                    ///< アスパラガスの一意識別ID
-    float confidence;                          ///< 検出信頼度（0.0-1.0）
-    cv::Rect bounding_box_2d;                  ///< 2D画像上のバウンディングボックス
-    sensor_msgs::msg::PointCloud2 filtered_pointcloud;  ///< フィルタリング済み3D点群
-    geometry_msgs::msg::Point root_position_3d; ///< 根元の3D座標
-    float length;                              ///< アスパラガスの長さ（mm）
-    float straightness;                        ///< 真っ直ぐ度（0.0-1.0）
-    bool is_harvestable;                       ///< 収穫可能フラグ
-    rclcpp::Time last_update_time;             ///< 最後の更新時刻
-    ProcessingTimes processing_times;          ///< 処理時間記録
-    
-    // アニメーション用フィールド
-    cv::Rect smooth_bbox;                      ///< スムージングされたバウンディングボックス
-    float animation_alpha = 1.0f;              ///< アニメーション透明度
-    bool is_new = true;                        ///< 新規検出フラグ
-    int frame_count = 0;                       ///< フレームカウント
-    
-    // 追跡用フィールド
-    int detection_count = 0;                   ///< 検出回数
-    float overlap_ratio = 0.0f;                ///< 前フレームとの重複度
-    rclcpp::Time first_detected_time;          ///< 初回検出時刻
-};
-
-/**
- * @enum AsparaguGrade
- * @brief アスパラガス品質グレード
- */
-enum class AsparaguGrade
-{
-    UNKNOWN = 0,    ///< 未評価
-    GRADE_A,        ///< A級（最高品質）
-    GRADE_B,        ///< B級（標準品質）
-    GRADE_C,        ///< C級（低品質）
-    NOT_GRADED      ///< 規格外
-};
-
-/**
- * @struct SkeletonPoint
- * @brief アスパラガス骨格ポイント
- */
-struct SkeletonPoint
-{
-    cv::Point2f image_point;        ///< 2D画像座標
-    geometry_msgs::msg::Point world_point;  ///< 3D世界座標
-    float distance_from_base = 0.0f; ///< 根元からの距離（メートル）
-    float radius_at_point = 0.0f;    ///< その点での半径（メートル）
-};
-
-/**
- * @struct AsparagusPart
- * @brief アスパラガス部位情報（本体・穂）
- */
-struct AsparagusPart
-{
-    int class_id = -1;                         ///< クラスID（0=本体、1=穂）
-    cv::Rect bounding_box_2d;                  ///< 2Dバウンディングボックス
-    float confidence = 0.0f;                   ///< 検出信頼度
-    bool is_valid = false;                     ///< 有効フラグ
-};
-
-/**
- * @struct SelectedAsparaInfo
- * @brief 選択中アスパラガス情報構造体
- */
-struct SelectedAsparaInfo
-{
-    int asparagus_id = -1;                     ///< 選択中ID（-1=未選択）
-    bool is_selected = false;                  ///< 選択状態
-    
-    // 2D検出情報（本体・穂）
-    AsparagusPart body_part;                   ///< アスパラガス本体情報（クラスID 0）
-    std::vector<AsparagusPart> spike_parts;    ///< アスパラガス穂情報リスト（クラスID 1）
-    
-    // 品質情報（全てメートル単位）
-    float length = 0.0f;                       ///< 長さ（メートル）
-    float distance_from_camera = 0.0f;         ///< カメラからの距離（メートル）
-    float curvature = 0.0f;                    ///< 曲がり度（メートル）
-    float diameter = 0.0f;                     ///< 太さ（メートル）
-    AsparaguGrade grade = AsparaguGrade::UNKNOWN; ///< 品質グレード
-    
-    // 切断情報
-    bool is_cutting_target = false;            ///< 切断対象フラグ
-    cv::Point2f cut_point_pixel;               ///< 切断ポイント画像座標（ピクセル）
-    geometry_msgs::msg::Point cut_point_world; ///< 切断ポイント3D座標（メートル）
-    
-    // 骨格ポイント配列（設計書通り5-10点）
-    std::vector<SkeletonPoint> skeleton_points; ///< 骨格ポイント配列（頂点から根元まで）
-    
-    // メタ情報
-    float confidence = 0.0f;                   ///< 信頼度（0.0-1.0）
-    rclcpp::Time timestamp;                    ///< タイムスタンプ
-};
 
 /**
  * @class FvAsparaAnalyzerNode
@@ -364,7 +254,7 @@ private:
      * @details 本体（クラスID 0）と穂（クラスID 1）を関連付け
      */
     void associateAsparagusParts(const vision_msgs::msg::Detection2DArray::SharedPtr& detections,
-                                SelectedAsparaInfo& aspara_info);
+                                AsparaInfo& aspara_info);
     
     /**
      * @brief 最適なアスパラガスを選択
@@ -496,14 +386,14 @@ private:
 
     // ===== データストレージ =====
     std::vector<AsparaInfo> aspara_list_;                                                    ///< アスパラガス情報リスト
+    AsparaSelection aspara_selection_;                                                       ///< アスパラ選択管理
     sensor_msgs::msg::PointCloud2::SharedPtr latest_pointcloud_;                             ///< 最新の点群データ
     sensor_msgs::msg::Image::SharedPtr latest_depth_image_;                                  ///< 最新の深度画像
     sensor_msgs::msg::CameraInfo::SharedPtr latest_camera_info_;                             ///< 最新のカメラ情報
     sensor_msgs::msg::Image::SharedPtr latest_color_image_;                                  ///< 最新のカラー画像
     cv::Mat latest_mask_;                                                                    ///< 最新のマスク画像
-    int selected_aspara_id_;                                                                 ///< 選択中のアスパラガスID
+    int selected_aspara_id_;                                                                 ///< 選択中のアスパラガスID（-1=未選択）
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr selected_pointcloud_;                            ///< 選択中のアスパラガス点群
-    SelectedAsparaInfo selected_aspara_info_;                                                ///< 選択中アスパラガス情報
     std::map<int, AsparaInfo> tracked_asparagus_;                                            ///< 追跡中アスパラガス辞書
     vision_msgs::msg::Detection2DArray::SharedPtr latest_detections_;                        ///< 最新の検出結果（穂情報取得用）
     
@@ -522,6 +412,7 @@ private:
     double harvest_min_length_;                                                               ///< 収穫最小長さ
     double harvest_max_length_;                                                               ///< 収穫最大長さ
     double straightness_threshold_;                                                           ///< 真っ直ぐ度閾値
+    bool enable_pointcloud_processing_;                                                       ///< ポイントクラウド処理有効化フラグ
     
     // ===== 選択管理パラメータ =====
     double object_tracking_overlap_threshold_;                                                ///< 重複度閾値

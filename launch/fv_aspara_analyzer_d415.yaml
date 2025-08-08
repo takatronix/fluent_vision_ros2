@@ -33,8 +33,9 @@ fv_aspara_analyzer_d415:
     imu_topic: "/livox/imu"                                      # IMUデータ（姿勢補正用）
 
     # 出力トピック（解析結果）
-    output_filtered_pointcloud_topic: "/fv/d415/aspara_analysis/asparagus/points"  # フィルタリング済み点群
-    output_annotated_image_topic: "/fv/d415/aspara_analysis/result"          # 注釈付き可視化画像
+    output_filtered_pointcloud_topic: "/fv/d415/aspara_analysis/filtered_points"   # フィルタリング済み点群（中間結果）
+    output_selected_pointcloud_topic: "/fv/d415/aspara_analysis/selected_points"   # 選択中アスパラ点群（最終結果）
+    output_annotated_image_topic: "/fv/d415/aspara_analysis/result"                # 注釈付き可視化画像
 
     # ===== 基本処理パラメータ =====
     
