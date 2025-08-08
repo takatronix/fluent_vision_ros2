@@ -173,6 +173,11 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     depth_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
         depth_topic, 10,
         std::bind(&FvAsparaAnalyzerNode::depthCallback, this, std::placeholders::_1));
+    
+    // マウスクリックサブスクライバー（RQTからのカーソル位置設定用）
+    mouse_click_sub_ = this->create_subscription<geometry_msgs::msg::Point>(
+        "mouse_click", 10,
+        std::bind(&FvAsparaAnalyzerNode::mouseClickCallback, this, std::placeholders::_1));
 
     // ===== パブリッシャー初期化 =====
     filtered_pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -215,6 +220,13 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     
     // selected_aspara_id_の初期化
     selected_aspara_id_ = -1;
+    
+    // カーソル初期化
+    cursor_position_ = cv::Point(-1, -1);  // 非表示
+    smooth_cursor_position_ = cv::Point(-1, -1);
+    cursor_visible_ = false;
+    cursor_auto_hide_ms_ = 5000;  // 5秒デフォルト
+    last_detection_time_ = std::chrono::steady_clock::now();
 
     // ===== フォント初期化 =====
     RCLCPP_INFO(this->get_logger(), "Japanese font support is now built into the new Fluent API");
@@ -614,6 +626,126 @@ void FvAsparaAnalyzerNode::depthCallback(const sensor_msgs::msg::Image::SharedPt
     }
 }
 
+/**
+ * @brief マウスクリックコールバック関数
+ * @param msg クリック座標メッセージ（x, y座標）
+ * @details RQTからのマウスクリックイベントを受信してカーソル位置を設定
+ */
+void FvAsparaAnalyzerNode::mouseClickCallback(const geometry_msgs::msg::Point::SharedPtr msg)
+{
+    // カーソル位置を設定
+    cursor_position_.x = static_cast<int>(msg->x);
+    cursor_position_.y = static_cast<int>(msg->y);
+    
+    // カーソルを表示
+    cursor_visible_ = true;
+    
+    // アニメーション開始時刻を更新
+    cursor_animation_start_ = std::chrono::steady_clock::now();
+    
+    RCLCPP_INFO(this->get_logger(), "Mouse click received: (%d, %d)", 
+                cursor_position_.x, cursor_position_.y);
+}
+
+/**
+ * @brief カーソル位置を設定
+ * @param x カーソルのX座標
+ * @param y カーソルのY座標
+ */
+void FvAsparaAnalyzerNode::setCursor(int x, int y)
+{
+    cursor_position_.x = x;
+    cursor_position_.y = y;
+    cursor_visible_ = true;
+    cursor_animation_start_ = std::chrono::steady_clock::now();
+}
+
+/**
+ * @brief カーソル位置を取得
+ * @param x カーソルのX座標（出力）
+ * @param y カーソルのY座標（出力）
+ */
+void FvAsparaAnalyzerNode::getCursor(int& x, int& y) const
+{
+    x = cursor_position_.x;
+    y = cursor_position_.y;
+}
+
+/**
+ * @brief カーソル位置のアスパラを選択
+ * @return 選択成功したらtrue
+ */
+bool FvAsparaAnalyzerNode::selectAsparaAtCursor()
+{
+    if (!cursor_visible_ || cursor_position_.x < 0 || cursor_position_.y < 0) {
+        return false;
+    }
+    
+    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+    for (const auto& aspara : aspara_list_) {
+        if (aspara.bounding_box_2d.contains(cursor_position_)) {
+            selected_aspara_id_ = aspara.id;
+            aspara_selection_.setSelectedAsparaId(aspara.id);
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief 次のアスパラへカーソル移動
+ * @return 移動成功したらtrue
+ */
+bool FvAsparaAnalyzerNode::moveCursorToNext()
+{
+    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+    if (aspara_list_.empty()) {
+        return false;
+    }
+    
+    // 次のアスパラを選択
+    int next_id = aspara_selection_.selectNextAsparagus(aspara_list_);
+    
+    // 選択されたアスパラの中心にカーソル移動
+    for (const auto& aspara : aspara_list_) {
+        if (aspara.id == next_id) {
+            cursor_position_.x = aspara.bounding_box_2d.x + aspara.bounding_box_2d.width / 2;
+            cursor_position_.y = aspara.bounding_box_2d.y + aspara.bounding_box_2d.height / 2;
+            cursor_visible_ = true;
+            selected_aspara_id_ = next_id;
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief 前のアスパラへカーソル移動
+ * @return 移動成功したらtrue
+ */
+bool FvAsparaAnalyzerNode::moveCursorToPrev()
+{
+    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+    if (aspara_list_.empty()) {
+        return false;
+    }
+    
+    // 前のアスパラを選択
+    int prev_id = aspara_selection_.selectPrevAsparagus(aspara_list_);
+    
+    // 選択されたアスパラの中心にカーソル移動
+    for (const auto& aspara : aspara_list_) {
+        if (aspara.id == prev_id) {
+            cursor_position_.x = aspara.bounding_box_2d.x + aspara.bounding_box_2d.width / 2;
+            cursor_position_.y = aspara.bounding_box_2d.y + aspara.bounding_box_2d.height / 2;
+            cursor_visible_ = true;
+            selected_aspara_id_ = prev_id;
+            return true;
+        }
+    }
+    return false;
+}
+
 
 
 
@@ -681,6 +813,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     auto cvt_end = std::chrono::high_resolution_clock::now();
     double cvt_ms = std::chrono::duration<double, std::milli>(cvt_end - cvt_start).count();
     
+    // オフスクリーンバッファを作成（クローンではなく新規作成）
     cv::Mat output_image = color_image.clone();
     
     // FPS計算用（FPSMeterを使用）
@@ -731,6 +864,52 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     // 常に永続リストを使用（検出がなくても前の位置を保持）
     snapshot_list = persistent_list;
     snapshot_selected_id = persistent_selected_id;
+    
+    // カーソル自動管理
+    auto cursor_time_now = std::chrono::steady_clock::now();
+    if (!snapshot_list.empty()) {
+        // アスパラが検出されたらlast_detection_timeを更新
+        last_detection_time_ = cursor_time_now;
+        
+        // カーソルが非表示の場合、自動で表示ON
+        if (!cursor_visible_) {
+            cursor_visible_ = true;
+            // 最初のアスパラの中心にカーソルを設定
+            if (cursor_position_.x == -1 && cursor_position_.y == -1) {
+                const auto& first_aspara = snapshot_list[0];
+                cursor_position_.x = first_aspara.bounding_box_2d.x + first_aspara.bounding_box_2d.width / 2;
+                cursor_position_.y = first_aspara.bounding_box_2d.y + first_aspara.bounding_box_2d.height / 2;
+                smooth_cursor_position_ = cursor_position_;
+            }
+        }
+    } else {
+        // アスパラが検出されない場合、5秒後に自動でカーソルOFF
+        auto time_since_detection = std::chrono::duration_cast<std::chrono::milliseconds>(
+            cursor_time_now - last_detection_time_).count();
+        if (time_since_detection > cursor_auto_hide_ms_ && cursor_visible_) {
+            cursor_visible_ = false;
+            // カーソル位置はリセットしない（記憶する）
+        }
+    }
+    
+    // カーソルがONの場合、カーソル位置のアスパラを選択
+    if (cursor_visible_ && cursor_position_.x >= 0 && cursor_position_.y >= 0) {
+        // カーソル位置にヒットするアスパラを探す
+        int hit_aspara_id = -1;
+        for (const auto& aspara : snapshot_list) {
+            if (aspara.bounding_box_2d.contains(cursor_position_)) {
+                hit_aspara_id = aspara.id;
+                break;
+            }
+        }
+        
+        // ヒットしたアスパラがあれば選択
+        if (hit_aspara_id != -1) {
+            snapshot_selected_id = hit_aspara_id;
+            persistent_selected_id = hit_aspara_id;
+            selected_aspara_id_ = hit_aspara_id;
+        }
+    }
     
     // タイムアウト処理（設定値後に自動的に消去）
     static double detection_timeout = this->get_parameter("detection_timeout_seconds").as_double();
@@ -822,6 +1001,40 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     } else {
         // 未検出の場合 - 表示なし
         selected_aspara_id_ = -1; // 選択解除
+    }
+    
+    // カーソルのスムーズアニメーション更新と描画
+    if (cursor_visible_ && cursor_position_.x >= 0 && cursor_position_.y >= 0) {
+        // スムーズアニメーション（200msで収束）
+        const float cursor_smoothing_time = 0.2f;
+        float cursor_smooth_factor = std::min(1.0f, delta_time / cursor_smoothing_time);
+        
+        auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+        smooth_cursor_position_.x = lerp(smooth_cursor_position_.x, cursor_position_.x, cursor_smooth_factor);
+        smooth_cursor_position_.y = lerp(smooth_cursor_position_.y, cursor_position_.y, cursor_smooth_factor);
+        
+        // 緑の十字カーソルを描画
+        cv::Scalar cursor_color(0, 255, 0);  // 緑色
+        int cursor_size = 20;
+        int cursor_thickness = 2;
+        
+        // 横線
+        cv::line(output_image, 
+                cv::Point(smooth_cursor_position_.x - cursor_size, smooth_cursor_position_.y),
+                cv::Point(smooth_cursor_position_.x + cursor_size, smooth_cursor_position_.y),
+                cursor_color, cursor_thickness);
+        
+        // 縦線
+        cv::line(output_image,
+                cv::Point(smooth_cursor_position_.x, smooth_cursor_position_.y - cursor_size),
+                cv::Point(smooth_cursor_position_.x, smooth_cursor_position_.y + cursor_size),
+                cursor_color, cursor_thickness);
+        
+        // カーソル位置情報表示（デバッグ用）
+        std::string cursor_info = cv::format("Cursor: (%d, %d)", cursor_position_.x, cursor_position_.y);
+        fluent::text::draw(output_image, cursor_info, 
+                          cv::Point(smooth_cursor_position_.x + 25, smooth_cursor_position_.y - 25),
+                          cursor_color, 0.4, 1);
     }
     
     // FPS表示を簡略化（重い処理を削除）
@@ -951,24 +1164,14 @@ void FvAsparaAnalyzerNode::nextAsparaguService(
 {
     (void)request;  // 未使用パラメータの警告回避
     
-    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
-    if (aspara_list_.empty()) {
-        response->success = false;
-        response->message = "No asparagus detected";
-        return;
-    }
-    
-    // AsparaSelectionで次のアスパラを選択
-    int next_id = aspara_selection_.selectNextAsparagus(aspara_list_);
-    selected_aspara_id_ = next_id;
-    
-    if (next_id != -1) {
+    // カーソル移動を使用
+    if (moveCursorToNext()) {
         response->success = true;
-        response->message = "Selected next asparagus ID: " + std::to_string(next_id);
-        RCLCPP_INFO(this->get_logger(), "Next asparagus selected: ID %d", next_id);
+        response->message = "Selected next asparagus ID: " + std::to_string(selected_aspara_id_);
+        RCLCPP_INFO(this->get_logger(), "Next asparagus selected: ID %d", selected_aspara_id_);
     } else {
         response->success = false;
-        response->message = "Failed to select next asparagus";
+        response->message = "No asparagus detected or failed to select next";
     }
 }
 
@@ -981,24 +1184,14 @@ void FvAsparaAnalyzerNode::prevAsparaguService(
 {
     (void)request;  // 未使用パラメータの警告回避
     
-    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
-    if (aspara_list_.empty()) {
-        response->success = false;
-        response->message = "No asparagus detected";
-        return;
-    }
-    
-    // AsparaSelectionで前のアスパラを選択
-    int prev_id = aspara_selection_.selectPrevAsparagus(aspara_list_);
-    selected_aspara_id_ = prev_id;
-    
-    if (prev_id != -1) {
+    // カーソル移動を使用
+    if (moveCursorToPrev()) {
         response->success = true;
-        response->message = "Selected previous asparagus ID: " + std::to_string(prev_id);
-        RCLCPP_INFO(this->get_logger(), "Previous asparagus selected: ID %d", prev_id);
+        response->message = "Selected previous asparagus ID: " + std::to_string(selected_aspara_id_);
+        RCLCPP_INFO(this->get_logger(), "Previous asparagus selected: ID %d", selected_aspara_id_);
     } else {
         response->success = false;
-        response->message = "Failed to select previous asparagus";
+        response->message = "No asparagus detected or failed to select previous";
     }
 }
 

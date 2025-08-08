@@ -97,6 +97,7 @@ public:
     void maskCallback(const sensor_msgs::msg::Image::SharedPtr msg);
     void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg);
     void depthCallback(const sensor_msgs::msg::Image::SharedPtr msg);
+    void mouseClickCallback(const geometry_msgs::msg::Point::SharedPtr msg);
     
     // ===== アスパラガス関連付け =====
     void associateAsparagusParts(const vision_msgs::msg::Detection2DArray::SharedPtr& detections, AsparaInfo& aspara_info);
@@ -116,7 +117,38 @@ public:
     
     // ===== 選択管理関数群 =====
     
-
+    // ===== カーソル機能 =====
+    /**
+     * @brief カーソル位置を設定
+     * @param x カーソルのX座標
+     * @param y カーソルのY座標
+     */
+    void setCursor(int x, int y);
+    
+    /**
+     * @brief カーソル位置を取得
+     * @param x カーソルのX座標（出力）
+     * @param y カーソルのY座標（出力）
+     */
+    void getCursor(int& x, int& y) const;
+    
+    /**
+     * @brief カーソル位置のアスパラを選択
+     * @return 選択成功したらtrue
+     */
+    bool selectAsparaAtCursor();
+    
+    /**
+     * @brief 次のアスパラへカーソル移動
+     * @return 移動成功したらtrue
+     */
+    bool moveCursorToNext();
+    
+    /**
+     * @brief 前のアスパラへカーソル移動
+     * @return 移動成功したらtrue
+     */
+    bool moveCursorToPrev();
     
 
     
@@ -144,6 +176,7 @@ public:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr mask_sub_;                      ///< マスク画像サブスクライバー
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;                     ///< カラー画像サブスクライバー
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_;                     ///< 深度画像サブスクライバー
+    rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr mouse_click_sub_;             ///< マウスクリックサブスクライバー
 
     // ===== ROS2 パブリッシャー =====
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_pointcloud_pub_;    ///< フィルタリング済み点群パブリッシャー
@@ -220,6 +253,14 @@ public:
     
     // ===== 高頻度出力タイマー =====
     rclcpp::TimerBase::SharedPtr animation_timer_;                                          ///< アニメーション用30FPSタイマー
+
+    // ===== カーソル管理 =====
+    cv::Point cursor_position_;                                                              ///< カーソル位置（-1,-1で非表示）
+    cv::Point smooth_cursor_position_;                                                       ///< スムーズアニメーション用カーソル位置
+    bool cursor_visible_;                                                                    ///< カーソル表示フラグ
+    std::chrono::steady_clock::time_point cursor_animation_start_;                          ///< カーソルアニメーション開始時刻
+    std::chrono::steady_clock::time_point last_detection_time_;                             ///< 最後にアスパラを検出した時刻
+    int cursor_auto_hide_ms_;                                                               ///< カーソル自動消去時間（ミリ秒）
 
 };
 
