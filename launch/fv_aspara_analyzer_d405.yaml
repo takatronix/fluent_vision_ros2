@@ -19,7 +19,7 @@
 #       -r __node:=fv_aspara_analyzer_d405
 # =============================================================================
 
-fv_aspara_analyzer_d405:
+/**:
   ros__parameters:
     # ===== システム情報 =====
     camera_name: "D405"  # カメラ名称（画面表示用）
@@ -169,6 +169,10 @@ fv_aspara_analyzer_d405:
     cut_point_marker_size: 0.015             # 切断ポイントマーカーサイズ（1.5cm、D405精密）
     cut_point_marker_color: [0, 0, 255]     # 切断ポイント色（赤）BGR
     cut_point_marker_lifetime: 5.0           # マーカー生存時間（秒）
+    
+    # ===== 点群生成サービス設定 =====
+    generate_pointcloud_service_enabled: true  # 点群生成サービス使用有効
+    generate_pointcloud_service_name: "fv/d405/generate_pointcloud"  # サービス名
 
 # =============================================================================
 # D405 vs D415 の違い

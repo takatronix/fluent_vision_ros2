@@ -8,8 +8,9 @@ AsparaPointcloudProcessor::AsparaPointcloudProcessor(FvAsparaAnalyzerNode* node_
     : node_(node_ptr)
 {
     // パブリッシャー初期化
-    filtered_pointcloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-        "output_filtered_pointcloud", 10);
+    // このパブリッシャーは使用しない（FvAsparaAnalyzerNodeで作成済み）
+    // filtered_pointcloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+    //     "output_filtered_pointcloud", 10);
     annotated_image_pub_ = node_->create_publisher<sensor_msgs::msg::Image>(
         "output_annotated_image", 10);
     
@@ -371,7 +372,50 @@ void AsparaPointcloudProcessor::publishFilteredPointCloud(
     output_msg.header.stamp = node_->now();
     output_msg.header.frame_id = frame_id;
     
-    filtered_pointcloud_pub_->publish(output_msg);
+    // 優先: ノードの設定済みトピックへ公開
+    if (node_->filtered_pointcloud_pub_) {
+        try {
+            node_->filtered_pointcloud_pub_->publish(output_msg);
+            RCLCPP_INFO(node_->get_logger(), "[POINTCLOUD] Successfully published filtered pointcloud to topic: %s, size: %zu bytes", 
+                        node_->filtered_pointcloud_pub_->get_topic_name(), 
+                        output_msg.data.size());
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(), "[POINTCLOUD] Failed to publish: %s", e.what());
+        }
+    } else {
+        RCLCPP_ERROR(node_->get_logger(), "[POINTCLOUD] filtered_pointcloud_pub_ is null!");
+    }
+}
+
+void AsparaPointcloudProcessor::publishFilteredPointCloud(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
+    const std::string& frame_id,
+    int /*aspara_id*/,
+    const rclcpp::Time& stamp)
+{
+    RCLCPP_INFO(node_->get_logger(), "[POINTCLOUD] publishFilteredPointCloud called with cloud size: %zu, pub_valid: %d", 
+                cloud ? cloud->points.size() : 0, node_->filtered_pointcloud_pub_ ? 1 : 0);
+    
+    if (!cloud || cloud->points.empty()) {
+        RCLCPP_WARN(node_->get_logger(), "Cannot publish empty or null point cloud");
+        return;
+    }
+    sensor_msgs::msg::PointCloud2 output_msg;
+    pcl::toROSMsg(*cloud, output_msg);
+    output_msg.header.stamp = stamp;
+    output_msg.header.frame_id = frame_id;
+    if (node_->filtered_pointcloud_pub_) {
+        try {
+            node_->filtered_pointcloud_pub_->publish(output_msg);
+            RCLCPP_INFO(node_->get_logger(), "[POINTCLOUD] Successfully published filtered pointcloud to topic: %s, size: %zu bytes", 
+                        node_->filtered_pointcloud_pub_->get_topic_name(), 
+                        output_msg.data.size());
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(node_->get_logger(), "[POINTCLOUD] Failed to publish: %s", e.what());
+        }
+    } else {
+        RCLCPP_ERROR(node_->get_logger(), "[POINTCLOUD] filtered_pointcloud_pub_ is null!");
+    }
 }
 
 void AsparaPointcloudProcessor::publishRootTF(

@@ -43,7 +43,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetDistance.srv"      # 距離取得サービス
   "srv/GetCameraInfo.srv"    # カメラ情報取得サービス
   "srv/SetMode.srv"          # モード設定サービス
-  DEPENDENCIES geometry_msgs std_srvs
+  "srv/GeneratePointCloud.srv"  # 点群生成サービス
+  DEPENDENCIES geometry_msgs std_srvs sensor_msgs
 )
 
 # ===== インクルードディレクトリ設定 =====
@@ -138,6 +139,15 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)                    # 自動リントツール
   ament_lint_auto_find_test_dependencies()                  # テスト依存関係検索
 endif()
+
+# ===== パッケージエクスポート設定 =====
+ament_export_dependencies(
+  rclcpp
+  sensor_msgs
+  geometry_msgs
+  rosidl_default_runtime
+)
+ament_export_include_directories(include)
 
 # ===== パッケージ設定 =====
 ament_package()  # ROS2パッケージ設定の完了 

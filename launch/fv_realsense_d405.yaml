@@ -39,14 +39,16 @@
       depth_width: 640              # 深度画像幅（ピクセル）
       depth_height: 480             # 深度画像高さ（ピクセル）
       depth_fps: 15                 # 深度画像フレームレート
+      depth_scale: 0.001            # 深度スケール（1mm単位） - D405センサーは0.0001を返すが実際は0.001が正しい
     
     # ===== ストリーム設定（D405全機能） =====
     streams:
       color_enabled: true           # カラーストリーム有効
       depth_enabled: true           # 深度ストリーム有効
       infrared_enabled: false       # 赤外線ストリーム無効（省電力）
-      pointcloud_enabled: false      # 点群生成有効
+      pointcloud_enabled: true       # 点群生成有効
       depth_colormap_enabled: false  # 深度カラーマップ有効
+      sync_enabled: true            # 深度・カラー同期有効（重要！）
     
     # ===== 点群処理パラメータ（D405 - 近距離特化） =====
     pointcloud:
@@ -96,6 +98,8 @@
     services:
       get_distance_enabled: true       # 距離取得サービス有効
       get_camera_info_enabled: true    # カメラ情報取得サービス有効
+      generate_pointcloud_enabled: true # 点群生成サービス有効
+      generate_pointcloud_name: "fv/d405/generate_pointcloud"  # 点群生成サービス名
     
     # ===== TF（座標変換）設定 =====
     tf:
@@ -155,4 +159,5 @@
 # - base_frame: "base_link" - ロボットベース（上向き）
 # - base_frame: "odom" - オドメトリ座標系
 # =============================================================================
+
 # ============================================================================= 

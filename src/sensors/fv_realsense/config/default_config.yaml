@@ -30,6 +30,7 @@ fv_realsense:
       infrared_enabled: false
       pointcloud_enabled: false
       depth_colormap_enabled: false
+      sync_enabled: true            # 深度・カラー同期有効
     
     # Camera info and compression
     camera_info:

@@ -54,6 +54,7 @@
 
 // サービス関連
 #include <std_srvs/srv/trigger.hpp>
+#include "fv_realsense/srv/generate_point_cloud.hpp"
 
 // ===== Fluent Library =====
 #include <fluent.hpp>
@@ -187,6 +188,9 @@ public:
     // ===== ROS2 サービス =====
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr next_asparagus_service_;              ///< 次のアスパラガス選択サービス
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr prev_asparagus_service_;              ///< 前のアスパラガス選択サービス
+    
+    // ===== ROS2 サービスクライアント =====
+    rclcpp::Client<fv_realsense::srv::GeneratePointCloud>::SharedPtr generate_pointcloud_client_;  ///< 点群生成サービスクライアント
     
     // CallbackGroupは削除済み（シングルスレッド構成）                                ///< サービス用コールバックグループ
     

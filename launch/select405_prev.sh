@@ -61,12 +61,12 @@ main() {
     log_info "D405アスパラガス解析「前へ」選択を実行中..."
     
     # D405アスパラガス解析ノードに「前へ」メッセージを送信
-    # サービス名: /fv_aspara_analyzer_d405/select_previous_asparagus
+    # サービス名: /prev_asparagus（グローバルサービス）
     # メッセージタイプ: std_srvs/srv/Trigger
     
-    if ros2 service list | grep -q "/fv_aspara_analyzer_d405/select_previous_asparagus"; then
+    if ros2 service list | grep -q "/prev_asparagus"; then
         log_info "D405アスパラガス解析ノードに「前へ」メッセージを送信中..."
-        ros2 service call /fv_aspara_analyzer_d405/select_previous_asparagus std_srvs/srv/Trigger
+        ros2 service call /prev_asparagus std_srvs/srv/Trigger
         log_info "✅ D405「前へ」選択完了"
     else
         log_error "❌ D405アスパラガス解析ノードのサービスが見つかりません"

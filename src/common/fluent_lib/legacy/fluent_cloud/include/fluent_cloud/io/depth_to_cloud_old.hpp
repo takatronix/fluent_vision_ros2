@@ -72,12 +72,9 @@ public:
                     
                     // 色
                     cv::Vec3b bgr = color_image.at<cv::Vec3b>(v, u);
-                    // RGB値をパックする（Foxglove仕様：BGRパック、アルファチャンネル付き）
-                    uint8_t r = bgr[2];
-                    uint8_t g = bgr[1];
-                    uint8_t b = bgr[0];
-                    uint32_t rgb = ((uint32_t)r << 16 | (uint32_t)g << 8 | (uint32_t)b);
-                    point.rgb = *reinterpret_cast<float*>(&rgb);
+                    point.b = bgr[0];
+                    point.g = bgr[1];
+                    point.r = bgr[2];
                     
                     cloud->push_back(point);
                 }
@@ -136,12 +133,9 @@ public:
                     point.y = (v - cy) * depth / fy;
                     
                     cv::Vec3b bgr = color_image.at<cv::Vec3b>(v, u);
-                    // RGB値をパックする（Foxglove仕様：BGRパック、アルファチャンネル付き）
-                    uint8_t r = bgr[2];
-                    uint8_t g = bgr[1];
-                    uint8_t b = bgr[0];
-                    uint32_t rgb = ((uint32_t)r << 16 | (uint32_t)g << 8 | (uint32_t)b);
-                    point.rgb = *reinterpret_cast<float*>(&rgb);
+                    point.b = bgr[0];
+                    point.g = bgr[1];
+                    point.r = bgr[2];
                     
                     cloud->push_back(point);
                 }
@@ -193,23 +187,16 @@ public:
         
         for (int v = roi.y; v < roi.y + roi.height; v += v_skip) {
             for (int u = roi.x; u < roi.x + roi.width; u += u_skip) {
-                float depth_raw = getDepthValue(depth_image, u, v);
-                
-                // 深度画像の型に応じて単位を統一（m単位に）
-                float depth;
-                if (depth_image.type() == CV_16UC1) {
-                    depth = depth_raw * 0.001f;  // mm -> m
-                } else if (depth_image.type() == CV_32FC1) {
-                    depth = depth_raw;  // 既にm単位
-                } else {
-                    continue;
-                }
+                float depth_mm = getDepthValue(depth_image, u, v);
                 
                 // デバッグ：最初の有効な深度値を表示
-                if (!debug_printed && depth > 0) {
-                    printf("[DEBUG] Depth value: raw=%f, converted to m=%f\n", depth_raw, depth);
+                if (!debug_printed && depth_mm > 0) {
+                    printf("[DEBUG] First valid depth value: raw=%f mm, converted=%f m\n", depth_mm, depth_mm * 0.001f);
                     debug_printed = true;
                 }
+                
+                // getDepthValueはmm単位で返すので、m単位に変換
+                float depth = depth_mm * 0.001f;  // mm -> m
                 
                 // アスパラガスの典型的な距離範囲
                 if (depth > 0.2f && depth < 1.5f) {
@@ -220,12 +207,9 @@ public:
                     point.y = (v - cy) * depth / fy;
                     
                     cv::Vec3b bgr = color_image.at<cv::Vec3b>(v, u);
-                    // RGB値をパックする（Foxglove仕様：BGRパック、アルファチャンネル付き）
-                    uint8_t r = bgr[2];
-                    uint8_t g = bgr[1];
-                    uint8_t b = bgr[0];
-                    uint32_t rgb = ((uint32_t)r << 16 | (uint32_t)g << 8 | (uint32_t)b);
-                    point.rgb = *reinterpret_cast<float*>(&rgb);
+                    point.b = bgr[0];
+                    point.g = bgr[1];
+                    point.r = bgr[2];
                     
                     cloud->push_back(point);
                 }
@@ -242,13 +226,13 @@ public:
 private:
     /**
      * @brief 深度値取得（型に対応）
-     * @note 16UC1はmm単位、32FC1はm単位で返す
+     * @note RealSenseは常に16UC1（mm単位）を使用
      */
     static float getDepthValue(const cv::Mat& depth, int u, int v) {
         if (depth.type() == CV_16UC1) {
             return depth.at<uint16_t>(v, u);  // mm単位（RealSense標準）
         } else if (depth.type() == CV_32FC1) {
-            return depth.at<float>(v, u);  // m単位のまま返す
+            return depth.at<float>(v, u) * 1000.0f;  // m -> mm
         }
         return 0;
     }

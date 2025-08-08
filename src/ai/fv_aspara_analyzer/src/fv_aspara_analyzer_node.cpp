@@ -185,11 +185,11 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     
     // 選択中のアスパラガスの点群パブリッシャー（最終結果）
     selected_pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-        output_selected_pointcloud_topic, 10);
+        output_selected_pointcloud_topic, rclcpp::QoS(10).reliability(rclcpp::ReliabilityPolicy::BestEffort));
     
-    // QoS設定（ベストエフォートで高速配信）
-    auto qos = rclcpp::QoS(10)
-        .reliability(rclcpp::ReliabilityPolicy::BestEffort)
+    // QoS設定（画像は信頼性重視、遅延防止のためキューサイズ1）
+    auto qos = rclcpp::QoS(1)  // キューサイズを1に削減して遅延防止
+        .reliability(rclcpp::ReliabilityPolicy::Reliable)  // 画像は信頼性重視
         .durability(rclcpp::DurabilityPolicy::Volatile)
         .history(rclcpp::HistoryPolicy::KeepLast);
     
@@ -208,6 +208,18 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     prev_asparagus_service_ = this->create_service<std_srvs::srv::Trigger>(
         "prev_asparagus",
         std::bind(&FvAsparaAnalyzerNode::prevAsparaguService, this, std::placeholders::_1, std::placeholders::_2));
+    
+    // ===== サービスクライアント初期化 =====
+    // 点群生成サービスの設定を確認
+    bool service_enabled = this->declare_parameter<bool>("generate_pointcloud_service_enabled", false);
+    std::string service_name = this->declare_parameter<std::string>("generate_pointcloud_service_name", "");
+    
+    if (service_enabled && !service_name.empty()) {
+        generate_pointcloud_client_ = this->create_client<fv_realsense::srv::GeneratePointCloud>(service_name);
+        RCLCPP_INFO(this->get_logger(), "GeneratePointCloud service client created: %s", service_name.c_str());
+    } else {
+        RCLCPP_INFO(this->get_logger(), "GeneratePointCloud service disabled or not configured");
+    }
 
     // ===== TF2（座標変換）初期化 =====
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());

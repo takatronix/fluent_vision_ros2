@@ -24,6 +24,7 @@
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
 #include "fv_realsense/srv/set_mode.hpp"
+#include "fv_realsense/srv/generate_point_cloud.hpp"
 
 class FVDepthCameraNode : public rclcpp::Node
 {
@@ -63,6 +64,7 @@ private:
         bool infrared_enabled = false;
         bool pointcloud_enabled = true;
         bool depth_colormap_enabled = true;
+        bool sync_enabled = true;        // 深度・カラー同期設定
     };
 
     struct CameraInfoConfig
@@ -116,6 +118,9 @@ private:
     rs2::config cfg_;
     rs2::pipeline_profile profile_;
     rs2::device device_;
+    
+    // Synchronization flag
+    bool sync_enabled_ = false;
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr color_pub_;
@@ -132,6 +137,7 @@ private:
     rclcpp::Service<fv_realsense::srv::GetDistance>::SharedPtr get_distance_service_;
     rclcpp::Service<fv_realsense::srv::GetCameraInfo>::SharedPtr get_camera_info_service_;
     rclcpp::Service<fv_realsense::srv::SetMode>::SharedPtr set_mode_service_;
+    rclcpp::Service<fv_realsense::srv::GeneratePointCloud>::SharedPtr generate_pointcloud_service_;
 
     // Subscribers
     rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr click_event_sub_;
@@ -144,6 +150,11 @@ private:
     std::thread processing_thread_;
     std::atomic<bool> running_;
     std::mutex frame_mutex_;
+    // Cache of latest frames for service-safe access
+    std::mutex latest_frame_mutex_;
+    cv::Mat latest_color_image_mat_;
+    cv::Mat latest_depth_image_mat_;
+    rclcpp::Time latest_frame_stamp_;
     
     // Mode control
     std::atomic<int> current_mode_{1};  // デフォルトは基本動作モード
@@ -162,6 +173,7 @@ private:
     rs2_intrinsics color_intrinsics_;
     rs2_intrinsics depth_intrinsics_;
     float depth_scale_ = 0.001f;
+    float config_depth_scale_ = -1.0;  // 設定ファイルからのオーバーライド値（-1.0はセンサーから取得）
 
     // Methods
     void loadParameters();
@@ -188,6 +200,10 @@ private:
     void handleSetMode(
         const std::shared_ptr<fv_realsense::srv::SetMode::Request> request,
         std::shared_ptr<fv_realsense::srv::SetMode::Response> response);
+    
+    void handleGeneratePointCloud(
+        const std::shared_ptr<fv_realsense::srv::GeneratePointCloud::Request> request,
+        std::shared_ptr<fv_realsense::srv::GeneratePointCloud::Response> response);
 
     // Utility methods
     bool get3DCoordinate(int x, int y, float& world_x, float& world_y, float& world_z);

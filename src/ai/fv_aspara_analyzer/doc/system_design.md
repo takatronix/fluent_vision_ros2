@@ -119,6 +119,7 @@ struct AsparaInfo {
     
     // 3D分析結果
     sensor_msgs::msg::PointCloud2 filtered_pointcloud;  ///< フィルタリング済み3D点群
+    sensor_msgs::msg::PointCloud2 asparagus_pointcloud; ///< ROI抽出後の生点群（フィルター前）
     geometry_msgs::msg::Point root_position_3d;         ///< 根元の3D座標
     float length;                              ///< アスパラガス長さ（メートル）
     float straightness;                        ///< 真っ直ぐ度（0.0-1.0）
@@ -177,6 +178,39 @@ struct SelectedAsparaInfo {
 - **切断ポイント**: 2D画像座標と3D世界座標の両方を保持
 - **骨格ポイント**: 5-10点の詳細骨格情報（ピンク色表示）
 - **品質評価**: 長さ・太さ・曲がり度・グレード判定
+
+---
+
+## 点群処理の詳細
+
+### 点群データの流れ
+
+1. **ROI抽出（filtered_cloud）**
+   - 深度画像からバウンディングボックス内の点群を抽出
+   - フィルター前の生データ
+   - `asparagus_pointcloud`として公開（選択中のアスパラのみ）
+
+2. **ノイズ除去（denoised_cloud）**
+   - ボクセルグリッドフィルタでダウンサンプリング
+   - 統計的外れ値除去フィルタでノイズ除去
+   - `filtered_pointcloud`として公開
+
+### 公開トピック
+
+- **`/fv/d415/aspara_analysis/filtered_points`**: フィルタリング済み点群（全アスパラ）
+- **`/fv/d415/aspara_analysis/selected_points`**: 選択中アスパラの生点群（フィルター前）
+
+### AsparaInfo構造体の点群フィールド
+
+```cpp
+// 3D分析結果
+sensor_msgs::msg::PointCloud2 filtered_pointcloud;  ///< フィルタリング済み3D点群
+sensor_msgs::msg::PointCloud2 asparagus_pointcloud; ///< ROI抽出後の生点群（フィルター前）
+```
+
+**重要な違い**:
+- `asparagus_pointcloud`: ROI抽出直後の生データ、ノイズを含む高密度点群
+- `filtered_pointcloud`: ノイズ除去・ダウンサンプリング済み、分析用の清浄な点群
 
 ---
 

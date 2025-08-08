@@ -18,7 +18,7 @@
 #       -r __node:=fv_aspara_analyzer_d415
 # =============================================================================
 
-fv_aspara_analyzer_d415:
+/**:
   ros__parameters:
     # ===== システム情報 =====
     camera_name: "D415"  # カメラ名称（画面表示用）
@@ -168,6 +168,10 @@ fv_aspara_analyzer_d415:
     cut_point_marker_size: 0.02             # 切断ポイントマーカーサイズ（2cm）
     cut_point_marker_color: [0, 0, 255]     # 切断ポイント色（赤）BGR
     cut_point_marker_lifetime: 5.0           # マーカー生存時間（秒）
+    
+    # ===== 点群生成サービス設定 =====
+    generate_pointcloud_service_enabled: false  # 点群生成サービス使用無効（ローカル計算が高速）
+    generate_pointcloud_service_name: "fv/d415/generate_pointcloud"  # サービス名（未使用）
 
 # =============================================================================
 # パラメータ調整ガイド

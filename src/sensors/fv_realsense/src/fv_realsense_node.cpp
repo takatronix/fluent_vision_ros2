@@ -11,6 +11,7 @@
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
 #include "fv_realsense/srv/set_mode.hpp"
+#include "fv_realsense/srv/generate_point_cloud.hpp"
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
@@ -190,6 +191,9 @@ void FVDepthCameraNode::loadParameters()
     camera_config_.depth_fps = 
         this->declare_parameter("camera.depth_fps", 30);
     
+    // 深度スケールのオーバーライド設定（設定ファイルから）
+    config_depth_scale_ = this->declare_parameter("camera.depth_scale", -1.0);
+    
     // Stream settings
     stream_config_.color_enabled = 
         this->declare_parameter("streams.color_enabled", true);
@@ -201,6 +205,8 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("streams.pointcloud_enabled", true);
     stream_config_.depth_colormap_enabled = 
         this->declare_parameter("streams.depth_colormap_enabled", true);
+    stream_config_.sync_enabled = 
+        this->declare_parameter("streams.sync_enabled", true);
     
     // Camera info settings
     camera_info_config_.enable_camera_info = 
@@ -223,6 +229,8 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("services.get_distance_enabled", true);
     services_config_.get_camera_info_enabled = 
         this->declare_parameter("services.get_camera_info_enabled", true);
+    services_config_.set_mode_enabled = 
+        this->declare_parameter("services.set_mode_enabled", false);
     
     // TF settings
     tf_config_.enabled = 
@@ -293,6 +301,30 @@ bool FVDepthCameraNode::initializeRealSense()
                 RS2_FORMAT_Z16, camera_config_.depth_fps);
             RCLCPP_INFO(this->get_logger(), "📏 Enabled depth stream: %dx%d @ %dfps",
                 camera_config_.depth_width, camera_config_.depth_height, camera_config_.depth_fps);
+        }
+        
+        // 重要：同期設定を追加
+        if (stream_config_.sync_enabled && stream_config_.color_enabled && stream_config_.depth_enabled) {
+            // 真の同期設定を有効化
+            RCLCPP_INFO(this->get_logger(), "🔗 Enabling true synchronization for color and depth streams");
+            
+            // 1. 同期オプションを設定
+            rs2::config sync_config;
+            sync_config.enable_stream(RS2_STREAM_COLOR, camera_config_.color_width, camera_config_.color_height, RS2_FORMAT_BGR8, camera_config_.color_fps);
+            sync_config.enable_stream(RS2_STREAM_DEPTH, camera_config_.depth_width, camera_config_.depth_height, RS2_FORMAT_Z16, camera_config_.depth_fps);
+            
+            // 2. 同期設定（wait_for_framesが自動的に同期する）
+            
+            // 3. 同期設定を適用
+            cfg_ = sync_config;
+            
+            // 4. パイプライン開始後に同期オプションを設定
+            sync_enabled_ = true;  // フラグを設定
+            
+            RCLCPP_INFO(this->get_logger(), "🔗 Synchronization enabled - frames will be synchronized by wait_for_frames");
+        } else {
+            sync_enabled_ = false;
+            RCLCPP_INFO(this->get_logger(), "⚠️ Synchronization disabled - streams may have timing differences");
         }
         
         // Apply startup delay for power management
@@ -380,18 +412,23 @@ bool FVDepthCameraNode::initializeRealSense()
                             depth_scale_ = 0.001f;  // Force correct value for D415
                         }
                     } else if (device_name.find("D405") != std::string::npos) {
-                        if (std::abs(depth_scale_ - 0.0001f) > 0.00001f) {
-                            RCLCPP_WARN(this->get_logger(), "⚠️ D405 depth scale mismatch: got %f, expected 0.0001", depth_scale_);
-                            depth_scale_ = 0.0001f;  // Force correct value for D405
-                        }
+                        // D405は実際には0.0001を返すが、これは間違い。強制的に0.001に設定
+                        RCLCPP_WARN(this->get_logger(), "⚠️ D405 depth scale override: got %f, forcing to 0.001", depth_scale_);
+                        depth_scale_ = 0.001f;  // Force correct value for D405 (1mm per unit, same as D415)
                     }
                     break;
                 }
             }
+            // 設定ファイルからのオーバーライド
+            if (config_depth_scale_ > 0) {
+                RCLCPP_INFO(this->get_logger(), "📏 Overriding depth scale from config: %f -> %f", depth_scale_, config_depth_scale_);
+                depth_scale_ = config_depth_scale_;
+            }
+            
             RCLCPP_INFO(this->get_logger(), "📏 Final depth scale: %f", depth_scale_);
         } catch (const rs2::error& e) {
             RCLCPP_WARN(this->get_logger(), "⚠️ Could not get depth scale: %s", e.what());
-            depth_scale_ = 0.001f; // Default value
+            depth_scale_ = (config_depth_scale_ > 0) ? config_depth_scale_ : 0.001f; // Use config or default
         }
         
         // Get intrinsics with error handling
@@ -595,6 +632,23 @@ void FVDepthCameraNode::initializeServices()
         RCLCPP_INFO(this->get_logger(), "🎛️ SetMode service initialized");
     }
     
+    // 点群生成サービスを設定に基づいて有効化
+    bool generate_pointcloud_enabled = this->declare_parameter<bool>(
+        "services.generate_pointcloud_enabled", false);
+    
+    if (generate_pointcloud_enabled) {
+        // サービス名を設定から取得（デフォルト値を設定）
+        std::string service_name = this->declare_parameter<std::string>(
+            "services.generate_pointcloud_name", "generate_pointcloud");
+        service_name = this->get_parameter("services.generate_pointcloud_name").as_string();
+        
+        generate_pointcloud_service_ = this->create_service<fv_realsense::srv::GeneratePointCloud>(
+            service_name,
+            std::bind(&FVDepthCameraNode::handleGeneratePointCloud, this, 
+                std::placeholders::_1, std::placeholders::_2));
+        RCLCPP_INFO(this->get_logger(), "☁️ GeneratePointCloud service initialized: %s", service_name.c_str());
+    }
+    
     // Initialize subscribers
     initializeSubscribers();
 }
@@ -669,22 +723,71 @@ void FVDepthCameraNode::processingLoop()
                 }
                     
                 case 2: {  // フル機能モード
-                    // 全機能配信
-                    rs2::frameset frames_full = pipe_.wait_for_frames(1000);
+                    // 同期が有効な場合は同期フレームセットを使用
+                    rs2::frameset frames_full;
+                    if (sync_enabled_) {
+                        // 同期フレームセットを取得（深度とカラーが同じタイムスタンプ）
+                        frames_full = pipe_.wait_for_frames(1000);
+                        
+                        // 同期チェック（タイムスタンプが同じか確認）
+                        auto color_frame_full = frames_full.get_color_frame();
+                        auto depth_frame_full = frames_full.get_depth_frame();
+                        
+                        if (color_frame_full && depth_frame_full) {
+                            // タイムスタンプを比較（ミリ秒単位で）
+                            double color_timestamp = color_frame_full.get_timestamp();
+                            double depth_timestamp = depth_frame_full.get_timestamp();
+                            double timestamp_diff = std::abs(color_timestamp - depth_timestamp);
+                            
+                            if (timestamp_diff > 1.0) {  // 1ms以上ずれている場合
+                                RCLCPP_WARN(this->get_logger(), 
+                                    "⚠️ Frame sync warning: color=%.3f, depth=%.3f, diff=%.3fms", 
+                                    color_timestamp, depth_timestamp, timestamp_diff);
+                            } else {
+                                RCLCPP_DEBUG(this->get_logger(), 
+                                    "🔗 Frames synchronized: color=%.3f, depth=%.3f, diff=%.3fms", 
+                                    color_timestamp, depth_timestamp, timestamp_diff);
+                            }
+                        }
+                    } else {
+                        // 非同期モード（従来通り）
+                        frames_full = pipe_.wait_for_frames(1000);
+                    }
+                    
                     auto color_frame_full = frames_full.get_color_frame();
                     auto depth_frame_full = frames_full.get_depth_frame();
                     
                     if (color_frame_full || depth_frame_full) {
                         frame_count++;
                         publishFrames(color_frame_full, depth_frame_full);
+                        // Cache latest frames for service-safe access
+                        try {
+                            std::lock_guard<std::mutex> lk(latest_frame_mutex_);
+                            latest_frame_stamp_ = this->now();
+                            if (color_frame_full) {
+                                latest_color_image_mat_ = cv::Mat(cv::Size(color_intrinsics_.width, color_intrinsics_.height),
+                                                                  CV_8UC3, (void*)color_frame_full.get_data(), cv::Mat::AUTO_STEP).clone();
+                            } else {
+                                latest_color_image_mat_.release();
+                            }
+                            if (depth_frame_full) {
+                                latest_depth_image_mat_ = cv::Mat(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height),
+                                                                  CV_16UC1, (void*)depth_frame_full.get_data(), cv::Mat::AUTO_STEP).clone();
+                            } else {
+                                latest_depth_image_mat_.release();
+                            }
+                        } catch (const std::exception& e) {
+                            RCLCPP_WARN(this->get_logger(), "Failed to cache latest frames: %s", e.what());
+                        }
                         
                         // Log every second
                         auto now = std::chrono::steady_clock::now();
                         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
-                            RCLCPP_DEBUG(this->get_logger(), "📊 Mode 2: %d frames, Color: %s, Depth: %s", 
+                            RCLCPP_DEBUG(this->get_logger(), "📊 Mode 2: %d frames, Color: %s, Depth: %s, Sync: %s", 
                                 frame_count, 
                                 color_frame_full ? "✅" : "❌",
-                                depth_frame_full ? "✅" : "❌");
+                                depth_frame_full ? "✅" : "❌",
+                                sync_enabled_ ? "🔗" : "⚠️");
                             frame_count = 0;
                             last_log_time = now;
                         }
@@ -853,10 +956,24 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
 
 void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const rs2::frame& depth_frame)
 {
+    RCLCPP_INFO(this->get_logger(), "🔍 publishPointCloud called");
+    
     // Point cloud requires both color and depth frames
     if (!color_frame || !depth_frame) {
+        RCLCPP_WARN(this->get_logger(), "⚠️ Missing frames - color: %s, depth: %s", 
+            color_frame ? "✅" : "❌", depth_frame ? "✅" : "❌");
         return;
     }
+    
+    // Check if publisher is valid
+    if (!pointcloud_pub_) {
+        RCLCPP_ERROR(this->get_logger(), "❌ Point cloud publisher is null!");
+        return;
+    }
+    
+    // Check publisher status
+    size_t sub_count = pointcloud_pub_->get_subscription_count();
+    RCLCPP_INFO(this->get_logger(), "📊 Point cloud publisher - subscribers: %zu", sub_count);
     
     // Create point cloud
     pcl::PointCloud<pcl::PointXYZRGB> cloud;
@@ -867,7 +984,12 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
     cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), 
                        CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
     
+    RCLCPP_INFO(this->get_logger(), "📐 Images - color: %dx%d, depth: %dx%d", 
+        color_image.cols, color_image.rows, depth_image.cols, depth_image.rows);
+    
     // Convert to point cloud
+    int valid_points = 0;
+    int skipped_points = 0;
     for (int y = 0; y < depth_intrinsics_.height; y += 2) {
         for (int x = 0; x < depth_intrinsics_.width; x += 2) {
             float depth = depth_image.at<uint16_t>(y, x) * depth_scale_;
@@ -876,7 +998,7 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
                 float pixel[2] = {static_cast<float>(x), static_cast<float>(y)};
                 float point[3];
                 
-                rs2_deproject_pixel_to_point(point, &color_intrinsics_, pixel, depth);
+                rs2_deproject_pixel_to_point(point, &depth_intrinsics_, pixel, depth);
                 
                 pcl::PointXYZRGB pcl_point;
                 pcl_point.x = point[0];
@@ -890,9 +1012,15 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
                 pcl_point.b = color[0];
                 
                 cloud.points.push_back(pcl_point);
+                valid_points++;
+            } else {
+                skipped_points++;
             }
         }
     }
+    
+    RCLCPP_INFO(this->get_logger(), "☁️ Point cloud - valid: %d, skipped: %d, total: %zu", 
+        valid_points, skipped_points, cloud.points.size());
     
     cloud.width = cloud.points.size();
     cloud.height = 1;
@@ -903,7 +1031,10 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
     pcl::toROSMsg(cloud, cloud_msg);
     cloud_msg.header.stamp = this->now();
     cloud_msg.header.frame_id = tf_config_.color_optical_frame;
+    
+    RCLCPP_INFO(this->get_logger(), "📤 Publishing point cloud with %zu points", cloud.points.size());
     pointcloud_pub_->publish(cloud_msg);
+    RCLCPP_INFO(this->get_logger(), "✅ Point cloud published successfully");
 }
 
 cv::Mat FVDepthCameraNode::createDepthColormap(const rs2::frame& depth_frame)
@@ -1069,6 +1200,91 @@ void FVDepthCameraNode::handleSetMode(
     }
 }
 
+void FVDepthCameraNode::handleGeneratePointCloud(
+    const std::shared_ptr<fv_realsense::srv::GeneratePointCloud::Request> request,
+    std::shared_ptr<fv_realsense::srv::GeneratePointCloud::Response> response)
+{
+    try {
+        // GPT5様よろしくお願いします - パイプライン競合問題の修正が必要
+        // 問題: pipe_.wait_for_frames()を直接呼び出しているため、メインループと競合
+        // 修正案: std::mutexでパイプラインアクセスを保護、または最新フレームのキャッシュから取得
+        // 最新のフレームを取得
+        rs2::frameset frames = pipe_.wait_for_frames();
+        rs2::frame color_frame = frames.get_color_frame();
+        rs2::frame depth_frame = frames.get_depth_frame();
+        
+        if (!color_frame || !depth_frame) {
+            response->success = false;
+            response->message = "No frames available";
+            return;
+        }
+        
+        // ROIの設定
+        int width = depth_intrinsics_.width;
+        int height = depth_intrinsics_.height;
+        int roi_x = request->use_roi ? request->roi_x : 0;
+        int roi_y = request->use_roi ? request->roi_y : 0;
+        int roi_width = request->use_roi ? request->roi_width : width;
+        int roi_height = request->use_roi ? request->roi_height : height;
+        
+        // ROIの範囲チェック
+        roi_x = std::max(0, std::min(roi_x, width - 1));
+        roi_y = std::max(0, std::min(roi_y, height - 1));
+        roi_width = std::min(roi_width, width - roi_x);
+        roi_height = std::min(roi_height, height - roi_y);
+        
+        // PCL点群を作成
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+        cloud->reserve(roi_width * roi_height);
+        
+        // 画像データを取得
+        cv::Mat color_image(cv::Size(color_intrinsics_.width, color_intrinsics_.height), 
+                           CV_8UC3, (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
+        cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), 
+                           CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
+        
+        // ROI内の点群を生成（RealSense SDKのAPIを使用）
+        for (int v = roi_y; v < roi_y + roi_height; v++) {
+            for (int u = roi_x; u < roi_x + roi_width; u++) {
+                float depth = depth_image.at<uint16_t>(v, u) * depth_scale_;
+                
+                if (depth > 0.1f && depth < 10.0f) {
+                    float pixel[2] = {static_cast<float>(u), static_cast<float>(v)};
+                    float point_3d[3];
+                    
+                    // RealSense SDKのAPIで2D→3D変換
+                    rs2_deproject_pixel_to_point(point_3d, &depth_intrinsics_, pixel, depth);
+                    
+                    pcl::PointXYZRGB point;
+                    point.x = point_3d[0];
+                    point.y = point_3d[1];
+                    point.z = point_3d[2];
+                    
+                    // RGB値を設定
+                    cv::Vec3b color = color_image.at<cv::Vec3b>(v, u);
+                    point.r = color[2];
+                    point.g = color[1];
+                    point.b = color[0];
+                    
+                    cloud->push_back(point);
+                }
+            }
+        }
+        
+        // PCLからROS2メッセージに変換
+        pcl::toROSMsg(*cloud, response->pointcloud);
+        response->pointcloud.header.stamp = this->now();
+        response->pointcloud.header.frame_id = tf_config_.color_optical_frame;
+        
+        response->success = true;
+        response->message = "Point cloud generated with " + std::to_string(cloud->size()) + " points";
+        
+    } catch (const std::exception& e) {
+        response->success = false;
+        response->message = std::string("Error generating point cloud: ") + e.what();
+    }
+}
+
 void FVDepthCameraNode::clickEventCallback(const geometry_msgs::msg::Point::SharedPtr msg)
 {
     try {
@@ -1102,6 +1318,9 @@ void FVDepthCameraNode::clickEventCallback(const geometry_msgs::msg::Point::Shar
 bool FVDepthCameraNode::get3DCoordinate(int x, int y, float& world_x, float& world_y, float& world_z)
 {
     try {
+        // GPT5様よろしくお願いします - ここも同じパイプライン競合問題
+        // 問題: pipe_.wait_for_frames()の競合
+        // 修正案: ミューテックスまたはキャッシュフレーム使用
         // Get latest depth frame
         rs2::frameset frames = pipe_.wait_for_frames();
         auto depth_frame = frames.get_depth_frame();

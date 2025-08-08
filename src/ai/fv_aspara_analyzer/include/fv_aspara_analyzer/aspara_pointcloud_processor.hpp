@@ -120,6 +120,19 @@ public:
         const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
         const std::string& frame_id,
         int aspara_id);
+
+    /**
+     * @brief フィルタリング済み点群をパブリッシュ（タイムスタンプ指定）
+     * @param cloud 点群データ
+     * @param frame_id 座標系ID
+     * @param aspara_id アスパラガスID
+     * @param stamp 元フレームのタイムスタンプ
+     */
+    void publishFilteredPointCloud(
+        const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
+        const std::string& frame_id,
+        int aspara_id,
+        const rclcpp::Time& stamp);
     
     /**
      * @brief 根元位置のTF座標をパブリッシュ
