@@ -211,6 +211,9 @@ public:
     
     // ===== 検出処理時間計測用 =====
     fluent::utils::Stopwatch detection_stopwatch_;                                          ///< 検出処理時間計測
+    std::atomic<double> last_analysis_time_ms_{0.0};                                        ///< 最後の分析時間（ミリ秒）
+    std::atomic<double> last_pointcloud_time_ms_{0.0};                                      ///< 最後の点群処理時間（ミリ秒）
+    std::unique_ptr<fluent::utils::FPSMeter> pointcloud_fps_meter_;                         ///< 点群処理FPS計測
     
     // ===== 非同期点群処理用 =====
     std::unique_ptr<class AnalyzerThread> analyzer_thread_;                                  ///< 点群解析専用スレッド

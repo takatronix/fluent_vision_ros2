@@ -262,6 +262,12 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
 
 void AnalyzerThread::updateAnalysisResult(const AsparaInfo& aspara_info, long processing_time_ms)
 {
+    // 点群処理時間とFPSを更新
+    node_->last_pointcloud_time_ms_ = processing_time_ms;
+    if (node_->pointcloud_fps_meter_) {
+        node_->pointcloud_fps_meter_->tick(node_->now());
+    }
+    
     std::lock_guard<std::mutex> lock(node_->aspara_list_mutex_);
     
     auto it = std::find_if(node_->aspara_list_.begin(), node_->aspara_list_.end(),

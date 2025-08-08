@@ -182,12 +182,18 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     selected_pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         output_selected_pointcloud_topic, 10);
     
-    annotated_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-        output_annotated_image_topic, 10);
+    // QoS設定（ベストエフォートで高速配信）
+    auto qos = rclcpp::QoS(10)
+        .reliability(rclcpp::ReliabilityPolicy::BestEffort)
+        .durability(rclcpp::DurabilityPolicy::Volatile)
+        .history(rclcpp::HistoryPolicy::KeepLast);
     
-    // 圧縮画像パブリッシャー
+    annotated_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
+        output_annotated_image_topic, qos);
+    
+    // 圧縮画像パブリッシャー（同じQoS設定）
     annotated_image_compressed_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
-        output_annotated_image_topic + "/compressed", 10);
+        output_annotated_image_topic + "/compressed", qos);
 
     // ===== サービス初期化 =====
     next_asparagus_service_ = this->create_service<std_srvs::srv::Trigger>(
@@ -218,6 +224,7 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     depth_fps_meter_ = std::make_unique<fluent::utils::FPSMeter>(10);
     detection_fps_meter_ = std::make_unique<fluent::utils::FPSMeter>(10);
     segmentation_fps_meter_ = std::make_unique<fluent::utils::FPSMeter>(10);
+    pointcloud_fps_meter_ = std::make_unique<fluent::utils::FPSMeter>(10);
     
     // 検出処理時間計測用（StopWatchはデフォルトコンストラクタで初期化済み）
     // detection_stopwatch_は自動初期化されるのでここでの明示的な初期化は不要
@@ -393,6 +400,9 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
     // 全体処理時間
     auto callback_end = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(callback_end - callback_start).count();
+    
+    // 分析時間を保存
+    last_analysis_time_ms_ = total_ms;
     
     // 詳細ログ出力（1秒に1回に制限）
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
@@ -839,7 +849,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     // ===== 画面左上に情報表示 =====
     // 背景パネル（半透明の黒）
     cv::Mat overlay = output_image.clone();
-    cv::rectangle(overlay, cv::Rect(5, 5, 600, 70), cv::Scalar(0, 0, 0), -1);
+    cv::rectangle(overlay, cv::Rect(5, 5, 600, 95), cv::Scalar(0, 0, 0), -1);  // 高さを増やして点群処理情報を収納
     cv::addWeighted(overlay, 0.6, output_image, 0.4, 0, output_image);
     
     // フレーム番号（常に更新される値）
@@ -850,7 +860,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     float color_fps = color_fps_meter_ ? color_fps_meter_->getCurrentFPS() : 0.0f;
     float depth_fps = depth_fps_meter_ ? depth_fps_meter_->getCurrentFPS() : 0.0f;
     float detection_fps = detection_fps_meter_ ? detection_fps_meter_->getCurrentFPS() : 0.0f;
-    float segmentation_fps = segmentation_fps_meter_ ? segmentation_fps_meter_->getCurrentFPS() : 0.0f;
+    // float segmentation_fps = segmentation_fps_meter_ ? segmentation_fps_meter_->getCurrentFPS() : 0.0f;  // 現在未使用
     
     // テキスト描画
     cv::Scalar text_color(255, 255, 255);  // 白色
@@ -868,17 +878,28 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     cv::putText(output_image, fps_line, cv::Point(15, y_offset),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1);
     
-    // 2行目: フレーム番号と検出数
+    // 2行目: フレーム番号、検出数、分析時間
     y_offset += 22;
     std::string info_line;
+    double analysis_ms = last_analysis_time_ms_.load();
     if (snapshot_list.empty()) {
-        info_line = cv::format("Frame: %lu | 未検出", (unsigned long)total_frame_count);
+        info_line = cv::format("Frame: %lu | 未検出 | Analysis: %.1fms", 
+                              (unsigned long)total_frame_count, analysis_ms);
     } else {
-        info_line = cv::format("Frame: %lu | Detected: %zu", (unsigned long)total_frame_count, snapshot_list.size());
+        info_line = cv::format("Frame: %lu | Detected: %zu | Analysis: %.1fms", 
+                              (unsigned long)total_frame_count, snapshot_list.size(), analysis_ms);
     }
     cv::Scalar info_color = snapshot_list.empty() ? cv::Scalar(128, 128, 128) : cv::Scalar(0, 255, 0);
     cv::putText(output_image, info_line, cv::Point(15, y_offset),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, info_color, 1);
+    
+    // 3行目: 点群処理情報
+    y_offset += 22;
+    float pointcloud_fps = pointcloud_fps_meter_ ? pointcloud_fps_meter_->getCurrentFPS() : 0.0f;
+    double pointcloud_ms = last_pointcloud_time_ms_.load();
+    std::string pointcloud_line = cv::format("点群処理: %.1f FPS | %.1fms", pointcloud_fps, pointcloud_ms);
+    cv::putText(output_image, pointcloud_line, cv::Point(15, y_offset),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1);
     
     // FPS値に応じて色付け（オプション）
     if (display_fps < 15.0f) {

@@ -80,37 +80,37 @@ ros2 launch fv_object_detector fv_object_detector_launch.py \
     output_detections_topic:="/fv/d405/object_detection/detections" &
 
 # UNet セグメンテーション D415 ノード起動
-#echo "🎭 Starting UNet Segmentation D415 node..."
-#echo "   Model: UNet (/models/unet_asparagus_ch16_256_v1.0_ep20.xml)"
-#ros2 launch fv_object_mask_generator fv_object_mask_generator_launch.py \
-#    node_name:=fv_object_mask_generator_d415 \
-#    config_file:="$SCRIPT_DIR/fv_object_mask_generator_d415.yaml" \
-#    input_image_topic:="/fv/d415/color/image_raw" \
-#    output_segmentation_mask_topic:="/fv/d415/segmentation_mask/image" \
-#    output_colored_mask_topic:="/fv/d415/segmentation_mask/colored" &
+echo "🎭 Starting UNet Segmentation D415 node..."
+echo "   Model: UNet (/models/unet_asparagus_ch16_256_v1.0_ep20.xml)"
+ros2 launch fv_object_mask_generator fv_object_mask_generator_launch.py \
+    node_name:=fv_object_mask_generator_d415 \
+    config_file:="$SCRIPT_DIR/fv_object_mask_generator_d415.yaml" \
+    input_image_topic:="/fv/d415/color/image_raw" \
+    output_segmentation_mask_topic:="/fv/d415/segmentation_mask/image" \
+    output_colored_mask_topic:="/fv/d415/segmentation_mask/colored" &
 
 # UNet セグメンテーション D405 ノード起動
-#echo "🎭 Starting UNet Segmentation D405 node..."
-#echo "   Model: UNet (/models/unet_asparagus_ch16_256_v1.0_ep20.xml)"
-#ros2 launch fv_object_mask_generator fv_object_mask_generator_launch.py \
-#    node_name:=fv_object_mask_generator_d405 \
-#    config_file:="$SCRIPT_DIR/fv_object_mask_generator_d405.yaml" \
-#    input_image_topic:="/fv/d405/color/image_raw" \
-#    output_segmentation_mask_topic:="/fv/d405/segmentation_mask/image" \
-#    output_colored_mask_topic:="/fv/d405/segmentation_mask/colored" &
+echo "🎭 Starting UNet Segmentation D405 node..."
+echo "   Model: UNet (/models/unet_asparagus_ch16_256_v1.0_ep20.xml)"
+ros2 launch fv_object_mask_generator fv_object_mask_generator_launch.py \
+    node_name:=fv_object_mask_generator_d405 \
+    config_file:="$SCRIPT_DIR/fv_object_mask_generator_d405.yaml" \
+    input_image_topic:="/fv/d405/color/image_raw" \
+    output_segmentation_mask_topic:="/fv/d405/segmentation_mask/image" \
+    output_colored_mask_topic:="/fv/d405/segmentation_mask/colored" &
 
 # レコーダー ノード起動（一時無効化 - パフォーマンス改善のため）
-#echo "📹 Starting Recorder node..."
-#ros2 launch fv_recorder fv_recorder_launch.py \
-#    node_name:=fv_recorder \
-#    config_file:="$SCRIPT_DIR/fv_recorder.yaml" &
+echo "📹 Starting Recorder node..."
+ros2 launch fv_recorder fv_recorder_launch.py \
+    node_name:=fv_recorder \
+    config_file:="$SCRIPT_DIR/fv_recorder.yaml" &
 
 # トピックリレー起動（/fv/* -> /vision_ai/* 転送）
-#echo "🔄 Starting Topic Relay (/fv/* -> /vision_ai/*)..."
-#echo "📁 Config file: $SCRIPT_DIR/relay_vision_ai.yaml"
-#ros2 run fv_topic_relay fv_topic_relay_node \
-#    --ros-args \
-#     --params-file "$SCRIPT_DIR/relay_vision_ai.yaml" &
+echo "🔄 Starting Topic Relay (/fv/* -> /vision_ai/*)..."
+echo "📁 Config file: $SCRIPT_DIR/relay_vision_ai.yaml"
+ros2 run fv_topic_relay fv_topic_relay_node \
+    --ros-args \
+     --params-file "$SCRIPT_DIR/relay_vision_ai.yaml" &
 
 # Foxglove Bridge起動
 echo "🦊 Starting Foxglove Bridge..."
