@@ -146,6 +146,13 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     RCLCPP_WARN(this->get_logger(), "  Depth: %s", depth_topic.c_str());
     RCLCPP_WARN(this->get_logger(), "  Output annotated: %s", output_annotated_image_topic.c_str());
 
+    // ===== CallbackGroup初期化（マルチスレッド対応）=====
+    image_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    detection_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    service_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    
+    RCLCPP_INFO(this->get_logger(), "Callback groups created for multithreading");
+
     // ===== サブスクライバー初期化 =====
     detection_sub_ = this->create_subscription<vision_msgs::msg::Detection2DArray>(
         detection_topic, 10, 
@@ -214,6 +221,14 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     // 検出処理時間計測用（StopWatchはデフォルトコンストラクタで初期化済み）
     // detection_stopwatch_は自動初期化されるのでここでの明示的な初期化は不要
     
+    // ===== 非同期点群処理初期化 =====
+    shutdown_flag_ = false;
+    processing_in_progress_ = false;
+    
+    // ワーカースレッド開始
+    pointcloud_worker_thread_ = std::thread(&FvAsparaAnalyzerNode::pointcloudWorkerLoop, this);
+    RCLCPP_INFO(this->get_logger(), "Pointcloud processing worker thread started");
+    
     // ===== 初期化完了ログ =====
     RCLCPP_WARN(this->get_logger(), "All subscribers created successfully");
     RCLCPP_WARN(this->get_logger(), "All publishers created successfully");
@@ -225,7 +240,17 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
  * @brief デストラクタ
  * @details リソースの適切な解放を行う
  */
-FvAsparaAnalyzerNode::~FvAsparaAnalyzerNode() {}
+FvAsparaAnalyzerNode::~FvAsparaAnalyzerNode() 
+{
+    // ワーカースレッド終了処理
+    shutdown_flag_ = true;
+    pointcloud_cv_.notify_all();  // 待機中のスレッドを起こす
+    
+    if (pointcloud_worker_thread_.joinable()) {
+        pointcloud_worker_thread_.join();
+        RCLCPP_INFO(this->get_logger(), "Pointcloud processing worker thread terminated");
+    }
+}
 
 /**
  * @brief 2D検出結果のコールバック関数
@@ -505,44 +530,17 @@ void FvAsparaAnalyzerNode::imageCallback(const sensor_msgs::msg::Image::SharedPt
         color_fps_meter_->tick(this->now());
     }
     
-    // 全アスパラの点群処理を毎フレーム実行（余裕があれば全部、優先は選択中）
+    // アスパラの非同期点群処理をキューに追加（メインスレッドは軽量な処理のみ）
     if (enable_pointcloud_processing_ && !aspara_list_.empty()) {
-        for (auto& aspara : aspara_list_) {
+        for (const auto& aspara : aspara_list_) {
             // 選択中のアスパラは必ず分析、その他は余裕があれば分析
             bool should_analyze = (aspara.id == selected_aspara_id_) || (selected_aspara_id_ == -1);
             
             if (should_analyze) {
-                try {
-                    RCLCPP_DEBUG(this->get_logger(), "Starting analysis for asparagus ID %d", aspara.id);
-                    
-                    // 分析時間計測開始
-                    auto start_time = std::chrono::high_resolution_clock::now();
-                    
-                    // アスパラの点群分析を実行
-                    processAsparagus(aspara);
-                    
-                    // 分析時間計測終了・記録
-                    auto end_time = std::chrono::high_resolution_clock::now();
-                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-                    aspara.processing_times.total_ms = duration.count();
-                    
-                    RCLCPP_DEBUG(this->get_logger(), "Asparagus %d analysis completed: %.1fms", 
-                               aspara.id, aspara.processing_times.total_ms);
-                    
-                } catch (const std::exception& e) {
-                    RCLCPP_ERROR(this->get_logger(), "Exception in asparagus %d analysis: %s", aspara.id, e.what());
-                    // 分析失敗時は時間を0に設定
-                    aspara.processing_times.total_ms = 0.0;
-                } catch (...) {
-                    RCLCPP_ERROR(this->get_logger(), "Unknown exception in asparagus %d analysis", aspara.id);
-                    // 分析失敗時は時間を0に設定
-                    aspara.processing_times.total_ms = 0.0;
-                }
+                // 重い点群処理は非同期キューに追加（カクつき回避）
+                enqueueAsparaguProcessing(aspara);
                 
-                // 選択中のアスパラを分析済みなら、時間に余裕があれば他も分析
-                if (aspara.id == selected_aspara_id_) {
-                    continue;  // 選択中分析完了、次のアスパラへ
-                }
+                RCLCPP_DEBUG(this->get_logger(), "Enqueued asparagus ID %d for async processing", aspara.id);
             }
         }
     }
@@ -1587,6 +1585,99 @@ void FvAsparaAnalyzerNode::prevAsparaguService(
     }
 }
 
+/**
+ * @brief アスパラガス処理をキューに追加
+ * @param aspara_info 処理対象アスパラガス情報
+ */
+void FvAsparaAnalyzerNode::enqueueAsparaguProcessing(const AsparaInfo& aspara_info)
+{
+    std::lock_guard<std::mutex> lock(pointcloud_mutex_);
+    
+    // キューサイズ制限（メモリリーク防止）
+    if (processing_queue_.size() >= 10) {
+        // 古いタスクを削除
+        processing_queue_.pop();
+        RCLCPP_WARN(this->get_logger(), "Processing queue full, dropping oldest task");
+    }
+    
+    processing_queue_.push(aspara_info);
+    pointcloud_cv_.notify_one();  // ワーカースレッドに通知
+}
+
+/**
+ * @brief ワーカースレッドのメインループ
+ */
+void FvAsparaAnalyzerNode::pointcloudWorkerLoop()
+{
+    RCLCPP_INFO(this->get_logger(), "Pointcloud worker thread started");
+    
+    while (!shutdown_flag_) {
+        std::unique_lock<std::mutex> lock(pointcloud_mutex_);
+        
+        // キューにタスクがあるまで待機
+        pointcloud_cv_.wait(lock, [this]() {
+            return !processing_queue_.empty() || shutdown_flag_;
+        });
+        
+        if (shutdown_flag_) {
+            break;
+        }
+        
+        if (!processing_queue_.empty()) {
+            // キューからタスクを取得
+            AsparaInfo aspara_copy = processing_queue_.front();
+            processing_queue_.pop();
+            lock.unlock();  // ロック解除してから重い処理を実行
+            
+            // 処理中フラグを設定
+            processing_in_progress_ = true;
+            
+            try {
+                RCLCPP_DEBUG(this->get_logger(), "Starting async analysis for asparagus ID %d", aspara_copy.id);
+                
+                // 分析時間計測開始
+                auto start_time = std::chrono::high_resolution_clock::now();
+                
+                // アスパラの点群分析を実行（重い処理）
+                processAsparagus(aspara_copy);
+                
+                // 分析時間計測終了・記録
+                auto end_time = std::chrono::high_resolution_clock::now();
+                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                
+                // 結果をメインスレッドのデータに反映（スレッドセーフ）
+                {
+                    std::lock_guard<std::mutex> result_lock(pointcloud_mutex_);
+                    for (auto& aspara : aspara_list_) {
+                        if (aspara.id == aspara_copy.id) {
+                            aspara.processing_times.total_ms = duration.count();
+                            aspara.length = aspara_copy.length;
+                            aspara.straightness = aspara_copy.straightness;
+                            aspara.is_harvestable = aspara_copy.is_harvestable;
+                            // 他の分析結果も更新...
+                            break;
+                        }
+                    }
+                }
+                
+                RCLCPP_DEBUG(this->get_logger(), "Async asparagus %d analysis completed: %.1fms", 
+                           aspara_copy.id, duration.count());
+                           
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(this->get_logger(), "Exception in async asparagus %d analysis: %s", 
+                           aspara_copy.id, e.what());
+            } catch (...) {
+                RCLCPP_ERROR(this->get_logger(), "Unknown exception in async asparagus %d analysis", 
+                           aspara_copy.id);
+            }
+            
+            processing_in_progress_ = false;
+        }
+    }
+    
+    RCLCPP_INFO(this->get_logger(), "Pointcloud worker thread terminated");
+}
+
 } // namespace fv_aspara_analyzer
 
 /**
@@ -1610,8 +1701,12 @@ int main(int argc, char * argv[])
     
     try {
         auto node = std::make_shared<fv_aspara_analyzer::FvAsparaAnalyzerNode>();
-        RCLCPP_WARN(logger, "Node created, starting spin...");
-        rclcpp::spin(node);
+        RCLCPP_WARN(logger, "Node created, starting MultiThreadedExecutor...");
+        
+        // マルチスレッドエグゼキューター使用（カクつき解決）
+        rclcpp::executors::MultiThreadedExecutor executor;
+        executor.add_node(node);
+        executor.spin();
     } catch (const std::exception& e) {
         RCLCPP_ERROR(logger, "Exception in main: %s", e.what());
     }

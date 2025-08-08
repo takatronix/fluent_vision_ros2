@@ -41,6 +41,13 @@
 // 時間計測用
 #include <chrono>
 
+// 非同期処理用
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <queue>
+
 // 日本語テキスト描画
 // cvx_text.hppは削除済み（fluent統合ライブラリを使用）
 
@@ -379,6 +386,11 @@ private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr next_asparagus_service_;              ///< 次のアスパラガス選択サービス
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr prev_asparagus_service_;              ///< 前のアスパラガス選択サービス
     
+    // ===== CallbackGroup（マルチスレッド対応）=====
+    rclcpp::CallbackGroup::SharedPtr image_callback_group_;                                  ///< 画像処理用コールバックグループ
+    rclcpp::CallbackGroup::SharedPtr detection_callback_group_;                              ///< 検出処理用コールバックグループ
+    rclcpp::CallbackGroup::SharedPtr service_callback_group_;                                ///< サービス用コールバックグループ
+    
     // ===== TF2（座標変換）関連 =====
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;                                             ///< TFバッファ
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;                                ///< TFリスナー
@@ -430,6 +442,26 @@ private:
     
     // ===== 検出処理時間計測用 =====
     fluent::utils::Stopwatch detection_stopwatch_;                                          ///< 検出処理時間計測
+    
+    // ===== 非同期点群処理用 =====
+    std::thread pointcloud_worker_thread_;                                                   ///< 点群処理ワーカースレッド
+    std::mutex pointcloud_mutex_;                                                            ///< 点群処理用ミューテックス
+    std::condition_variable pointcloud_cv_;                                                  ///< 点群処理用条件変数
+    std::atomic<bool> shutdown_flag_;                                                        ///< シャットダウンフラグ
+    std::atomic<bool> processing_in_progress_;                                               ///< 処理中フラグ
+    std::queue<AsparaInfo> processing_queue_;                                               ///< 処理待ちキュー
+    
+    // ===== 非同期処理メソッド =====
+    /**
+     * @brief ワーカースレッドのメインループ
+     */
+    void pointcloudWorkerLoop();
+    
+    /**
+     * @brief アスパラガス処理をキューに追加
+     * @param aspara_info 処理対象アスパラガス情報
+     */
+    void enqueueAsparaguProcessing(const AsparaInfo& aspara_info);
 };
 
 } // namespace fv_aspara_analyzer

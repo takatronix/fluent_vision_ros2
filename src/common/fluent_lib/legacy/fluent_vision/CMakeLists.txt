@@ -12,7 +12,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(image_transport REQUIRED)
-find_package(cvx REQUIRED)
+# find_package(cvx REQUIRED)  # Temporarily disabled
 
 # FluentVision library
 add_library(fluent_vision SHARED
@@ -33,7 +33,7 @@ ament_target_dependencies(fluent_vision
   sensor_msgs
   cv_bridge
   image_transport
-  cvx
+  # cvx  # Temporarily disabled
 )
 
 target_link_libraries(fluent_vision
