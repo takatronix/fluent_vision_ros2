@@ -774,8 +774,8 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             // 既存 - スムージング（より滑らかに）
             auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
             cv::Rect& smooth = smooth_bbox_map[aspara_info.id];
-            // スムージング係数を調整（より滑らかに）
-            float smooth_factor = std::min(1.0f, animation_speed * 0.5f);  // 半分の速度でより滑らかに
+            // スムージング係数を調整（より速く反応）
+            float smooth_factor = std::min(1.0f, animation_speed * 2.0f);  // 速い反応で自然な動き
             smooth.x = lerp(smooth.x, aspara_info.bounding_box_2d.x, smooth_factor);
             smooth.y = lerp(smooth.y, aspara_info.bounding_box_2d.y, smooth_factor);
             smooth.width = lerp(smooth.width, aspara_info.bounding_box_2d.width, smooth_factor);
@@ -815,8 +815,8 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 color, -1);
             
             // テキスト（黒文字）
-            cv::putText(output_image, label, cv::Point(text_pos.x + 3, text_pos.y), 
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
+            fluent::text::draw(output_image, label, cv::Point(text_pos.x + 3, text_pos.y), 
+                cv::Scalar(0, 0, 0), 0.5, 1);
         }
     } else {
         // 未検出の場合 - 表示なし
@@ -875,37 +875,37 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     int y_offset = 25;
     std::string fps_line = cv::format("[%s] FPS: C=%.0f D=%.0f Det=%.0f Out=%.0f",
                                        camera_name.c_str(), color_fps, depth_fps, detection_fps, display_fps);
-    cv::putText(output_image, fps_line, cv::Point(15, y_offset),
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1);
+    fluent::text::draw(output_image, fps_line, cv::Point(15, y_offset),
+                text_color, 0.5, 1);
     
     // 2行目: フレーム番号、検出数、分析時間
     y_offset += 22;
     std::string info_line;
     double analysis_ms = last_analysis_time_ms_.load();
     if (snapshot_list.empty()) {
-        info_line = cv::format("Frame: %lu | 未検出 | Analysis: %.1fms", 
+        info_line = cv::format("Frame: %lu | Not Detected | Analysis: %.1fms", 
                               (unsigned long)total_frame_count, analysis_ms);
     } else {
         info_line = cv::format("Frame: %lu | Detected: %zu | Analysis: %.1fms", 
                               (unsigned long)total_frame_count, snapshot_list.size(), analysis_ms);
     }
     cv::Scalar info_color = snapshot_list.empty() ? cv::Scalar(128, 128, 128) : cv::Scalar(0, 255, 0);
-    cv::putText(output_image, info_line, cv::Point(15, y_offset),
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, info_color, 1);
+    fluent::text::draw(output_image, info_line, cv::Point(15, y_offset),
+                info_color, 0.5, 1);
     
     // 3行目: 点群処理情報
     y_offset += 22;
     float pointcloud_fps = pointcloud_fps_meter_ ? pointcloud_fps_meter_->getCurrentFPS() : 0.0f;
     double pointcloud_ms = last_pointcloud_time_ms_.load();
-    std::string pointcloud_line = cv::format("点群処理: %.1f FPS | %.1fms", pointcloud_fps, pointcloud_ms);
-    cv::putText(output_image, pointcloud_line, cv::Point(15, y_offset),
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1);
+    std::string pointcloud_line = cv::format("Pointcloud: %.1f FPS | %.1fms", pointcloud_fps, pointcloud_ms);
+    fluent::text::draw(output_image, pointcloud_line, cv::Point(15, y_offset),
+                text_color, 0.5, 1);
     
     // FPS値に応じて色付け（オプション）
     if (display_fps < 15.0f) {
         // 出力FPSが低い場合の警告
-        cv::putText(output_image, "!", cv::Point(580, 25),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, fps_bad, 2);
+        fluent::text::draw(output_image, "!", cv::Point(580, 25),
+                    fps_bad, 0.7, 2);
     }
     
     // 画像をパブリッシュ

@@ -32,12 +32,15 @@ find_package(PCL REQUIRED)
 include_directories(include)
 include_directories(${OpenCV_INCLUDE_DIRS})
 include_directories(${PCL_INCLUDE_DIRS})
+include_directories(legacy/cvx/include)
 
 # Source files
 set(FLUENT_LIB_SOURCES
   src/fluent_image.cpp
   src/fluent_cloud_impl.cpp
   src/fluent_utils.cpp
+  src/fluent_text.cpp
+  src/cvx_text.cpp
 )
 
 # Create library

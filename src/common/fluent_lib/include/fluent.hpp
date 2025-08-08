@@ -7,6 +7,7 @@
 #include "image.hpp"
 #include "cloud.hpp" 
 #include "utils/fps.hpp"
+#include "fluent_text.hpp"
 
 // 便利なヘルパー関数
 namespace Colors {
