@@ -37,7 +37,7 @@ find_package(OpenCV REQUIRED)                # OpenCVコンピュータビジョ
 find_package(vision_msgs REQUIRED)           # コンピュータビジョンメッセージ
 find_package(std_srvs REQUIRED)              # 標準サービスメッセージ
 find_package(fluent_lib REQUIRED)
-find_package(fv_realsense REQUIRED)          # fv_realsenseサービス定義
+## fv_realsense のサービス依存は廃止（画像トピックからのローカル変換に統一）
 
 # ===== インクルードディレクトリ設定 =====
 include_directories(include)                 # ヘッダーファイルディレクトリ
@@ -60,7 +60,6 @@ set(dependencies
   vision_msgs               # コンピュータビジョンメッセージ
   std_srvs                  # 標準サービスメッセージ
   fluent_lib                # Fluent統合ライブラリ
-  fv_realsense              # fv_realsenseサービス
 )
 
 # ===== 実行ファイル作成 =====

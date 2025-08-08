@@ -209,17 +209,7 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
         "prev_asparagus",
         std::bind(&FvAsparaAnalyzerNode::prevAsparaguService, this, std::placeholders::_1, std::placeholders::_2));
     
-    // ===== サービスクライアント初期化 =====
-    // 点群生成サービスの設定を確認
-    bool service_enabled = this->declare_parameter<bool>("generate_pointcloud_service_enabled", false);
-    std::string service_name = this->declare_parameter<std::string>("generate_pointcloud_service_name", "");
-    
-    if (service_enabled && !service_name.empty()) {
-        generate_pointcloud_client_ = this->create_client<fv_realsense::srv::GeneratePointCloud>(service_name);
-        RCLCPP_INFO(this->get_logger(), "GeneratePointCloud service client created: %s", service_name.c_str());
-    } else {
-        RCLCPP_INFO(this->get_logger(), "GeneratePointCloud service disabled or not configured");
-    }
+    // サービスクライアントは廃止（画像トピックからのローカル変換に統一）
 
     // ===== TF2（座標変換）初期化 =====
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());

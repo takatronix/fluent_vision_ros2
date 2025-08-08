@@ -24,7 +24,7 @@
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
 #include "fv_realsense/srv/set_mode.hpp"
-#include "fv_realsense/srv/generate_point_cloud.hpp"
+// GeneratePointCloud service removed; use topic-based pipeline only
 
 class FVDepthCameraNode : public rclcpp::Node
 {
@@ -137,7 +137,7 @@ private:
     rclcpp::Service<fv_realsense::srv::GetDistance>::SharedPtr get_distance_service_;
     rclcpp::Service<fv_realsense::srv::GetCameraInfo>::SharedPtr get_camera_info_service_;
     rclcpp::Service<fv_realsense::srv::SetMode>::SharedPtr set_mode_service_;
-    rclcpp::Service<fv_realsense::srv::GeneratePointCloud>::SharedPtr generate_pointcloud_service_;
+    // GeneratePointCloud service removed
 
     // Subscribers
     rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr click_event_sub_;
@@ -201,9 +201,7 @@ private:
         const std::shared_ptr<fv_realsense::srv::SetMode::Request> request,
         std::shared_ptr<fv_realsense::srv::SetMode::Response> response);
     
-    void handleGeneratePointCloud(
-        const std::shared_ptr<fv_realsense::srv::GeneratePointCloud::Request> request,
-        std::shared_ptr<fv_realsense::srv::GeneratePointCloud::Response> response);
+    // GeneratePointCloud handler removed
 
     // Utility methods
     bool get3DCoordinate(int x, int y, float& world_x, float& world_y, float& world_z);

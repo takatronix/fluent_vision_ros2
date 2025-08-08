@@ -98,8 +98,7 @@
     services:
       get_distance_enabled: true       # 距離取得サービス有効
       get_camera_info_enabled: true    # カメラ情報取得サービス有効
-      generate_pointcloud_enabled: true # 点群生成サービス有効
-      generate_pointcloud_name: "fv/d405/generate_pointcloud"  # 点群生成サービス名
+      generate_pointcloud_enabled: false # 点群生成サービス廃止
     
     # ===== TF（座標変換）設定 =====
     tf:

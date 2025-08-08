@@ -11,7 +11,7 @@
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
 #include "fv_realsense/srv/set_mode.hpp"
-#include "fv_realsense/srv/generate_point_cloud.hpp"
+// #include "fv_realsense/srv/generate_point_cloud.hpp"  // Removed: service deleted
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
@@ -632,22 +632,7 @@ void FVDepthCameraNode::initializeServices()
         RCLCPP_INFO(this->get_logger(), "🎛️ SetMode service initialized");
     }
     
-    // 点群生成サービスを設定に基づいて有効化
-    bool generate_pointcloud_enabled = this->declare_parameter<bool>(
-        "services.generate_pointcloud_enabled", false);
-    
-    if (generate_pointcloud_enabled) {
-        // サービス名を設定から取得（デフォルト値を設定）
-        std::string service_name = this->declare_parameter<std::string>(
-            "services.generate_pointcloud_name", "generate_pointcloud");
-        service_name = this->get_parameter("services.generate_pointcloud_name").as_string();
-        
-        generate_pointcloud_service_ = this->create_service<fv_realsense::srv::GeneratePointCloud>(
-            service_name,
-            std::bind(&FVDepthCameraNode::handleGeneratePointCloud, this, 
-                std::placeholders::_1, std::placeholders::_2));
-        RCLCPP_INFO(this->get_logger(), "☁️ GeneratePointCloud service initialized: %s", service_name.c_str());
-    }
+    // GeneratePointCloud service removed
     
     // Initialize subscribers
     initializeSubscribers();
@@ -1200,90 +1185,7 @@ void FVDepthCameraNode::handleSetMode(
     }
 }
 
-void FVDepthCameraNode::handleGeneratePointCloud(
-    const std::shared_ptr<fv_realsense::srv::GeneratePointCloud::Request> request,
-    std::shared_ptr<fv_realsense::srv::GeneratePointCloud::Response> response)
-{
-    try {
-        // GPT5様よろしくお願いします - パイプライン競合問題の修正が必要
-        // 問題: pipe_.wait_for_frames()を直接呼び出しているため、メインループと競合
-        // 修正案: std::mutexでパイプラインアクセスを保護、または最新フレームのキャッシュから取得
-        // 最新のフレームを取得
-        rs2::frameset frames = pipe_.wait_for_frames();
-        rs2::frame color_frame = frames.get_color_frame();
-        rs2::frame depth_frame = frames.get_depth_frame();
-        
-        if (!color_frame || !depth_frame) {
-            response->success = false;
-            response->message = "No frames available";
-            return;
-        }
-        
-        // ROIの設定
-        int width = depth_intrinsics_.width;
-        int height = depth_intrinsics_.height;
-        int roi_x = request->use_roi ? request->roi_x : 0;
-        int roi_y = request->use_roi ? request->roi_y : 0;
-        int roi_width = request->use_roi ? request->roi_width : width;
-        int roi_height = request->use_roi ? request->roi_height : height;
-        
-        // ROIの範囲チェック
-        roi_x = std::max(0, std::min(roi_x, width - 1));
-        roi_y = std::max(0, std::min(roi_y, height - 1));
-        roi_width = std::min(roi_width, width - roi_x);
-        roi_height = std::min(roi_height, height - roi_y);
-        
-        // PCL点群を作成
-        pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-        cloud->reserve(roi_width * roi_height);
-        
-        // 画像データを取得
-        cv::Mat color_image(cv::Size(color_intrinsics_.width, color_intrinsics_.height), 
-                           CV_8UC3, (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
-        cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), 
-                           CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
-        
-        // ROI内の点群を生成（RealSense SDKのAPIを使用）
-        for (int v = roi_y; v < roi_y + roi_height; v++) {
-            for (int u = roi_x; u < roi_x + roi_width; u++) {
-                float depth = depth_image.at<uint16_t>(v, u) * depth_scale_;
-                
-                if (depth > 0.1f && depth < 10.0f) {
-                    float pixel[2] = {static_cast<float>(u), static_cast<float>(v)};
-                    float point_3d[3];
-                    
-                    // RealSense SDKのAPIで2D→3D変換
-                    rs2_deproject_pixel_to_point(point_3d, &depth_intrinsics_, pixel, depth);
-                    
-                    pcl::PointXYZRGB point;
-                    point.x = point_3d[0];
-                    point.y = point_3d[1];
-                    point.z = point_3d[2];
-                    
-                    // RGB値を設定
-                    cv::Vec3b color = color_image.at<cv::Vec3b>(v, u);
-                    point.r = color[2];
-                    point.g = color[1];
-                    point.b = color[0];
-                    
-                    cloud->push_back(point);
-                }
-            }
-        }
-        
-        // PCLからROS2メッセージに変換
-        pcl::toROSMsg(*cloud, response->pointcloud);
-        response->pointcloud.header.stamp = this->now();
-        response->pointcloud.header.frame_id = tf_config_.color_optical_frame;
-        
-        response->success = true;
-        response->message = "Point cloud generated with " + std::to_string(cloud->size()) + " points";
-        
-    } catch (const std::exception& e) {
-        response->success = false;
-        response->message = std::string("Error generating point cloud: ") + e.what();
-    }
-}
+// GeneratePointCloud handler removed
 
 void FVDepthCameraNode::clickEventCallback(const geometry_msgs::msg::Point::SharedPtr msg)
 {

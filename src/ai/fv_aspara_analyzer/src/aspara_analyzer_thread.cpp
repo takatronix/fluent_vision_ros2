@@ -250,57 +250,13 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             "[POINTCLOUD] Camera info: fx=%f, fy=%f, cx=%f, cy=%f", 
             camera_info->k[0], camera_info->k[4], camera_info->k[2], camera_info->k[5]);
         
-        RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
-            "[POINTCLOUD] Calling GeneratePointCloud service...");
-        
-        // サービスを使用して点群を生成
-        pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered_cloud;
-        
-        // GPT5様よろしくお願いします - ここでサービス呼び出しがタイムアウトする問題の修正が必要
-        // 問題: RealSenseパイプラインへの同時アクセスによる競合とミューテックス不足
-        // 修正案: パイプラインアクセスをミューテックスで保護し、フレームキャッシュを実装
-        // サービスクライアントが利用可能かチェック
-        if (node_->generate_pointcloud_client_ && node_->generate_pointcloud_client_->wait_for_service(std::chrono::milliseconds(100))) {
-            // サービスリクエストを作成
-            auto request = std::make_shared<fv_realsense::srv::GeneratePointCloud::Request>();
-            request->roi_x = clipped.x;
-            request->roi_y = clipped.y;
-            request->roi_width = clipped.width;
-            request->roi_height = clipped.height;
-            request->use_roi = true;
-            
-            // サービスを呼び出し
-            auto future = node_->generate_pointcloud_client_->async_send_request(request);
-            
-            // 結果を待つ（最大1秒）
-            if (future.wait_for(std::chrono::milliseconds(500)) == std::future_status::ready) {
-                auto result = future.get();
-                if (result->success) {
-                    // PointCloud2メッセージをPCLに変換
-                    filtered_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZRGB>>();
-                    pcl::fromROSMsg(result->pointcloud, *filtered_cloud);
-                    RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
-                        "[POINTCLOUD] Service returned %zu points", filtered_cloud->points.size());
-                } else {
-                    RCLCPP_ERROR(rclcpp::get_logger("analyzer_thread"), 
-                        "[POINTCLOUD] Service failed: %s", result->message.c_str());
-                    return;
-                }
-            } else {
-                RCLCPP_ERROR(rclcpp::get_logger("analyzer_thread"), 
-                    "[POINTCLOUD] Service call timed out");
-                return;
-            }
-        } else {
-            // サービスが利用できない場合は従来の方法を使用（フォールバック）
-            RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), 
-                "[POINTCLOUD] Service not available, using local conversion");
-            filtered_cloud = fluent_cloud::io::DepthToCloud::convertAsparagusROI(
+        // 画像トピックからのローカル変換に統一
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered_cloud = 
+            fluent_cloud::io::DepthToCloud::convertAsparagusROI(
                 depth_mat,
                 color_mat,
                 clipped,
                 *camera_info);
-        }
         
         RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
             "[POINTCLOUD] convertAsparagusROI returned successfully");
