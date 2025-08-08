@@ -240,8 +240,8 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
         }
     };
     animation_timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(67), timer_callback);  // 15FPS (1000ms/15=67ms)
-    RCLCPP_WARN(this->get_logger(), "Animation timer created (15 FPS independent output)");
+        std::chrono::milliseconds(33), timer_callback);  // 30FPS (1000ms/30=33ms)
+    RCLCPP_WARN(this->get_logger(), "Animation timer created (30 FPS smooth animation)");
     
     // ===== 初期化完了ログ =====
     RCLCPP_WARN(this->get_logger(), "All subscribers created successfully");
@@ -694,7 +694,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     
     // アニメーション更新（実際のFPSに基づいて調整）
     // delta_timeを使って、フレームレート非依存のスムージングを実現
-    const float target_smoothing_time = 0.1f;  // 100msで目標値に収束
+    const float target_smoothing_time = 0.2f;  // 200msで目標値に収束（より滑らか）
     const float animation_speed = std::min(1.0f, delta_time / target_smoothing_time);
     
     // 検出結果の描画
@@ -774,8 +774,8 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             // 既存 - スムージング（より滑らかに）
             auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
             cv::Rect& smooth = smooth_bbox_map[aspara_info.id];
-            // スムージング係数を調整（より速く反応）
-            float smooth_factor = std::min(1.0f, animation_speed * 2.0f);  // 速い反応で自然な動き
+            // スムージング係数を調整（滑らかなアニメーション）
+            float smooth_factor = std::min(1.0f, animation_speed * 1.5f);  // 滑らかで自然な動き
             smooth.x = lerp(smooth.x, aspara_info.bounding_box_2d.x, smooth_factor);
             smooth.y = lerp(smooth.y, aspara_info.bounding_box_2d.y, smooth_factor);
             smooth.width = lerp(smooth.width, aspara_info.bounding_box_2d.width, smooth_factor);
@@ -808,10 +808,11 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             int baseline;
             cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
             
-            // 背景ボックス
+            // 背景ボックス（アスパラ矩形と同じ幅）
             cv::Point text_pos(aspara_info.smooth_bbox.x, aspara_info.smooth_bbox.y - 5);
             cv::rectangle(output_image, 
-                cv::Rect(text_pos.x, text_pos.y - text_size.height - 3, text_size.width + 6, text_size.height + 6),
+                cv::Rect(aspara_info.smooth_bbox.x, text_pos.y - text_size.height - 3, 
+                        aspara_info.smooth_bbox.width, text_size.height + 6),
                 color, -1);
             
             // テキスト（黒文字）
