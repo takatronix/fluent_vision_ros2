@@ -8,6 +8,7 @@
  */
 
 #include "fv_aspara_analyzer/fv_aspara_analyzer_node.hpp"
+#include "fv_aspara_analyzer/aspara_analyzer_thread.hpp"
 #include <fluent.hpp>
 
 namespace fv_aspara_analyzer
@@ -146,25 +147,18 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     RCLCPP_WARN(this->get_logger(), "  Depth: %s", depth_topic.c_str());
     RCLCPP_WARN(this->get_logger(), "  Output annotated: %s", output_annotated_image_topic.c_str());
 
-    // ===== CallbackGroup初期化（マルチスレッド対応）=====
-    image_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    detection_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    service_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    
-    RCLCPP_INFO(this->get_logger(), "Callback groups created for multithreading");
-
     // ===== サブスクライバー初期化 =====
     detection_sub_ = this->create_subscription<vision_msgs::msg::Detection2DArray>(
         detection_topic, 10, 
         std::bind(&FvAsparaAnalyzerNode::detectionCallback, this, std::placeholders::_1));
 
-    pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-        pointcloud_topic, 10,
-        std::bind(&FvAsparaAnalyzerNode::pointcloudCallback, this, std::placeholders::_1));
+    // 点群サブスクリプションは実際には使用されていない（深度画像から生成するため）
+    // pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+    //     pointcloud_topic, 10,
+    //     std::bind(&FvAsparaAnalyzerNode::pointcloudCallback, this, std::placeholders::_1));
 
-    camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
-        camera_info_topic, 10,
-        std::bind(&FvAsparaAnalyzerNode::cameraInfoCallback, this, std::placeholders::_1));
+    // カメラ情報を起動時に1回だけ取得（毎フレーム受信は無駄）
+    getCameraInfoOnce(camera_info_topic);
 
     mask_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
         mask_topic, 10,
@@ -222,12 +216,8 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     // detection_stopwatch_は自動初期化されるのでここでの明示的な初期化は不要
     
     // ===== 非同期点群処理初期化 =====
-    shutdown_flag_ = false;
-    processing_in_progress_ = false;
-    
-    // ワーカースレッド開始
-    pointcloud_worker_thread_ = std::thread(&FvAsparaAnalyzerNode::pointcloudWorkerLoop, this);
-    RCLCPP_INFO(this->get_logger(), "Pointcloud processing worker thread started");
+    analyzer_thread_ = std::make_unique<AnalyzerThread>(this);
+    RCLCPP_INFO(this->get_logger(), "Aspara analyzer thread initialized");
     
     // ===== 初期化完了ログ =====
     RCLCPP_WARN(this->get_logger(), "All subscribers created successfully");
@@ -240,17 +230,7 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
  * @brief デストラクタ
  * @details リソースの適切な解放を行う
  */
-FvAsparaAnalyzerNode::~FvAsparaAnalyzerNode() 
-{
-    // ワーカースレッド終了処理
-    shutdown_flag_ = true;
-    pointcloud_cv_.notify_all();  // 待機中のスレッドを起こす
-    
-    if (pointcloud_worker_thread_.joinable()) {
-        pointcloud_worker_thread_.join();
-        RCLCPP_INFO(this->get_logger(), "Pointcloud processing worker thread terminated");
-    }
-}
+FvAsparaAnalyzerNode::~FvAsparaAnalyzerNode() {}
 
 /**
  * @brief 2D検出結果のコールバック関数
@@ -275,10 +255,11 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
         detection_fps_meter_->tick(this->now());
     }
     
-    // 深度画像とカメラ情報の可用性チェック
+    // 必要なデータの可用性チェック
     if (!latest_depth_image_ || !latest_camera_info_) {
-        RCLCPP_WARN(this->get_logger(), "Depth image or camera info not available yet. Depth:%s, CI:%s", 
-                   latest_depth_image_ ? "OK" : "NULL", latest_camera_info_ ? "OK" : "NULL");
+        RCLCPP_WARN(this->get_logger(), "Required data not available yet. Depth:%s, CI:%s", 
+                   latest_depth_image_ ? "OK" : "NULL", 
+                   latest_camera_info_ ? "OK" : "NULL");
         return;
     }
 
@@ -317,9 +298,13 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
     }
 
     // AsparaSelectionでID管理とスムーズアニメーションを実行
-    aspara_list_ = aspara_selection_.updateAsparaList(new_detections, aspara_list_);
+    {
+        std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+        aspara_list_ = aspara_selection_.updateAsparaList(new_detections, aspara_list_);
+    }
 
     // 最高信頼度のアスパラガスを処理
+    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
     if (!aspara_list_.empty()) {
         // 距離優先、同じなら信頼度でソート
         std::sort(aspara_list_.begin(), aspara_list_.end(),
@@ -350,7 +335,15 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
             associateAsparagusParts(msg, aspara);
         }
         
-        // 検出情報更新時は点群処理はスキップ（imageCallbackで毎フレーム実行）
+        // 選択中のアスパラを非同期処理に送信
+        if (selected_aspara_id_ != -1 && analyzer_thread_) {
+            for (const auto& aspara : aspara_list_) {
+                if (aspara.id == selected_aspara_id_) {
+                    analyzer_thread_->enqueueAnalysis(aspara);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -483,22 +476,19 @@ bool FvAsparaAnalyzerNode::isAssociatedSpike(const cv::Rect& body_bbox, const cv
  * @param msg 点群データメッセージ
  * @details RealSense等からの3D点群を受信し、解析用データとして保存
  */
-void FvAsparaAnalyzerNode::pointcloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
-{
-    RCLCPP_WARN_ONCE(this->get_logger(), "Pointcloud callback received first pointcloud");
-    latest_pointcloud_ = msg;
-}
+// 点群コールバック（現在未使用 - 深度画像から直接生成）
+// void FvAsparaAnalyzerNode::pointcloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+// {
+//     RCLCPP_WARN_ONCE(this->get_logger(), "Pointcloud callback received first pointcloud");
+//     latest_pointcloud_ = msg;
+// }
 
 /**
  * @brief カメラ情報のコールバック関数
  * @param msg カメラキャリブレーション情報
  * @details カメラの内部パラメータを受信し、3D-2D変換に使用
  */
-void FvAsparaAnalyzerNode::cameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
-{
-    RCLCPP_WARN_ONCE(this->get_logger(), "Camera info callback received first camera info");
-    latest_camera_info_ = msg;
-}
+
 
 /**
  * @brief マスク画像のコールバック関数
@@ -523,27 +513,18 @@ void FvAsparaAnalyzerNode::maskCallback(const sensor_msgs::msg::Image::SharedPtr
 void FvAsparaAnalyzerNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
     RCLCPP_WARN_ONCE(this->get_logger(), "Image callback received first image");
-    latest_color_image_ = msg;
+    {
+        std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+        latest_color_image_ = msg;
+    }
     
     // FPS計測
     if (color_fps_meter_) {
         color_fps_meter_->tick(this->now());
     }
     
-    // アスパラの非同期点群処理をキューに追加（メインスレッドは軽量な処理のみ）
-    if (enable_pointcloud_processing_ && !aspara_list_.empty()) {
-        for (const auto& aspara : aspara_list_) {
-            // 選択中のアスパラは必ず分析、その他は余裕があれば分析
-            bool should_analyze = (aspara.id == selected_aspara_id_) || (selected_aspara_id_ == -1);
-            
-            if (should_analyze) {
-                // 重い点群処理は非同期キューに追加（カクつき回避）
-                enqueueAsparaguProcessing(aspara);
-                
-                RCLCPP_DEBUG(this->get_logger(), "Enqueued asparagus ID %d for async processing", aspara.id);
-            }
-        }
-    }
+    // 重い点群処理はAnalyzerThreadで非同期実行される
+    // imageCallbackでは軽い画像出力のみ実行
     
     // 常に画像を出力する
     // 検出結果がある場合はオーバーレイ付き、ない場合は元画像をそのまま出力
@@ -558,7 +539,10 @@ void FvAsparaAnalyzerNode::imageCallback(const sensor_msgs::msg::Image::SharedPt
 void FvAsparaAnalyzerNode::depthCallback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
     RCLCPP_WARN_ONCE(this->get_logger(), "Depth callback received first depth image");
-    latest_depth_image_ = msg;
+    {
+        std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+        latest_depth_image_ = msg;
+    }
     
     // FPS計測
     if (depth_fps_meter_) {
@@ -566,615 +550,36 @@ void FvAsparaAnalyzerNode::depthCallback(const sensor_msgs::msg::Image::SharedPt
     }
 }
 
-/**
- * @brief 深度画像から効率的に点群を生成
- * @param bbox 2Dバウンディングボックス
- * @return フィルタリング済み点群
- * @details バウンディングボックス内の深度ピクセルのみを3D点に変換
- */
-pcl::PointCloud<pcl::PointXYZRGB>::Ptr FvAsparaAnalyzerNode::extractPointCloudFromDepth(
-    const cv::Rect& bbox)
-{
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-    
-    if (!latest_depth_image_ || !latest_camera_info_ || !latest_color_image_) {
-        return cloud;
-    }
-    
-    // 深度画像とカラー画像をOpenCV形式に変換
-    cv::Mat depth_image;
-    cv::Mat color_image;
-    
-    try {
-        // 深度画像の変換
-        cv_bridge::CvImagePtr depth_ptr;
-        if (latest_depth_image_->encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
-            depth_ptr = cv_bridge::toCvCopy(latest_depth_image_, sensor_msgs::image_encodings::TYPE_16UC1);
-            depth_image = depth_ptr->image;
-        } else if (latest_depth_image_->encoding == sensor_msgs::image_encodings::TYPE_32FC1) {
-            depth_ptr = cv_bridge::toCvCopy(latest_depth_image_, sensor_msgs::image_encodings::TYPE_32FC1);
-            depth_ptr->image.convertTo(depth_image, CV_16UC1, 1000.0); // メートルをミリメートルに変換
-        } else {
-            RCLCPP_WARN(this->get_logger(), "Unsupported depth encoding: %s", latest_depth_image_->encoding.c_str());
-            return cloud;
-        }
-        
-        // カラー画像の変換
-        cv_bridge::CvImagePtr color_ptr = cv_bridge::toCvCopy(latest_color_image_, sensor_msgs::image_encodings::BGR8);
-        color_image = color_ptr->image;
-        
-    } catch (cv_bridge::Exception& e) {
-        RCLCPP_ERROR(this->get_logger(), "CV bridge exception in extractPointCloudFromDepth: %s", e.what());
-        return cloud;
-    }
-    
-    // 画像サイズの一致確認
-    if (depth_image.rows != color_image.rows || depth_image.cols != color_image.cols) {
-        RCLCPP_WARN(this->get_logger(), 
-                    "Depth and color image size mismatch: depth(%dx%d) vs color(%dx%d)",
-                    depth_image.cols, depth_image.rows, color_image.cols, color_image.rows);
-        return cloud;
-    }
-    
-    // カメラパラメータの取得と有効性チェック
-    double fx = latest_camera_info_->k[0];
-    double fy = latest_camera_info_->k[4];
-    double cx = latest_camera_info_->k[2];
-    double cy = latest_camera_info_->k[5];
-    
-    // 0除算の回避
-    if (fx <= 0.0 || fy <= 0.0) {
-        RCLCPP_ERROR(this->get_logger(), "Invalid camera parameters: fx=%.3f, fy=%.3f", fx, fy);
-        return cloud;
-    }
-    
-    // バウンディングボックスの有効性確認と範囲クリップ
-    if (bbox.width <= 0 || bbox.height <= 0) {
-        RCLCPP_WARN(this->get_logger(), "Invalid bounding box size: %dx%d", bbox.width, bbox.height);
-        return cloud;
-    }
-    
-    int x_start = std::max(0, bbox.x);
-    int y_start = std::max(0, bbox.y);
-    int x_end = std::min(depth_image.cols, bbox.x + bbox.width);
-    int y_end = std::min(depth_image.rows, bbox.y + bbox.height);
-    
-    // クリップ後のサイズ確認
-    if (x_start >= x_end || y_start >= y_end) {
-        RCLCPP_WARN(this->get_logger(), 
-                    "Bounding box outside image bounds: bbox(%d,%d,%d,%d), image(%dx%d)",
-                    bbox.x, bbox.y, bbox.width, bbox.height, depth_image.cols, depth_image.rows);
-        return cloud;
-    }
-    
-    // バウンディングボックス内のピクセルのみを処理
-    for (int v = y_start; v < y_end; v++) {
-        for (int u = x_start; u < x_end; u++) {
-            // 深度値を取得（単位：mm）
-            uint16_t depth_mm = depth_image.at<uint16_t>(v, u);
-            
-            // 無効な深度値をスキップ
-            if (depth_mm == 0) continue;
-            
-            // メートルに変換
-            float depth_m = depth_mm / 1000.0f;
-            
-            // 距離フィルタリング
-            if (depth_m < pointcloud_distance_min_ || depth_m > pointcloud_distance_max_) {
-                continue;
-            }
-            
-            // 3D座標を計算（カメラ座標系）
-            pcl::PointXYZRGB point;
-            point.z = depth_m;
-            point.x = (u - cx) * depth_m / fx;
-            point.y = (v - cy) * depth_m / fy;
-            
-            // カラー情報を追加
-            cv::Vec3b color = color_image.at<cv::Vec3b>(v, u);
-            point.b = color[0];
-            point.g = color[1];
-            point.r = color[2];
-            
-            cloud->points.push_back(point);
-        }
-    }
-    
-    // 点群のメタデータを設定
-    cloud->width = cloud->points.size();
-    cloud->height = 1;
-    cloud->is_dense = false;
-    
-    RCLCPP_DEBUG(this->get_logger(), "Extracted %zu points from depth image bbox", cloud->points.size());
-    
-    return cloud;
-}
 
-/**
- * @brief 3D点を2D画像座標に投影
- * @param point 3D点
- * @param camera_info カメラ情報
- * @return 2D画像座標
- * @details カメラの内部パラメータを使用して3D-2D変換
- * 
- * 変換処理：
- * - カメラ内部パラメータ（fx, fy, cx, cy）を使用
- * - レンズ歪み補正を適用（k1, k2, p1, p2, k3）
- * - 正規化座標での歪み補正
- */
-cv::Point2f FvAsparaAnalyzerNode::project3DTo2D(
-    const pcl::PointXYZRGB& point,
-    const sensor_msgs::msg::CameraInfo& camera_info)
-{
-    // カメラ内部パラメータ
-    double fx = camera_info.k[0];  // K[0,0] - 焦点距離X
-    double fy = camera_info.k[4];  // K[1,1] - 焦点距離Y
-    double cx = camera_info.k[2];  // K[0,2] - 光学中心X
-    double cy = camera_info.k[5];  // K[1,2] - 光学中心Y
 
-    // 3D点を2Dに投影
-    double u = (point.x * fx / point.z) + cx;
-    double v = (point.y * fy / point.z) + cy;
 
-    // レンズ歪み補正（必要に応じて）
-    if (!camera_info.d.empty()) {
-        double k1 = camera_info.d[0];  // 半径方向歪み係数1
-        double k2 = camera_info.d[1];  // 半径方向歪み係数2
-        double p1 = camera_info.d[2];  // 接線方向歪み係数1
-        double p2 = camera_info.d[3];  // 接線方向歪み係数2
-        double k3 = (camera_info.d.size() > 4) ? camera_info.d[4] : 0.0;  // 半径方向歪み係数3
 
-        // 正規化座標
-        double x_norm = (u - cx) / fx;
-        double y_norm = (v - cy) / fy;
-        
-        double r2 = x_norm * x_norm + y_norm * y_norm;  // 半径の2乗
-        double r4 = r2 * r2;                            // 半径の4乗
-        double r6 = r4 * r2;                            // 半径の6乗
 
-        // 半径方向歪み
-        double radial_distortion = 1 + k1 * r2 + k2 * r4 + k3 * r6;
 
-        // 接線方向歪み
-        double dx = 2 * p1 * x_norm * y_norm + p2 * (r2 + 2 * x_norm * x_norm);
-        double dy = p1 * (r2 + 2 * y_norm * y_norm) + 2 * p2 * x_norm * y_norm;
 
-        // 歪み補正を適用
-        x_norm = x_norm * radial_distortion + dx;
-        y_norm = y_norm * radial_distortion + dy;
 
-        // ピクセル座標に戻す
-        u = x_norm * fx + cx;
-        v = y_norm * fy + cy;
-    }
 
-    return cv::Point2f(static_cast<float>(u), static_cast<float>(v));
-}
 
-/**
- * @brief バウンディングボックスで点群をフィルタリング
- * @param input_cloud 入力点群
- * @param bbox 2Dバウンディングボックス
- * @param camera_info カメラ情報
- * @return フィルタリング済み点群
- * @details 2D検出領域に対応する3D点群を抽出
- * 
- * フィルタリング処理：
- * - 無効点の除去（NaN、無限大値）
- * - 距離フィルタリング（設定範囲内）
- * - 3D-2D投影によるバウンディングボックス内の点抽出
- */
-pcl::PointCloud<pcl::PointXYZRGB>::Ptr FvAsparaAnalyzerNode::filterPointCloudByBoundingBox(
-    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& input_cloud,
-    const cv::Rect& bbox,
-    const sensor_msgs::msg::CameraInfo& camera_info)
-{
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
 
-    for (const auto& point : input_cloud->points) {
-        // 無効点をスキップ
-        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
-            continue;
-        }
 
-        // 距離フィルタリング
-        float distance = std::sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
-        if (distance < pointcloud_distance_min_ || distance > pointcloud_distance_max_) {
-            continue;
-        }
 
-        // 2Dに投影
-        cv::Point2f projected = project3DTo2D(point, camera_info);
 
-        // バウンディングボックス内かチェック
-        if (bbox.contains(cv::Point(static_cast<int>(projected.x), static_cast<int>(projected.y)))) {
-            filtered_cloud->points.push_back(point);
-        }
-    }
 
-    // 点群のメタデータを設定
-    filtered_cloud->width = filtered_cloud->points.size();
-    filtered_cloud->height = 1;
-    filtered_cloud->is_dense = false;
 
-    return filtered_cloud;
-}
 
-/**
- * @brief 点群のノイズ除去処理
- * @param input_cloud 入力点群
- * @return ノイズ除去済み点群
- * @details 統計的外れ値除去とボクセルグリッドフィルタを適用
- * 
- * ノイズ除去処理：
- * - ボクセルグリッドフィルタ（ダウンサンプリング）
- * - 統計的外れ値除去（ノイズ除去）
- * - 点群密度に応じた適応的処理
- */
-pcl::PointCloud<pcl::PointXYZRGB>::Ptr FvAsparaAnalyzerNode::applyNoiseReduction(
-    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& input_cloud)
-{
-    // 点群サイズチェック
-    if (input_cloud->points.size() < 10) {
-        RCLCPP_WARN(this->get_logger(), "Too few points for noise reduction");
-        return input_cloud;
-    }
 
-    // ステップ1: ボクセルグリッドフィルタ（ダウンサンプリング）
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr voxel_filtered(new pcl::PointCloud<pcl::PointXYZRGB>);
-    pcl::VoxelGrid<pcl::PointXYZRGB> voxel_filter;
-    voxel_filter.setInputCloud(input_cloud);
-    voxel_filter.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
-    voxel_filter.filter(*voxel_filtered);
 
-    if (voxel_filtered->points.size() < 10) {
-        RCLCPP_WARN(this->get_logger(), "Too few points after voxel filtering");
-        return voxel_filtered;
-    }
 
-    // ステップ2: 統計的外れ値除去
-    pcl::PointCloud<pcl::PointXYZRGB>::Ptr denoised_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
-    pcl::StatisticalOutlierRemoval<pcl::PointXYZRGB> statistical_filter;
-    statistical_filter.setInputCloud(voxel_filtered);
-    statistical_filter.setMeanK(noise_reduction_neighbors_);
-    statistical_filter.setStddevMulThresh(noise_reduction_std_dev_);
-    statistical_filter.filter(*denoised_cloud);
 
-    // デバッグログ
-    RCLCPP_DEBUG(this->get_logger(), 
-                 "Noise reduction: %zu -> %zu -> %zu points",
-                 input_cloud->points.size(),
-                 voxel_filtered->points.size(),
-                 denoised_cloud->points.size());
 
-    return denoised_cloud;
-}
 
-/**
- * @brief アスパラガスの根元位置を推定
- * @param aspara_cloud アスパラガス点群
- * @return 根元の3D座標
- * @details 点群の下端部から根元位置を推定
- * 
- * 推定方法：
- * - Z座標の最小値を根元位置として使用
- * - 地面との交点計算は将来的に実装予定
- */
-geometry_msgs::msg::Point FvAsparaAnalyzerNode::estimateRootPosition(
-    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& aspara_cloud)
-{
-    geometry_msgs::msg::Point root_position;
-    
-    if (aspara_cloud->points.empty()) {
-        return root_position;
-    }
 
-    // Z座標の最小値を根元位置として使用
-    float min_z = std::numeric_limits<float>::max();
-    pcl::PointXYZRGB root_point;
-    
-    for (const auto& point : aspara_cloud->points) {
-        if (point.z < min_z) {
-            min_z = point.z;
-            root_point = point;
-        }
-    }
 
-    root_position.x = root_point.x;
-    root_position.y = root_point.y;
-    root_position.z = root_point.z;
 
-    return root_position;
-}
 
-/**
- * @brief アスパラガスの真っ直ぐ度を計算
- * @param aspara_cloud アスパラガス点群
- * @return 真っ直ぐ度（0.0-1.0）
- * @details PCAの第1主成分の分散から直線性を評価
- * 
- * 計算方法：
- * - 主成分分析（PCA）を実行
- * - 第1主成分の固有値の比率を計算
- * - 高値ほど直線的（真っ直ぐ）
- */
-float FvAsparaAnalyzerNode::calculateStraightness(
-    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& aspara_cloud)
-{
-    if (aspara_cloud->points.size() < 3) {
-        return 0.0f;
-    }
 
-    // PCAによる真っ直ぐ度計算
-    pcl::PCA<pcl::PointXYZRGB> pca;
-    pca.setInputCloud(aspara_cloud);
-    
-    Eigen::Vector3f eigenvalues = pca.getEigenValues();
-    
-    // 真っ直ぐ度 = 最大固有値 / 全固有値の和
-    if (eigenvalues[1] == 0.0f) {
-        return 1.0f;  // 完全な直線
-    }
-    
-    float straightness = eigenvalues[0] / (eigenvalues[0] + eigenvalues[1] + eigenvalues[2]);
-    return std::min(1.0f, straightness);
-}
 
-/**
- * @brief アスパラガスの長さを計算
- * @param aspara_cloud アスパラガス点群
- * @return 長さ（メートル）
- * @details 点群の主軸方向の最大距離を計算
- * 
- * 計算方法：
- * - Z軸方向の最大・最小値を取得
- * - その差を長さとして使用
- * - 将来的には曲線長の計算を実装予定
- */
-float FvAsparaAnalyzerNode::calculateLength(
-    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& aspara_cloud)
-{
-    if (aspara_cloud->points.size() < 2) {
-        return 0.0f;
-    }
 
-    // Z軸方向の最大・最小値を取得
-    float min_val = std::numeric_limits<float>::max();
-    float max_val = std::numeric_limits<float>::lowest();
-
-    for (const auto& point : aspara_cloud->points) {
-        float z = point.z;  // Z軸を主軸として仮定
-        if (z < min_val) min_val = z;
-        if (z > max_val) max_val = z;
-    }
-
-    return std::abs(max_val - min_val);
-}
-
-/**
- * @brief PCA直線を生成
- * @param aspara_cloud アスパラガス点群
- * @return PCA直線の点群
- * @details 主成分分析による直線近似を生成
- * 
- * 生成処理：
- * - PCAで主成分軸を計算
- * - データの投影範囲を取得
- * - 直線上に等間隔でポイントを生成
- * - 可視化用のデバッグデータとして使用
- */
-pcl::PointCloud<pcl::PointXYZ>::Ptr FvAsparaAnalyzerNode::generatePCALine(
-    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& aspara_cloud)
-{
-    pcl::PointCloud<pcl::PointXYZ>::Ptr pca_line(new pcl::PointCloud<pcl::PointXYZ>);
-    
-    if (aspara_cloud->points.size() < 3) {
-        return pca_line;
-    }
-
-    // PCA計算
-    pcl::PCA<pcl::PointXYZRGB> pca;
-    pca.setInputCloud(aspara_cloud);
-    
-    // 主成分軸とデータの範囲を取得
-    Eigen::Vector4f centroid = pca.getMean();
-    Eigen::Vector3f principal_axis = pca.getEigenVectors().col(0); // 第1主成分
-    
-    // データの投影範囲を計算
-    float min_proj = std::numeric_limits<float>::max();
-    float max_proj = std::numeric_limits<float>::lowest();
-    
-    for (const auto& point : aspara_cloud->points) {
-        Eigen::Vector3f p(point.x, point.y, point.z);
-        Eigen::Vector3f centered = p - centroid.head<3>();
-        float projection = centered.dot(principal_axis);
-        
-        if (projection < min_proj) min_proj = projection;
-        if (projection > max_proj) max_proj = projection;
-    }
-    
-    // PCAライン上に等間隔でポイントを生成
-    int num_points = 50; // ライン解像度
-    for (int i = 0; i < num_points; ++i) {
-        float t = min_proj + (max_proj - min_proj) * i / (num_points - 1);
-        Eigen::Vector3f line_point = centroid.head<3>() + t * principal_axis;
-        
-        pcl::PointXYZ point;
-        point.x = line_point.x();
-        point.y = line_point.y();
-        point.z = line_point.z();
-        
-        pca_line->points.push_back(point);
-    }
-    
-    // 点群のメタデータを設定
-    pca_line->width = pca_line->points.size();
-    pca_line->height = 1;
-    pca_line->is_dense = false;
-    
-    return pca_line;
-}
-
-/**
- * @brief アスパラガス情報の処理
- * @param aspara_info アスパラガス情報
- * @details 品質評価と収穫判定の実行
- * 
- * 処理フロー：
- * - 点群フィルタリング
- * - ノイズ除去
- * - 品質評価（長さ、真っ直ぐ度）
- * - 収穫適性判定
- * - 結果の可視化とパブリッシュ
- */
-void FvAsparaAnalyzerNode::processAsparagus(const AsparaInfo& aspara_info)
-{
-    RCLCPP_WARN(this->get_logger(), "Processing asparagus %d with confidence %.3f", aspara_info.id, aspara_info.confidence);
-    
-    try {
-        // 全体処理時間の計測開始
-        fluent::utils::Stopwatch total_stopwatch;
-    
-    // mutableなコピーを作成して処理時間を記録できるようにする
-    AsparaInfo mutable_aspara_info = aspara_info;
-    
-    if (!latest_color_image_) {
-        RCLCPP_WARN(this->get_logger(), "Color image not available yet");
-        return;
-    }
-
-    // 深度画像から効率的に点群を抽出（バウンディングボックス内のみ）
-    fluent::utils::Stopwatch filter_stopwatch;
-    auto filtered_cloud = extractPointCloudFromDepth(aspara_info.bounding_box_2d);
-    mutable_aspara_info.processing_times.filter_bbox_ms = filter_stopwatch.elapsed_ms();
-    
-    if (filtered_cloud->points.empty()) {
-        RCLCPP_WARN(this->get_logger(), "No points found in bounding box");
-        return;
-    }
-
-    // ノイズ除去
-    fluent::utils::Stopwatch noise_stopwatch;
-    auto denoised_cloud = applyNoiseReduction(filtered_cloud);
-    mutable_aspara_info.processing_times.noise_reduction_ms = noise_stopwatch.elapsed_ms();
-
-    if (denoised_cloud->points.empty()) {
-        RCLCPP_WARN(this->get_logger(), "No points left after noise reduction");
-        return;
-    }
-
-    // アスパラガス特性を計算
-    fluent::utils::Stopwatch measurement_stopwatch;
-    auto root_position = estimateRootPosition(denoised_cloud);
-    float straightness = calculateStraightness(denoised_cloud);
-    float length = calculateLength(denoised_cloud);
-    mutable_aspara_info.processing_times.measurement_ms = measurement_stopwatch.elapsed_ms();
-    
-    // 可視化用PCAラインを生成
-    fluent::utils::Stopwatch pca_stopwatch;
-    auto pca_line = generatePCALine(denoised_cloud);
-    mutable_aspara_info.processing_times.pca_calculation_ms = pca_stopwatch.elapsed_ms();
-
-    // 収穫適性を判定
-    bool is_harvestable = (length >= harvest_min_length_ && 
-                          length <= harvest_max_length_ && 
-                          straightness >= straightness_threshold_);
-
-    // カラー画像をcv::Matに変換
-    cv::Mat color_image;
-    try {
-        cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(latest_color_image_, sensor_msgs::image_encodings::BGR8);
-        color_image = cv_ptr->image;
-    } catch (cv_bridge::Exception& e) {
-        RCLCPP_ERROR(this->get_logger(), "CV bridge exception: %s", e.what());
-        return;
-    }
-
-    // 可視化処理時間の計測
-    fluent::utils::Stopwatch vis_stopwatch;
-    
-    // 結果をパブリッシュ
-    publishFilteredPointCloud(denoised_cloud, latest_pointcloud_->header.frame_id, aspara_info.id);
-    publishRootTF(root_position, latest_pointcloud_->header.frame_id, aspara_info.id);
-    
-    // 全体処理時間を記録
-    mutable_aspara_info.processing_times.total_ms = total_stopwatch.elapsed_ms();
-    mutable_aspara_info.processing_times.visualization_ms = vis_stopwatch.elapsed_ms();
-    
-    publishAnnotatedImage(color_image, mutable_aspara_info, denoised_cloud, pca_line, length, straightness, is_harvestable);
-
-    // 結果ログ出力（処理時間含む）
-    RCLCPP_INFO(this->get_logger(), 
-                "Aspara ID:%d, Confidence:%.2f, Length:%.3fm, Straightness:%.2f, Harvestable:%s, Total:%.1fms (Filter:%.1fms, Noise:%.1fms, PCA:%.1fms)",
-                aspara_info.id, aspara_info.confidence, length, straightness, 
-                is_harvestable ? "YES" : "NO",
-                mutable_aspara_info.processing_times.total_ms,
-                mutable_aspara_info.processing_times.filter_bbox_ms,
-                mutable_aspara_info.processing_times.noise_reduction_ms,
-                mutable_aspara_info.processing_times.pca_calculation_ms);
-                
-    } catch (const cv_bridge::Exception& e) {
-        RCLCPP_ERROR(this->get_logger(), "CV bridge exception in processAsparagus (ID:%d): %s", aspara_info.id, e.what());
-        return;
-    } catch (const pcl::PCLException& e) {
-        RCLCPP_ERROR(this->get_logger(), "PCL exception in processAsparagus (ID:%d): %s", aspara_info.id, e.what());
-        return;
-    } catch (const std::exception& e) {
-        RCLCPP_ERROR(this->get_logger(), "Standard exception in processAsparagus (ID:%d): %s", aspara_info.id, e.what());
-        return;
-    } catch (...) {
-        RCLCPP_ERROR(this->get_logger(), "Unknown exception in processAsparagus (ID:%d)", aspara_info.id);
-        return;
-    }
-}
-
-/**
- * @brief フィルタリング済み点群をパブリッシュ
- * @param cloud 点群データ
- * @param frame_id 座標系ID
- * @param aspara_id アスパラガスID
- * @details デバッグ用の可視化データを出力
- */
-void FvAsparaAnalyzerNode::publishFilteredPointCloud(
-    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
-    const std::string& frame_id,
-    int /*aspara_id*/)
-{
-    sensor_msgs::msg::PointCloud2 output_msg;
-    pcl::toROSMsg(*cloud, output_msg);
-    output_msg.header.stamp = this->now();
-    output_msg.header.frame_id = frame_id;
-    
-    filtered_pointcloud_pub_->publish(output_msg);
-}
-
-/**
- * @brief 根元位置のTF座標をパブリッシュ
- * @param root_position 根元位置
- * @param frame_id 座標系ID
- * @param aspara_id アスパラガスID
- * @details ロボット制御用の座標変換情報を出力
- */
-void FvAsparaAnalyzerNode::publishRootTF(
-    const geometry_msgs::msg::Point& root_position,
-    const std::string& frame_id,
-    int aspara_id)
-{
-    geometry_msgs::msg::TransformStamped transform_stamped;
-    transform_stamped.header.stamp = this->now();
-    transform_stamped.header.frame_id = frame_id;
-    transform_stamped.child_frame_id = "aspara_" + std::to_string(aspara_id) + "_root";
-    
-    transform_stamped.transform.translation.x = root_position.x;
-    transform_stamped.transform.translation.y = root_position.y;
-    transform_stamped.transform.translation.z = root_position.z;
-    transform_stamped.transform.rotation.x = 0.0;
-    transform_stamped.transform.rotation.y = 0.0;
-    transform_stamped.transform.rotation.z = 0.0;
-    transform_stamped.transform.rotation.w = 1.0;
-    
-    tf_broadcaster_->sendTransform(transform_stamped);
-}
 
 /**
  * @brief 現在の画像を出力（検出結果がある場合はオーバーレイ付き）
@@ -1198,31 +603,22 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     
     cv::Mat output_image = color_image.clone();
     
-    // FPS計算用（static変数で状態保持）
+    // FPS計算用（FPSMeterを使用）
     static auto last_time = std::chrono::high_resolution_clock::now();
     static auto last_detection_time = std::chrono::high_resolution_clock::now();
-    static float publish_fps = 0.0f;
-    static int frame_counter = 0;
-    static std::chrono::time_point<std::chrono::high_resolution_clock> fps_update_time = std::chrono::high_resolution_clock::now();
     
     // 現在時刻取得
     auto current_time = std::chrono::high_resolution_clock::now();
     auto delta_time = std::chrono::duration<float>(current_time - last_time).count();
     last_time = current_time;
     
-    // FPS計算（1秒ごとに更新）
-    frame_counter++;
-    auto fps_elapsed = std::chrono::duration<float>(current_time - fps_update_time).count();
-    if (fps_elapsed >= 1.0f) {
-        publish_fps = frame_counter / fps_elapsed;
-        frame_counter = 0;
-        fps_update_time = current_time;
-    }
-    
-    // アニメーション更新（60FPS = 16.67ms）
-    const float animation_speed = 0.15f; // スムージング係数
+    // アニメーション更新（実際のFPSに基づいて調整）
+    // delta_timeを使って、フレームレート非依存のスムージングを実現
+    const float target_smoothing_time = 0.1f;  // 100msで目標値に収束
+    const float animation_speed = std::min(1.0f, delta_time / target_smoothing_time);
     
     // 検出結果の描画
+    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
     if (!aspara_list_.empty() && latest_camera_info_) {
         last_detection_time = current_time;
         
@@ -1237,176 +633,96 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         for (auto& aspara_info : aspara_list_) {
             bool is_selected = (aspara_info.id == selected_aspara_id_);
             
-            // スムーズアニメーション計算
+            // アニメーション更新
             if (aspara_info.is_new) {
                 aspara_info.smooth_bbox = aspara_info.bounding_box_2d;
                 aspara_info.animation_alpha = 0.0f;
                 aspara_info.is_new = false;
             } else {
-                // バウンディングボックスのスムージング（線形補間）
-                aspara_info.smooth_bbox.x = aspara_info.smooth_bbox.x + 
-                    (aspara_info.bounding_box_2d.x - aspara_info.smooth_bbox.x) * animation_speed;
-                aspara_info.smooth_bbox.y = aspara_info.smooth_bbox.y + 
-                    (aspara_info.bounding_box_2d.y - aspara_info.smooth_bbox.y) * animation_speed;
-                aspara_info.smooth_bbox.width = aspara_info.smooth_bbox.width + 
-                    (aspara_info.bounding_box_2d.width - aspara_info.smooth_bbox.width) * animation_speed;
-                aspara_info.smooth_bbox.height = aspara_info.smooth_bbox.height + 
-                    (aspara_info.bounding_box_2d.height - aspara_info.smooth_bbox.height) * animation_speed;
-                
-                // フェードインアニメーション
-                if (aspara_info.animation_alpha < 1.0f) {
-                    aspara_info.animation_alpha = std::min(1.0f, aspara_info.animation_alpha + delta_time * 3.0f);
-                }
+                // Lerp補間でスムージング
+                auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+                aspara_info.smooth_bbox.x = lerp(aspara_info.smooth_bbox.x, aspara_info.bounding_box_2d.x, animation_speed);
+                aspara_info.smooth_bbox.y = lerp(aspara_info.smooth_bbox.y, aspara_info.bounding_box_2d.y, animation_speed);
+                aspara_info.smooth_bbox.width = lerp(aspara_info.smooth_bbox.width, aspara_info.bounding_box_2d.width, animation_speed);
+                aspara_info.smooth_bbox.height = lerp(aspara_info.smooth_bbox.height, aspara_info.bounding_box_2d.height, animation_speed);
+                aspara_info.animation_alpha = std::min(1.0f, aspara_info.animation_alpha + delta_time * 3.0f);
             }
             
-            // 選択中のアスパラガスの点群を保存
-            if (is_selected && aspara_info.filtered_pointcloud.data.size() > 0) {
-                // 点群をPCLフォーマットに変換
-                pcl::fromROSMsg(aspara_info.filtered_pointcloud, *selected_pointcloud_);
-                
-                // 選択中の点群をパブリッシュ
-                sensor_msgs::msg::PointCloud2 selected_msg;
-                pcl::toROSMsg(*selected_pointcloud_, selected_msg);
-                selected_msg.header = latest_color_image_->header;
-                selected_pointcloud_pub_->publish(selected_msg);
-            }
+            // 描画設定
+            cv::Scalar color = is_selected ? cv::Scalar(0, 255, 0) : cv::Scalar(128, 128, 128);
+            int thickness = is_selected ? 2 : 1;
             
-            // 半透明オーバーレイ用の一時画像
-            cv::Mat overlay = output_image.clone();
+            // バウンディングボックス描画
+            cv::rectangle(output_image, aspara_info.smooth_bbox, color, thickness);
             
-            // 色とアルファ値の設定
-            cv::Scalar bbox_color;
-            float alpha;
-            
+            // ラベル描画（選択中のみ詳細表示）
             if (is_selected) {
-                // 選択中：緑色、半透明
-                bbox_color = cv::Scalar(0, 255, 0); // 緑色（BGR）
-                alpha = 0.3f * aspara_info.animation_alpha; // より透明に
+                std::string label = cv::format("#%d (%.0f%%)", aspara_info.id, aspara_info.confidence * 100);
+                int baseline;
+                cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.6, 1, &baseline);
                 
-                // バウンディングボックス塗りつぶし（半透明）
-                cv::rectangle(overlay, aspara_info.smooth_bbox, bbox_color, -1);
-                cv::addWeighted(overlay, alpha, output_image, 1.0 - alpha, 0, output_image);
+                // 背景ボックス
+                cv::Point text_pos(aspara_info.smooth_bbox.x, aspara_info.smooth_bbox.y - 5);
+                cv::rectangle(output_image, 
+                    cv::Rect(text_pos.x, text_pos.y - text_size.height - 3, text_size.width + 6, text_size.height + 6),
+                    color, -1);
                 
-                // 枠線（不透明）
-                cv::rectangle(output_image, aspara_info.smooth_bbox, bbox_color, 2);
-                
-                // クラス名と信頼度を緑色で表示
-                int y_offset = aspara_info.smooth_bbox.y - 10;
-                if (y_offset < 30) {
-                    y_offset = aspara_info.smooth_bbox.y + aspara_info.smooth_bbox.height + 30;
-                }
-                
-                std::string class_name = cv::format("Asparagus #%d", aspara_info.id);
-                std::string confidence_text = cv::format("%.1f%%", aspara_info.confidence * 100);
-                
-                // テキスト描画（影付き、背景なし、サイズ大きめ）
-                cv::Point shadow_offset(2, 2);
-                
-                // クラス名
-                cv::putText(output_image, class_name,
-                    cv::Point(aspara_info.smooth_bbox.x, y_offset) + shadow_offset, 
-                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 1);
-                cv::putText(output_image, class_name,
-                    cv::Point(aspara_info.smooth_bbox.x, y_offset), 
-                    cv::FONT_HERSHEY_SIMPLEX, 0.8, bbox_color, 1);
-                    
-                // 信頼度
-                cv::putText(output_image, confidence_text,
-                    cv::Point(aspara_info.smooth_bbox.x, y_offset + 30) + shadow_offset, 
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 1);
-                cv::putText(output_image, confidence_text,
-                    cv::Point(aspara_info.smooth_bbox.x, y_offset + 30), 
-                    cv::FONT_HERSHEY_SIMPLEX, 0.7, bbox_color, 1);
-                    
-            } else {
-                // 選択されていない：モノクロ、80%透過
-                alpha = 0.2f * aspara_info.animation_alpha; // 80%透過 = 20%不透明
-                
-                // モノクロ変換用のROI
-                cv::Rect roi = aspara_info.smooth_bbox;
-                // 画像境界チェック
-                roi.x = std::max(0, roi.x);
-                roi.y = std::max(0, roi.y);
-                roi.width = std::min(roi.width, output_image.cols - roi.x);
-                roi.height = std::min(roi.height, output_image.rows - roi.y);
-                
-                if (roi.width > 0 && roi.height > 0) {
-                    cv::Mat roi_color = output_image(roi);
-                    cv::Mat roi_gray;
-                    cv::cvtColor(roi_color, roi_gray, cv::COLOR_BGR2GRAY);
-                    cv::cvtColor(roi_gray, roi_gray, cv::COLOR_GRAY2BGR);
-                    
-                    // モノクロ領域を80%透過でブレンド
-                    cv::addWeighted(roi_gray, alpha, roi_color, 1.0 - alpha, 0, roi_color);
-                    
-                    // グレーの枠線
-                    cv::rectangle(output_image, aspara_info.smooth_bbox, cv::Scalar(128, 128, 128), 1);
-                }
+                // テキスト
+                cv::putText(output_image, label, cv::Point(text_pos.x + 3, text_pos.y), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 1);
             }
             
             aspara_info.frame_count++;
         }
     } else {
         // 未検出の場合
-        Image::from(output_image).text("未検出", 10, 250);
+        cv::putText(output_image, "未検出", cv::Point(10, 250), 
+                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(128, 128, 128), 2);
         selected_aspara_id_ = -1; // 選択解除
     }
     
-    // FPS情報を左上に表示（位置を調整して重ならないように）
-    cv::Point text_pos(15, 40);  // 左に余白、上にも余裕を持たせる
+    // FPS情報を左上に表示
+    auto img = Image::from(output_image);  // 一度だけImage作成
+    int y_pos = 40;
     
     // カメラFPS（FPSMeterから実測値を取得）
     float actual_color_fps = color_fps_meter_ ? color_fps_meter_->getCurrentFPS() : 0.0f;
     float actual_depth_fps = depth_fps_meter_ ? depth_fps_meter_->getCurrentFPS() : 0.0f;
     float actual_detection_fps = detection_fps_meter_ ? detection_fps_meter_->getCurrentFPS() : 0.0f;
     
-    Image::from(output_image).text(cv::format("Color: %.0fFPS", actual_color_fps), text_pos.x, text_pos.y);
+    // FPS情報表示
+    img.text(cv::format("Color: %.0fFPS", actual_color_fps), 15, y_pos);
+    y_pos += 40;
+    img.text(cv::format("Depth: %.0fFPS", actual_depth_fps), 15, y_pos);
+    y_pos += 40;
+    img.text(cv::format("Output: %.1fFPS", actual_color_fps), 15, y_pos);
+    y_pos += 40;
+    img.text(cv::format("物体検知: %.1fFPS", actual_detection_fps), 15, y_pos);
+    y_pos += 40;
     
-    text_pos.y += 40;  // 行間を広げる
-    Image::from(output_image).text(cv::format("Depth: %.0fFPS", actual_depth_fps), text_pos.x, text_pos.y);
-    
-    // 出力FPS
-    text_pos.y += 40;
-    Image::from(output_image).text(cv::format("Output: %.1fFPS", publish_fps), text_pos.x, text_pos.y);
-    
-    // 物体検知FPS
-    text_pos.y += 40;
-    Image::from(output_image).text(cv::format("物体検知: %.1fFPS", actual_detection_fps), text_pos.x, text_pos.y);
-        
     // 検出処理時間
-    text_pos.y += 40;
     double detection_time_ms = detection_stopwatch_.elapsed_ms();
-    Image::from(output_image).text(cv::format("処理時間: %.1fms", detection_time_ms), text_pos.x, text_pos.y);
+    img.text(cv::format("処理時間: %.1fms", detection_time_ms), 15, y_pos);
+    y_pos += 40;
     
-    // 検出数の詳細（アスパラと稂を分けて表示）
-    text_pos.y += 40;
-    
-    // アスパラガス本体と穂の数を数える
+    // 検出数の詳細
     size_t aspara_count = aspara_list_.size();
     size_t spike_count = 0;
-    
-    // 各アスパラの穂情報から穂数を計算
     for (const auto& aspara : aspara_list_) {
         spike_count += aspara.spike_parts.size();
     }
     
-    std::string detection_text;
-    if (aspara_count > 0 || spike_count > 0) {
-        detection_text = cv::format("検出数: アスパラ:%zu 穂:%zu", aspara_count, spike_count);
-    } else {
-        detection_text = "検出数: なし";
-    }
-    
-    Image::from(output_image).text(detection_text, text_pos.x, text_pos.y);
+    std::string detection_text = (aspara_count > 0 || spike_count > 0) 
+        ? cv::format("検出数: アスパラ:%zu 穂:%zu", aspara_count, spike_count)
+        : "検出数: なし";
+    img.text(detection_text, 15, y_pos);
     
     // 選択中のアスパラの分析時間を表示
     if (selected_aspara_id_ != -1 && enable_pointcloud_processing_) {
-        text_pos.y += 40;
+        y_pos += 40;
         for (const auto& aspara : aspara_list_) {
             if (aspara.id == selected_aspara_id_) {
-                double analysis_time = aspara.processing_times.total_ms;
-                std::string analysis_text = cv::format("アスパラ#%d分析: %.1fms", aspara.id, analysis_time);
-                Image::from(output_image).text(analysis_text, text_pos.x, text_pos.y);
+                img.text(cv::format("アスパラ#%d分析: %.1fms", aspara.id, aspara.processing_times.total_ms), 15, y_pos);
                 break;
             }
         }
@@ -1426,108 +742,6 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
 }
 
 /**
- * @brief 注釈付き画像をパブリッシュ
- * @param image 元画像
- * @param aspara_info アスパラガス情報
- * @param filtered_cloud フィルタリング済み点群
- * @param pca_line_cloud PCA直線点群
- * @param length 長さ
- * @param straightness 真っ直ぐ度
- * @param is_harvestable 収穫可能フラグ
- * @details デバッグ用の可視化画像を生成・出力
- * 
- * 可視化内容：
- * - バウンディングボックス（収穫可能：緑、不可：赤）
- * - フィルタリング済み点群（シアン色）
- * - PCA直線（ピンク色）
- * - 情報テキスト（ID、信頼度、長さ、真っ直ぐ度、収穫適性）
- */
-void FvAsparaAnalyzerNode::publishAnnotatedImage(
-    const cv::Mat& image,
-    const AsparaInfo& aspara_info,
-    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& filtered_cloud,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr& pca_line_cloud,
-    float length,
-    float straightness,
-    bool is_harvestable)
-{
-    RCLCPP_WARN(this->get_logger(), "Publishing annotated image for aspara %d", aspara_info.id);
-    cv::Mat annotated_image = image.clone();
-    
-    // バウンディングボックスを描画
-    cv::Scalar bbox_color = is_harvestable ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255); // 収穫可能：緑、不可：赤
-    cv::rectangle(annotated_image, aspara_info.bounding_box_2d, bbox_color, 3);
-    
-    // フィルタリング済み点群を画像上に描画
-    if (!filtered_cloud->points.empty() && latest_camera_info_) {
-        for (const auto& point : filtered_cloud->points) {
-            cv::Point2f projected = project3DTo2D(point, *latest_camera_info_);
-            if (projected.x >= 0 && projected.x < image.cols && projected.y >= 0 && projected.y < image.rows) {
-                cv::circle(annotated_image, cv::Point(projected.x, projected.y), 2, cv::Scalar(255, 255, 0), -1); // シアン色の点
-            }
-        }
-    }
-    
-    // PCA直線をピンク色で描画
-    if (!pca_line_cloud->points.empty() && latest_camera_info_ && pca_line_cloud->points.size() > 1) {
-        std::vector<cv::Point> line_points_2d;
-        
-        // 全PCA直線点を2Dに投影
-        for (const auto& point : pca_line_cloud->points) {
-            // pcl::PointXYZをpcl::PointXYZRGBに変換（投影関数用）
-            pcl::PointXYZRGB rgb_point;
-            rgb_point.x = point.x;
-            rgb_point.y = point.y; 
-            rgb_point.z = point.z;
-            
-            cv::Point2f projected = project3DTo2D(rgb_point, *latest_camera_info_);
-            if (projected.x >= 0 && projected.x < image.cols && projected.y >= 0 && projected.y < image.rows) {
-                line_points_2d.push_back(cv::Point(projected.x, projected.y));
-            }
-        }
-        
-        // 接続されたピンク色の線分を描画
-        cv::Scalar pink_color(255, 0, 255); // ピンク色（BGR形式）
-        for (size_t i = 1; i < line_points_2d.size(); ++i) {
-            cv::line(annotated_image, line_points_2d[i-1], line_points_2d[i], pink_color, 3);
-        }
-    }
-    
-    // テキスト情報を準備（日本語）
-    std::string status_text = is_harvestable ? "収穫可能" : "未成熟";
-    cv::Scalar text_color = is_harvestable ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
-    
-    // 情報テキストを描画
-    int y_offset = aspara_info.bounding_box_2d.y - 10;
-    if (y_offset < 30) y_offset = aspara_info.bounding_box_2d.y + aspara_info.bounding_box_2d.height + 30;
-    
-    // 基本的なテキスト描画のみ
-    std::string info_text = cv::format("ID:%d %.2f", aspara_info.id, aspara_info.confidence);
-    cv::putText(annotated_image, info_text, cv::Point(aspara_info.bounding_box_2d.x, y_offset), 
-                cv::FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2);
-    
-    std::string status_info = cv::format("L:%.1fcm S:%.2f %s", length * 100, straightness, status_text.c_str());
-    cv::putText(annotated_image, status_info, cv::Point(aspara_info.bounding_box_2d.x, y_offset + 25), 
-                cv::FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2);
-    
-    // 処理時間情報（簡略化）
-    std::string timing_info = cv::format("Points:%zu Time:%.1fms", filtered_cloud->points.size(), aspara_info.processing_times.total_ms);
-    cv::putText(annotated_image, timing_info, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
-    
-    // 注釈付き画像をパブリッシュ
-    try {
-        sensor_msgs::msg::Image::SharedPtr msg = cv_bridge::CvImage(
-            latest_color_image_->header,
-            sensor_msgs::image_encodings::BGR8,
-            annotated_image).toImageMsg();
-        
-        annotated_image_pub_->publish(*msg);
-    } catch (cv_bridge::Exception& e) {
-        RCLCPP_ERROR(this->get_logger(), "CV bridge exception in publishAnnotatedImage: %s", e.what());
-    }
-}
-
-/**
  * @brief 次のアスパラガスを選択（サービス）
  */
 void FvAsparaAnalyzerNode::nextAsparaguService(
@@ -1536,6 +750,7 @@ void FvAsparaAnalyzerNode::nextAsparaguService(
 {
     (void)request;  // 未使用パラメータの警告回避
     
+    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
     if (aspara_list_.empty()) {
         response->success = false;
         response->message = "No asparagus detected";
@@ -1565,6 +780,7 @@ void FvAsparaAnalyzerNode::prevAsparaguService(
 {
     (void)request;  // 未使用パラメータの警告回避
     
+    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
     if (aspara_list_.empty()) {
         response->success = false;
         response->message = "No asparagus detected";
@@ -1586,97 +802,49 @@ void FvAsparaAnalyzerNode::prevAsparaguService(
 }
 
 /**
- * @brief アスパラガス処理をキューに追加
- * @param aspara_info 処理対象アスパラガス情報
+ * @brief カメラ情報を起動時に1回だけ取得
+ * @param camera_info_topic カメラ情報トピック名
  */
-void FvAsparaAnalyzerNode::enqueueAsparaguProcessing(const AsparaInfo& aspara_info)
+void FvAsparaAnalyzerNode::getCameraInfoOnce(const std::string& camera_info_topic)
 {
-    std::lock_guard<std::mutex> lock(pointcloud_mutex_);
+    RCLCPP_WARN(this->get_logger(), "カメラ情報を取得中: %s", camera_info_topic.c_str());
     
-    // キューサイズ制限（メモリリーク防止）
-    if (processing_queue_.size() >= 10) {
-        // 古いタスクを削除
-        processing_queue_.pop();
-        RCLCPP_WARN(this->get_logger(), "Processing queue full, dropping oldest task");
+    // カメラ情報取得用のワンタイムサブスクライバー
+    auto camera_info_received = false;
+    
+    auto camera_info_sub = this->create_subscription<sensor_msgs::msg::CameraInfo>(
+        camera_info_topic, 1, 
+        [this, &camera_info_received](const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
+            {
+                std::lock_guard<std::mutex> lock(this->aspara_list_mutex_);
+                this->latest_camera_info_ = msg;
+            }
+            camera_info_received = true;
+            
+            RCLCPP_WARN(this->get_logger(), "カメラ情報を取得しました:");
+            RCLCPP_WARN(this->get_logger(), "  Image size: %dx%d", msg->width, msg->height);
+            RCLCPP_WARN(this->get_logger(), "  Focal length: fx=%.2f, fy=%.2f", msg->k[0], msg->k[4]);
+            RCLCPP_WARN(this->get_logger(), "  Principal point: cx=%.2f, cy=%.2f", msg->k[2], msg->k[5]);
+            RCLCPP_WARN(this->get_logger(), "  Distortion model: %s", msg->distortion_model.c_str());
+        });
+    
+    // カメラ情報が取得できるまで待機
+    auto start_time = this->now();
+    while (!camera_info_received && rclcpp::ok()) {
+        rclcpp::spin_some(this->get_node_base_interface());
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        auto elapsed = (this->now() - start_time).seconds();
+        if (elapsed > 1.0) {
+            RCLCPP_WARN(this->get_logger(), "カメラノードの起動を待っています... (%.1fs)", elapsed);
+            start_time = this->now(); // リセットして1秒ごとにメッセージ
+        }
     }
     
-    processing_queue_.push(aspara_info);
-    pointcloud_cv_.notify_one();  // ワーカースレッドに通知
+    RCLCPP_WARN(this->get_logger(), "カメラ情報の取得が完了しました");
 }
 
-/**
- * @brief ワーカースレッドのメインループ
- */
-void FvAsparaAnalyzerNode::pointcloudWorkerLoop()
-{
-    RCLCPP_INFO(this->get_logger(), "Pointcloud worker thread started");
-    
-    while (!shutdown_flag_) {
-        std::unique_lock<std::mutex> lock(pointcloud_mutex_);
-        
-        // キューにタスクがあるまで待機
-        pointcloud_cv_.wait(lock, [this]() {
-            return !processing_queue_.empty() || shutdown_flag_;
-        });
-        
-        if (shutdown_flag_) {
-            break;
-        }
-        
-        if (!processing_queue_.empty()) {
-            // キューからタスクを取得
-            AsparaInfo aspara_copy = processing_queue_.front();
-            processing_queue_.pop();
-            lock.unlock();  // ロック解除してから重い処理を実行
-            
-            // 処理中フラグを設定
-            processing_in_progress_ = true;
-            
-            try {
-                RCLCPP_DEBUG(this->get_logger(), "Starting async analysis for asparagus ID %d", aspara_copy.id);
-                
-                // 分析時間計測開始
-                auto start_time = std::chrono::high_resolution_clock::now();
-                
-                // アスパラの点群分析を実行（重い処理）
-                processAsparagus(aspara_copy);
-                
-                // 分析時間計測終了・記録
-                auto end_time = std::chrono::high_resolution_clock::now();
-                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-                
-                // 結果をメインスレッドのデータに反映（スレッドセーフ）
-                {
-                    std::lock_guard<std::mutex> result_lock(pointcloud_mutex_);
-                    for (auto& aspara : aspara_list_) {
-                        if (aspara.id == aspara_copy.id) {
-                            aspara.processing_times.total_ms = duration.count();
-                            aspara.length = aspara_copy.length;
-                            aspara.straightness = aspara_copy.straightness;
-                            aspara.is_harvestable = aspara_copy.is_harvestable;
-                            // 他の分析結果も更新...
-                            break;
-                        }
-                    }
-                }
-                
-                RCLCPP_DEBUG(this->get_logger(), "Async asparagus %d analysis completed: %.1fms", 
-                           aspara_copy.id, duration.count());
-                           
-            } catch (const std::exception& e) {
-                RCLCPP_ERROR(this->get_logger(), "Exception in async asparagus %d analysis: %s", 
-                           aspara_copy.id, e.what());
-            } catch (...) {
-                RCLCPP_ERROR(this->get_logger(), "Unknown exception in async asparagus %d analysis", 
-                           aspara_copy.id);
-            }
-            
-            processing_in_progress_ = false;
-        }
-    }
-    
-    RCLCPP_INFO(this->get_logger(), "Pointcloud worker thread terminated");
-}
+
 
 } // namespace fv_aspara_analyzer
 
@@ -1701,12 +869,8 @@ int main(int argc, char * argv[])
     
     try {
         auto node = std::make_shared<fv_aspara_analyzer::FvAsparaAnalyzerNode>();
-        RCLCPP_WARN(logger, "Node created, starting MultiThreadedExecutor...");
-        
-        // マルチスレッドエグゼキューター使用（カクつき解決）
-        rclcpp::executors::MultiThreadedExecutor executor;
-        executor.add_node(node);
-        executor.spin();
+        RCLCPP_WARN(logger, "Node created, starting spin...");
+        rclcpp::spin(node);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(logger, "Exception in main: %s", e.what());
     }

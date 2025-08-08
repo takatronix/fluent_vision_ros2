@@ -63,8 +63,10 @@ set(dependencies
 
 # ===== 実行ファイル作成 =====
 add_executable(fv_aspara_analyzer_node
-  src/fv_aspara_analyzer_node.cpp  # メインソースファイル（統合管理）
-  src/aspara_selection.cpp         # アスパラ選択管理クラス
+  src/fv_aspara_analyzer_node.cpp      # メインソースファイル（統合管理）
+  src/aspara_selection.cpp             # アスパラ選択管理クラス
+  src/aspara_analyzer_thread.cpp       # アスパラ解析専用スレッド
+  src/aspara_pointcloud_processor.cpp  # 点群処理専用クラス
 )
 
 

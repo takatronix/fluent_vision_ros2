@@ -45,7 +45,7 @@ fv_aspara_analyzer_d405:
     pointcloud_distance_min: 0.1           # 点群処理最小距離（10cm）
     pointcloud_distance_max: 2.0           # 点群処理最大距離（2m）
     aspara_filter_distance: 0.05           # アスパラガス根元からのフィルタ距離（5cm）
-    enable_pointcloud_processing: false    # ポイントクラウド処理を一時的に無効化（安定性優先）
+    enable_pointcloud_processing: true     # ポイントクラウド処理を有効化（非同期処理でカクつき解決）
 
     # ===== ノイズ除去パラメータ =====
     
