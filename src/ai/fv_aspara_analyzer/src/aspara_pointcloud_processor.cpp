@@ -404,7 +404,7 @@ void AsparaPointcloudProcessor::publishAnnotatedImage(
     float straightness,
     bool is_harvestable)
 {
-    RCLCPP_WARN(node_->get_logger(), "Publishing annotated image for aspara %d", aspara_info.id);
+    RCLCPP_DEBUG(node_->get_logger(), "Publishing annotated image for aspara %d", aspara_info.id);
     cv::Mat annotated_image = image.clone();
     
     // バウンディングボックスを描画

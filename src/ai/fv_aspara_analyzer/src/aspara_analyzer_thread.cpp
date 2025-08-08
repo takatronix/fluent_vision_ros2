@@ -47,15 +47,21 @@ void AnalyzerThread::enqueueAnalysis(const AsparaInfo& aspara_info)
 
 void AnalyzerThread::workerLoop()
 {
-    std::cout << "Analyzer thread worker loop started" << std::endl;
+    RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), "Analyzer thread worker loop started");
     
     while (!shutdown_flag_) {
+        auto t_wait_start = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> lock(data_mutex_);
         
         // 新しいデータが来るまで待機
         data_cv_.wait(lock, [this]() {
             return has_new_data_.load() || shutdown_flag_;
         });
+        auto t_acq = std::chrono::steady_clock::now();
+        double wait_ms = std::chrono::duration<double, std::milli>(t_acq - t_wait_start).count();
+        if (has_new_data_.load() && wait_ms > 1.0) {
+            RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"), "[LOCK ACQ] analyzer/data_queue waited=%.2fms", wait_ms);
+        }
         
         if (shutdown_flag_) {
             break;
@@ -71,7 +77,8 @@ void AnalyzerThread::workerLoop()
             processing_in_progress_ = true;
             
             try {
-                std::cout << "Starting analysis for asparagus ID " << aspara_copy.id << std::endl;
+                auto analysis_start = std::chrono::steady_clock::now();
+            RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"), "Starting analysis for asparagus ID %d", aspara_copy.id);
                 
                 // アスパラの点群分析をスレッド内で直接実行（重い処理）
                 auto start_time = std::chrono::high_resolution_clock::now();
@@ -85,17 +92,23 @@ void AnalyzerThread::workerLoop()
                 // 結果を安全に反映（ID存在チェック付き）
                 updateAnalysisResult(aspara_copy, processing_time_ms);
                 
+                auto analysis_end = std::chrono::steady_clock::now();
+                double analysis_ms = std::chrono::duration<double, std::milli>(analysis_end - analysis_start).count();
+                RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
+                    "[ANALYZER] ID:%d completed in %.2fms", aspara_copy.id, analysis_ms);
             } catch (const std::exception& e) {
-                std::cout << "Exception in asparagus " << aspara_copy.id << " analysis: " << e.what() << std::endl;
+                RCLCPP_ERROR(rclcpp::get_logger("analyzer_thread"), 
+                    "Exception in asparagus %d analysis: %s", aspara_copy.id, e.what());
             } catch (...) {
-                std::cout << "Unknown exception in asparagus " << aspara_copy.id << " analysis" << std::endl;
+                RCLCPP_ERROR(rclcpp::get_logger("analyzer_thread"), 
+                    "Unknown exception in asparagus %d analysis", aspara_copy.id);
             }
             
             processing_in_progress_ = false;
         }
     }
     
-    std::cout << "Analyzer thread worker loop terminated" << std::endl;
+            std::cout << "Analyzer thread worker loop terminated" << std::endl;
 }
 
 void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
@@ -165,13 +178,13 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         // ノイズ除去（Fluent libのフィルタを使用）
         fluent::utils::Stopwatch noise_stopwatch;
         
-        // ボクセルグリッドフィルタでダウンサンプリング
-        auto voxel_filtered = fluent::cloud::VoxelGrid<pcl::PointXYZRGB>()
+        // ボクセルグリッドフィルタでダウンサンプリング（fluent_cloud）
+        auto voxel_filtered = fluent_cloud::filters::VoxelGrid<pcl::PointXYZRGB>()
             .setLeafSize(node_->voxel_leaf_size_)
             .filter(filtered_cloud);
         
-        // 統計的外れ値除去
-        auto denoised_cloud = fluent::cloud::StatisticalOutlierRemoval<pcl::PointXYZRGB>()
+        // 統計的外れ値除去（fluent_cloud）
+        auto denoised_cloud = fluent_cloud::filters::StatisticalOutlierRemoval<pcl::PointXYZRGB>()
             .setMeanK(node_->noise_reduction_neighbors_)
             .setStddevMulThresh(node_->noise_reduction_std_dev_)
             .filter(voxel_filtered);
@@ -217,13 +230,20 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         aspara_info.processing_times.total_ms = total_stopwatch.elapsed_ms();
         aspara_info.processing_times.visualization_ms = vis_stopwatch.elapsed_ms();
         
-        pointcloud_processor_->publishAnnotatedImage(color_mat, aspara_info, denoised_cloud, pca_line, length, straightness, is_harvestable);
+        // 画像合成はメインスレッドで行うため、ここでは出力しない
 
-        // 結果ログ出力（処理時間含む）
-        std::cout << "Aspara ID:" << aspara_info.id << ", Confidence:" << aspara_info.confidence 
-                  << ", Length:" << length << "m, Straightness:" << straightness 
-                  << ", Harvestable:" << (is_harvestable ? "YES" : "NO")
-                  << ", Total:" << aspara_info.processing_times.total_ms << "ms" << std::endl;
+        // 詳細な処理時間ログ出力
+        std::cout << "[ANALYZER THREAD] ID:" << aspara_info.id 
+                  << " Total:" << aspara_info.processing_times.total_ms << "ms"
+                  << " (ROI:" << aspara_info.processing_times.filter_bbox_ms << "ms"
+                  << ", Noise:" << aspara_info.processing_times.noise_reduction_ms << "ms"
+                  << ", Measure:" << aspara_info.processing_times.measurement_ms << "ms"
+                  << ", PCA:" << aspara_info.processing_times.pca_calculation_ms << "ms"
+                  << ", Vis:" << aspara_info.processing_times.visualization_ms << "ms)"
+                  << " Length:" << length << "m"
+                  << " Straight:" << straightness
+                  << " Harvest:" << (is_harvestable ? "YES" : "NO")
+                  << " Points:" << denoised_cloud->points.size() << std::endl;
                 
     } catch (const cv_bridge::Exception& e) {
         std::cout << "CV bridge exception in processAsparagus (ID:" << aspara_info.id << "): " << e.what() << std::endl;

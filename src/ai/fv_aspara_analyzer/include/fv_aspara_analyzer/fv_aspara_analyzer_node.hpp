@@ -163,12 +163,13 @@ public:
     // ===== データストレージ =====
     std::vector<AsparaInfo> aspara_list_;                                                    ///< アスパラガス情報リスト
     std::mutex aspara_list_mutex_;                                                           ///< アスパラガスリスト用ミューテックス
+    std::mutex image_data_mutex_;                                                            ///< 画像データ用ミューテックス（分離）
     AsparaSelection aspara_selection_;                                                       ///< アスパラ選択管理
     sensor_msgs::msg::PointCloud2::SharedPtr latest_pointcloud_;                             ///< 最新の点群データ
-    sensor_msgs::msg::Image::SharedPtr latest_depth_image_;                                  ///< 最新の深度画像
+    sensor_msgs::msg::Image::SharedPtr latest_depth_image_;                                  ///< 最新の深度画像（image_data_mutexで保護）
     sensor_msgs::msg::CameraInfo::SharedPtr latest_camera_info_;                             ///< 最新のカメラ情報
-    sensor_msgs::msg::Image::SharedPtr latest_color_image_;                                  ///< 最新のカラー画像
-    cv::Mat latest_mask_;                                                                    ///< 最新のマスク画像
+    sensor_msgs::msg::Image::SharedPtr latest_color_image_;                                  ///< 最新のカラー画像（image_data_mutexで保護）
+    cv::Mat latest_mask_;                                                                    ///< 最新のマスク画像（image_data_mutexで保護）
     int selected_aspara_id_;                                                                 ///< 選択中のアスパラガスID（-1=未選択）
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr selected_pointcloud_;                            ///< 選択中のアスパラガス点群
     std::map<int, AsparaInfo> tracked_asparagus_;                                            ///< 追跡中アスパラガス辞書

@@ -17,6 +17,7 @@
 #include <pcl/point_types.h>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
+#include <rclcpp/qos.hpp>
 
 #include <chrono>
 #include <thread>
@@ -210,6 +211,12 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("camera_info.compressed_quality", 85);
     camera_info_config_.enable_depth_compressed = 
         this->declare_parameter("camera_info.enable_depth_compressed", false);
+    
+    // QoS設定の読み込み
+    int qos_queue_size = this->declare_parameter("qos.queue_size", 1);
+    std::string qos_reliability = this->declare_parameter("qos.reliability", "best_effort");
+    std::string qos_durability = this->declare_parameter("qos.durability", "volatile");
+    std::string qos_history = this->declare_parameter("qos.history", "keep_last");
     
     // Services settings
     services_config_.get_distance_enabled = 
@@ -491,10 +498,33 @@ void FVDepthCameraNode::initializePublishers()
     // Create image transport for compressed images
     // Note: ImageTransport will be created after the node is fully initialized
     
+    // QoS設定を構築（パラメータから読み込み）
+    int qos_queue_size = this->get_parameter("qos.queue_size").as_int();
+    std::string qos_reliability = this->get_parameter("qos.reliability").as_string();
+    std::string qos_durability = this->get_parameter("qos.durability").as_string();
+    
+    auto qos = rclcpp::QoS(qos_queue_size);
+    
+    // Reliability設定
+    if (qos_reliability == "best_effort") {
+        qos.reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
+    } else {
+        qos.reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+    }
+    
+    // Durability設定
+    if (qos_durability == "volatile") {
+        qos.durability(RMW_QOS_POLICY_DURABILITY_VOLATILE);
+    } else {
+        qos.durability(RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL);
+    }
+    
+    qos.history(RMW_QOS_POLICY_HISTORY_KEEP_LAST);
+    
     // Basic publishers
     if (stream_config_.color_enabled) {
         color_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.color, 10);
+            topic_config_.color, qos);
         RCLCPP_INFO(this->get_logger(), "📷 Color publisher created: %s, ptr: %p", 
             topic_config_.color.c_str(), static_cast<void*>(color_pub_.get()));
         
@@ -502,7 +532,7 @@ void FVDepthCameraNode::initializePublishers()
             // Create compressed image publisher directly
             std::string compressed_topic = topic_config_.color + "/compressed";
             color_compressed_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
-                compressed_topic, 10);
+                compressed_topic, qos);
             RCLCPP_INFO(this->get_logger(), "📷 Compressed publisher created: %s", 
                 compressed_topic.c_str());
         }
@@ -510,25 +540,25 @@ void FVDepthCameraNode::initializePublishers()
     
     if (stream_config_.depth_enabled) {
         depth_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.depth, 10);
+            topic_config_.depth, qos);
     }
     
     if (stream_config_.depth_colormap_enabled) {
         depth_colormap_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.depth_colormap, 10);
+            topic_config_.depth_colormap, qos);
     }
     
     if (stream_config_.pointcloud_enabled) {
         pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            topic_config_.pointcloud, 10);
+            topic_config_.pointcloud, qos);
     }
     
     // Camera info publishers
     if (camera_info_config_.enable_camera_info) {
         color_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            topic_config_.color_camera_info, 10);
+            topic_config_.color_camera_info, qos);
         depth_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            topic_config_.depth_camera_info, 10);
+            topic_config_.depth_camera_info, qos);
         RCLCPP_INFO(this->get_logger(), "📋 Camera info publishers created: %s, %s", 
             topic_config_.color_camera_info.c_str(), 
             topic_config_.depth_camera_info.c_str());

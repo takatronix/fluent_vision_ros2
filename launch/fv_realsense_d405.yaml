@@ -45,8 +45,8 @@
       color_enabled: true           # カラーストリーム有効
       depth_enabled: true           # 深度ストリーム有効
       infrared_enabled: false       # 赤外線ストリーム無効（省電力）
-      pointcloud_enabled: true      # 点群生成有効
-      depth_colormap_enabled: true  # 深度カラーマップ有効
+      pointcloud_enabled: false      # 点群生成有効
+      depth_colormap_enabled: false  # 深度カラーマップ有効
     
     # ===== 点群処理パラメータ（D405 - 近距離特化） =====
     pointcloud:
@@ -85,6 +85,13 @@
       compressed_quality: 85           # 圧縮品質（0-100、高値=高品質）
       enable_depth_compressed: true    # 深度圧縮有効
     
+    # ===== QoS設定（高速配信） =====
+    qos:
+      queue_size: 1                    # キューサイズ1（最新フレームのみ）
+      reliability: "best_effort"       # ベストエフォート（高速配信）
+      durability: "volatile"           # 揮発性（履歴なし）
+      history: "keep_last"             # 最新のみ保持
+      
     # ===== サービス設定 =====
     services:
       get_distance_enabled: true       # 距離取得サービス有効

@@ -245,9 +245,8 @@ FvAsparaAnalyzerNode::~FvAsparaAnalyzerNode() {}
  */
 void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2DArray::SharedPtr msg)
 {
-    RCLCPP_WARN(this->get_logger(), "===== Detection callback START: %zu detections =====", msg->detections.size());
-    
-    // 処理時間計測開始
+    // 全体処理時間計測開始
+    auto callback_start = std::chrono::high_resolution_clock::now();
     detection_stopwatch_.reset();
     
     // FPS計測
@@ -257,9 +256,7 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
     
     // 必要なデータの可用性チェック
     if (!latest_depth_image_ || !latest_camera_info_) {
-        RCLCPP_WARN(this->get_logger(), "Required data not available yet. Depth:%s, CI:%s", 
-                   latest_depth_image_ ? "OK" : "NULL", 
-                   latest_camera_info_ ? "OK" : "NULL");
+        RCLCPP_WARN_ONCE(this->get_logger(), "Required data not available yet. Waiting for depth and camera info...");
         return;
     }
 
@@ -296,16 +293,39 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
             new_detections.push_back(std::make_pair(bbox, confidence));
         }
     }
+    
+    // 検出データ処理時間
+    auto parse_end = std::chrono::high_resolution_clock::now();
+    double parse_ms = std::chrono::duration<double, std::milli>(parse_end - callback_start).count();
 
     // AsparaSelectionでID管理とスムーズアニメーションを実行
+    auto update_start = std::chrono::high_resolution_clock::now();
     {
+        auto t_wait_start = std::chrono::steady_clock::now();
+        RCLCPP_DEBUG(this->get_logger(), "[LOCK WAIT] detection/updateAsparaList");
         std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+        auto t_acq = std::chrono::steady_clock::now();
+        double wait_ms = std::chrono::duration<double, std::milli>(t_acq - t_wait_start).count();
+        size_t before_sz = aspara_list_.size();
+        RCLCPP_DEBUG(this->get_logger(), "[LOCK ACQ] detection/updateAsparaList waited=%.3fms size_before=%zu", wait_ms, before_sz);
         aspara_list_ = aspara_selection_.updateAsparaList(new_detections, aspara_list_);
+        auto t_rel = std::chrono::steady_clock::now();
+        double hold_ms = std::chrono::duration<double, std::milli>(t_rel - t_acq).count();
+        RCLCPP_DEBUG(this->get_logger(), "[LOCK HOLD] detection/updateAsparaList hold=%.3fms size_after=%zu", hold_ms, aspara_list_.size());
     }
+    auto update_end = std::chrono::high_resolution_clock::now();
+    double update_ms = std::chrono::duration<double, std::milli>(update_end - update_start).count();
 
     // 最高信頼度のアスパラガスを処理
-    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
-    if (!aspara_list_.empty()) {
+    auto process_start = std::chrono::high_resolution_clock::now();
+    {
+        auto t_wait_start = std::chrono::steady_clock::now();
+        RCLCPP_DEBUG(this->get_logger(), "[LOCK WAIT] detection/processSelected");
+        std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+        auto t_acq = std::chrono::steady_clock::now();
+        double wait_ms = std::chrono::duration<double, std::milli>(t_acq - t_wait_start).count();
+        RCLCPP_DEBUG(this->get_logger(), "[LOCK ACQ] detection/processSelected waited=%.3fms size=%zu", wait_ms, aspara_list_.size());
+        if (!aspara_list_.empty()) {
         // 距離優先、同じなら信頼度でソート
         std::sort(aspara_list_.begin(), aspara_list_.end(),
                   [](const AsparaInfo& a, const AsparaInfo& b) {
@@ -330,21 +350,37 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
         }
         selected_aspara_id_ = aspara_selection_.getSelectedAsparaId();
         
-        // 各アスパラに穂情報を関連付け
-        for (auto& aspara : aspara_list_) {
-            associateAsparagusParts(msg, aspara);
-        }
-        
-        // 選択中のアスパラを非同期処理に送信
-        if (selected_aspara_id_ != -1 && analyzer_thread_) {
-            for (const auto& aspara : aspara_list_) {
+        // 選択中アスパラのみ穂情報を関連付け（ロック時間短縮）
+        if (selected_aspara_id_ != -1) {
+            for (auto& aspara : aspara_list_) {
                 if (aspara.id == selected_aspara_id_) {
-                    analyzer_thread_->enqueueAnalysis(aspara);
+                    associateAsparagusParts(msg, aspara);
+                    // 非同期処理に送信
+                    if (analyzer_thread_) {
+                        analyzer_thread_->enqueueAnalysis(aspara);
+                    }
                     break;
                 }
             }
         }
-    }
+        // if (!aspara_list_.empty()) の終了
+        auto t_rel = std::chrono::steady_clock::now();
+        double hold_ms = std::chrono::duration<double, std::milli>(t_rel - t_acq).count();
+        RCLCPP_DEBUG(this->get_logger(), "[LOCK HOLD] detection/processSelected hold=%.3fms", hold_ms);
+    }  // if (!aspara_list_.empty())の終了
+    }  // ロックスコープの終了
+    
+    auto process_end = std::chrono::high_resolution_clock::now();
+    double process_ms = std::chrono::duration<double, std::milli>(process_end - process_start).count();
+    
+    // 全体処理時間
+    auto callback_end = std::chrono::high_resolution_clock::now();
+    double total_ms = std::chrono::duration<double, std::milli>(callback_end - callback_start).count();
+    
+    // 詳細ログ出力
+    RCLCPP_INFO(this->get_logger(), 
+        "[DETECTION] Total:%.2fms (Parse:%.2fms, Update:%.2fms, Process:%.2fms) Detections:%zu",
+        total_ms, parse_ms, update_ms, process_ms, msg->detections.size());
 }
 
 /**
@@ -514,7 +550,7 @@ void FvAsparaAnalyzerNode::imageCallback(const sensor_msgs::msg::Image::SharedPt
 {
     RCLCPP_WARN_ONCE(this->get_logger(), "Image callback received first image");
     {
-        std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+        std::lock_guard<std::mutex> lock(image_data_mutex_);  // 分離したmutexを使用
         latest_color_image_ = msg;
     }
     
@@ -540,7 +576,7 @@ void FvAsparaAnalyzerNode::depthCallback(const sensor_msgs::msg::Image::SharedPt
 {
     RCLCPP_WARN_ONCE(this->get_logger(), "Depth callback received first depth image");
     {
-        std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+        std::lock_guard<std::mutex> lock(image_data_mutex_);  // 分離したmutexを使用
         latest_depth_image_ = msg;
     }
     
@@ -587,11 +623,14 @@ void FvAsparaAnalyzerNode::depthCallback(const sensor_msgs::msg::Image::SharedPt
  */
 void FvAsparaAnalyzerNode::publishCurrentImage()
 {
+    auto pub_start = std::chrono::high_resolution_clock::now();
+    
     if (!latest_color_image_) {
         return;
     }
     
     // カラー画像をcv::Matに変換
+    auto cvt_start = std::chrono::high_resolution_clock::now();
     cv::Mat color_image;
     try {
         cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(latest_color_image_, sensor_msgs::image_encodings::BGR8);
@@ -600,6 +639,8 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         RCLCPP_ERROR(this->get_logger(), "CV bridge exception: %s", e.what());
         return;
     }
+    auto cvt_end = std::chrono::high_resolution_clock::now();
+    double cvt_ms = std::chrono::duration<double, std::milli>(cvt_end - cvt_start).count();
     
     cv::Mat output_image = color_image.clone();
     
@@ -618,35 +659,50 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     const float animation_speed = std::min(1.0f, delta_time / target_smoothing_time);
     
     // 検出結果の描画
-    std::lock_guard<std::mutex> lock(aspara_list_mutex_);
-    if (!aspara_list_.empty() && latest_camera_info_) {
+    // 1) ロック下でスナップショット取得（最小限）
+    auto snap_start = std::chrono::high_resolution_clock::now();
+    std::vector<AsparaInfo> snapshot_list;
+    int snapshot_selected_id = -1;
+    {
+        std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+        if (!aspara_list_.empty() && latest_camera_info_) {
+            // 選択IDの整合性チェックのみ
+            if (selected_aspara_id_ == -1 ||
+                std::find_if(aspara_list_.begin(), aspara_list_.end(),
+                    [this](const AsparaInfo& info) { return info.id == selected_aspara_id_; }) == aspara_list_.end()) {
+                selected_aspara_id_ = aspara_list_[0].id;
+            }
+            // スナップショット取得（コピー）
+            snapshot_list = aspara_list_;
+            snapshot_selected_id = selected_aspara_id_;
+        }
+    }  // ロック解放
+    auto snap_end = std::chrono::high_resolution_clock::now();
+    double snap_ms = std::chrono::duration<double, std::milli>(snap_end - snap_start).count();
+    
+    // 2) ロック外でスムージング計算
+    for (auto& aspara_info : snapshot_list) {
+        if (aspara_info.is_new) {
+            aspara_info.smooth_bbox = aspara_info.bounding_box_2d;
+            aspara_info.animation_alpha = 0.0f;
+            aspara_info.is_new = false;
+        } else {
+            auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+            aspara_info.smooth_bbox.x = lerp(aspara_info.smooth_bbox.x, aspara_info.bounding_box_2d.x, animation_speed);
+            aspara_info.smooth_bbox.y = lerp(aspara_info.smooth_bbox.y, aspara_info.bounding_box_2d.y, animation_speed);
+            aspara_info.smooth_bbox.width = lerp(aspara_info.smooth_bbox.width, aspara_info.bounding_box_2d.width, animation_speed);
+            aspara_info.smooth_bbox.height = lerp(aspara_info.smooth_bbox.height, aspara_info.bounding_box_2d.height, animation_speed);
+            aspara_info.animation_alpha = std::min(1.0f, aspara_info.animation_alpha + delta_time * 3.0f);
+        }
+        aspara_info.frame_count++;
+    }
+
+    if (!snapshot_list.empty() && latest_camera_info_) {
         last_detection_time = current_time;
         
-        // 選択中のIDが未設定または無効な場合、最初のアスパラガスを選択
-        if (selected_aspara_id_ == -1 || 
-            std::find_if(aspara_list_.begin(), aspara_list_.end(), 
-                [this](const AsparaInfo& info) { return info.id == selected_aspara_id_; }) == aspara_list_.end()) {
-            selected_aspara_id_ = aspara_list_[0].id;
-        }
-        
         // 各検出されたアスパラガスを描画
-        for (auto& aspara_info : aspara_list_) {
-            bool is_selected = (aspara_info.id == selected_aspara_id_);
-            
-            // アニメーション更新
-            if (aspara_info.is_new) {
-                aspara_info.smooth_bbox = aspara_info.bounding_box_2d;
-                aspara_info.animation_alpha = 0.0f;
-                aspara_info.is_new = false;
-            } else {
-                // Lerp補間でスムージング
-                auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
-                aspara_info.smooth_bbox.x = lerp(aspara_info.smooth_bbox.x, aspara_info.bounding_box_2d.x, animation_speed);
-                aspara_info.smooth_bbox.y = lerp(aspara_info.smooth_bbox.y, aspara_info.bounding_box_2d.y, animation_speed);
-                aspara_info.smooth_bbox.width = lerp(aspara_info.smooth_bbox.width, aspara_info.bounding_box_2d.width, animation_speed);
-                aspara_info.smooth_bbox.height = lerp(aspara_info.smooth_bbox.height, aspara_info.bounding_box_2d.height, animation_speed);
-                aspara_info.animation_alpha = std::min(1.0f, aspara_info.animation_alpha + delta_time * 3.0f);
-            }
+        for (auto& aspara_info : snapshot_list) {
+            bool is_selected = (aspara_info.id == snapshot_selected_id);
             
             // 描画設定
             cv::Scalar color = is_selected ? cv::Scalar(0, 255, 0) : cv::Scalar(128, 128, 128);
@@ -671,8 +727,6 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 cv::putText(output_image, label, cv::Point(text_pos.x + 3, text_pos.y), 
                     cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 0, 0), 1);
             }
-            
-            aspara_info.frame_count++;
         }
     } else {
         // 未検出の場合
@@ -685,6 +739,18 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     auto img = Image::from(output_image);  // 一度だけImage作成
     int y_pos = 40;
     
+    // 出力FPS計測（static変数で管理）
+    static auto last_output_time = std::chrono::high_resolution_clock::now();
+    static int output_frame_count = 0;
+    static float output_fps = 0.0f;
+    output_frame_count++;
+    auto output_delta = std::chrono::duration<float>(current_time - last_output_time).count();
+    if (output_delta > 1.0f) {
+        output_fps = output_frame_count / output_delta;
+        output_frame_count = 0;
+        last_output_time = current_time;
+    }
+    
     // カメラFPS（FPSMeterから実測値を取得）
     float actual_color_fps = color_fps_meter_ ? color_fps_meter_->getCurrentFPS() : 0.0f;
     float actual_depth_fps = depth_fps_meter_ ? depth_fps_meter_->getCurrentFPS() : 0.0f;
@@ -695,7 +761,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     y_pos += 40;
     img.text(cv::format("Depth: %.0fFPS", actual_depth_fps), 15, y_pos);
     y_pos += 40;
-    img.text(cv::format("Output: %.1fFPS", actual_color_fps), 15, y_pos);
+    img.text(cv::format("Output: %.1fFPS", output_fps), 15, y_pos);  // 実際の出力FPS
     y_pos += 40;
     img.text(cv::format("物体検知: %.1fFPS", actual_detection_fps), 15, y_pos);
     y_pos += 40;
@@ -705,10 +771,10 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     img.text(cv::format("処理時間: %.1fms", detection_time_ms), 15, y_pos);
     y_pos += 40;
     
-    // 検出数の詳細
-    size_t aspara_count = aspara_list_.size();
+    // 検出数の詳細（スナップショットを使用）
+    size_t aspara_count = snapshot_list.size();
     size_t spike_count = 0;
-    for (const auto& aspara : aspara_list_) {
+    for (const auto& aspara : snapshot_list) {
         spike_count += aspara.spike_parts.size();
     }
     
@@ -718,10 +784,10 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     img.text(detection_text, 15, y_pos);
     
     // 選択中のアスパラの分析時間を表示
-    if (selected_aspara_id_ != -1 && enable_pointcloud_processing_) {
+    if (snapshot_selected_id != -1 && enable_pointcloud_processing_) {
         y_pos += 40;
-        for (const auto& aspara : aspara_list_) {
-            if (aspara.id == selected_aspara_id_) {
+        for (const auto& aspara : snapshot_list) {
+            if (aspara.id == snapshot_selected_id) {
                 img.text(cv::format("アスパラ#%d分析: %.1fms", aspara.id, aspara.processing_times.total_ms), 15, y_pos);
                 break;
             }
@@ -729,6 +795,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     }
     
     // 画像をパブリッシュ
+    auto pub_msg_start = std::chrono::high_resolution_clock::now();
     try {
         sensor_msgs::msg::Image::SharedPtr msg = cv_bridge::CvImage(
             latest_color_image_->header,
@@ -738,6 +805,17 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         annotated_image_pub_->publish(*msg);
     } catch (cv_bridge::Exception& e) {
         RCLCPP_ERROR(this->get_logger(), "CV bridge exception in publishCurrentImage: %s", e.what());
+    }
+    
+    auto pub_end = std::chrono::high_resolution_clock::now();
+    double pub_ms = std::chrono::duration<double, std::milli>(pub_end - pub_msg_start).count();
+    double total_ms = std::chrono::duration<double, std::milli>(pub_end - pub_start).count();
+    
+    // 処理時間が10ms以上の場合のみログ出力
+    if (total_ms > 10.0) {
+        RCLCPP_WARN(this->get_logger(), 
+            "[PUBLISH] Total:%.2fms (Convert:%.2fms, Snapshot:%.2fms, Publish:%.2fms)",
+            total_ms, cvt_ms, snap_ms, pub_ms);
     }
 }
 
