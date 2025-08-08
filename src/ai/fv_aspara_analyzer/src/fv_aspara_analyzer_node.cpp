@@ -66,6 +66,7 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<std::string>("output_selected_pointcloud_topic", "");
     this->declare_parameter<std::string>("output_annotated_image_topic", "");
     this->declare_parameter<double>("detection_timeout_seconds", 3.0);  // デフォルト3秒
+    this->declare_parameter<std::string>("camera_name", "Camera");  // カメラ名
 
     // ===== トピック名取得 =====
     std::string detection_topic = this->get_parameter("detection_topic").as_string();
@@ -808,9 +809,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
         }
     } else {
-        // 未検出の場合 - 日本語テキストは現在未実装
-        cv::putText(output_image, "Not Detected", cv::Point(10, 250), 
-                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(128, 128, 128), 2);
+        // 未検出の場合 - 表示なし
         selected_aspara_id_ = -1; // 選択解除
     }
     
@@ -859,16 +858,24 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     cv::Scalar fps_warn(0, 255, 255);    // 黄色（警告）
     cv::Scalar fps_bad(0, 0, 255);       // 赤（問題）
     
-    // 1行目: FPS情報を一列に表示
+    // カメラ名を取得
+    static std::string camera_name = this->get_parameter("camera_name").as_string();
+    
+    // 1行目: カメラ名とFPS情報を一列に表示
     int y_offset = 25;
-    std::string fps_line = cv::format("FPS: Color=%.1f Depth=%.1f Detect=%.1f Seg=%.1f Out=%.1f",
-                                       color_fps, depth_fps, detection_fps, segmentation_fps, display_fps);
+    std::string fps_line = cv::format("[%s] FPS: C=%.0f D=%.0f Det=%.0f Out=%.0f",
+                                       camera_name.c_str(), color_fps, depth_fps, detection_fps, display_fps);
     cv::putText(output_image, fps_line, cv::Point(15, y_offset),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1);
     
     // 2行目: フレーム番号と検出数
     y_offset += 22;
-    std::string info_line = cv::format("Frame: %lu | Detected: %zu", (unsigned long)total_frame_count, snapshot_list.size());
+    std::string info_line;
+    if (snapshot_list.empty()) {
+        info_line = cv::format("Frame: %lu | 未検出", (unsigned long)total_frame_count);
+    } else {
+        info_line = cv::format("Frame: %lu | Detected: %zu", (unsigned long)total_frame_count, snapshot_list.size());
+    }
     cv::Scalar info_color = snapshot_list.empty() ? cv::Scalar(128, 128, 128) : cv::Scalar(0, 255, 0);
     cv::putText(output_image, info_line, cv::Point(15, y_offset),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, info_color, 1);

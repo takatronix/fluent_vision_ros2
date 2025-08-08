@@ -20,6 +20,9 @@
 
 fv_aspara_analyzer_d415:
   ros__parameters:
+    # ===== システム情報 =====
+    camera_name: "D415"  # カメラ名称（画面表示用）
+    
     # ===== トピック設定（D415カメラ用） =====
     
     # 入力トピック（Fluent Vision AIシステムから）
