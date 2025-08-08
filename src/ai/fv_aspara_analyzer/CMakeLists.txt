@@ -35,13 +35,13 @@ find_package(pcl_conversions REQUIRED)       # PCL-ROS2変換
 find_package(pcl_ros REQUIRED)               # PCL ROS2統合
 find_package(OpenCV REQUIRED)                # OpenCVコンピュータビジョン
 find_package(vision_msgs REQUIRED)           # コンピュータビジョンメッセージ
-# find_package(cvx REQUIRED)                   # CVX日本語テキストライブラリ（直接includeで代用）
-# find_package(fluent_cloud REQUIRED)          # FluentCloudライブラリ（一時的に無効）
+find_package(std_srvs REQUIRED)              # 標準サービスメッセージ
+find_package(fluent_lib REQUIRED)
 
 # ===== インクルードディレクトリ設定 =====
 include_directories(include)                 # ヘッダーファイルディレクトリ
 include_directories(${OpenCV_INCLUDE_DIRS})  # OpenCVインクルードディレクトリ
-include_directories(../../common/cvx/include)  # CVXライブラリヘッダー
+include_directories(/home/aspara/seedbox-r1/fluent_vision_ros2/src/common/fluent_lib/include)  # fluent_lib
 
 # ===== 依存関係リスト =====
 set(dependencies
@@ -57,42 +57,25 @@ set(dependencies
   pcl_conversions           # PCL-ROS2変換
   pcl_ros                   # PCL ROS2統合
   vision_msgs               # コンピュータビジョンメッセージ
-  # fluent_cloud              # FluentCloudライブラリ（一時的に無効）
+  std_srvs                  # 標準サービスメッセージ
+  fluent_lib                # Fluent統合ライブラリ
 )
 
 # ===== 実行ファイル作成 =====
 add_executable(fv_aspara_analyzer_node
-  src/fv_aspara_analyzer_node.cpp  # メインソースファイル
-  src/cvx_text.cpp                  # 日本語テキスト描画サポート
+  src/fv_aspara_analyzer_node.cpp  # メインソースファイル（統合管理）
 )
 
-# シンプル点群生成ノード（FluentCloud不要）
-add_executable(simple_pointcloud_generator
-  src/simple_pointcloud_generator.cpp
-)
-
-# アスパラガス用ビジュアルノード（CVX使用）
-add_executable(asparagus_visual
-  src/asparagus_visual_node.cpp
-  ../../common/cvx/src/cvx_text.cpp
-)
 
 # ===== 依存関係とライブラリリンク =====
 ament_target_dependencies(fv_aspara_analyzer_node ${dependencies})  # ROS2依存関係
-target_link_libraries(fv_aspara_analyzer_node ${OpenCV_LIBRARIES})  # OpenCVライブラリ
+target_link_libraries(fv_aspara_analyzer_node ${OpenCV_LIBRARIES})  # ライブラリリンク
 
-ament_target_dependencies(simple_pointcloud_generator ${dependencies})
-target_link_libraries(simple_pointcloud_generator ${OpenCV_LIBRARIES})
-
-ament_target_dependencies(asparagus_visual ${dependencies})
-target_link_libraries(asparagus_visual ${OpenCV_LIBRARIES})
 
 # ===== インストール設定 =====
 # 実行ファイルのインストール
 install(TARGETS
   fv_aspara_analyzer_node
-  simple_pointcloud_generator
-  asparagus_visual
   DESTINATION lib/${PROJECT_NAME}  # インストール先：lib/fv_aspara_analyzer/
 )
 

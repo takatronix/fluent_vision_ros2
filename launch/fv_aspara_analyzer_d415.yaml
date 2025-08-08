@@ -25,13 +25,15 @@ fv_aspara_analyzer_d415:
     # 入力トピック（Fluent Vision AIシステムから）
     detection_topic: "/fv/d415/object_detection/detections"      # YOLO検出結果
     pointcloud_topic: "/fv/d415/asparagus/points"                # 3D点群データ
-    camera_info_topic: "/fv/d415/color/camera_info"              # カメラキャリブレーション情報
+    camera_info_topic: "/fv/d415/color/camera_info"              # カラーカメラキャリブレーション情報
+    depth_camera_info_topic: "/fv/d415/depth/camera_info"        # 深度カメラキャリブレーション情報
     camera_topic: "/fv/d415/color/image_raw"                     # カラー画像
     depth_topic: "/fv/d415/depth/image_rect_raw"                 # 深度画像
     mask_topic: "/fv/d415/segmentation_mask/image"               # セグメンテーションマスク
+    imu_topic: "/livox/imu"                                      # IMUデータ（姿勢補正用）
 
     # 出力トピック（解析結果）
-    output_filtered_pointcloud_topic: "/fv/d415/aspara_analysis/filtered_pointcloud"  # フィルタリング済み点群
+    output_filtered_pointcloud_topic: "/fv/d415/aspara_analysis/asparagus/points"  # フィルタリング済み点群
     output_annotated_image_topic: "/fv/d415/aspara_analysis/result"          # 注釈付き可視化画像
 
     # ===== 基本処理パラメータ =====
@@ -57,6 +59,109 @@ fv_aspara_analyzer_d415:
     harvest_min_length: 0.23               # 収穫最小長さ（23cm）
     harvest_max_length: 0.50               # 収穫最大長さ（50cm）
     straightness_threshold: 0.7            # 真っ直ぐ度閾値（70%以上で収穫可能）
+    cutting_target_length: 0.23            # 切断対象判定長さ（23cm以上）
+
+    # ===== 点群合成パラメータ =====
+    
+    # 高品質点群合成設定
+    mesh_building_enabled: true             # 点群合成機能有効
+    frame_history_size: 30                  # 履歴フレーム数（1秒分@30FPS）
+    registration_distance_threshold: 0.02   # レジストレーション距離閾値（2cm）
+    mesh_voxel_size: 0.003                 # 合成用ボクセルサイズ（3mm、高密度）
+    
+    # MLS平滑化パラメータ
+    mls_search_radius: 0.01                 # MLS検索半径（1cm）
+    mls_polynomial_order: 2                 # MLS多項式次数（2次）
+    mls_upsampling_enabled: true            # アップサンプリング有効
+    
+    # ===== TF・rtabmapパラメータ =====
+    
+    # TF作成設定
+    tf_enabled: true                        # TF作成機能有効
+    tf_frame_prefix: "asparagus_"           # TFフレーム名プレフィックス
+    tf_base_frame: "map"                    # 基準座標系
+    stem_base_detection_threshold: 0.02     # 根元検出範囲（2cm）
+    
+    # rtabmap統合設定
+    rtabmap_enabled: true                   # rtabmap統合有効
+    rtabmap_add_label_service: "/rtabmap/add_label"      # ラベル追加サービス
+    rtabmap_set_label_service: "/rtabmap/set_label"      # ラベル設定サービス
+    rtabmap_service_timeout: 5.0            # サービスタイムアウト（秒）
+    
+    # 完全認識判定基準
+    complete_recognition_confidence: 0.8     # 完全認識信頼度閾値
+    complete_recognition_frame_count: 10     # 完全認識継続フレーム数
+    complete_recognition_point_density: 100  # 必要点群密度（点/cm²）
+    
+    # ===== 3Dマーカー表示パラメータ =====
+    
+    # マーカー表示設定
+    marker_enabled: true                     # 3Dマーカー表示有効
+    mesh_marker_enabled: true                # メッシュマーカー有効（高品質）
+    cylinder_marker_enabled: true            # 円柱マーカー有効（簡易）
+    info_text_marker_enabled: true           # 情報テキストマーカー有効
+    
+    # マーカートピック設定
+    mesh_marker_topic: "/asparagus/mesh_markers"      # メッシュマーカートピック
+    cylinder_marker_topic: "/asparagus/markers"       # 円柱マーカートピック
+    
+    # メッシュ品質設定
+    mesh_segments: 20                        # 長さ方向セグメント数
+    mesh_radial_points: 8                    # 円周方向点数
+    mesh_smoothing_enabled: true             # メッシュ平滑化有効
+    
+    # マーカー色設定（グレード別）BGR
+    marker_grade_a_color: [0, 255, 0]       # A級色（緑）
+    marker_grade_b_color: [0, 255, 255]     # B級色（黄）
+    marker_grade_c_color: [0, 128, 255]     # C級色（オレンジ）
+    marker_grade_ng_color: [128, 128, 128]  # 規格外色（グレー）
+    marker_alpha: 0.8                       # マーカー透明度
+    
+    # テキストマーカー設定
+    text_marker_size: 0.03                   # テキストサイズ（3cm）
+    text_marker_offset: 0.05                 # テキスト位置オフセット（5cm上）
+    text_marker_color: [255, 255, 255]      # テキスト色（白）BGR
+    
+    # マーカー更新設定
+    marker_update_rate: 2.0                  # マーカー更新レート（Hz）
+    marker_lifetime: 300.0                   # マーカー生存時間（秒、5分）
+    persistent_markers: true                 # 永続マーカー有効
+    
+    # ===== 骨格ポイント抽出パラメータ =====
+    
+    # 骨格ポイント設定
+    skeleton_enabled: true                   # 骨格ポイント抽出有効
+    skeleton_points_count: 5                 # 骨格ポイント数（5または10）
+    skeleton_extraction_method: "pca_centerline"  # 抽出手法
+    
+    # 骨格表示設定
+    skeleton_color: [255, 0, 255]           # 骨格色（ピンク）BGR
+    skeleton_line_thickness: 2               # ライン太さ（ピクセル）
+    skeleton_point_radius: 3                 # ポイント円半径（ピクセル）
+    skeleton_point_outline_color: [255, 255, 255]  # ポイント外枠色（白）
+    skeleton_point_outline_thickness: 1      # 外枠太さ
+    
+    # 骨格品質計算設定
+    skeleton_curvature_smoothing: 3          # 曲率計算平滑化ウィンドウサイズ
+    skeleton_length_precision: 0.001        # 長さ計算精度（1mm）
+    skeleton_interpolation_method: "linear"  # 補間方法（"linear", "spline"）
+    
+    # 骨格情報公開設定
+    skeleton_topic: "/fv/d415/aspara_analysis/skeleton"  # 骨格情報トピック
+    skeleton_publish_rate: 5.0               # 骨格情報公開レート（Hz）
+    
+    # ===== 選択中アスパラガス情報公開設定 =====
+    
+    # 選択中アスパラガス情報設定
+    selected_asparagus_info_enabled: true    # 選択中アスパラガス情報公開有効
+    selected_asparagus_topic: "/selected_asparagus_info"  # 選択中アスパラガス情報トピック
+    selected_asparagus_publish_rate: 10.0    # 公開レート（Hz、リアルタイム用に高頻度）
+    
+    # 切断ポイント設定
+    cut_point_marker_enabled: true           # 切断ポイントマーカー表示有効
+    cut_point_marker_size: 0.02             # 切断ポイントマーカーサイズ（2cm）
+    cut_point_marker_color: [0, 0, 255]     # 切断ポイント色（赤）BGR
+    cut_point_marker_lifetime: 5.0           # マーカー生存時間（秒）
 
 # =============================================================================
 # パラメータ調整ガイド

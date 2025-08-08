@@ -41,33 +41,18 @@
 #include <chrono>
 
 // 日本語テキスト描画
-#include "fv_aspara_analyzer/cvx_text.hpp"
+// cvx_text.hppは削除済み（fluent統合ライブラリを使用）
+
+// サービス関連
+#include <std_srvs/srv/trigger.hpp>
+
+// ===== Fluent Library =====
+#include <fluent.hpp>
 
 namespace fv_aspara_analyzer
 {
 
-/**
- * @class Stopwatch
- * @brief 処理時間計測用のシンプルなストップウォッチクラス
- */
-class Stopwatch
-{
-public:
-    Stopwatch() : start_time_(std::chrono::high_resolution_clock::now()) {}
-    
-    void reset() {
-        start_time_ = std::chrono::high_resolution_clock::now();
-    }
-    
-    double elapsed_ms() const {
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time_);
-        return duration.count() / 1000.0;  // ミリ秒単位で返す
-    }
-    
-private:
-    std::chrono::time_point<std::chrono::high_resolution_clock> start_time_;
-};
+
 
 /**
  * @struct ProcessingTimes
@@ -100,6 +85,87 @@ struct AsparaInfo
     bool is_harvestable;                       ///< 収穫可能フラグ
     rclcpp::Time last_update_time;             ///< 最後の更新時刻
     ProcessingTimes processing_times;          ///< 処理時間記録
+    
+    // アニメーション用フィールド
+    cv::Rect smooth_bbox;                      ///< スムージングされたバウンディングボックス
+    float animation_alpha = 1.0f;              ///< アニメーション透明度
+    bool is_new = true;                        ///< 新規検出フラグ
+    int frame_count = 0;                       ///< フレームカウント
+    
+    // 追跡用フィールド
+    int detection_count = 0;                   ///< 検出回数
+    float overlap_ratio = 0.0f;                ///< 前フレームとの重複度
+    rclcpp::Time first_detected_time;          ///< 初回検出時刻
+};
+
+/**
+ * @enum AsparaguGrade
+ * @brief アスパラガス品質グレード
+ */
+enum class AsparaguGrade
+{
+    UNKNOWN = 0,    ///< 未評価
+    GRADE_A,        ///< A級（最高品質）
+    GRADE_B,        ///< B級（標準品質）
+    GRADE_C,        ///< C級（低品質）
+    NOT_GRADED      ///< 規格外
+};
+
+/**
+ * @struct SkeletonPoint
+ * @brief アスパラガス骨格ポイント
+ */
+struct SkeletonPoint
+{
+    cv::Point2f image_point;        ///< 2D画像座標
+    geometry_msgs::msg::Point world_point;  ///< 3D世界座標
+    float distance_from_base = 0.0f; ///< 根元からの距離（メートル）
+    float radius_at_point = 0.0f;    ///< その点での半径（メートル）
+};
+
+/**
+ * @struct AsparagusPart
+ * @brief アスパラガス部位情報（本体・穂）
+ */
+struct AsparagusPart
+{
+    int class_id = -1;                         ///< クラスID（0=本体、1=穂）
+    cv::Rect bounding_box_2d;                  ///< 2Dバウンディングボックス
+    float confidence = 0.0f;                   ///< 検出信頼度
+    bool is_valid = false;                     ///< 有効フラグ
+};
+
+/**
+ * @struct SelectedAsparaInfo
+ * @brief 選択中アスパラガス情報構造体
+ */
+struct SelectedAsparaInfo
+{
+    int asparagus_id = -1;                     ///< 選択中ID（-1=未選択）
+    bool is_selected = false;                  ///< 選択状態
+    
+    // 2D検出情報（本体・穂）
+    AsparagusPart body_part;                   ///< アスパラガス本体情報（クラスID 0）
+    std::vector<AsparagusPart> spike_parts;    ///< アスパラガス穂情報リスト（クラスID 1）
+    
+    // 品質情報（全てメートル単位）
+    float length = 0.0f;                       ///< 長さ（メートル）
+    float distance_from_camera = 0.0f;         ///< カメラからの距離（メートル）
+    float curvature = 0.0f;                    ///< 曲がり度（メートル）
+    float diameter = 0.0f;                     ///< 太さ（メートル）
+    AsparaguGrade grade = AsparaguGrade::UNKNOWN; ///< 品質グレード
+    
+    // 切断情報
+    bool is_cutting_target = false;            ///< 切断対象フラグ
+    cv::Point2f cut_point_pixel;               ///< 切断ポイント画像座標（ピクセル）
+    geometry_msgs::msg::Point cut_point_world; ///< 切断ポイント3D座標（メートル）
+    
+    // 骨格ポイント配列（設計書通り5-10点）
+    std::vector<SkeletonPoint> skeleton_points; ///< 骨格ポイント配列（頂点から根元まで）
+    
+    // メタ情報
+    float confidence = 0.0f;                   ///< 信頼度（0.0-1.0）
+    rclcpp::Time timestamp;                    ///< タイムスタンプ
 };
 
 /**
@@ -282,6 +348,80 @@ private:
      */
     void processAsparagus(const AsparaInfo& aspara_info);
     
+    // ===== 選択管理関数群 =====
+    
+    /**
+     * @brief アスパラガス選択管理
+     * @param new_detections 新しい検出結果
+     * @details 非同期追跡システムによる選択状態管理
+     */
+    void updateAsparaguSelection(const std::vector<AsparaInfo>& new_detections);
+    
+    /**
+     * @brief 検出結果からアスパラガス部位を関連付け
+     * @param detections 全検出結果
+     * @param aspara_info アスパラガス情報
+     * @details 本体（クラスID 0）と穂（クラスID 1）を関連付け
+     */
+    void associateAsparagusParts(const vision_msgs::msg::Detection2DArray::SharedPtr& detections,
+                                SelectedAsparaInfo& aspara_info);
+    
+    /**
+     * @brief 最適なアスパラガスを選択
+     * @param aspara_list アスパラガス候補リスト
+     * @return 選択されたアスパラガスのID
+     */
+    int selectBestAsparagus(const std::vector<AsparaInfo>& aspara_list);
+    
+    /**
+     * @brief 次のアスパラガスを選択（サービス）
+     */
+    void nextAsparaguService(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                            std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+    
+    /**
+     * @brief 前のアスパラガスを選択（サービス）
+     */
+    void prevAsparaguService(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+                            std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+    
+    /**
+     * @brief 選択中アスパラガス情報を公開
+     */
+    void publishSelectedAsparaguInfo();
+    
+    /**
+     * @brief アスパラガスの骨格ポイントを抽出
+     * @param cloud アスパラガス点群
+     * @param points_count 抽出するポイント数（5-10）
+     * @return 骨格ポイント配列
+     */
+    std::vector<SkeletonPoint> extractSkeletonPoints(
+        const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud, int points_count);
+    
+    /**
+     * @brief グレードを文字列に変換
+     * @param grade グレード列挙体
+     * @return 日本語グレード文字列
+     */
+    std::string gradeToString(AsparaguGrade grade) const;
+    
+    /**
+     * @brief バウンディングボックスの重複度を計算
+     * @param bbox1 矩形1
+     * @param bbox2 矩形2
+     * @return 重複度（0.0-1.0）
+     */
+    float calculateOverlapRatio(const cv::Rect& bbox1, const cv::Rect& bbox2);
+    
+    /**
+     * @brief アスパラガス本体と穂の空間的関連性を判定
+     * @param body_bbox 本体のバウンディングボックス
+     * @param spike_bbox 穂のバウンディングボックス
+     * @return 関連性ありかどうか
+     */
+    bool isAssociatedSpike(const cv::Rect& body_bbox, const cv::Rect& spike_bbox);
+    
     // ===== ユーティリティ関数群 =====
     
     /**
@@ -342,7 +482,12 @@ private:
 
     // ===== ROS2 パブリッシャー =====
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_pointcloud_pub_;    ///< フィルタリング済み点群パブリッシャー
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr selected_pointcloud_pub_;    ///< 選択中のアスパラガス点群パブリッシャー
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr annotated_image_pub_;              ///< 注釈付き画像パブリッシャー
+    
+    // ===== ROS2 サービス =====
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr next_asparagus_service_;              ///< 次のアスパラガス選択サービス
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr prev_asparagus_service_;              ///< 前のアスパラガス選択サービス
     
     // ===== TF2（座標変換）関連 =====
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;                                             ///< TFバッファ
@@ -356,6 +501,11 @@ private:
     sensor_msgs::msg::CameraInfo::SharedPtr latest_camera_info_;                             ///< 最新のカメラ情報
     sensor_msgs::msg::Image::SharedPtr latest_color_image_;                                  ///< 最新のカラー画像
     cv::Mat latest_mask_;                                                                    ///< 最新のマスク画像
+    int selected_aspara_id_;                                                                 ///< 選択中のアスパラガスID
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr selected_pointcloud_;                            ///< 選択中のアスパラガス点群
+    SelectedAsparaInfo selected_aspara_info_;                                                ///< 選択中アスパラガス情報
+    std::map<int, AsparaInfo> tracked_asparagus_;                                            ///< 追跡中アスパラガス辞書
+    vision_msgs::msg::Detection2DArray::SharedPtr latest_detections_;                        ///< 最新の検出結果（穂情報取得用）
     
     // ===== パラメータ群 =====
     double min_confidence_;                                                                   ///< 最小信頼度閾値
@@ -372,6 +522,23 @@ private:
     double harvest_min_length_;                                                               ///< 収穫最小長さ
     double harvest_max_length_;                                                               ///< 収穫最大長さ
     double straightness_threshold_;                                                           ///< 真っ直ぐ度閾値
+    
+    // ===== 選択管理パラメータ =====
+    double object_tracking_overlap_threshold_;                                                ///< 重複度閾値
+    double object_tracking_timeout_ms_;                                                      ///< 追跡タイムアウト（ms）
+    
+    // ===== 内部状態 =====
+    int next_asparagus_id_;                                                                  ///< 次のアスパラガスID
+    rclcpp::Time last_selection_time_;                                                       ///< 最後の選択時刻
+    int skeleton_points_count_;                                                              ///< 骨格ポイント数（設定ファイルから）
+    
+    // ===== FPS測定用 =====
+    std::unique_ptr<fluent::utils::FPSMeter> color_fps_meter_;                              ///< カラー画像FPS計測
+    std::unique_ptr<fluent::utils::FPSMeter> depth_fps_meter_;                              ///< 深度画像FPS計測  
+    std::unique_ptr<fluent::utils::FPSMeter> detection_fps_meter_;                          ///< 検出FPS計測
+    
+    // ===== 検出処理時間計測用 =====
+    fluent::utils::Stopwatch detection_stopwatch_;                                          ///< 検出処理時間計測
 };
 
 } // namespace fv_aspara_analyzer

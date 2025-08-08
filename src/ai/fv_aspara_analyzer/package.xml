@@ -44,6 +44,9 @@
 
   <!-- ===== AI/検出メッセージ依存関係 ===== -->
   <depend>vision_msgs</depend>  <!-- コンピュータビジョンメッセージ -->
+  
+  <!-- ===== Fluent統合ライブラリ ===== -->
+  <depend>fluent_lib</depend>  <!-- Fluent統合ライブラリ -->
 
   <!-- ===== テスト依存関係 ===== -->
   <test_depend>ament_lint_auto</test_depend>  <!-- 自動リントツール -->

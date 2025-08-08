@@ -496,7 +496,7 @@ void FVDepthCameraNode::initializePublishers()
         color_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
             topic_config_.color, 10);
         RCLCPP_INFO(this->get_logger(), "📷 Color publisher created: %s, ptr: %p", 
-            topic_config_.color.c_str(), color_pub_.get());
+            topic_config_.color.c_str(), static_cast<void*>(color_pub_.get()));
         
         if (camera_info_config_.enable_compressed_topics) {
             // Create compressed image publisher directly
@@ -629,7 +629,7 @@ void FVDepthCameraNode::processingLoop()
                         // Log every second
                         auto now = std::chrono::steady_clock::now();
                         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
-                            RCLCPP_INFO(this->get_logger(), "📊 Mode 1: %d frames, Color: %s", 
+                            RCLCPP_DEBUG(this->get_logger(), "📊 Mode 1: %d frames, Color: %s", 
                                 frame_count, color_frame ? "✅" : "❌");
                             frame_count = 0;
                             last_log_time = now;
@@ -651,7 +651,7 @@ void FVDepthCameraNode::processingLoop()
                         // Log every second
                         auto now = std::chrono::steady_clock::now();
                         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
-                            RCLCPP_INFO(this->get_logger(), "📊 Mode 2: %d frames, Color: %s, Depth: %s", 
+                            RCLCPP_DEBUG(this->get_logger(), "📊 Mode 2: %d frames, Color: %s, Depth: %s", 
                                 frame_count, 
                                 color_frame_full ? "✅" : "❌",
                                 depth_frame_full ? "✅" : "❌");
@@ -705,7 +705,7 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
         // Debug: Check if actually published
         static int debug_count = 0;
         if (++debug_count % 30 == 0) {  // Log every 30 frames (1 second)
-            RCLCPP_INFO(this->get_logger(), "🔍 Published color image to topic: %s", 
+            RCLCPP_DEBUG(this->get_logger(), "🔍 Published color image to topic: %s", 
                 topic_config_.color.c_str());
         }
         
@@ -815,7 +815,7 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
     // Log publishing status
     auto current_time = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::seconds>(current_time - last_publish_log).count() >= 1) {
-        RCLCPP_INFO(this->get_logger(), "📤 Published %d frames in last second", publish_count);
+        RCLCPP_DEBUG(this->get_logger(), "📤 Published %d frames in last second", publish_count);
         publish_count = 0;
         last_publish_log = current_time;
     }
@@ -972,6 +972,7 @@ void FVDepthCameraNode::handleGetCameraInfo(
     const std::shared_ptr<fv_realsense::srv::GetCameraInfo::Request> request,
     std::shared_ptr<fv_realsense::srv::GetCameraInfo::Response> response)
 {
+    (void)request; // suppress unused parameter warning
     try {
         response->success = true;
         response->camera_name = device_.get_info(RS2_CAMERA_INFO_NAME);

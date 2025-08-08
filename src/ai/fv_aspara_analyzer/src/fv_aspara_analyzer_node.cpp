@@ -8,6 +8,7 @@
  */
 
 #include "fv_aspara_analyzer/fv_aspara_analyzer_node.hpp"
+#include <fluent.hpp>
 
 namespace fv_aspara_analyzer
 {
@@ -108,6 +109,10 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     filtered_pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         output_filtered_pointcloud_topic, 10);
     
+    // 選択中のアスパラガスの点群パブリッシャー
+    selected_pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/selected_asparagus", 10);
+    
     annotated_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
         output_annotated_image_topic, 10);
 
@@ -115,7 +120,37 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
+    
+    // ===== データ初期化 =====
+    selected_aspara_id_ = -1;  // 未選択状態
+    selected_pointcloud_ = std::make_shared<pcl::PointCloud<pcl::PointXYZRGB>>();
+    
+    // selected_aspara_info_の初期化
+    selected_aspara_info_.asparagus_id = -1;
+    selected_aspara_info_.is_selected = false;
+    selected_aspara_info_.body_part.class_id = -1;
+    selected_aspara_info_.body_part.confidence = 0.0f;
+    selected_aspara_info_.body_part.is_valid = false;
+    selected_aspara_info_.length = 0.0f;
+    selected_aspara_info_.distance_from_camera = 0.0f;
+    selected_aspara_info_.curvature = 0.0f;
+    selected_aspara_info_.diameter = 0.0f;
+    selected_aspara_info_.grade = AsparaguGrade::UNKNOWN;
+    selected_aspara_info_.is_cutting_target = false;
+    selected_aspara_info_.confidence = 0.0f;
+    selected_aspara_info_.timestamp = this->now();
 
+    // ===== フォント初期化 =====
+    RCLCPP_INFO(this->get_logger(), "Japanese font support is now built into the new Fluent API");
+    
+    // FPS測定用メーターを初期化
+    color_fps_meter_ = std::make_unique<fluent::utils::FPSMeter>(10);
+    depth_fps_meter_ = std::make_unique<fluent::utils::FPSMeter>(10);
+    detection_fps_meter_ = std::make_unique<fluent::utils::FPSMeter>(10);
+    
+    // 検出処理時間計測用（StopWatchはデフォルトコンストラクタで初期化済み）
+    // detection_stopwatch_は自動初期化されるのでここでの明示的な初期化は不要
+    
     // ===== 初期化完了ログ =====
     RCLCPP_WARN(this->get_logger(), "All subscribers created successfully");
     RCLCPP_WARN(this->get_logger(), "All publishers created successfully");
@@ -142,7 +177,15 @@ FvAsparaAnalyzerNode::~FvAsparaAnalyzerNode() {}
  */
 void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2DArray::SharedPtr msg)
 {
-    RCLCPP_WARN(this->get_logger(), "Detection callback received %zu detections", msg->detections.size());
+    RCLCPP_WARN(this->get_logger(), "===== Detection callback START: %zu detections =====", msg->detections.size());
+    
+    // 処理時間計測開始
+    detection_stopwatch_.reset();
+    
+    // FPS計測
+    if (detection_fps_meter_) {
+        detection_fps_meter_->tick(this->now());
+    }
     
     // 深度画像とカメラ情報の可用性チェック
     if (!latest_depth_image_ || !latest_camera_info_) {
@@ -239,6 +282,11 @@ void FvAsparaAnalyzerNode::imageCallback(const sensor_msgs::msg::Image::SharedPt
     RCLCPP_WARN_ONCE(this->get_logger(), "Image callback received first image");
     latest_color_image_ = msg;
     
+    // FPS計測
+    if (color_fps_meter_) {
+        color_fps_meter_->tick(this->now());
+    }
+    
     // 常に画像を出力する
     // 検出結果がある場合はオーバーレイ付き、ない場合は元画像をそのまま出力
     publishCurrentImage();
@@ -253,6 +301,11 @@ void FvAsparaAnalyzerNode::depthCallback(const sensor_msgs::msg::Image::SharedPt
 {
     RCLCPP_WARN_ONCE(this->get_logger(), "Depth callback received first depth image");
     latest_depth_image_ = msg;
+    
+    // FPS計測
+    if (depth_fps_meter_) {
+        depth_fps_meter_->tick(this->now());
+    }
 }
 
 /**
@@ -694,7 +747,7 @@ void FvAsparaAnalyzerNode::processAsparagus(const AsparaInfo& aspara_info)
     RCLCPP_WARN(this->get_logger(), "Processing asparagus %d with confidence %.3f", aspara_info.id, aspara_info.confidence);
     
     // 全体処理時間の計測開始
-    Stopwatch total_stopwatch;
+    fluent::utils::Stopwatch total_stopwatch;
     
     // mutableなコピーを作成して処理時間を記録できるようにする
     AsparaInfo mutable_aspara_info = aspara_info;
@@ -705,7 +758,7 @@ void FvAsparaAnalyzerNode::processAsparagus(const AsparaInfo& aspara_info)
     }
 
     // 深度画像から効率的に点群を抽出（バウンディングボックス内のみ）
-    Stopwatch filter_stopwatch;
+    fluent::utils::Stopwatch filter_stopwatch;
     auto filtered_cloud = extractPointCloudFromDepth(aspara_info.bounding_box_2d);
     mutable_aspara_info.processing_times.filter_bbox_ms = filter_stopwatch.elapsed_ms();
     
@@ -715,7 +768,7 @@ void FvAsparaAnalyzerNode::processAsparagus(const AsparaInfo& aspara_info)
     }
 
     // ノイズ除去
-    Stopwatch noise_stopwatch;
+    fluent::utils::Stopwatch noise_stopwatch;
     auto denoised_cloud = applyNoiseReduction(filtered_cloud);
     mutable_aspara_info.processing_times.noise_reduction_ms = noise_stopwatch.elapsed_ms();
 
@@ -725,14 +778,14 @@ void FvAsparaAnalyzerNode::processAsparagus(const AsparaInfo& aspara_info)
     }
 
     // アスパラガス特性を計算
-    Stopwatch measurement_stopwatch;
+    fluent::utils::Stopwatch measurement_stopwatch;
     auto root_position = estimateRootPosition(denoised_cloud);
     float straightness = calculateStraightness(denoised_cloud);
     float length = calculateLength(denoised_cloud);
     mutable_aspara_info.processing_times.measurement_ms = measurement_stopwatch.elapsed_ms();
     
     // 可視化用PCAラインを生成
-    Stopwatch pca_stopwatch;
+    fluent::utils::Stopwatch pca_stopwatch;
     auto pca_line = generatePCALine(denoised_cloud);
     mutable_aspara_info.processing_times.pca_calculation_ms = pca_stopwatch.elapsed_ms();
 
@@ -752,7 +805,7 @@ void FvAsparaAnalyzerNode::processAsparagus(const AsparaInfo& aspara_info)
     }
 
     // 可視化処理時間の計測
-    Stopwatch vis_stopwatch;
+    fluent::utils::Stopwatch vis_stopwatch;
     
     // 結果をパブリッシュ
     publishFilteredPointCloud(denoised_cloud, latest_pointcloud_->header.frame_id, aspara_info.id);
@@ -785,7 +838,7 @@ void FvAsparaAnalyzerNode::processAsparagus(const AsparaInfo& aspara_info)
 void FvAsparaAnalyzerNode::publishFilteredPointCloud(
     const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
     const std::string& frame_id,
-    int aspara_id)
+    int /*aspara_id*/)
 {
     sensor_msgs::msg::PointCloud2 output_msg;
     pcl::toROSMsg(*cloud, output_msg);
@@ -845,27 +898,201 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     
     cv::Mat output_image = color_image.clone();
     
-    // 検出結果がある場合はオーバーレイを追加
+    // FPS計算用（static変数で状態保持）
+    static auto last_time = std::chrono::high_resolution_clock::now();
+    static auto last_detection_time = std::chrono::high_resolution_clock::now();
+    static float publish_fps = 0.0f;
+    static int frame_counter = 0;
+    static std::chrono::time_point<std::chrono::high_resolution_clock> fps_update_time = std::chrono::high_resolution_clock::now();
+    
+    // 現在時刻取得
+    auto current_time = std::chrono::high_resolution_clock::now();
+    auto delta_time = std::chrono::duration<float>(current_time - last_time).count();
+    last_time = current_time;
+    
+    // FPS計算（1秒ごとに更新）
+    frame_counter++;
+    auto fps_elapsed = std::chrono::duration<float>(current_time - fps_update_time).count();
+    if (fps_elapsed >= 1.0f) {
+        publish_fps = frame_counter / fps_elapsed;
+        frame_counter = 0;
+        fps_update_time = current_time;
+    }
+    
+    // アニメーション更新（60FPS = 16.67ms）
+    const float animation_speed = 0.15f; // スムージング係数
+    
+    // 検出結果の描画
     if (!aspara_list_.empty() && latest_camera_info_) {
+        last_detection_time = current_time;
+        
+        // 選択中のIDが未設定または無効な場合、最初のアスパラガスを選択
+        if (selected_aspara_id_ == -1 || 
+            std::find_if(aspara_list_.begin(), aspara_list_.end(), 
+                [this](const AsparaInfo& info) { return info.id == selected_aspara_id_; }) == aspara_list_.end()) {
+            selected_aspara_id_ = aspara_list_[0].id;
+        }
+        
         // 各検出されたアスパラガスを描画
-        for (const auto& aspara_info : aspara_list_) {
-            // バウンディングボックスを描画（検出あり：黄色）
-            cv::Scalar bbox_color(0, 255, 255); // 黄色
-            cv::rectangle(output_image, aspara_info.bounding_box_2d, bbox_color, 2);
+        for (auto& aspara_info : aspara_list_) {
+            bool is_selected = (aspara_info.id == selected_aspara_id_);
             
-            // 検出情報を表示
-            int y_offset = aspara_info.bounding_box_2d.y - 10;
-            if (y_offset < 30) {
-                y_offset = aspara_info.bounding_box_2d.y + aspara_info.bounding_box_2d.height + 30;
+            // スムーズアニメーション計算
+            if (aspara_info.is_new) {
+                aspara_info.smooth_bbox = aspara_info.bounding_box_2d;
+                aspara_info.animation_alpha = 0.0f;
+                aspara_info.is_new = false;
+            } else {
+                // バウンディングボックスのスムージング（線形補間）
+                aspara_info.smooth_bbox.x = aspara_info.smooth_bbox.x + 
+                    (aspara_info.bounding_box_2d.x - aspara_info.smooth_bbox.x) * animation_speed;
+                aspara_info.smooth_bbox.y = aspara_info.smooth_bbox.y + 
+                    (aspara_info.bounding_box_2d.y - aspara_info.smooth_bbox.y) * animation_speed;
+                aspara_info.smooth_bbox.width = aspara_info.smooth_bbox.width + 
+                    (aspara_info.bounding_box_2d.width - aspara_info.smooth_bbox.width) * animation_speed;
+                aspara_info.smooth_bbox.height = aspara_info.smooth_bbox.height + 
+                    (aspara_info.bounding_box_2d.height - aspara_info.smooth_bbox.height) * animation_speed;
+                
+                // フェードインアニメーション
+                if (aspara_info.animation_alpha < 1.0f) {
+                    aspara_info.animation_alpha = std::min(1.0f, aspara_info.animation_alpha + delta_time * 3.0f);
+                }
             }
             
-            // ID と信頼度を表示
-            cv::putText(output_image, 
-                       cv::format("ID:%d %.2f", aspara_info.id, aspara_info.confidence),
-                       cv::Point(aspara_info.bounding_box_2d.x, y_offset), 
-                       cv::FONT_HERSHEY_SIMPLEX, 0.5, bbox_color, 2);
+            // 選択中のアスパラガスの点群を保存
+            if (is_selected && aspara_info.filtered_pointcloud.data.size() > 0) {
+                // 点群をPCLフォーマットに変換
+                pcl::fromROSMsg(aspara_info.filtered_pointcloud, *selected_pointcloud_);
+                
+                // 選択中の点群をパブリッシュ
+                sensor_msgs::msg::PointCloud2 selected_msg;
+                pcl::toROSMsg(*selected_pointcloud_, selected_msg);
+                selected_msg.header = latest_color_image_->header;
+                selected_pointcloud_pub_->publish(selected_msg);
+            }
+            
+            // 半透明オーバーレイ用の一時画像
+            cv::Mat overlay = output_image.clone();
+            
+            // 色とアルファ値の設定
+            cv::Scalar bbox_color;
+            float alpha;
+            
+            if (is_selected) {
+                // 選択中：緑色、半透明
+                bbox_color = cv::Scalar(0, 255, 0); // 緑色（BGR）
+                alpha = 0.3f * aspara_info.animation_alpha; // より透明に
+                
+                // バウンディングボックス塗りつぶし（半透明）
+                cv::rectangle(overlay, aspara_info.smooth_bbox, bbox_color, -1);
+                cv::addWeighted(overlay, alpha, output_image, 1.0 - alpha, 0, output_image);
+                
+                // 枠線（不透明）
+                cv::rectangle(output_image, aspara_info.smooth_bbox, bbox_color, 2);
+                
+                // クラス名と信頼度を緑色で表示
+                int y_offset = aspara_info.smooth_bbox.y - 10;
+                if (y_offset < 30) {
+                    y_offset = aspara_info.smooth_bbox.y + aspara_info.smooth_bbox.height + 30;
+                }
+                
+                std::string class_name = cv::format("Asparagus #%d", aspara_info.id);
+                std::string confidence_text = cv::format("%.1f%%", aspara_info.confidence * 100);
+                
+                // テキスト描画（影付き、背景なし、サイズ大きめ）
+                cv::Point shadow_offset(2, 2);
+                
+                // クラス名
+                cv::putText(output_image, class_name,
+                    cv::Point(aspara_info.smooth_bbox.x, y_offset) + shadow_offset, 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 0), 1);
+                cv::putText(output_image, class_name,
+                    cv::Point(aspara_info.smooth_bbox.x, y_offset), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, bbox_color, 1);
+                    
+                // 信頼度
+                cv::putText(output_image, confidence_text,
+                    cv::Point(aspara_info.smooth_bbox.x, y_offset + 30) + shadow_offset, 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 0), 1);
+                cv::putText(output_image, confidence_text,
+                    cv::Point(aspara_info.smooth_bbox.x, y_offset + 30), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7, bbox_color, 1);
+                    
+            } else {
+                // 選択されていない：モノクロ、80%透過
+                alpha = 0.2f * aspara_info.animation_alpha; // 80%透過 = 20%不透明
+                
+                // モノクロ変換用のROI
+                cv::Rect roi = aspara_info.smooth_bbox;
+                // 画像境界チェック
+                roi.x = std::max(0, roi.x);
+                roi.y = std::max(0, roi.y);
+                roi.width = std::min(roi.width, output_image.cols - roi.x);
+                roi.height = std::min(roi.height, output_image.rows - roi.y);
+                
+                if (roi.width > 0 && roi.height > 0) {
+                    cv::Mat roi_color = output_image(roi);
+                    cv::Mat roi_gray;
+                    cv::cvtColor(roi_color, roi_gray, cv::COLOR_BGR2GRAY);
+                    cv::cvtColor(roi_gray, roi_gray, cv::COLOR_GRAY2BGR);
+                    
+                    // モノクロ領域を80%透過でブレンド
+                    cv::addWeighted(roi_gray, alpha, roi_color, 1.0 - alpha, 0, roi_color);
+                    
+                    // グレーの枠線
+                    cv::rectangle(output_image, aspara_info.smooth_bbox, cv::Scalar(128, 128, 128), 1);
+                }
+            }
+            
+            aspara_info.frame_count++;
         }
+    } else {
+        // 未検出の場合
+        Image::from(output_image).text("未検出", 10, 250);
+        selected_aspara_id_ = -1; // 選択解除
     }
+    
+    // FPS情報を左上に表示（位置を調整して重ならないように）
+    cv::Point text_pos(15, 40);  // 左に余白、上にも余裕を持たせる
+    
+    // カメラFPS（FPSMeterから実測値を取得）
+    float actual_color_fps = color_fps_meter_ ? color_fps_meter_->getCurrentFPS() : 0.0f;
+    float actual_depth_fps = depth_fps_meter_ ? depth_fps_meter_->getCurrentFPS() : 0.0f;
+    float actual_detection_fps = detection_fps_meter_ ? detection_fps_meter_->getCurrentFPS() : 0.0f;
+    
+    Image::from(output_image).text(cv::format("Color: %.0fFPS", actual_color_fps), text_pos.x, text_pos.y);
+    
+    text_pos.y += 40;  // 行間を広げる
+    Image::from(output_image).text(cv::format("Depth: %.0fFPS", actual_depth_fps), text_pos.x, text_pos.y);
+    
+    // 出力FPS
+    text_pos.y += 40;
+    Image::from(output_image).text(cv::format("Output: %.1fFPS", publish_fps), text_pos.x, text_pos.y);
+    
+    // 物体検知FPS
+    text_pos.y += 40;
+    Image::from(output_image).text(cv::format("物体検知: %.1fFPS", actual_detection_fps), text_pos.x, text_pos.y);
+        
+    // 検出処理時間
+    text_pos.y += 40;
+    double detection_time_ms = detection_stopwatch_.elapsed_ms();
+    Image::from(output_image).text(cv::format("処理時間: %.1fms", detection_time_ms), text_pos.x, text_pos.y);
+    
+    // 検出数の詳細（アスパラと稂を分けて表示）
+    text_pos.y += 40;
+    
+    // アスパラガス本体と穂の数を数える（仮想的に設定）
+    size_t aspara_count = aspara_list_.size();
+    size_t spike_count = 0;  // 穂の数（実際にはdetectionから取得すべき）
+    
+    std::string detection_text;
+    if (aspara_count > 0 || spike_count > 0) {
+        detection_text = cv::format("検出数: アスパラ:%zu 穂:%zu", aspara_count, spike_count);
+    } else {
+        detection_text = "検出数: なし";
+    }
+    
+    Image::from(output_image).text(detection_text, text_pos.x, text_pos.y);
     
     // 画像をパブリッシュ
     try {
@@ -956,82 +1183,18 @@ void FvAsparaAnalyzerNode::publishAnnotatedImage(
     int y_offset = aspara_info.bounding_box_2d.y - 10;
     if (y_offset < 30) y_offset = aspara_info.bounding_box_2d.y + aspara_info.bounding_box_2d.height + 30;
     
-    putTextJP(annotated_image, 
-              cv::format("ID: %d | 信頼度: %.2f", aspara_info.id, aspara_info.confidence),
-              cv::Point(aspara_info.bounding_box_2d.x, y_offset), 
-              14.0, text_color, 2);
+    // 基本的なテキスト描画のみ
+    std::string info_text = cv::format("ID:%d %.2f", aspara_info.id, aspara_info.confidence);
+    cv::putText(annotated_image, info_text, cv::Point(aspara_info.bounding_box_2d.x, y_offset), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2);
     
-    putTextJP(annotated_image, 
-              cv::format("長さ: %.1fcm | 真っ直ぐ度: %.2f", length * 100, straightness),
-              cv::Point(aspara_info.bounding_box_2d.x, y_offset + 25), 
-              14.0, text_color, 2);
-                
-    putTextJP(annotated_image, 
-              status_text,
-              cv::Point(aspara_info.bounding_box_2d.x, y_offset + 50), 
-              16.0, text_color, 2);
+    std::string status_info = cv::format("L:%.1fcm S:%.2f %s", length * 100, straightness, status_text.c_str());
+    cv::putText(annotated_image, status_info, cv::Point(aspara_info.bounding_box_2d.x, y_offset + 25), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2);
     
-    // 点群統計情報を追加
-    putTextJP(annotated_image, 
-              cv::format("点群数: %zu", filtered_cloud->points.size()),
-              cv::Point(aspara_info.bounding_box_2d.x, y_offset + 75), 
-              12.0, cv::Scalar(255, 255, 255), 2);
-    
-    // 処理時間情報を画面上部に表示（半透明の背景）
-    cv::Mat overlay = annotated_image.clone();
-    cv::Scalar time_bg_color(0, 0, 0); // 黒背景
-    cv::Scalar time_text_color(255, 255, 255); // 白文字
-    
-    // 背景の矩形を描画（半透明にするためにオーバーレイを使用）
-    cv::rectangle(overlay, 
-                 cv::Point(5, 5), 
-                 cv::Point(420, 125), 
-                 time_bg_color, 
-                 cv::FILLED);
-    
-    // 半透明のブレンド（alpha=0.7）
-    cv::addWeighted(overlay, 0.7, annotated_image, 0.3, 0, annotated_image);
-    
-    // 処理時間情報を表示（日本語版）
-    int time_y = 25;
-    putTextJP(annotated_image, 
-              "=== 処理時間計測 ===",
-              cv::Point(10, time_y), 
-              12.0, cv::Scalar(0, 255, 255), 2); // 黄色で強調
-    
-    time_y += 25;
-    // 全体時間を大きく表示（日本語）
-    putTextJP(annotated_image, 
-              cv::format("合計: %.1f ms (%.1f FPS)", 
-                        aspara_info.processing_times.total_ms,
-                        1000.0 / aspara_info.processing_times.total_ms),
-              cv::Point(10, time_y), 
-              14.0, cv::Scalar(0, 255, 0), 2); // 緑色で全体時間
-    
-    time_y += 22;
-    // 各処理の内訳を表示（日本語）
-    putTextJP(annotated_image, 
-              cv::format("領域抽出: %.1fms, ノイズ除去: %.1fms", 
-                        aspara_info.processing_times.filter_bbox_ms,
-                        aspara_info.processing_times.noise_reduction_ms),
-              cv::Point(10, time_y), 
-              9.0, time_text_color, 1);
-    
-    time_y += 18;
-    putTextJP(annotated_image, 
-              cv::format("PCA解析: %.1fms, 測定: %.1fms", 
-                        aspara_info.processing_times.pca_calculation_ms,
-                        aspara_info.processing_times.measurement_ms),
-              cv::Point(10, time_y), 
-              9.0, time_text_color, 1);
-    
-    time_y += 18;
-    // 点群のポイント数を赤色で警告的に表示（多い場合）
-    cv::Scalar points_color = filtered_cloud->points.size() > 500 ? cv::Scalar(0, 0, 255) : time_text_color;
-    putTextJP(annotated_image, 
-              cv::format("点群数: %zu", filtered_cloud->points.size()),
-              cv::Point(10, time_y), 
-              9.0, points_color, 1);
+    // 処理時間情報（簡略化）
+    std::string timing_info = cv::format("Points:%zu Time:%.1fms", filtered_cloud->points.size(), aspara_info.processing_times.total_ms);
+    cv::putText(annotated_image, timing_info, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
     
     // 注釈付き画像をパブリッシュ
     try {
