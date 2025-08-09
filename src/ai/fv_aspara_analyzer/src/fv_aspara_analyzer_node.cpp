@@ -1002,6 +1002,14 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 smooth_cursor_position_ = cursor_position_;
             }
         }
+
+        // 検出が1つしかない場合は常にその中心へ追従
+        if (snapshot_list.size() == 1) {
+            const auto& only_aspara = snapshot_list[0];
+            cursor_position_.x = only_aspara.bounding_box_2d.x + only_aspara.bounding_box_2d.width / 2;
+            cursor_position_.y = only_aspara.bounding_box_2d.y + only_aspara.bounding_box_2d.height / 2;
+            cursor_visible_ = true;
+        }
     } else {
         // アスパラが検出されない場合、5秒後に自動でカーソルOFF
         auto time_since_detection = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1150,11 +1158,88 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 cv::Point(smooth_cursor_position_.x, smooth_cursor_position_.y + cursor_size),
                 cursor_color, cursor_thickness);
         
-        // カーソル位置情報表示（デバッグ用）
-        std::string cursor_info = cv::format("Cursor: (%d, %d)", cursor_position_.x, cursor_position_.y);
-        fluent::text::draw(output_image, cursor_info, 
-                          cv::Point(smooth_cursor_position_.x + 25, smooth_cursor_position_.y - 25),
-                          cursor_color, 0.4, 1);
+        // カーソル位置の距離・座標表示（(x,y,z) と 距離[cm]）
+        double distance_m = 0.0;
+        bool has_distance = false;
+        double x_m = 0.0, y_m = 0.0, z_m = 0.0;
+        {
+            // 深度・カメラ情報を取得
+            sensor_msgs::msg::Image::SharedPtr depth_copy;
+            sensor_msgs::msg::Image::SharedPtr color_copy;
+            sensor_msgs::msg::CameraInfo::SharedPtr caminfo_copy;
+            {
+                std::lock_guard<std::mutex> lk(image_data_mutex_);
+                depth_copy = latest_depth_image_;
+                color_copy = latest_color_image_;
+                caminfo_copy = latest_camera_info_;
+            }
+            if (depth_copy && color_copy) {
+                try {
+                    // 変換
+                    cv::Mat depth_mat;
+                    if (depth_copy->encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
+                        depth_mat = cv_bridge::toCvCopy(depth_copy, sensor_msgs::image_encodings::TYPE_16UC1)->image;
+                    } else if (depth_copy->encoding == sensor_msgs::image_encodings::TYPE_32FC1) {
+                        depth_mat = cv_bridge::toCvCopy(depth_copy, sensor_msgs::image_encodings::TYPE_32FC1)->image;
+                    }
+                    // カラー画像サイズ
+                    int cw = static_cast<int>(color_copy->width);
+                    int ch = static_cast<int>(color_copy->height);
+                    int dw = static_cast<int>(depth_copy->width);
+                    int dh = static_cast<int>(depth_copy->height);
+                    // カーソル座標を深度座標にスケール
+                    double sx = (cw > 0) ? static_cast<double>(dw) / cw : 1.0;
+                    double sy = (ch > 0) ? static_cast<double>(dh) / ch : 1.0;
+                    int xd = static_cast<int>(std::round(smooth_cursor_position_.x * sx));
+                    int yd = static_cast<int>(std::round(smooth_cursor_position_.y * sy));
+                    // 近傍3x3で中央値
+                    std::vector<double> vals;
+                    for (int vy = std::max(0, yd - 1); vy <= std::min(dh - 1, yd + 1); ++vy) {
+                        for (int ux = std::max(0, xd - 1); ux <= std::min(dw - 1, xd + 1); ++ux) {
+                            if (depth_mat.type() == CV_16UC1) {
+                                uint16_t mm = depth_mat.at<uint16_t>(vy, ux);
+                                if (mm > 0) vals.push_back(static_cast<double>(mm) * depth_unit_m_16u_);
+                            } else if (depth_mat.type() == CV_32FC1) {
+                                float m = depth_mat.at<float>(vy, ux);
+                                if (std::isfinite(m) && m > 0.0f) vals.push_back(static_cast<double>(m));
+                            }
+                        }
+                    }
+                    if (!vals.empty()) {
+                        std::nth_element(vals.begin(), vals.begin() + vals.size() / 2, vals.end());
+                        distance_m = vals[vals.size() / 2];
+                        z_m = distance_m;
+                        // 3D座標計算（カメラ座標系）
+                        if (caminfo_copy) {
+                            double fx = caminfo_copy->k[0];
+                            double fy = caminfo_copy->k[4];
+                            double cx = caminfo_copy->k[2];
+                            double cy = caminfo_copy->k[5];
+                            // カメラ内参が別解像度の場合はスケール調整
+                            int kiw = static_cast<int>(caminfo_copy->width);
+                            int kih = static_cast<int>(caminfo_copy->height);
+                            if (kiw > 0 && kih > 0) {
+                                double sfx = static_cast<double>(dw) / kiw;
+                                double sfy = static_cast<double>(dh) / kih;
+                                fx *= sfx; cx *= sfx; fy *= sfy; cy *= sfy;
+                            }
+                            if (fx > 0.0 && fy > 0.0) {
+                                x_m = (static_cast<double>(xd) - cx) * z_m / fx;
+                                y_m = (static_cast<double>(yd) - cy) * z_m / fy;
+                            }
+                        }
+                        has_distance = true;
+                    }
+                } catch (...) {
+                    has_distance = false;
+                }
+            }
+        }
+        std::string cursor_info = has_distance ?
+            cv::format("(%.2f, %.2f, %.2f) %.1fcm", x_m, y_m, z_m, distance_m * 100.0) : std::string("(--, --, --) N/A");
+        fluent::text::draw(output_image, cursor_info,
+                           cv::Point(smooth_cursor_position_.x + 25, smooth_cursor_position_.y - 25),
+                           cursor_color, 0.5, 1);
     }
     
     // FPS表示を簡略化（重い処理を削除）
