@@ -117,6 +117,13 @@ fv_realsense_d405:
       pointcloud: "/fv/d405/points"                        # 点群トピック（絶対名）
       color_camera_info: "/fv/d405/color/camera_info"      # カラーカメラ情報トピック（絶対名）
       depth_camera_info: "/fv/d405/depth/camera_info"      # 深度カメラ情報トピック（絶対名）
+      registered_points: "/fv/d405/registered_points"      # organized点群（新規）
+    
+    # ===== Organized点群出力設定 =====
+    organized_pointcloud:
+      enabled: true
+      decimation: 2
+      rgb: false
     # ===== 初期モード =====
     # 0: 停止, 1: カラーのみ, 2: フル（カラー+深度）
     initial_mode: 2

@@ -214,6 +214,8 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         }
 
         if (!sliced_from_registered) {
+            RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"),
+                "[FALLBACK] organized cloud not available. Building ROI cloud from depth image (slow path)");
             // 深度画像とカラー画像をOpenCV形式に変換し、従来ルートでROI点群を生成
             cv::Mat depth_mat, color_mat;
             try {

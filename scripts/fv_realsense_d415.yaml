@@ -116,6 +116,13 @@ fv_realsense_d415:
       pointcloud: "fv/d415/points"                        # 点群トピック
       color_camera_info: "fv/d415/color/camera_info"      # カラーカメラ情報トピック
       depth_camera_info: "fv/d415/depth/camera_info"      # 深度カメラ情報トピック
+      registered_points: "/fv/d415/registered_points"      # organized点群（新規）
+
+    # ===== Organized点群出力設定 =====
+    organized_pointcloud:
+      enabled: true
+      decimation: 2
+      rgb: false
       
       # デフォルトトピック無効化（名前空間競合回避）
       enable_default_topics: false     # デフォルトトピック無効

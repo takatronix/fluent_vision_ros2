@@ -11,25 +11,20 @@
 # [0] 前準備フェーズ
 # -----------------------------------------------------------------
 
+WS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+
 # 共有メモリ転送を有効化（高速画像転送）
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export FASTRTPS_DEFAULT_PROFILES_FILE=../fastdds_shared_memory.xml
+export FASTRTPS_DEFAULT_PROFILES_FILE="$WS_ROOT/fastdds_shared_memory.xml"
 # QoSはコード/YAMLの設定を使う（XMLの上書きを無効化）
 export RMW_FASTRTPS_USE_QOS_FROM_XML=0
 
-# 注: スクリプト内での source は行いません（起動を速くするため）。
-# 必要なら事前に環境を用意してください（例: `source install/setup.bash`）。
-source ../install/setup.bash
+# 環境の読み込み（スクリプトの位置からWS_ROOTを解決）
+if [ -f "$WS_ROOT/install/setup.bash" ]; then
+  # shellcheck disable=SC1090
+  source "$WS_ROOT/install/setup.bash"
+fi
 
-############################################
-# vision系ノードの生き残りを削除
-############################################
-echo "🔧 Stopping any existing FV D415 processes..."
-pkill -9 -f "fv_realsense_d415" || true
-pkill -9 -f "depth_image_proc_d415" || true
-pkill -9 -f "fv_object_detector_d415" || true
-pkill -9 -f "fv_aspara_analyzer_d415" || true
-sleep 1
 
 #######################################################################################
 # ここからvision系ノードの起動
@@ -45,7 +40,7 @@ sleep 1
 echo "📷 Starting RealSense D415 node..."
 ros2 run fv_realsense fv_realsense_node \
     --ros-args \
-    --params-file "fv_realsense_d415.yaml" \
+    --params-file "$WS_ROOT/scripts/fv_realsense_d415.yaml" \
     -r __node:=fv_realsense_d415 &
 
 
@@ -74,7 +69,7 @@ ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
 # -----------------------------------------------------------------
 echo "🎯 Starting Object Detector D415 node..."
 ros2 run fv_object_detector fv_object_detector_node \
-    --ros-args --params-file "fv_object_detector_d415.yaml" \
+    --ros-args --params-file "$WS_ROOT/scripts/fv_object_detector_d415.yaml" \
     -r __node:=fv_object_detector_d415 &
 
 # -----------------------------------------------------------------
@@ -83,7 +78,7 @@ ros2 run fv_object_detector fv_object_detector_node \
 echo "🌱 Starting Aspara Analyzer D415 node..."
 ros2 run fv_aspara_analyzer fv_aspara_analyzer_node \
     --ros-args \
-    --params-file "fv_aspara_analyzer_d415.yaml" \
+    --params-file "$WS_ROOT/scripts/fv_aspara_analyzer_d415.yaml" \
     -r __node:=fv_aspara_analyzer_d415 &
 
 # -----------------------------------------------------------------

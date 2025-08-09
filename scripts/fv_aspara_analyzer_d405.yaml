@@ -40,7 +40,7 @@ fv_aspara_analyzer_d405:
     output_filtered_pointcloud_topic: "/fv/d405/aspara_analysis/filtered_points"  # フィルタリング済み点群
     output_selected_pointcloud_topic: "/fv/d405/aspara_analysis/selected_points"   # 選択点群（生ROI）
     output_detected_all_pointcloud_topic: "/fv/d405/aspara_analysis/detected_all_points"  # 全検出ROIの結合点群
-    enable_detected_all_points: true
+    enable_detected_all_points: false  # 重い処理のためデフォルト無効（必要時のみ有効化）
     output_marker_topic: "/fv/d405/aspara_analysis/markers"  # MarkerArray出力
     output_annotated_image_topic: "/fv/d405/aspara_analysis/result"          # 注釈付き可視化画像
 

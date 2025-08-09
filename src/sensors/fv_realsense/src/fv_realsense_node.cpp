@@ -264,7 +264,19 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("topics.color_camera_info", "color/camera_info");
     topic_config_.depth_camera_info = 
         this->declare_parameter("topics.depth_camera_info", "depth/camera_info");
+    topic_config_.registered_points = 
+        this->declare_parameter("topics.registered_points", "");
     
+    // Organized cloud parameters
+    organized_pointcloud_enabled_ = this->declare_parameter("organized_pointcloud.enabled", false);
+    organized_pointcloud_decimation_ = this->declare_parameter("organized_pointcloud.decimation", 1);
+    organized_pointcloud_rgb_ = this->declare_parameter("organized_pointcloud.rgb", true);
+
+    // Organized cloud parameters
+    organized_pointcloud_enabled_ = this->declare_parameter("organized_pointcloud.enabled", false);
+    organized_pointcloud_decimation_ = this->declare_parameter("organized_pointcloud.decimation", 1);
+    organized_pointcloud_rgb_ = this->declare_parameter("organized_pointcloud.rgb", true);
+
     RCLCPP_INFO(this->get_logger(), "✅ Parameters loaded successfully");
     RCLCPP_INFO(this->get_logger(), "📺 Color topic: %s", topic_config_.color.c_str());
     RCLCPP_INFO(this->get_logger(), "📺 Depth topic: %s", topic_config_.depth.c_str());
@@ -599,6 +611,16 @@ void FVDepthCameraNode::initializePublishers()
         pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
             topic_config_.pointcloud, qos);
     }
+
+    if (organized_pointcloud_enabled_) {
+        std::string reg_topic = topic_config_.registered_points;
+        if (reg_topic.empty()) {
+            // try to build from color topic prefix if absolute path not provided
+            reg_topic = "/fv/d415/registered_points";
+        }
+        registered_points_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(reg_topic, qos);
+        RCLCPP_INFO(this->get_logger(), "📌 Organized cloud publisher: %s", reg_topic.c_str());
+    }
     
     // Camera info publishers
     if (camera_info_config_.enable_camera_info) {
@@ -886,6 +908,70 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
         colormap_msg->header.stamp = now;
         colormap_msg->header.frame_id = tf_config_.depth_optical_frame;
         depth_colormap_pub_->publish(*colormap_msg);
+    }
+
+    // Publish organized registered_points (optional)
+    if (current_mode == 2 && organized_pointcloud_enabled_ && registered_points_pub_ && depth_frame) {
+        try {
+            int dw = depth_intrinsics_.width;
+            int dh = depth_intrinsics_.height;
+            int step = std::max(1, organized_pointcloud_decimation_);
+            bool include_rgb = organized_pointcloud_rgb_ && color_frame;
+
+            sensor_msgs::msg::PointCloud2 cloud_msg;
+            cloud_msg.header.stamp = now;
+            cloud_msg.header.frame_id = align_to_color_ ? tf_config_.color_optical_frame : tf_config_.depth_optical_frame;
+            cloud_msg.width = dw / step;
+            cloud_msg.height = dh / step;
+            cloud_msg.is_bigendian = false;
+            cloud_msg.is_dense = false;
+
+            std::vector<sensor_msgs::msg::PointField> fields;
+            auto addf = [&](const std::string& n, uint32_t off){ sensor_msgs::msg::PointField f; f.name=n; f.offset=off; f.datatype=sensor_msgs::msg::PointField::FLOAT32; f.count=1; fields.push_back(f); };
+            addf("x",0); addf("y",4); addf("z",8);
+            uint32_t point_step = 12;
+            if (include_rgb) { sensor_msgs::msg::PointField f; f.name="rgb"; f.offset=12; f.datatype=sensor_msgs::msg::PointField::FLOAT32; f.count=1; fields.push_back(f); point_step=16; }
+            cloud_msg.fields = fields;
+            cloud_msg.point_step = point_step;
+            cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width;
+            cloud_msg.data.resize(cloud_msg.row_step * cloud_msg.height);
+
+            cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
+            cv::Mat color_image;
+            if (include_rgb) {
+                color_image = cv::Mat(cv::Size(color_intrinsics_.width, color_intrinsics_.height), CV_8UC3, (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
+            }
+
+            uint8_t* dst = cloud_msg.data.data();
+            for (int v = 0; v < dh; v += step) {
+                for (int u = 0; u < dw; u += step) {
+                    uint16_t d = depth_image.at<uint16_t>(v, u);
+                    float z = (d > 0) ? d * depth_scale_ : std::numeric_limits<float>::quiet_NaN();
+                    float x = std::numeric_limits<float>::quiet_NaN();
+                    float y = std::numeric_limits<float>::quiet_NaN();
+                    if (d > 0) {
+                        float pix[2] = {static_cast<float>(u), static_cast<float>(v)};
+                        float pt[3];
+                        rs2_deproject_pixel_to_point(pt, &depth_intrinsics_, pix, z);
+                        x = pt[0]; y = pt[1];
+                    }
+                    memcpy(dst+0,&x,4); memcpy(dst+4,&y,4); memcpy(dst+8,&z,4);
+                    if (include_rgb) {
+                        float rgbf = std::numeric_limits<float>::quiet_NaN();
+                        if (!color_image.empty()) {
+                            cv::Vec3b c = color_image.at<cv::Vec3b>(v,u);
+                            uint32_t rgb = (uint32_t(c[2])<<16) | (uint32_t(c[1])<<8) | uint32_t(c[0]);
+                            memcpy(&rgbf,&rgb,4);
+                        }
+                        memcpy(dst+12,&rgbf,4);
+                    }
+                    dst += point_step;
+                }
+            }
+            registered_points_pub_->publish(cloud_msg);
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(this->get_logger(), "organized cloud publish failed: %s", e.what());
+        }
     }
     
     // Publish camera info

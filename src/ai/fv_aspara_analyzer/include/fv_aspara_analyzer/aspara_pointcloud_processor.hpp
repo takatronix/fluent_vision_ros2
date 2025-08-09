@@ -8,6 +8,7 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
 // Markers
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -156,6 +157,16 @@ public:
         float length_m,
         bool is_harvestable,
         const rclcpp::Time& stamp);
+
+    // Overload: specify principal axis direction in frame_id
+    void publishAsparaMarker(
+        const geometry_msgs::msg::Point& root_position,
+        const std::string& frame_id,
+        int aspara_id,
+        float length_m,
+        bool is_harvestable,
+        const rclcpp::Time& stamp,
+        const geometry_msgs::msg::Vector3& axis_dir);
     
     /**
      * @brief 注釈付き画像をパブリッシュ
@@ -194,7 +205,7 @@ private:
     int noise_reduction_neighbors_;
     double noise_reduction_std_dev_;
     double voxel_leaf_size_;
-    double marker_lifetime_sec_ {0.3};
+    double marker_lifetime_sec_ {30.0};
 };
 
 } // namespace fv_aspara_analyzer

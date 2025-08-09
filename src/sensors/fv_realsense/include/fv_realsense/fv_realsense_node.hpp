@@ -100,6 +100,7 @@ private:
         std::string pointcloud = "depth/color/points";
         std::string color_camera_info = "color/camera_info";
         std::string depth_camera_info = "depth/camera_info";
+        std::string registered_points = ""; // organized cloud topic（空なら無効）
     };
 
     // Configuration members
@@ -122,12 +123,16 @@ private:
     // Synchronization flag
     bool sync_enabled_ = false;
     bool align_to_color_ = false;  // Align depth frames to color stream
+    bool organized_pointcloud_enabled_ = false; // organized cloud publish flag
+    int organized_pointcloud_decimation_ = 1;    // 1=full, >1 decimated with NaN fill
+    bool organized_pointcloud_rgb_ = true;      // include RGB in organized cloud
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr color_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_colormap_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr registered_points_pub_;
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr color_info_pub_;
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr depth_info_pub_;
 

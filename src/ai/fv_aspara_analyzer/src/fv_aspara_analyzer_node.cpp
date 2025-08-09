@@ -1294,6 +1294,18 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     draw_status("深度", depth_alive);
     draw_status("カメラ", cam_alive);
 
+    // 点群（organized）受信状態を表示（organizedでなければ🔴）
+    bool organized_cloud_ok = false;
+    if (latest_pointcloud_) {
+        // organized: height > 1
+        bool is_organized = latest_pointcloud_->height > 1;
+        // recent within 1.5s
+        rclcpp::Time now_rcl = this->now();
+        bool is_recent = (now_rcl - latest_pointcloud_->header.stamp).seconds() <= 1.5;
+        organized_cloud_ok = is_organized && is_recent;
+    }
+    draw_status("点群", organized_cloud_ok);
+
     // フレーム番号（常に更新される値）
     static uint64_t total_frame_count = 0;
     total_frame_count++;
