@@ -131,22 +131,22 @@ void FVObjectMaskGeneratorNode::declareParameters()
 void FVObjectMaskGeneratorNode::initializeTopics()
 {
   // ===== QoSを構築 =====
-  rclcpp::QoS qos(rclcpp::KeepLast(qos_queue_size_));
+  auto qos_profile = rclcpp::QoS{rclcpp::KeepLast(static_cast<size_t>(qos_queue_size_))};
   if (qos_reliability_ == "reliable") {
-    qos.reliable();
+    qos_profile.reliable();
   } else {
-    qos.best_effort();
+    qos_profile.best_effort();
   }
   
   // ===== パブリッシャー作成 =====
   segmentation_mask_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-    output_segmentation_mask_topic_, qos);  // セグメンテーションマスク出力
+    output_segmentation_mask_topic_, qos_profile);  // セグメンテーションマスク出力
   colored_mask_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-    output_colored_mask_topic_, qos);       // カラーマスク出力
+    output_colored_mask_topic_, qos_profile);       // カラーマスク出力
   
   // ===== サブスクライバー作成 =====
   image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-    input_image_topic_, qos,  // 入力画像
+    input_image_topic_, qos_profile,  // 入力画像
     std::bind(&FVObjectMaskGeneratorNode::imageCallback, this, std::placeholders::_1));
     
   RCLCPP_INFO(this->get_logger(), "Topics initialized");
