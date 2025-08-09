@@ -2,9 +2,8 @@
 # ================================================
 # Fluent Vision D415 システム起動スクリプト
 # ================================================
-# depth_image_procがない場合は、
-# sudo apt-get install -y ros-$ROS_DISTRO-depth-image-proc
-# を実行してください。
+# 注: organizedなregistered_pointsはfv_realsenseが直接Publishするため
+# depth_image_procは不要になりました。
 # ================================================
 
 # -----------------------------------------------------------------
@@ -44,21 +43,7 @@ ros2 run fv_realsense fv_realsense_node \
     -r __node:=fv_realsense_d415 &
 
 
-# -----------------------------------------------------------------
-# [2] depth_image_proc の起動
-# 部分的ポイントクラウドの生成（点群処理が重たいためアスパラ領域だけの点群を作成)
-# -----------------------------------------------------------------
-echo "☁️ Starting depth_image_proc for D415..."
-ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
-  -p use_sensor_data_qos:=true \
-  -p qos_overrides./rgb/image_rect_color.reliability:=best_effort \
-  -p qos_overrides./rgb/camera_info.reliability:=best_effort \
-  -p qos_overrides./depth_registered/image_rect.reliability:=best_effort \
-  -r rgb/image_rect_color:=/fv/d415/color/image_raw \
-  -r rgb/camera_info:=/fv/d415/color/camera_info \
-  -r depth_registered/image_rect:=/fv/d415/depth/image_rect_raw \
-  -r points:=/fv/d415/registered_points \
-  -r __node:=depth_image_proc_d415 &
+## depth_image_proc 起動は不要（fv_realsenseが /fv/d415/registered_points を提供）
 
 #######################################################################################
 # ここから分析系ノードの起動

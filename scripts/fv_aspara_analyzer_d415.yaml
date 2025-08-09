@@ -27,7 +27,7 @@
     
     # 入力トピック（Fluent Vision AIシステムから）
     detection_topic: "/fv/d415/object_detection/detections"      # YOLO検出結果
-    pointcloud_topic: "/fv/d415/registered_points"               # 3D点群データ（depth_image_proc出力）
+    pointcloud_topic: "/fv/d415/registered_points"               # 3D点群データ（fv_realsenseのorganized出力）
     camera_info_topic: "/fv/d415/color/camera_info"              # カラーカメラキャリブレーション情報
     depth_camera_info_topic: "/fv/d415/depth/camera_info"        # 深度カメラキャリブレーション情報
     use_color_camera_info: true                                  # 深度をカラーへ整列している場合はtrue（カラー内参を使用）。未整列の生深度の場合はfalse（深度内参を使用）
