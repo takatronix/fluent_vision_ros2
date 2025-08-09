@@ -762,11 +762,10 @@ void FVDepthCameraNode::processingLoop()
                         frame_count++;
                         publishFrames(color_frame_full, depth_frame_full);
                         // Cache latest frames for service-safe access
-                        try {
+            try {
                             std::lock_guard<std::mutex> lk(latest_frame_mutex_);
-                            // Use local clock consistent with message stamps
-                            rclcpp::Clock clock(this->get_clock()->get_clock_type());
-                            latest_frame_stamp_ = clock.now();
+                // Use a consistent SYSTEM_TIME clock for all stamps to avoid mixed time sources
+                latest_frame_stamp_ = rclcpp::Clock(RCL_SYSTEM_TIME).now();
                             if (color_frame_full) {
                                 latest_color_image_mat_ = cv::Mat(cv::Size(color_intrinsics_.width, color_intrinsics_.height),
                                                                   CV_8UC3, (void*)color_frame_full.get_data(), cv::Mat::AUTO_STEP).clone();
@@ -813,9 +812,8 @@ void FVDepthCameraNode::processingLoop()
 
 void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::frame& depth_frame)
 {
-    // Use a local Clock constructed with the same clock type to avoid const issues
-    rclcpp::Clock clock(this->get_clock()->get_clock_type());
-    auto now = clock.now();
+    // Use a consistent SYSTEM_TIME clock for all message stamps to avoid mixed time sources
+    auto now = rclcpp::Clock(RCL_SYSTEM_TIME).now();
     static int publish_count = 0;
     static auto last_publish_log = std::chrono::steady_clock::now();
     
@@ -1034,7 +1032,7 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
     // Publish
     sensor_msgs::msg::PointCloud2 cloud_msg;
     pcl::toROSMsg(cloud, cloud_msg);
-    cloud_msg.header.stamp = this->now();
+    cloud_msg.header.stamp = rclcpp::Clock(RCL_SYSTEM_TIME).now();
     cloud_msg.header.frame_id = tf_config_.color_optical_frame;
     
     RCLCPP_INFO(this->get_logger(), "📤 Publishing point cloud with %zu points", cloud.points.size());
@@ -1060,7 +1058,7 @@ void FVDepthCameraNode::publishTF()
         return;
     }
     
-    auto now = this->now();
+    auto now = rclcpp::Clock(RCL_SYSTEM_TIME).now();
     
     // Static transform from base_link to camera_link
     geometry_msgs::msg::TransformStamped transform;
@@ -1219,7 +1217,7 @@ void FVDepthCameraNode::clickEventCallback(const geometry_msgs::msg::Point::Shar
         if (get3DCoordinate(x, y, world_x, world_y, world_z)) {
             // ポイントマーカーを更新
             point_marker_.point = cv::Point(x, y);
-            point_marker_.start_time = this->now();
+            point_marker_.start_time = rclcpp::Clock(RCL_SYSTEM_TIME).now();
             point_marker_.active = true;
             point_marker_.mode = current_mode_.load();
             point_marker_.x = world_x;
@@ -1283,7 +1281,7 @@ void FVDepthCameraNode::drawMarker(cv::Mat& frame) const
     }
     
     // 10秒経過したら非アクティブにする
-    auto now = this->now();
+    auto now = rclcpp::Clock(RCL_SYSTEM_TIME).now();
     auto elapsed = now - point_marker_.start_time;
     if (elapsed.seconds() > 10.0) {
         point_marker_.active = false;
