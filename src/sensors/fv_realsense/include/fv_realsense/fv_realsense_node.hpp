@@ -121,6 +121,7 @@ private:
     
     // Synchronization flag
     bool sync_enabled_ = false;
+    bool align_to_color_ = false;  // Align depth frames to color stream
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr color_pub_;

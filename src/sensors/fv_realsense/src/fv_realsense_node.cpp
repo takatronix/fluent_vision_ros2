@@ -203,10 +203,15 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("streams.infrared_enabled", false);
     stream_config_.pointcloud_enabled = 
         this->declare_parameter("streams.pointcloud_enabled", true);
+    // Align option (depth aligned to color)
+    // store align flag in a member via parameter (use topic_config_.pointcloud as temp holder if needed)
+    align_to_color_ = this->declare_parameter("streams.align_to_color", false);
+    // keep sync flag as existing behavior
+    sync_enabled_ = this->declare_parameter("streams.sync_enabled", true);
     stream_config_.depth_colormap_enabled = 
         this->declare_parameter("streams.depth_colormap_enabled", true);
-    stream_config_.sync_enabled = 
-        this->declare_parameter("streams.sync_enabled", true);
+    // reuse the already-declared value to avoid double declaration
+    stream_config_.sync_enabled = sync_enabled_;
     
     // Camera info settings
     camera_info_config_.enable_camera_info = 
@@ -540,7 +545,7 @@ void FVDepthCameraNode::initializePublishers()
     std::string qos_reliability = this->get_parameter("qos.reliability").as_string();
     std::string qos_durability = this->get_parameter("qos.durability").as_string();
     
-    auto qos = rclcpp::QoS(qos_queue_size);
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(qos_queue_size)).best_effort().durability_volatile();
     
     // Reliability設定
     if (qos_reliability == "best_effort") {
@@ -561,7 +566,7 @@ void FVDepthCameraNode::initializePublishers()
     // Basic publishers
     if (stream_config_.color_enabled) {
         color_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.color, qos);
+            topic_config_.color, rclcpp::SensorDataQoS());
         RCLCPP_INFO(this->get_logger(), "📷 Color publisher created: %s, ptr: %p", 
             topic_config_.color.c_str(), static_cast<void*>(color_pub_.get()));
         
@@ -569,7 +574,7 @@ void FVDepthCameraNode::initializePublishers()
             // Create compressed image publisher directly
             std::string compressed_topic = topic_config_.color + "/compressed";
             color_compressed_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
-                compressed_topic, qos);
+                compressed_topic, rclcpp::SensorDataQoS());
             RCLCPP_INFO(this->get_logger(), "📷 Compressed publisher created: %s", 
                 compressed_topic.c_str());
         }
@@ -577,25 +582,25 @@ void FVDepthCameraNode::initializePublishers()
     
     if (stream_config_.depth_enabled) {
         depth_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.depth, qos);
+            topic_config_.depth, rclcpp::SensorDataQoS());
     }
     
     if (stream_config_.depth_colormap_enabled) {
         depth_colormap_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.depth_colormap, qos);
+            topic_config_.depth_colormap, rclcpp::SensorDataQoS());
     }
     
     if (stream_config_.pointcloud_enabled) {
         pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            topic_config_.pointcloud, qos);
+            topic_config_.pointcloud, rclcpp::SensorDataQoS());
     }
     
     // Camera info publishers
     if (camera_info_config_.enable_camera_info) {
         color_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            topic_config_.color_camera_info, qos);
+            topic_config_.color_camera_info, rclcpp::SensorDataQoS());
         depth_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            topic_config_.depth_camera_info, qos);
+            topic_config_.depth_camera_info, rclcpp::SensorDataQoS());
         RCLCPP_INFO(this->get_logger(), "📋 Camera info publishers created: %s, %s", 
             topic_config_.color_camera_info.c_str(), 
             topic_config_.depth_camera_info.c_str());
@@ -713,6 +718,12 @@ void FVDepthCameraNode::processingLoop()
                     if (sync_enabled_) {
                         // 同期フレームセットを取得（深度とカラーが同じタイムスタンプ）
                         frames_full = pipe_.wait_for_frames(1000);
+                        if (align_to_color_) {
+                            static rs2::align align_color(RS2_STREAM_COLOR);
+                            frames_full = align_color.process(frames_full);
+                            // Use color intrinsics for aligned depth
+                            depth_intrinsics_ = color_intrinsics_;
+                        }
                         
                         // 同期チェック（タイムスタンプが同じか確認）
                         auto color_frame_full = frames_full.get_color_frame();
@@ -737,6 +748,11 @@ void FVDepthCameraNode::processingLoop()
                     } else {
                         // 非同期モード（従来通り）
                         frames_full = pipe_.wait_for_frames(1000);
+                        if (align_to_color_) {
+                            static rs2::align align_color(RS2_STREAM_COLOR);
+                            frames_full = align_color.process(frames_full);
+                            depth_intrinsics_ = color_intrinsics_;
+                        }
                     }
                     
                     auto color_frame_full = frames_full.get_color_frame();
@@ -748,7 +764,9 @@ void FVDepthCameraNode::processingLoop()
                         // Cache latest frames for service-safe access
                         try {
                             std::lock_guard<std::mutex> lk(latest_frame_mutex_);
-                            latest_frame_stamp_ = this->now();
+                            // Use local clock consistent with message stamps
+                            rclcpp::Clock clock(this->get_clock()->get_clock_type());
+                            latest_frame_stamp_ = clock.now();
                             if (color_frame_full) {
                                 latest_color_image_mat_ = cv::Mat(cv::Size(color_intrinsics_.width, color_intrinsics_.height),
                                                                   CV_8UC3, (void*)color_frame_full.get_data(), cv::Mat::AUTO_STEP).clone();
@@ -795,7 +813,9 @@ void FVDepthCameraNode::processingLoop()
 
 void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::frame& depth_frame)
 {
-    auto now = this->now();
+    // Use a local Clock constructed with the same clock type to avoid const issues
+    rclcpp::Clock clock(this->get_clock()->get_clock_type());
+    auto now = clock.now();
     static int publish_count = 0;
     static auto last_publish_log = std::chrono::steady_clock::now();
     

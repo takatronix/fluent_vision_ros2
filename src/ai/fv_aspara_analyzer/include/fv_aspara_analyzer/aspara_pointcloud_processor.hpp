@@ -8,6 +8,9 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+// Markers
+#include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 // OpenCV関連のインクルード
 #include <cv_bridge/cv_bridge.h>
@@ -145,6 +148,15 @@ public:
         const std::string& frame_id,
         int aspara_id);
     
+    // Marker publisher (preferred over TF for per-detection visualization)
+    void publishAsparaMarker(
+        const geometry_msgs::msg::Point& root_position,
+        const std::string& frame_id,
+        int aspara_id,
+        float length_m,
+        bool is_harvestable,
+        const rclcpp::Time& stamp);
+    
     /**
      * @brief 注釈付き画像をパブリッシュ
      * @param image 元画像
@@ -171,6 +183,7 @@ private:
     // パブリッシャー
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_pointcloud_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr annotated_image_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_pub_;
     
     // TFブロードキャスター
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -181,6 +194,7 @@ private:
     int noise_reduction_neighbors_;
     double noise_reduction_std_dev_;
     double voxel_leaf_size_;
+    double marker_lifetime_sec_ {0.3};
 };
 
 } // namespace fv_aspara_analyzer

@@ -181,6 +181,7 @@ public:
     // ===== ROS2 パブリッシャー =====
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_pointcloud_pub_;    ///< フィルタリング済み点群パブリッシャー
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr selected_pointcloud_pub_;    ///< 選択中のアスパラガス点群パブリッシャー
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr detected_all_pointcloud_pub_; ///< 検出中すべてのアスパラ点群
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr annotated_image_pub_;              ///< 注釈付き画像パブリッシャー
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr annotated_image_compressed_pub_;  ///< 注釈付き圧縮画像パブリッシャー
     
@@ -226,6 +227,8 @@ public:
     double harvest_max_length_;                                                               ///< 収穫最大長さ
     double straightness_threshold_;                                                           ///< 真っ直ぐ度閾値
     bool enable_pointcloud_processing_;                                                       ///< ポイントクラウド処理有効化フラグ
+    double depth_unit_m_16u_ {0.001};                                                         ///< 16UC1のメートル換算係数
+    bool enable_detected_all_points_{false};                                                  ///< 全検出点群の公開有効化
     
     // ===== 選択管理パラメータ =====
     double object_tracking_overlap_threshold_;                                                ///< 重複度閾値

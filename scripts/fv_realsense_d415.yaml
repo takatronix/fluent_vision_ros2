@@ -48,6 +48,7 @@
       pointcloud_enabled: true       # 点群生成有効
       depth_colormap_enabled: false  # 深度カラーマップ有効
       sync_enabled: true            # 深度・カラー同期有効（重要！）
+      align_to_color: true          # 深度をカラーへ整列（ROI色付け整合）
     
     # ===== 点群処理パラメータ =====
     pointcloud:
@@ -97,8 +98,6 @@
     services:
       get_distance_enabled: true       # 距離取得サービス有効
       get_camera_info_enabled: true    # カメラ情報取得サービス有効
-      generate_pointcloud_enabled: false # 点群生成サービス廃止
-      generate_pointcloud_name: "fv/d415/generate_pointcloud"  # 点群生成サービス名
     
     # ===== TF（座標変換）設定 =====
     tf:

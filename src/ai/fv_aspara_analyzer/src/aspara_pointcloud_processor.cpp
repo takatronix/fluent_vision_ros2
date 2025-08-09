@@ -1,6 +1,7 @@
 #include "fv_aspara_analyzer/aspara_pointcloud_processor.hpp"
 #include "fv_aspara_analyzer/fv_aspara_analyzer_node.hpp"
 #include <fluent.hpp>
+#include <cmath>
 
 namespace fv_aspara_analyzer {
 
@@ -8,11 +9,17 @@ AsparaPointcloudProcessor::AsparaPointcloudProcessor(FvAsparaAnalyzerNode* node_
     : node_(node_ptr)
 {
     // パブリッシャー初期化
-    // このパブリッシャーは使用しない（FvAsparaAnalyzerNodeで作成済み）
-    // filtered_pointcloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-    //     "output_filtered_pointcloud", 10);
+    filtered_pointcloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "output_filtered_pointcloud", 10);
     annotated_image_pub_ = node_->create_publisher<sensor_msgs::msg::Image>(
         "output_annotated_image", 10);
+    // マーカートピックはパラメータ化
+    std::string marker_topic = node_->declare_parameter<std::string>(
+        "output_marker_topic", "aspara_markers");
+    markers_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
+        marker_topic, 10);
+    // 表示寿命をパラメータ化
+    marker_lifetime_sec_ = node_->declare_parameter<double>("marker_lifetime_sec", 0.3);
     
     // TFブロードキャスター初期化
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(node_);
@@ -372,30 +379,16 @@ void AsparaPointcloudProcessor::publishFilteredPointCloud(
     output_msg.header.stamp = node_->now();
     output_msg.header.frame_id = frame_id;
     
-    // 優先: ノードの設定済みトピックへ公開
-    if (node_->filtered_pointcloud_pub_) {
-        try {
-            node_->filtered_pointcloud_pub_->publish(output_msg);
-            RCLCPP_INFO(node_->get_logger(), "[POINTCLOUD] Successfully published filtered pointcloud to topic: %s, size: %zu bytes", 
-                        node_->filtered_pointcloud_pub_->get_topic_name(), 
-                        output_msg.data.size());
-        } catch (const std::exception& e) {
-            RCLCPP_ERROR(node_->get_logger(), "[POINTCLOUD] Failed to publish: %s", e.what());
-        }
-    } else {
-        RCLCPP_ERROR(node_->get_logger(), "[POINTCLOUD] filtered_pointcloud_pub_ is null!");
-    }
+    filtered_pointcloud_pub_->publish(output_msg);
 }
 
+// Overload with explicit timestamp (used by analyzer thread)
 void AsparaPointcloudProcessor::publishFilteredPointCloud(
     const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
     const std::string& frame_id,
     int /*aspara_id*/,
     const rclcpp::Time& stamp)
 {
-    RCLCPP_INFO(node_->get_logger(), "[POINTCLOUD] publishFilteredPointCloud called with cloud size: %zu, pub_valid: %d", 
-                cloud ? cloud->points.size() : 0, node_->filtered_pointcloud_pub_ ? 1 : 0);
-    
     if (!cloud || cloud->points.empty()) {
         RCLCPP_WARN(node_->get_logger(), "Cannot publish empty or null point cloud");
         return;
@@ -404,18 +397,7 @@ void AsparaPointcloudProcessor::publishFilteredPointCloud(
     pcl::toROSMsg(*cloud, output_msg);
     output_msg.header.stamp = stamp;
     output_msg.header.frame_id = frame_id;
-    if (node_->filtered_pointcloud_pub_) {
-        try {
-            node_->filtered_pointcloud_pub_->publish(output_msg);
-            RCLCPP_INFO(node_->get_logger(), "[POINTCLOUD] Successfully published filtered pointcloud to topic: %s, size: %zu bytes", 
-                        node_->filtered_pointcloud_pub_->get_topic_name(), 
-                        output_msg.data.size());
-        } catch (const std::exception& e) {
-            RCLCPP_ERROR(node_->get_logger(), "[POINTCLOUD] Failed to publish: %s", e.what());
-        }
-    } else {
-        RCLCPP_ERROR(node_->get_logger(), "[POINTCLOUD] filtered_pointcloud_pub_ is null!");
-    }
+    filtered_pointcloud_pub_->publish(output_msg);
 }
 
 void AsparaPointcloudProcessor::publishRootTF(
@@ -423,20 +405,66 @@ void AsparaPointcloudProcessor::publishRootTF(
     const std::string& frame_id,
     int aspara_id)
 {
-    geometry_msgs::msg::TransformStamped transform_stamped;
-    transform_stamped.header.stamp = node_->now();
-    transform_stamped.header.frame_id = frame_id;
-    transform_stamped.child_frame_id = "aspara_" + std::to_string(aspara_id) + "_root";
-    
-    transform_stamped.transform.translation.x = root_position.x;
-    transform_stamped.transform.translation.y = root_position.y;
-    transform_stamped.transform.translation.z = root_position.z;
-    transform_stamped.transform.rotation.x = 0.0;
-    transform_stamped.transform.rotation.y = 0.0;
-    transform_stamped.transform.rotation.z = 0.0;
-    transform_stamped.transform.rotation.w = 1.0;
-    
-    tf_broadcaster_->sendTransform(transform_stamped);
+    // 廃止: TFの氾濫を避けるためMarkerに置換
+    (void)root_position; (void)frame_id; (void)aspara_id;
+}
+
+void AsparaPointcloudProcessor::publishAsparaMarker(
+    const geometry_msgs::msg::Point& root_position,
+    const std::string& frame_id,
+    int aspara_id,
+    float length_m,
+    bool is_harvestable,
+    const rclcpp::Time& stamp)
+{
+    if (!markers_pub_) return;
+    visualization_msgs::msg::MarkerArray array_msg;
+    visualization_msgs::msg::Marker cyl;
+    cyl.header.stamp = stamp;
+    cyl.header.frame_id = frame_id;
+    // camera名をprefix化（fv/d415/... → d415）
+    std::string camera_prefix = frame_id;
+    auto p = camera_prefix.find("/d415/");
+    if (p != std::string::npos) camera_prefix = "d415";
+    p = frame_id.find("/d405/");
+    if (p != std::string::npos) camera_prefix = "d405";
+
+    cyl.ns = camera_prefix + "_aspara";
+    cyl.id = aspara_id;
+    cyl.type = visualization_msgs::msg::Marker::CYLINDER;
+    cyl.action = visualization_msgs::msg::Marker::ADD;
+    cyl.pose.position = root_position; // 根元に立てる
+    cyl.pose.orientation.w = 1.0;      // Z軸向き（簡易）
+    cyl.scale.x = 0.02;                // 直径 2cm（調整可）
+    cyl.scale.y = 0.02;
+    cyl.scale.z = std::max(0.01f, length_m); // 高さを長さに合わせる
+    if (is_harvestable) {
+        cyl.color.r = 0.0; cyl.color.g = 1.0; cyl.color.b = 0.0; cyl.color.a = 0.9;
+    } else {
+        cyl.color.r = 1.0; cyl.color.g = 0.0; cyl.color.b = 0.0; cyl.color.a = 0.9;
+    }
+    cyl.lifetime = rclcpp::Duration::from_seconds(marker_lifetime_sec_);
+    array_msg.markers.push_back(cyl);
+    // 距離ラベル
+    visualization_msgs::msg::Marker txt;
+    txt.header = cyl.header;
+    txt.ns = cyl.ns + "_dist";
+    txt.id = aspara_id; // ペア
+    txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    txt.action = visualization_msgs::msg::Marker::ADD;
+    txt.pose = cyl.pose;
+    txt.pose.position.z += cyl.scale.z + 0.03; // 少し上
+    txt.scale.z = 0.06; // 6cm文字
+    txt.color.r = 1.0; txt.color.g = 1.0; txt.color.b = 1.0; txt.color.a = 0.95;
+    // 距離[m]（原点からのユークリッド距離）
+    double dist = std::sqrt(
+        cyl.pose.position.x * cyl.pose.position.x +
+        cyl.pose.position.y * cyl.pose.position.y +
+        cyl.pose.position.z * cyl.pose.position.z);
+    txt.text = (camera_prefix + ": " + std::to_string(static_cast<float>(dist))).substr(0, 16) + " m";
+    txt.lifetime = cyl.lifetime;
+    array_msg.markers.push_back(txt);
+    markers_pub_->publish(array_msg);
 }
 
 void AsparaPointcloudProcessor::publishAnnotatedImage(

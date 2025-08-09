@@ -30,7 +30,8 @@ public:
         const cv::Mat& color_image,
         const cv::Rect& roi,
         const sensor_msgs::msg::CameraInfo& camera_info,
-        int skip = 1)  // ピクセルスキップ（1=全部、2=半分、4=1/4）
+        int skip = 1,  // ピクセルスキップ（1=全部、2=半分、4=1/4）
+        float depth_scale_m_per_unit = 0.001f)  // 16UC1時の単位変換係数（m/units）
     {
         PointCloudRGBPtr cloud(new PointCloudRGB);
         
@@ -40,8 +41,8 @@ public:
         float cx = camera_info.k[2];
         float cy = camera_info.k[5];
         
-        // 深度スケール（RealSenseは通常0.001）
-        float depth_scale = 0.001f;
+        // 深度スケール（RealSense既定: 0.001。D405は機種により0.0001）
+        const float depth_scale = depth_scale_m_per_unit;
         
         // ROI範囲チェック
         cv::Rect safe_roi = roi & cv::Rect(0, 0, depth_image.cols, depth_image.rows);
@@ -57,7 +58,7 @@ public:
                 // 深度画像の型に応じて単位を統一（m単位に）
                 float depth;
                 if (depth_image.type() == CV_16UC1) {
-                    depth = depth_raw * 0.001f;  // mm -> m
+                    depth = depth_raw * depth_scale;  // units -> m
                 } else {
                     depth = depth_raw;  // 既にm単位
                 }
@@ -99,7 +100,8 @@ public:
         const cv::Mat& color_image,
         const cv::Mat& mask,  // 0/255のマスク画像
         const sensor_msgs::msg::CameraInfo& camera_info,
-        int skip = 1)
+        int skip = 1,
+        float depth_scale_m_per_unit = 0.001f)
     {
         PointCloudRGBPtr cloud(new PointCloudRGB);
         
@@ -107,7 +109,7 @@ public:
         float fy = camera_info.k[4];
         float cx = camera_info.k[2];
         float cy = camera_info.k[5];
-        float depth_scale = 0.001f;
+        const float depth_scale = depth_scale_m_per_unit;
         
         // マスクの有効ピクセル数を事前カウント（メモリ最適化）
         int valid_pixels = cv::countNonZero(mask) / (skip * skip);
@@ -123,7 +125,7 @@ public:
                 // 深度画像の型に応じて単位を統一（m単位に）
                 float depth;
                 if (depth_image.type() == CV_16UC1) {
-                    depth = depth_raw * 0.001f;  // mm -> m
+                    depth = depth_raw * depth_scale;  // units -> m
                 } else {
                     depth = depth_raw;  // 既にm単位
                 }
@@ -162,7 +164,10 @@ public:
         const cv::Mat& depth_image,
         const cv::Mat& color_image,
         const cv::Rect& bbox,  // YOLOのバウンディングボックス
-        const sensor_msgs::msg::CameraInfo& camera_info)
+        const sensor_msgs::msg::CameraInfo& camera_info,
+        float depth_scale_m_per_unit = 0.001f,
+        float min_depth_m = 0.2f,
+        float max_depth_m = 1.5f)
     {
         // アスパラガスは縦長なので、横方向は粗く、縦方向は細かく
         PointCloudRGBPtr cloud(new PointCloudRGB);
@@ -198,7 +203,7 @@ public:
                 // 深度画像の型に応じて単位を統一（m単位に）
                 float depth;
                 if (depth_image.type() == CV_16UC1) {
-                    depth = depth_raw * 0.001f;  // mm -> m
+                    depth = depth_raw * depth_scale_m_per_unit;  // units -> m
                 } else if (depth_image.type() == CV_32FC1) {
                     depth = depth_raw;  // 既にm単位
                 } else {
@@ -211,8 +216,8 @@ public:
                     debug_printed = true;
                 }
                 
-                // アスパラガスの典型的な距離範囲
-                if (depth > 0.2f && depth < 1.5f) {
+                // 指定距離範囲
+                if (depth > min_depth_m && depth < max_depth_m) {
                     pcl::PointXYZRGB point;
                     
                     point.z = depth;

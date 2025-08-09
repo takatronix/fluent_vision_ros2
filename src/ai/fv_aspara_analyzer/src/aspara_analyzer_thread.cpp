@@ -144,7 +144,16 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             color_image = node_->latest_color_image_;
             if (color_image) {
                 rclcpp::Time color_time = color_image->header.stamp;
-                double time_diff = std::abs((depth_time - color_time).seconds());
+                // 安全: Clock種が異なる場合は同期チェックをスキップ
+                double time_diff = 0.0;
+                if (depth_time.get_clock_type() == color_time.get_clock_type()) {
+                    time_diff = std::abs((depth_time - color_time).seconds());
+                } else {
+                    RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"),
+                        "[SYNC] Skipping timestamp diff due to different clock types: depth=%d color=%d",
+                        static_cast<int>(depth_time.get_clock_type()), static_cast<int>(color_time.get_clock_type()));
+                    time_diff = 0.0; // チェックせず続行
+                }
                 if (time_diff > 0.1) { // 100ms以上ずれている場合
                     RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), 
                         "[SYNC] Color image timestamp mismatch: %.3fs - using grayscale", time_diff);
@@ -172,91 +181,101 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             "[POINTCLOUD] Data available: depth_encoding=%s, color_encoding=%s", 
             depth_image->encoding.c_str(), color_image->encoding.c_str());
 
-        // 深度画像から効率的に点群を抽出（Fluent libのDepthToCloud使用）
+        // 可能ならregistered_points（organized cloud）からROIスライス、なければ深度→点群変換
         fluent::utils::Stopwatch filter_stopwatch;
-        
-        // 深度画像とカラー画像をOpenCV形式に変換
-        cv::Mat depth_mat, color_mat;
-        try {
-            RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
-                "[POINTCLOUD] Processing depth image: encoding=%s, size=%dx%d", 
-                depth_image->encoding.c_str(), depth_image->width, depth_image->height);
-            
-            // 深度は 16UC1 または 32FC1 を許容
-            if (depth_image->encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
-                cv_bridge::CvImagePtr depth_ptr = cv_bridge::toCvCopy(depth_image, sensor_msgs::image_encodings::TYPE_16UC1);
-                depth_mat = depth_ptr->image; // mm 単位
-                double min_val, max_val;
-                cv::minMaxLoc(depth_mat, &min_val, &max_val);
-                
-                // 8bitカメラ問題の検出
-                if (max_val < 1000) {
-                    RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), 
-                        "[POINTCLOUD] ⚠️ 8bit depth detected: range=[%.0f, %.0f] - possible camera issue", 
-                        min_val, max_val);
-                } else {
-                    RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"), 
-                        "[POINTCLOUD] Depth image converted: 16UC1, range=[%.0f, %.0f]", 
-                        min_val, max_val);
+        // まずはregistered_pointsの有無を確認
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+        bool sliced_from_registered = false;
+        auto pc2 = node_->latest_pointcloud_;
+        if (pc2 && pc2->width > 0 && pc2->height > 1) {
+            // organized cloud 前提
+            cv::Rect bbox = aspara_info.bounding_box_2d;
+            int width = static_cast<int>(pc2->width);
+            int height = static_cast<int>(pc2->height);
+            cv::Rect img_rect(0, 0, width, height);
+            cv::Rect roi = bbox & img_rect;
+            if (roi.area() > 0) {
+                pcl::PointCloud<pcl::PointXYZRGB> full;
+                pcl::fromROSMsg(*pc2, full);
+                for (int v = roi.y; v < roi.y + roi.height; ++v) {
+                    for (int u = roi.x; u < roi.x + roi.width; ++u) {
+                        const pcl::PointXYZRGB& p = full.at(u, v);
+                        if (!std::isfinite(p.z) || p.z <= 0.0f) continue;
+                        filtered_cloud->points.push_back(p);
+                    }
                 }
-            } else if (depth_image->encoding == sensor_msgs::image_encodings::TYPE_32FC1) {
-                cv_bridge::CvImagePtr depth_ptr = cv_bridge::toCvCopy(depth_image, sensor_msgs::image_encodings::TYPE_32FC1);
-                // 32FC1（メートル単位）をそのまま使用（Fluent libが適切に変換する）
-                depth_mat = depth_ptr->image;
-                double min_val, max_val;
-                cv::minMaxLoc(depth_mat, &min_val, &max_val);
-                RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"), 
-                    "[POINTCLOUD] Depth image converted: 32FC1, range=[%.3f, %.3f]m", 
-                    min_val, max_val);
-            } else {
-                RCLCPP_ERROR(rclcpp::get_logger("analyzer_thread"), 
-                    "[POINTCLOUD] Unsupported depth encoding: %s", depth_image->encoding.c_str());
+                filtered_cloud->width = filtered_cloud->points.size();
+                filtered_cloud->height = 1;
+                filtered_cloud->is_dense = false;
+                sliced_from_registered = true;
+                RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"),
+                    "[POINTCLOUD] Sliced %zu points from registered_points ROI", filtered_cloud->points.size());
+            }
+        }
+
+        if (!sliced_from_registered) {
+            // 深度画像とカラー画像をOpenCV形式に変換し、従来ルートでROI点群を生成
+            cv::Mat depth_mat, color_mat;
+            try {
+                RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"),
+                    "[POINTCLOUD] Processing depth image: encoding=%s, size=%dx%d",
+                    depth_image->encoding.c_str(), depth_image->width, depth_image->height);
+                if (depth_image->encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
+                    cv_bridge::CvImagePtr depth_ptr = cv_bridge::toCvCopy(depth_image, sensor_msgs::image_encodings::TYPE_16UC1);
+                    depth_mat = depth_ptr->image;
+                } else if (depth_image->encoding == sensor_msgs::image_encodings::TYPE_32FC1) {
+                    cv_bridge::CvImagePtr depth_ptr = cv_bridge::toCvCopy(depth_image, sensor_msgs::image_encodings::TYPE_32FC1);
+                    depth_mat = depth_ptr->image;
+                } else {
+                    RCLCPP_ERROR(rclcpp::get_logger("analyzer_thread"), "[POINTCLOUD] Unsupported depth encoding: %s", depth_image->encoding.c_str());
+                    return;
+                }
+                cv_bridge::CvImagePtr color_ptr = cv_bridge::toCvCopy(color_image, sensor_msgs::image_encodings::BGR8);
+                color_mat = color_ptr->image;
+            } catch (cv_bridge::Exception& e) {
+                std::cout << "CV bridge exception in image conversion: " << e.what() << std::endl;
                 return;
             }
+            cv::Rect bbox_color = aspara_info.bounding_box_2d;
+            double sx = static_cast<double>(depth_image->width) / static_cast<double>(color_image->width);
+            double sy = static_cast<double>(depth_image->height) / static_cast<double>(color_image->height);
+            if (!std::isfinite(sx) || sx <= 0.0) sx = 1.0;
+            if (!std::isfinite(sy) || sy <= 0.0) sy = 1.0;
+            cv::Rect bbox_depth(
+                static_cast<int>(std::round(bbox_color.x * sx)),
+                static_cast<int>(std::round(bbox_color.y * sy)),
+                static_cast<int>(std::round(bbox_color.width * sx)),
+                static_cast<int>(std::round(bbox_color.height * sy)));
+            cv::Rect image_rect(0, 0, depth_image->width, depth_image->height);
+            cv::Rect clipped = bbox_depth & image_rect;
+            if (!clipped.area()) {
+                RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), "[POINTCLOUD] ROI outside image bounds");
+                return;
+            }
+            float depth_scale_m = static_cast<float>(node_->depth_unit_m_16u_);
+            if (depth_mat.type() == CV_16UC1) {
+                double dmin, dmax; cv::minMaxLoc(depth_mat, &dmin, &dmax);
+                if (dmax < 200 && depth_scale_m > 0.0001f) {
+                    depth_scale_m = 0.0001f;
+                    RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), "[POINTCLOUD] override depth_scale=0.0001");
+                }
+            }
+            filtered_cloud = fluent_cloud::io::DepthToCloud::convertAsparagusROI(
+                depth_mat, color_mat, clipped, *camera_info, depth_scale_m);
 
-            cv_bridge::CvImagePtr color_ptr = cv_bridge::toCvCopy(color_image, sensor_msgs::image_encodings::BGR8);
-            color_mat = color_ptr->image;
-        } catch (cv_bridge::Exception& e) {
-            std::cout << "CV bridge exception in image conversion: " << e.what() << std::endl;
-            return;
+            // ROI深度統計ログ（fallback経路のみ）
+            {
+                cv::Mat roi_depth = depth_mat(clipped);
+                double roi_min, roi_max; cv::minMaxLoc(roi_depth, &roi_min, &roi_max);
+                cv::Scalar roi_mean = cv::mean(roi_depth);
+                int zero_count = cv::countNonZero(roi_depth == 0);
+                int total_count = roi_depth.rows * roi_depth.cols;
+                double zero_ratio = total_count > 0 ? (static_cast<double>(zero_count) / total_count) : 0.0;
+                RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"),
+                    "[ROI] depth stats: min=%.0f max=%.0f mean=%.1f zero=%.1f%% size=%dx%d",
+                    roi_min, roi_max, roi_mean[0], zero_ratio * 100.0, roi_depth.cols, roi_depth.rows);
+            }
         }
-        
-        // バウンディングボックスの範囲チェック
-        cv::Rect bbox = aspara_info.bounding_box_2d;
-        cv::Rect image_rect(0, 0, depth_image->width, depth_image->height);
-        cv::Rect clipped = bbox & image_rect;
-        if (!clipped.area()) {
-            RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), 
-                "[POINTCLOUD] Bounding box outside image bounds: bbox=(%d,%d,%d,%d), image=(%d,%d)", 
-                bbox.x, bbox.y, bbox.width, bbox.height, depth_image->width, depth_image->height);
-            return;
-        }
-        if (clipped.area() != bbox.area()) {
-            RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"),
-                "[POINTCLOUD] ROI clipped to image bounds: in=(%d,%d,%d,%d) -> clip=(%d,%d,%d,%d)",
-                bbox.x, bbox.y, bbox.width, bbox.height, clipped.x, clipped.y, clipped.width, clipped.height);
-        }
-        
-        // Fluent libのDepthToCloudを使用してアスパラガスROI専用の点群生成
-        RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
-            "[POINTCLOUD] Converting depth to cloud for bbox: x=%d, y=%d, w=%d, h=%d", 
-            clipped.x, clipped.y, clipped.width, clipped.height);
-        
-        RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
-            "[POINTCLOUD] Depth mat size: %dx%d, type: %d, Color mat size: %dx%d", 
-            depth_mat.cols, depth_mat.rows, depth_mat.type(), color_mat.cols, color_mat.rows);
-        
-        RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
-            "[POINTCLOUD] Camera info: fx=%f, fy=%f, cx=%f, cy=%f", 
-            camera_info->k[0], camera_info->k[4], camera_info->k[2], camera_info->k[5]);
-        
-        // 画像トピックからのローカル変換に統一
-        pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered_cloud = 
-            fluent_cloud::io::DepthToCloud::convertAsparagusROI(
-                depth_mat,
-                color_mat,
-                clipped,
-                *camera_info);
         
         RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
             "[POINTCLOUD] convertAsparagusROI returned successfully");
@@ -311,18 +330,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         // 可視化処理時間の計測
         fluent::utils::Stopwatch vis_stopwatch;
         
-        // ROI深度統計ログ
-        {
-            cv::Mat roi_depth = depth_mat(clipped);
-            double roi_min, roi_max; cv::minMaxLoc(roi_depth, &roi_min, &roi_max);
-            cv::Scalar roi_mean = cv::mean(roi_depth);
-            int zero_count = cv::countNonZero(roi_depth == 0);
-            int total_count = roi_depth.rows * roi_depth.cols;
-            double zero_ratio = total_count > 0 ? (static_cast<double>(zero_count) / total_count) : 0.0;
-            RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"),
-                "[ROI] depth stats: min=%.0f max=%.0f mean=%.1f zero=%.1f%% size=%dx%d", 
-                roi_min, roi_max, roi_mean[0], zero_ratio * 100.0, roi_depth.cols, roi_depth.rows);
-        }
+        // ROI深度統計ログはfallback経路で実施済み
 
         // 結果をパブリッシュ（frame_id, stampを厳密継承）
         const std::string frame_id_to_use = frame_id; // フォールバックしない
@@ -350,7 +358,9 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 aspara_info.id, filtered_cloud->points.size());
         }
         
-        pointcloud_processor_->publishRootTF(root_position, frame_id_to_use, aspara_info.id);
+        // TFの代わりにMarkerで可視化
+        pointcloud_processor_->publishAsparaMarker(
+            root_position, frame_id_to_use, aspara_info.id, length, is_harvestable, depth_image->header.stamp);
         
         // アスパラ情報を更新
         aspara_info.length = length;

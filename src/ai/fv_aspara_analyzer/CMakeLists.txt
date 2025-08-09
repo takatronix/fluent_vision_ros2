@@ -36,6 +36,7 @@ find_package(pcl_ros REQUIRED)               # PCL ROS2統合
 find_package(OpenCV REQUIRED)                # OpenCVコンピュータビジョン
 find_package(vision_msgs REQUIRED)           # コンピュータビジョンメッセージ
 find_package(std_srvs REQUIRED)              # 標準サービスメッセージ
+find_package(visualization_msgs REQUIRED)    # 可視化マーカー
 find_package(fluent_lib REQUIRED)
 ## fv_realsense のサービス依存は廃止（画像トピックからのローカル変換に統一）
 
@@ -43,6 +44,7 @@ find_package(fluent_lib REQUIRED)
 include_directories(include)                 # ヘッダーファイルディレクトリ
 include_directories(${OpenCV_INCLUDE_DIRS})  # OpenCVインクルードディレクトリ
 include_directories(/home/aspara/seedbox-r1/fluent_vision_ros2/src/common/fluent_lib/include)  # fluent_lib
+include_directories(/home/aspara/seedbox-r1/fluent_vision_ros2/src/common/fluent_lib/legacy/fluent_cloud/include)  # fluent_cloud legacy include
 
 # ===== 依存関係リスト =====
 set(dependencies
@@ -59,6 +61,7 @@ set(dependencies
   pcl_ros                   # PCL ROS2統合
   vision_msgs               # コンピュータビジョンメッセージ
   std_srvs                  # 標準サービスメッセージ
+  visualization_msgs        # 可視化マーカー
   fluent_lib                # Fluent統合ライブラリ
 )
 

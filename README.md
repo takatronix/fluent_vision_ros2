@@ -11,7 +11,6 @@ FluentVision ROS2は、Intel RealSense深度カメラとAI技術を組み合わ�
 ### 🤖 AI/ML (`src/ai/`)
 - **fv_object_detector**: YOLOv10を使用した汎用物体検出システム
 - **fv_object_mask_generator**: UNet使用のセマンティックセグメンテーション
-- **fv_aspara_detector**: アスパラガス専用検出器（YOLOv10ベース）
 - **fv_aspara_analyzer**: アスパラガス品質分析システム
 - **fv_face_recognizer**: リアルタイム顔認識システム（開発中）
 
@@ -20,7 +19,6 @@ FluentVision ROS2は、Intel RealSense深度カメラとAI技術を組み合わ�
   - キャリブレーション支援機能（表示モード0/1/2）
   - クリック座標取得・3D距離測定
 - **fv_camera**: 汎用カメラドライバ
-- **livox_ros_driver2**: LiDARセンサードライバ
 
 ### 🌐 ストリーミング (`src/streaming/`)
 - **fv_recorder**: 録画・再生システム
@@ -32,10 +30,6 @@ FluentVision ROS2は、Intel RealSense深度カメラとAI技術を組み合わ�
 ### 🛠️ ユーティリティ (`src/utils/`)
 - **fv_image_filter**: 画像フィルタリング・処理ユーティリティ
 - **fv_topic_relay**: トピック中継・変換ツール（開発中）
-
-### 🗺️ SLAM (`rtabmap/`)
-- **RTAB-Map**: リアルタイムSLAMシステム
-- マッピング・ナビゲーション機能
 
 ## 🎯 主要機能
 

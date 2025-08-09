@@ -21,4 +21,5 @@ colcon build \
 
 echo "[build_all] DONE"
 
+source ../install/setup.bash
 

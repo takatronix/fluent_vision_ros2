@@ -1,12 +1,11 @@
 # =============================================================================
-# Fluent Vision - アスパラガス解析ノード設定ファイル (D405カメラ用)
+# Fluent Vision - アスパラガス解析ノード設定ファイル (D415カメラ用)
 # =============================================================================
 # 
 # 概要：
-#   - Intel RealSense D405カメラを使用したアスパラガス品質解析システム
+#   - Intel RealSense D415カメラを使用したアスパラガス品質解析システム
 #   - 3D点群データと2D検出結果を統合して収穫適性を判定
 #   - 長さ、真っ直ぐ度、根元位置の自動測定機能
-#   - D405はD415より高精度な深度測定が可能
 #
 # 作者：Takashi Otsuka
 # 作成日：2024年
@@ -15,36 +14,40 @@
 # 使用方法：
 #   ros2 run fv_aspara_analyzer fv_aspara_analyzer_node \
 #       --ros-args \
-#       --params-file fv_aspara_analyzer_d405.yaml \
-#       -r __node:=fv_aspara_analyzer_d405
+#       --params-file fv_aspara_analyzer_d415.yaml \
+#       -r __node:=fv_aspara_analyzer_d415
 # =============================================================================
 
 /**:
   ros__parameters:
     # ===== システム情報 =====
-    camera_name: "D405"  # カメラ名称（画面表示用）
+    camera_name: "D415"  # カメラ名称（画面表示用）
     
-    # ===== トピック設定（D405カメラ用） =====
+    # ===== トピック設定（D415カメラ用） =====
     
     # 入力トピック（Fluent Vision AIシステムから）
-    detection_topic: "/fv/d405/object_detection/detections"      # YOLO検出結果
-    pointcloud_topic: "/fv/d405/asparagus/points"                # 3D点群データ
-    camera_info_topic: "/fv/d405/color/camera_info"              # カラーカメラキャリブレーション情報
-    depth_camera_info_topic: "/fv/d405/depth/camera_info"        # 深度カメラキャリブレーション情報
-    camera_topic: "/fv/d405/color/image_raw"                     # カラー画像
-    depth_topic: "/fv/d405/depth/image_rect_raw"                 # 深度画像
-    mask_topic: "/fv/d405/segmentation_mask/image"               # セグメンテーションマスク
+    detection_topic: "/fv/d415/object_detection/detections"      # YOLO検出結果
+    pointcloud_topic: "/fv/d415/registered_points"               # 3D点群データ（depth_image_proc出力）
+    camera_info_topic: "/fv/d415/color/camera_info"              # カラーカメラキャリブレーション情報
+    depth_camera_info_topic: "/fv/d415/depth/camera_info"        # 深度カメラキャリブレーション情報
+    use_color_camera_info: true              # RealSense整列時はtrue
+    camera_topic: "/fv/d415/color/image_raw"                     # カラー画像
+    depth_topic: "/fv/d415/depth/image_rect_raw"                 # 深度画像
+    mask_topic: "/fv/d415/segmentation_mask/image"               # セグメンテーションマスク
     imu_topic: "/livox/imu"                                      # IMUデータ（姿勢補正用）
 
     # 出力トピック（解析結果）
-    output_filtered_pointcloud_topic: "/fv/d405/aspara_analysis/filtered_points"   # フィルタリング済み点群（中間結果）
-    output_selected_pointcloud_topic: "/fv/d405/aspara_analysis/selected_points"   # 選択中アスパラ点群（最終結果）
-    output_annotated_image_topic: "/fv/d405/aspara_analysis/result"                # 注釈付き可視化画像
+    output_filtered_pointcloud_topic: "/fv/d415/aspara_analysis/filtered_points"   # フィルタリング済み点群（中間結果）
+    output_selected_pointcloud_topic: "/fv/d415/aspara_analysis/selected_points"   # 選択中アスパラ点群（最終結果）
+    output_detected_all_pointcloud_topic: "/fv/d415/aspara_analysis/detected_all_points"  # 全検出ROIの結合点群
+    enable_detected_all_points: true
+    output_marker_topic: "/fv/d415/aspara_analysis/markers"  # MarkerArray出力
+    output_annotated_image_topic: "/fv/d415/aspara_analysis/result"                # 注釈付き可視化画像
 
     # ===== 基本処理パラメータ =====
     
     # 検出・フィルタリング設定
-    min_confidence: 0.3                   # 最小検出信頼度（0.0-1.0）
+    min_confidence: 0.3                    # 最小検出信頼度（0.0-1.0）
     pointcloud_distance_min: 0.1           # 点群処理最小距離（10cm）
     pointcloud_distance_max: 2.0           # 点群処理最大距離（2m）
     aspara_filter_distance: 0.05           # アスパラガス根元からのフィルタ距離（5cm）
@@ -70,14 +73,14 @@
 
     # ===== 点群合成パラメータ =====
     
-    # 高品質点群合成設定（D405最適化）
+    # 高品質点群合成設定
     mesh_building_enabled: true             # 点群合成機能有効
     frame_history_size: 30                  # 履歴フレーム数（1秒分@30FPS）
-    registration_distance_threshold: 0.015  # レジストレーション距離閾値（1.5cm、D405高精度）
-    mesh_voxel_size: 0.002                 # 合成用ボクセルサイズ（2mm、D405高密度対応）
+    registration_distance_threshold: 0.02   # レジストレーション距離閾値（2cm）
+    mesh_voxel_size: 0.003                 # 合成用ボクセルサイズ（3mm、高密度）
     
-    # MLS平滑化パラメータ（D405用）
-    mls_search_radius: 0.008                # MLS検索半径（8mm、D405高精度対応）
+    # MLS平滑化パラメータ
+    mls_search_radius: 0.01                 # MLS検索半径（1cm）
     mls_polynomial_order: 2                 # MLS多項式次数（2次）
     mls_upsampling_enabled: true            # アップサンプリング有効
     
@@ -87,7 +90,7 @@
     tf_enabled: true                        # TF作成機能有効
     tf_frame_prefix: "asparagus_"           # TFフレーム名プレフィックス
     tf_base_frame: "map"                    # 基準座標系
-    stem_base_detection_threshold: 0.015    # 根元検出範囲（1.5cm、D405高精度）
+    stem_base_detection_threshold: 0.02     # 根元検出範囲（2cm）
     
     # rtabmap統合設定
     rtabmap_enabled: true                   # rtabmap統合有効
@@ -95,10 +98,10 @@
     rtabmap_set_label_service: "/rtabmap/set_label"      # ラベル設定サービス
     rtabmap_service_timeout: 5.0            # サービスタイムアウト（秒）
     
-    # 完全認識判定基準（D405高精度）
-    complete_recognition_confidence: 0.85    # 完全認識信頼度閾値（D405はより厳密）
-    complete_recognition_frame_count: 8      # 完全認識継続フレーム数（D405は早期判定）
-    complete_recognition_point_density: 150  # 必要点群密度（点/cm²、D405高密度）
+    # 完全認識判定基準
+    complete_recognition_confidence: 0.8     # 完全認識信頼度閾値
+    complete_recognition_frame_count: 10     # 完全認識継続フレーム数
+    complete_recognition_point_density: 100  # 必要点群密度（点/cm²）
     
     # ===== 3Dマーカー表示パラメータ =====
     
@@ -112,9 +115,9 @@
     mesh_marker_topic: "/asparagus/mesh_markers"      # メッシュマーカートピック
     cylinder_marker_topic: "/asparagus/markers"       # 円柱マーカートピック
     
-    # メッシュ品質設定（D405高品質）
-    mesh_segments: 25                        # 長さ方向セグメント数（D405はより細分化）
-    mesh_radial_points: 10                   # 円周方向点数（D405はより密）
+    # メッシュ品質設定
+    mesh_segments: 20                        # 長さ方向セグメント数
+    mesh_radial_points: 8                    # 円周方向点数
     mesh_smoothing_enabled: true             # メッシュ平滑化有効
     
     # マーカー色設定（グレード別）BGR
@@ -134,11 +137,11 @@
     marker_lifetime: 300.0                   # マーカー生存時間（秒、5分）
     persistent_markers: true                 # 永続マーカー有効
     
-    # ===== 骨格ポイント抽出パラメータ（D405最適化） =====
+    # ===== 骨格ポイント抽出パラメータ =====
     
     # 骨格ポイント設定
     skeleton_enabled: true                   # 骨格ポイント抽出有効
-    skeleton_points_count: 10                # 骨格ポイント数（D405は高精度で10点）
+    skeleton_points_count: 5                 # 骨格ポイント数（5または10）
     skeleton_extraction_method: "pca_centerline"  # 抽出手法
     
     # 骨格表示設定
@@ -148,13 +151,13 @@
     skeleton_point_outline_color: [255, 255, 255]  # ポイント外枠色（白）
     skeleton_point_outline_thickness: 1      # 外枠太さ
     
-    # 骨格品質計算設定（D405高精度）
-    skeleton_curvature_smoothing: 5          # 曲率計算平滑化ウィンドウサイズ（D405は大きく）
-    skeleton_length_precision: 0.0005       # 長さ計算精度（0.5mm、D405高精度）
-    skeleton_interpolation_method: "spline"  # 補間方法（D405はスプライン補間）
+    # 骨格品質計算設定
+    skeleton_curvature_smoothing: 3          # 曲率計算平滑化ウィンドウサイズ
+    skeleton_length_precision: 0.001        # 長さ計算精度（1mm）
+    skeleton_interpolation_method: "linear"  # 補間方法（"linear", "spline"）
     
     # 骨格情報公開設定
-    skeleton_topic: "/fv/d405/aspara_analysis/skeleton"  # 骨格情報トピック
+    skeleton_topic: "/fv/d415/aspara_analysis/skeleton"  # 骨格情報トピック
     skeleton_publish_rate: 5.0               # 骨格情報公開レート（Hz）
     
     # ===== 選択中アスパラガス情報公開設定 =====
@@ -164,30 +167,15 @@
     selected_asparagus_topic: "/selected_asparagus_info"  # 選択中アスパラガス情報トピック
     selected_asparagus_publish_rate: 10.0    # 公開レート（Hz、リアルタイム用に高頻度）
     
-    # 切断ポイント設定（D405高精度）
+    # 切断ポイント設定
     cut_point_marker_enabled: true           # 切断ポイントマーカー表示有効
-    cut_point_marker_size: 0.015             # 切断ポイントマーカーサイズ（1.5cm、D405精密）
+    cut_point_marker_size: 0.02             # 切断ポイントマーカーサイズ（2cm）
     cut_point_marker_color: [0, 0, 255]     # 切断ポイント色（赤）BGR
     cut_point_marker_lifetime: 5.0           # マーカー生存時間（秒）
     
-    # ===== 点群生成サービス設定 =====
-    generate_pointcloud_service_enabled: true  # 点群生成サービス使用有効
-    generate_pointcloud_service_name: "fv/d405/generate_pointcloud"  # サービス名
 
 # =============================================================================
-# D405 vs D415 の違い
-# =============================================================================
-#
-# 【D405の特徴】
-# - より高精度な深度測定（±2mm精度）
-# - より狭い視野角（87° vs 65°）
-# - より高密度な点群データ
-# - より高価格（産業用途向け）
-#
-# 【パラメータ調整の違い】
-# - voxel_leaf_size: D405はより小さく設定可能（0.003-0.008）
-# - noise_reduction_neighbors: D405はより多く設定可能（50-150）
-# - pointcloud_distance_max: D405はより遠距離まで測定可能（2.5m）
+# パラメータ調整ガイド
 # =============================================================================
 #
 # 【ノイズ除去の調整】

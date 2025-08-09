@@ -78,7 +78,9 @@ def check_config_file(camera_type, config_filename):
         camera_type (str): カメラタイプ（"D415" または "D405"）
         config_filename (str): 設定ファイル名
     """
-    config_path = f'/home/aspara/seedbox-r1/fluent_vision_ros2/launch/{config_filename}'
+    # スクリプトのディレクトリを基準に相対パスで設定
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, config_filename)
     
     try:
         # 設定ファイルを読み込み
