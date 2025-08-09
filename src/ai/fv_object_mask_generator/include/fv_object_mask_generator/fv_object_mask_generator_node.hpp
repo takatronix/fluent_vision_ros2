@@ -47,6 +47,8 @@ private:
   std::string output_colored_mask_topic_;
   double processing_frequency_;
   bool enable_visualization_;
+  int qos_queue_size_;
+  std::string qos_reliability_;
   
   // UNet model parameters
   std::string model_type_;

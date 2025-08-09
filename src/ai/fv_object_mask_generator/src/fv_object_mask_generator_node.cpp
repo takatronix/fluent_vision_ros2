@@ -9,6 +9,7 @@
 
 #include "fv_object_mask_generator/fv_object_mask_generator_node.hpp"
 #include <chrono>
+#include <rclcpp/qos.hpp>
 
 namespace fv_object_mask_generator
 {
@@ -83,6 +84,10 @@ void FVObjectMaskGeneratorNode::declareParameters()
   output_segmentation_mask_topic_ = this->get_parameter("output_segmentation_mask_topic").as_string();
   output_colored_mask_topic_ = this->get_parameter("output_colored_mask_topic").as_string();
   
+  // QoS設定
+  qos_queue_size_ = this->declare_parameter<int>("qos.queue_size", 10);
+  qos_reliability_ = this->declare_parameter<std::string>("qos.reliability", std::string("best_effort"));
+  
   processing_frequency_ = this->get_parameter("processing_frequency").as_double();
   enable_visualization_ = this->get_parameter("enable_visualization").as_bool();
   
@@ -125,15 +130,23 @@ void FVObjectMaskGeneratorNode::declareParameters()
  */
 void FVObjectMaskGeneratorNode::initializeTopics()
 {
+  // ===== QoSを構築 =====
+  rclcpp::QoS qos(rclcpp::KeepLast(qos_queue_size_));
+  if (qos_reliability_ == "reliable") {
+    qos.reliable();
+  } else {
+    qos.best_effort();
+  }
+  
   // ===== パブリッシャー作成 =====
   segmentation_mask_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-    output_segmentation_mask_topic_, 10);  // セグメンテーションマスク出力
+    output_segmentation_mask_topic_, qos);  // セグメンテーションマスク出力
   colored_mask_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-    output_colored_mask_topic_, 10);       // カラーマスク出力
+    output_colored_mask_topic_, qos);       // カラーマスク出力
   
   // ===== サブスクライバー作成 =====
   image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-    input_image_topic_, 10,  // 入力画像
+    input_image_topic_, qos,  // 入力画像
     std::bind(&FVObjectMaskGeneratorNode::imageCallback, this, std::placeholders::_1));
     
   RCLCPP_INFO(this->get_logger(), "Topics initialized");
