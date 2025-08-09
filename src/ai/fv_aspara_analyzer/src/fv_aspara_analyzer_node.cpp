@@ -1202,7 +1202,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         cv::circle(output_image, cv::Point(status_x, status_y-5), 6, color, -1);
         // テキストは●の右側に
         fluent::text::draw(output_image, label_jp, cv::Point(status_x + 14, status_y), cv::Scalar(255,255,255), 0.5, 1);
-        status_x += 120; // 次の項目へ余白
+        status_x += 60; // 次の項目へ余白（半分に詰める）
     };
     draw_status("検出", det_alive);
     draw_status("深度", depth_alive);
@@ -1228,7 +1228,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     static std::string camera_name = this->get_parameter("camera_name").as_string();
     
     // 1行目: カメラ名とFPS情報を一列に表示
-    int y_offset = 45;
+    int y_offset = 34; // 1行目との縦方向の間隔をやや詰める（約半分）
     std::string fps_line = cv::format("[%s] FPS: C=%.0f D=%.0f Det=%.0f Out=%.0f",
                                        camera_name.c_str(), color_fps, depth_fps, detection_fps, display_fps);
     fluent::text::draw(output_image, fps_line, cv::Point(15, y_offset),
@@ -1257,12 +1257,11 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     fluent::text::draw(output_image, pointcloud_line, cv::Point(15, y_offset),
                 text_color, 0.5, 1);
 
-    // 4行目: システム負荷情報（CPU/GPU/MEM）
+    // 4行目: システム負荷情報（CPU/MEM のみ。GPUは非表示）
     y_offset += 22;
     static auto last_sys_update = std::chrono::steady_clock::now();
     static float cpu_usage_pct = 0.0f;
     static int mem_used_mb = 0, mem_total_mb = 0;
-    static int gpu_util_pct = -1, gpu_mem_used_mb = -1, gpu_mem_total_mb = -1;
     auto now_sys = std::chrono::steady_clock::now();
     if (now_sys - last_sys_update > std::chrono::milliseconds(1000)) {
         last_sys_update = now_sys;
@@ -1303,68 +1302,10 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             mem_used_mb = std::max(0, mem_total_mb - mem_avail_mb);
         }
 
-        // GPU via NVIDIA (nvidia-smi) or Intel Arc (intel_gpu_top), optional
-        gpu_util_pct = -1; gpu_mem_used_mb = -1; gpu_mem_total_mb = -1;
-        {
-            // Try NVIDIA first
-            FILE* pipe = popen("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null", "r");
-            if (pipe) {
-                char buffer[256];
-                if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                    int util=0, used=0, total=0;
-                    if (sscanf(buffer, "%d, %d, %d", &util, &used, &total) == 3) {
-                        gpu_util_pct = util; gpu_mem_used_mb = used; gpu_mem_total_mb = total;
-                    }
-                }
-                pclose(pipe);
-            }
-        }
-        if (gpu_util_pct < 0) {
-            // Try Intel Arc via intel_gpu_top JSON (average busy across engines). Requires intel-gpu-tools
-            // One-shot sample (~200ms)
-            FILE* pipe = popen("intel_gpu_top -J -s 200 -n 1 2>/dev/null", "r");
-            if (pipe) {
-                std::string out; char buf[512]; size_t n;
-                while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) out.append(buf, buf + n);
-                pclose(pipe);
-                // Ad-hoc parse: find all occurrences of "\"busy\": <number>"
-                size_t pos = 0; int count = 0; double sum = 0.0;
-                while (true) {
-                    pos = out.find("\"busy\"", pos);
-                    if (pos == std::string::npos) break;
-                    size_t colon = out.find(':', pos);
-                    if (colon == std::string::npos) break;
-                    // advance past colon
-                    size_t start = out.find_first_of("0123456789", colon + 1);
-                    if (start == std::string::npos) { pos += 6; continue; }
-                    size_t end = start;
-                    while (end < out.size() && (isdigit(out[end]) || out[end]=='.')) end++;
-                    try {
-                        double val = std::stod(out.substr(start, end - start));
-                        // Filter unreasonable values
-                        if (val >= 0.0 && val <= 100.0) { sum += val; count++; }
-                    } catch (...) {}
-                    pos = end;
-                }
-                if (count > 0) {
-                    gpu_util_pct = static_cast<int>(std::round(sum / count));
-                }
-                // intel_gpu_top JSON does not provide VRAM usage in a simple way; keep N/A
-            }
-        }
     }
     // 描画テキスト生成
-    std::string sys_line;
-    if (gpu_util_pct >= 0 && gpu_mem_used_mb >= 0 && gpu_mem_total_mb >= 0) {
-        sys_line = cv::format("CPU: %.0f%% | GPU: %d%% | MEM: %d/%d MB | VRAM: %d/%d MB",
-                               cpu_usage_pct, gpu_util_pct, mem_used_mb, mem_total_mb, gpu_mem_used_mb, gpu_mem_total_mb);
-    } else if (gpu_util_pct >= 0) {
-        sys_line = cv::format("CPU: %.0f%% | GPU: %d%% | MEM: %d/%d MB | VRAM: N/A",
-                               cpu_usage_pct, gpu_util_pct, mem_used_mb, mem_total_mb);
-    } else {
-        sys_line = cv::format("CPU: %.0f%% | MEM: %d/%d MB | GPU: N/A",
+    std::string sys_line = cv::format("CPU: %.0f%% | MEM: %d/%d MB",
                                cpu_usage_pct, mem_used_mb, mem_total_mb);
-    }
     fluent::text::draw(output_image, sys_line, cv::Point(15, y_offset), text_color, 0.5, 1);
     
     // FPS値に応じて色付け（オプション）
