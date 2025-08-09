@@ -274,6 +274,9 @@ public:
     bool camera_node_seen_ {false};                                    ///< カメラノードから一度でも受信したか
     std::atomic<bool> last_pointcloud_was_organized_{false};          ///< 直近の点群がorganized(height>1)か
 
+    // デバッグ表示制御
+    bool debug_overlay_ {true};                                        ///< 画面デバッグオーバーレイの有効/無効
+
 };
 
 } // namespace fv_aspara_analyzer

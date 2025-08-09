@@ -2,6 +2,7 @@
 #include "fv_aspara_analyzer/fv_aspara_analyzer_node.hpp"
 #include <fluent.hpp>
 #include <cmath>
+#include <algorithm>
 
 namespace fv_aspara_analyzer {
 
@@ -319,46 +320,44 @@ cv::Point2f AsparaPointcloudProcessor::project3DTo2D(
     const pcl::PointXYZRGB& point,
     const sensor_msgs::msg::CameraInfo& camera_info)
 {
-    // カメラ内部パラメータ
-    double fx = camera_info.k[0];  // K[0,0] - 焦点距離X
-    double fy = camera_info.k[4];  // K[1,1] - 焦点距離Y
-    double cx = camera_info.k[2];  // K[0,2] - 光学中心X
-    double cy = camera_info.k[5];  // K[1,2] - 光学中心Y
+    // ガード
+    if (point.z <= 0.0f || !std::isfinite(point.z)) {
+        return cv::Point2f(-1.f, -1.f);
+    }
 
-    // 3D点を2Dに投影
-    double u = (point.x * fx / point.z) + cx;
-    double v = (point.y * fy / point.z) + cy;
+    // 内部パラメータ
+    const double fx = camera_info.k[0];
+    const double fy = camera_info.k[4];
+    const double cx = camera_info.k[2];
+    const double cy = camera_info.k[5];
 
-    // レンズ歪み補正（必要に応じて）
-    if (!camera_info.d.empty()) {
-        double k1 = camera_info.d[0];  // 半径方向歪み係数1
-        double k2 = camera_info.d[1];  // 半径方向歪み係数2
-        double p1 = camera_info.d[2];  // 接線方向歪み係数1
-        double p2 = camera_info.d[3];  // 接線方向歪み係数2
-        double k3 = (camera_info.d.size() > 4) ? camera_info.d[4] : 0.0;  // 半径方向歪み係数3
+    // 正規化座標 (OpenCVと同じ定義)
+    double x = static_cast<double>(point.x) / static_cast<double>(point.z);
+    double y = static_cast<double>(point.y) / static_cast<double>(point.z);
 
-        // 正規化座標
-        double x_norm = (u - cx) / fx;
-        double y_norm = (v - cy) / fy;
-        
-        double r2 = x_norm * x_norm + y_norm * y_norm;  // 半径の2乗
-        double r4 = r2 * r2;                            // 半径の4乗
-        double r6 = r4 * r2;                            // 半径の6乗
+    // 歪み（plumb_bob想定）
+    double u = 0.0, v = 0.0;
+    if (!camera_info.d.empty() && camera_info.distortion_model == "plumb_bob") {
+        const double k1 = camera_info.d.size() > 0 ? camera_info.d[0] : 0.0;
+        const double k2 = camera_info.d.size() > 1 ? camera_info.d[1] : 0.0;
+        const double p1 = camera_info.d.size() > 2 ? camera_info.d[2] : 0.0;
+        const double p2 = camera_info.d.size() > 3 ? camera_info.d[3] : 0.0;
+        const double k3 = camera_info.d.size() > 4 ? camera_info.d[4] : 0.0;
 
-        // 半径方向歪み
-        double radial_distortion = 1 + k1 * r2 + k2 * r4 + k3 * r6;
-
-        // 接線方向歪み
-        double dx = 2 * p1 * x_norm * y_norm + p2 * (r2 + 2 * x_norm * x_norm);
-        double dy = p1 * (r2 + 2 * y_norm * y_norm) + 2 * p2 * x_norm * y_norm;
-
-        // 歪み補正を適用
-        x_norm = x_norm * radial_distortion + dx;
-        y_norm = y_norm * radial_distortion + dy;
-
-        // ピクセル座標に戻す
-        u = x_norm * fx + cx;
-        v = y_norm * fy + cy;
+        const double r2 = x*x + y*y;
+        const double r4 = r2*r2;
+        const double r6 = r4*r2;
+        const double radial = 1.0 + k1*r2 + k2*r4 + k3*r6;
+        const double x_tangential = 2.0*p1*x*y + p2*(r2 + 2.0*x*x);
+        const double y_tangential = p1*(r2 + 2.0*y*y) + 2.0*p2*x*y;
+        const double x_distorted = x*radial + x_tangential;
+        const double y_distorted = y*radial + y_tangential;
+        u = fx * x_distorted + cx;
+        v = fy * y_distorted + cy;
+    } else {
+        // 歪みなし
+        u = fx * x + cx;
+        v = fy * y + cy;
     }
 
     return cv::Point2f(static_cast<float>(u), static_cast<float>(v));
@@ -464,6 +463,98 @@ void AsparaPointcloudProcessor::publishAsparaMarker(
     txt.text = (camera_prefix + ": " + std::to_string(static_cast<float>(dist))).substr(0, 16) + " m";
     txt.lifetime = cyl.lifetime;
     array_msg.markers.push_back(txt);
+    markers_pub_->publish(array_msg);
+}
+
+// Overload: specify axis direction (unit vector) for cylinder orientation
+void AsparaPointcloudProcessor::publishAsparaMarker(
+    const geometry_msgs::msg::Point& root_position,
+    const std::string& frame_id,
+    int aspara_id,
+    float length_m,
+    bool is_harvestable,
+    const rclcpp::Time& stamp,
+    const geometry_msgs::msg::Vector3& axis_dir)
+{
+    if (!markers_pub_) return;
+
+    // Normalize axis_dir (fallback to Z if invalid)
+    double ax = axis_dir.x, ay = axis_dir.y, az = axis_dir.z;
+    double norm = std::sqrt(ax*ax + ay*ay + az*az);
+    if (norm < 1e-6) { ax = 0; ay = 0; az = 1; norm = 1; }
+    ax /= norm; ay /= norm; az /= norm;
+
+    // Compute quaternion rotating Z(0,0,1) to axis (ax,ay,az)
+    // Reference: shortest-arc quaternion between two vectors
+    double zx = 0.0, zy = 0.0, zz = 1.0;
+    double cx = zy*az - zz*ay;
+    double cy = zz*ax - zx*az;
+    double cz = zx*ay - zy*ax;
+    double dot = zx*ax + zy*ay + zz*az; // = az
+    geometry_msgs::msg::Quaternion q;
+    if (dot < -0.999999) {
+        // Opposite direction: rotate 180 deg around X axis
+        q.x = 1.0; q.y = 0.0; q.z = 0.0; q.w = 0.0;
+    } else {
+        double s = std::sqrt((1.0 + dot) * 2.0);
+        double invs = 1.0 / s;
+        q.x = cx * invs;
+        q.y = cy * invs;
+        q.z = cz * invs;
+        q.w = s * 0.5;
+    }
+
+    // Position at the center of the cylinder along axis: root + axis * (length/2)
+    geometry_msgs::msg::Point center;
+    center.x = root_position.x + static_cast<double>(length_m) * 0.5 * ax;
+    center.y = root_position.y + static_cast<double>(length_m) * 0.5 * ay;
+    center.z = root_position.z + static_cast<double>(length_m) * 0.5 * az;
+
+    visualization_msgs::msg::MarkerArray array_msg;
+    visualization_msgs::msg::Marker cyl;
+    cyl.header.stamp = stamp;
+    cyl.header.frame_id = frame_id;
+
+    std::string camera_prefix = frame_id;
+    auto p = camera_prefix.find("/d415/");
+    if (p != std::string::npos) camera_prefix = "d415";
+    p = frame_id.find("/d405/");
+    if (p != std::string::npos) camera_prefix = "d405";
+
+    cyl.ns = camera_prefix + "_aspara";
+    cyl.id = aspara_id;
+    cyl.type = visualization_msgs::msg::Marker::CYLINDER;
+    cyl.action = visualization_msgs::msg::Marker::ADD;
+    cyl.pose.position = center;
+    cyl.pose.orientation = q;
+    cyl.scale.x = 0.02;
+    cyl.scale.y = 0.02;
+    cyl.scale.z = std::max(0.01f, length_m);
+    if (is_harvestable) {
+        cyl.color.r = 0.0; cyl.color.g = 1.0; cyl.color.b = 0.0; cyl.color.a = 0.9;
+    } else {
+        cyl.color.r = 1.0; cyl.color.g = 0.0; cyl.color.b = 0.0; cyl.color.a = 0.9;
+    }
+    cyl.lifetime = rclcpp::Duration::from_seconds(marker_lifetime_sec_);
+    array_msg.markers.push_back(cyl);
+
+    // Text label above tip
+    visualization_msgs::msg::Marker txt;
+    txt.header = cyl.header;
+    txt.ns = cyl.ns + "_dist";
+    txt.id = aspara_id;
+    txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    txt.action = visualization_msgs::msg::Marker::ADD;
+    txt.pose.position.x = center.x + ax * (static_cast<double>(length_m) * 0.5 + 0.03);
+    txt.pose.position.y = center.y + ay * (static_cast<double>(length_m) * 0.5 + 0.03);
+    txt.pose.position.z = center.z + az * (static_cast<double>(length_m) * 0.5 + 0.03);
+    txt.scale.z = 0.06;
+    txt.color.r = 1.0; txt.color.g = 1.0; txt.color.b = 1.0; txt.color.a = 0.95;
+    double dist = std::sqrt(center.x*center.x + center.y*center.y + center.z*center.z);
+    txt.text = (camera_prefix + ": " + std::to_string(static_cast<float>(dist))).substr(0, 16) + " m";
+    txt.lifetime = cyl.lifetime;
+    array_msg.markers.push_back(txt);
+
     markers_pub_->publish(array_msg);
 }
 

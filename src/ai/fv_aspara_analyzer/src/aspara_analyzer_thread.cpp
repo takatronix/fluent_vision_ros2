@@ -189,11 +189,21 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         auto pc2 = node_->latest_pointcloud_;
         if (pc2 && pc2->width > 0 && pc2->height > 1) {
             // organized cloud 前提
-            cv::Rect bbox = aspara_info.bounding_box_2d;
-            int width = static_cast<int>(pc2->width);
-            int height = static_cast<int>(pc2->height);
-            cv::Rect img_rect(0, 0, width, height);
-            cv::Rect roi = bbox & img_rect;
+            cv::Rect bboxC = aspara_info.bounding_box_2d; // color座標
+            int rp_w = static_cast<int>(pc2->width);
+            int rp_h = static_cast<int>(pc2->height);
+            int col_w = color_image ? static_cast<int>(color_image->width) : rp_w;
+            int col_h = color_image ? static_cast<int>(color_image->height) : rp_h;
+            double kx = (col_w > 0) ? static_cast<double>(rp_w) / static_cast<double>(col_w) : 1.0;
+            double ky = (col_h > 0) ? static_cast<double>(rp_h) / static_cast<double>(col_h) : 1.0;
+            cv::Rect bboxRP(
+                static_cast<int>(std::round(bboxC.x * kx)),
+                static_cast<int>(std::round(bboxC.y * ky)),
+                static_cast<int>(std::round(bboxC.width * kx)),
+                static_cast<int>(std::round(bboxC.height * ky))
+            );
+            cv::Rect img_rect(0, 0, rp_w, rp_h);
+            cv::Rect roi = bboxRP & img_rect;
             if (roi.area() > 0) {
                 pcl::PointCloud<pcl::PointXYZRGB> full;
                 pcl::fromROSMsg(*pc2, full);
@@ -319,10 +329,53 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         float length = pointcloud_processor_->calculateLength(denoised_cloud);
         aspara_info.processing_times.measurement_ms = measurement_stopwatch.elapsed_ms();
         
-        // 可視化用PCAラインを生成
+        // 可視化用PCAラインを生成 + 骨格エンドポイント推定
         fluent::utils::Stopwatch pca_stopwatch;
         auto pca_line = pointcloud_processor_->generatePCALine(denoised_cloud);
         aspara_info.processing_times.pca_calculation_ms = pca_stopwatch.elapsed_ms();
+
+        // PCA主軸に沿った直線の端点（tip/root）を推定し、骨格点列を作成
+        try {
+            // PCLのPCAで主成分を取得
+            pcl::PCA<pcl::PointXYZRGB> pca;
+            pca.setInputCloud(denoised_cloud);
+            Eigen::Matrix3f eigvec = pca.getEigenVectors();
+            Eigen::Vector3f axis = eigvec.col(0).normalized(); // 主軸
+            Eigen::Vector4f mean4 = pca.getMean();
+            Eigen::Vector3f mean(mean4[0], mean4[1], mean4[2]);
+
+            // 主軸方向のt最小/最大を求める（t = axis・(p-mean)）
+            float tmin = std::numeric_limits<float>::max();
+            float tmax = std::numeric_limits<float>::lowest();
+            for (const auto& pt : denoised_cloud->points) {
+                if (!std::isfinite(pt.z) || pt.z <= 0.0f) continue;
+                Eigen::Vector3f p(pt.x, pt.y, pt.z);
+                float t = axis.dot(p - mean);
+                tmin = std::min(tmin, t);
+                tmax = std::max(tmax, t);
+            }
+            // 3D端点
+            Eigen::Vector3f end_root = mean + tmin * axis;
+            Eigen::Vector3f end_tip  = mean + tmax * axis;
+
+            // 骨格サンプル（5点）
+            std::vector<SkeletonPoint> skel;
+            const int NUM = 5;
+            for (int i = 0; i < NUM; ++i) {
+                float alpha = static_cast<float>(i) / (NUM - 1);
+                Eigen::Vector3f p = end_root * (1.0f - alpha) + end_tip * alpha;
+                pcl::PointXYZRGB pxyz; pxyz.x = p.x(); pxyz.y = p.y(); pxyz.z = p.z();
+                cv::Point2f uv = pointcloud_processor_->project3DTo2D(pxyz, *camera_info);
+                SkeletonPoint sp;
+                sp.image_point = uv;
+                sp.world_point.x = pxyz.x; sp.world_point.y = pxyz.y; sp.world_point.z = pxyz.z;
+                sp.distance_from_base = alpha; // 0(root)→1(tip) の規格化距離
+                skel.push_back(sp);
+            }
+            aspara_info.skeleton_points = skel;
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), "PCA skeleton failed: %s", e.what());
+        }
 
         // 収穫適性を判定
         bool is_harvestable = (length >= node_->harvest_min_length_ && 
@@ -346,23 +399,64 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             node_->selected_aspara_id_, aspara_info.id, (node_->selected_pointcloud_pub_ != nullptr));
         
         if (node_->selected_aspara_id_ == aspara_info.id && node_->selected_pointcloud_pub_) {
+            // Viewer互換性のため、registered_pointsと同じフォーマット
+            // x,y,z(float32) + rgb(float32) に統一する
             sensor_msgs::msg::PointCloud2 selected_cloud_msg;
-            pcl::toROSMsg(*filtered_cloud, selected_cloud_msg);  // フィルター前のデータを使用
             selected_cloud_msg.header.stamp = depth_image->header.stamp;
             selected_cloud_msg.header.frame_id = frame_id_to_use;
+            selected_cloud_msg.height = 1;
+            selected_cloud_msg.width = static_cast<uint32_t>(filtered_cloud->points.size());
+            selected_cloud_msg.is_bigendian = false;
+            selected_cloud_msg.is_dense = false;
+
+            // フィールド定義: x,y,z(float32) + rgb(float32)
+            selected_cloud_msg.fields.clear();
+            auto makeField = [](const std::string& name, uint32_t offset, uint8_t datatype) {
+                sensor_msgs::msg::PointField f; f.name = name; f.offset = offset; f.datatype = datatype; f.count = 1; return f; };
+            selected_cloud_msg.fields.push_back(makeField("x", 0, 7));   // FLOAT32
+            selected_cloud_msg.fields.push_back(makeField("y", 4, 7));   // FLOAT32
+            selected_cloud_msg.fields.push_back(makeField("z", 8, 7));   // FLOAT32
+            selected_cloud_msg.fields.push_back(makeField("rgb", 12, 7)); // FLOAT32
+
+            selected_cloud_msg.point_step = 16; // 4*float
+            selected_cloud_msg.row_step = selected_cloud_msg.point_step * selected_cloud_msg.width;
+            selected_cloud_msg.data.resize(selected_cloud_msg.row_step);
+
+            uint8_t* dst = selected_cloud_msg.data.data();
+            for (const auto& p : filtered_cloud->points) {
+                float x = p.x; float y = p.y; float z = p.z;
+                std::memcpy(dst + 0, &x, 4);
+                std::memcpy(dst + 4, &y, 4);
+                std::memcpy(dst + 8, &z, 4);
+                // Pack BGR -> RGB 8:8:8 into float32 as in registered_points
+                uint32_t rgb = (uint32_t(p.r) << 16) | (uint32_t(p.g) << 8) | uint32_t(p.b);
+                float rgbf;
+                std::memcpy(&rgbf, &rgb, 4);
+                std::memcpy(dst + 12, &rgbf, 4);
+                dst += selected_cloud_msg.point_step;
+            }
+
             node_->selected_pointcloud_pub_->publish(selected_cloud_msg);
-            
+
             // AsparaInfo構造体にも点群を保存
             aspara_info.asparagus_pointcloud = selected_cloud_msg;
-            
-            RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
-                "[POINTCLOUD] Published asparagus_pointcloud for ID:%d, Points:%zu (raw ROI data)", 
+
+            RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"),
+                "[POINTCLOUD] Published asparagus_pointcloud for ID:%d, Points:%zu (raw ROI data)",
                 aspara_info.id, filtered_cloud->points.size());
         }
         
         // TFの代わりにMarkerで可視化
+        // PCA主軸方向をMarker姿勢に反映
+        geometry_msgs::msg::Vector3 axis_dir_msg;
+        try {
+            pcl::PCA<pcl::PointXYZRGB> pca_axis; pca_axis.setInputCloud(denoised_cloud);
+            Eigen::Vector3f axis = pca_axis.getEigenVectors().col(0).normalized();
+            axis_dir_msg.x = axis.x(); axis_dir_msg.y = axis.y(); axis_dir_msg.z = axis.z();
+        } catch (...) { axis_dir_msg.x = 0; axis_dir_msg.y = 0; axis_dir_msg.z = 1; }
+
         pointcloud_processor_->publishAsparaMarker(
-            root_position, frame_id_to_use, aspara_info.id, length, is_harvestable, depth_image->header.stamp);
+            root_position, frame_id_to_use, aspara_info.id, length, is_harvestable, depth_image->header.stamp, axis_dir_msg);
         
         // アスパラ情報を更新
         aspara_info.length = length;
