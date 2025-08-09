@@ -1052,17 +1052,7 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
 }
 void FVDepthCameraNode::drawHUD(cv::Mat& frame) const
 {
-    // 左上にモード表示
-    int mode = current_mode_.load();
-    const char* mode_text = (mode == 0) ? "Mode: Off" : (mode == 1) ? "Mode: Cursor" : "Mode: Full";
-    // 半透明黒背景
-    cv::Rect bg(8, 8, 180, 26);
-    cv::Mat roi = frame(bg);
-    cv::Mat overlay; roi.copyTo(overlay);
-    cv::rectangle(overlay, bg, cv::Scalar(0,0,0), -1);
-    cv::addWeighted(overlay, 0.4, roi, 0.6, 0.0, roi);
-    // テキスト
-    cv::putText(frame, mode_text, cv::Point(16, 26), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255,255,255), 1, cv::LINE_AA);
+    (void)frame; // HUD disabled per user request
 }
 
 void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const rs2::frame& depth_frame)

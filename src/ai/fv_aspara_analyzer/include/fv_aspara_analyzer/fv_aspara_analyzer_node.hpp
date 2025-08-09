@@ -277,6 +277,23 @@ public:
     // デバッグ表示制御
     bool debug_overlay_ {true};                                        ///< 画面デバッグオーバーレイの有効/無効
 
+    // 投射・座標系デバッグ用
+    bool use_color_camera_info_flag_ {false};                           ///< 投射にカラー内参を使う設定（起動時取得）
+
+    // 曲がり度・オーバーレイ設定
+    std::string curvature_method_ {"hybrid_max"};
+    double curvature_weight_skeleton_ {0.6};
+    double curvature_weight_pca_ {0.4};
+    double mask_overlay_alpha_ {0.25};
+  // HUDスタイル
+  double hud_alpha_ {0.45};
+  double hud_font_scale_ {0.45};
+
+    // HUD配置
+    int hud_left_offset_ {10};                                          ///< HUD左オフセット(px)
+    int hud_top_offset_ {50};                                           ///< HUD上オフセット(px)
+    int hud_panel_height_ {115};                                        ///< HUDパネル高さ(px)
+
 };
 
 } // namespace fv_aspara_analyzer

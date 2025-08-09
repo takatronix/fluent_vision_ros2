@@ -50,7 +50,7 @@ fv_aspara_analyzer_d405:
     min_confidence: 0.3                   # 最小検出信頼度（0.0-1.0）
     pointcloud_distance_min: 0.1           # 点群処理最小距離（10cm）
     pointcloud_distance_max: 2.0           # 点群処理最大距離（2m）
-    aspara_filter_distance: 0.05           # アスパラガス根元からのフィルタ距離（5cm）
+    aspara_filter_distance: 0.0           # アスパラガス根元からのフィルタ距離（5cm）
     depth_unit_m_16u: 0.0001               # 16UC1深度単位（D405は0.1mm/Unit）
 
     # ===== QoS設定（入力/出力） =====

@@ -1,0 +1,63 @@
+{
+  "mcpServers": {
+    "server-sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@smithery/cli@latest",
+        "run",
+        "@smithery-ai/server-sequential-thinking",
+        "--key",
+        "8f0ded6c-6371-4bd0-94ee-a1dec6424f48"
+      ]
+    },
+    "desktop-commander": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@smithery/cli@latest",
+        "run",
+        "@wonderwhy-er/desktop-commander",
+        "--key",
+        "8f0ded6c-6371-4bd0-94ee-a1dec6424f48"
+      ]
+    },
+    
+    "toolbox": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@smithery/cli@latest",
+        "run",
+        "@smithery/toolbox",
+        "--key",
+        "8f0ded6c-6371-4bd0-94ee-a1dec6424f48",
+        "--config",
+        "\"{\\\"smitheryApiKey\\\":\\\"6d045bbb-8cbe-4d43-a86b-75b4d9d94c13\\\"}\""
+      ]
+    },
+    "DeepResearchMCP": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@smithery/cli@latest",
+        "run",
+        "@ameeralns/DeepResearchMCP",
+        "--key",
+        "8f0ded6c-6371-4bd0-94ee-a1dec6424f48"
+      ]
+    },
+    "serena": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/Users/takatronix/projects/serena",
+        "serena",
+        "start-mcp-server",
+        "--context",
+        "ide-assistant"
+      ]
+    }
+  }
+}

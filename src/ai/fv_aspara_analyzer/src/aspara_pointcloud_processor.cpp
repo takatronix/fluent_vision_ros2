@@ -322,14 +322,23 @@ cv::Point2f AsparaPointcloudProcessor::project3DTo2D(
 {
     // ガード
     if (point.z <= 0.0f || !std::isfinite(point.z)) {
+        RCLCPP_DEBUG(node_->get_logger(), 
+            "[PROJECT] Invalid Z: z=%.3f", point.z);
         return cv::Point2f(-1.f, -1.f);
     }
 
     // 内部パラメータ
-    const double fx = camera_info.k[0];
-    const double fy = camera_info.k[4];
-    const double cx = camera_info.k[2];
-    const double cy = camera_info.k[5];
+    double fx = camera_info.k[0];
+    double fy = camera_info.k[4];
+    double cx = camera_info.k[2];
+    double cy = camera_info.k[5];
+    
+    // カメラ内部パラメータの解像度チェック
+    // camera_infoの解像度と実際の画像解像度が異なる場合はスケーリング
+    // ※点群がregistered_pointsの場合、camera_infoの解像度と一致する必要がある
+    RCLCPP_DEBUG(node_->get_logger(),
+        "[PROJECT] Camera params: fx=%.2f fy=%.2f cx=%.2f cy=%.2f (raw)",
+        fx, fy, cx, cy);
 
     // 正規化座標 (OpenCVと同じ定義)
     double x = static_cast<double>(point.x) / static_cast<double>(point.z);
@@ -360,6 +369,10 @@ cv::Point2f AsparaPointcloudProcessor::project3DTo2D(
         v = fy * y + cy;
     }
 
+    // 追加デバッグ: 非有限値ガード
+    if (!std::isfinite(u) || !std::isfinite(v)) {
+        return cv::Point2f(-1.f, -1.f);
+    }
     return cv::Point2f(static_cast<float>(u), static_cast<float>(v));
 }
 

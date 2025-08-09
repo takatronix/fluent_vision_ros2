@@ -58,6 +58,14 @@ ros2 run fv_object_detector fv_object_detector_node \
     -r __node:=fv_object_detector_d405 &
 
 # -----------------------------------------------------------------
+# [3b] セグメンテーション（マスク生成）D405 ノード起動
+# -----------------------------------------------------------------
+echo "🟢 Starting Object Mask Generator D405 node..."
+ros2 run fv_object_mask_generator fv_object_mask_generator_node \
+    --ros-args --params-file "$WS_ROOT/scripts/fv_object_mask_generator_d405.yaml" \
+    -r __node:=fv_object_mask_generator_d405 &
+
+# -----------------------------------------------------------------
 # [4] アスパラ分析ノード（重要）
 # -----------------------------------------------------------------
 echo "🌱 Starting Aspara Analyzer D405 node..."

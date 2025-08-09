@@ -469,3 +469,62 @@ spike_overlap_threshold: 0.3           # 穂の重複判定（30%）
 ### ドキュメント
 - `doc/system_design.md`: 本設計書
 - `doc/display_specification.md`: 表示仕様詳細書
+
+---
+
+## 近距離ROIベース抽出アルゴリズム（PCA非依存・画像座標固定）
+
+### 目的
+- 検出矩形内から「アスパラ本体だけ」の点群を安定に抽出し、左枠=RAW、右枠=FILTとして可視化・出力する。
+- 向きはカメラの画像座標系に固定（PCAに起因する±反転を排除）。
+
+### 入力
+- 2D検出矩形 `bbox`
+- カラー整列済みDepth（16UC1/32FC1）と `camera_info`（use_color_camera_info=true 推奨）
+- カラー画像（任意）
+- セグメンテーションマスク（任意、`/fv/*/segmentation_mask/image`）
+
+### パイプライン
+1. 中央帯選択
+   - ROIの中央縦帯 B = [cx − α·w, cx + α·w]（`band_alpha`、既定0.3）
+2. Depth量子化（近距離優先）
+   - ROI内の有効DepthをKクラスタ（`depth_k=3`）or 等間隔binに分割し、最浅クラスタ C0 を基底候補に。
+3. 近距離マスク生成
+   - M0 = (depth ∈ C0) ∧ (x ∈ B)
+4. 色マスク（任意）
+   - HSVで緑域フィルタ M1（`green_h_min/max`, `green_s_min`, `green_v_min`）。
+   - M = M0 ∧（M1）∧（segmentation_mask）
+5. 形態処理
+   - close(3×3)→open(3×3)→ラベリング
+6. コンポーネント評価（「近い・中心・縦」をスコア）
+   - 距離（−median depth）、中心性（−|x_centroid−cx|）、縦伸長（major/minor）、垂直性（|angle−90°|）、連続性（縦方向RLE）
+   - 重み付きスコアで最大の1成分のみ採択
+7. 左右整合チェック（安定化）
+   - ROI左右半分でmedian depth差 < `lr_depth_eps`（例5mm）。片側欠落は中央帯面積比で代替許容。
+8. 3D復元・細径円柱フィルタ
+   - 採択画素のみを投影（u=fx·x/z+cx, v=fy·y/z+cy）→ RAW点群
+   - 中央線に対する横偏差 < `cylinder_radius`（例8mm）で外れ点削減
+   - `voxel_leaf_size`＋`noise_reduction_*` でFILT点群生成
+
+### 出力と可視化
+- 左枠（RAW）: `output_selected_pointcloud_topic`
+- 右枠（FILT）: `output_filtered_pointcloud_topic`
+- ラベル: RAW/FILT の総点数（PointCloud2の width×height）
+- 画像への投影は常にカメラ画像座標で行い、PCAは使用しないため左右反転は発生しない。
+
+### 推奨パラメータ（YAML）
+```yaml
+band_alpha: 0.30              # 中央縦帯の相対幅
+depth_k: 3                    # Depthクラスタ数（または depth_bins）
+green_h_min: 35               # HSV緑域 [deg]
+green_h_max: 85
+green_s_min: 0.25
+green_v_min: 0.20
+elongation_min: 5.0           # 縦伸長の最小比
+vertical_tol_deg: 20          # 垂直許容角
+lr_depth_eps: 0.005           # 左右深度差[ｍ]
+cylinder_radius: 0.008        # 半径[ｍ]
+```
+
+### 参考文献
+- 密集環境での3D軸抽出と収穫点決定の考え方は、群生アスパラの再構成と対象選別の報告に整合（YS3AM, MDPI Agriculture 2025）。

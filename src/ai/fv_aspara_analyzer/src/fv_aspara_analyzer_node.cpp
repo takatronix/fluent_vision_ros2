@@ -79,8 +79,19 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<bool>("enable_detected_all_points", false);
     this->declare_parameter<std::string>("output_annotated_image_topic", "");
     this->declare_parameter<bool>("debug_overlay", true);
+    // 曲がり度メソッドと重み
+    this->declare_parameter<std::string>("curvature_method", "hybrid_max");
+    this->declare_parameter<double>("curvature_weight_skeleton", 0.6);
+    this->declare_parameter<double>("curvature_weight_pca", 0.4);
+    // マスク描画のアルファ
+    this->declare_parameter<double>("mask_overlay_alpha", 0.25);
+    this->declare_parameter<double>("hud_alpha", 0.45);
+    this->declare_parameter<double>("hud_font_scale", 0.45);
+    this->declare_parameter<double>("foreground_depth_margin", 0.04); // 右点群の前景マージン[m]
     this->declare_parameter<double>("detection_timeout_seconds", 3.0);  // デフォルト3秒
     this->declare_parameter<std::string>("camera_name", "Camera");  // カメラ名
+    // ルート描画Y固定のオフセット比率（矩形下端からの%）
+    this->declare_parameter<double>("root_y_offset_ratio", 0.05);
 
     // ===== トピック名取得 =====
     std::string detection_topic = this->get_parameter("detection_topic").as_string();
@@ -88,6 +99,7 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     std::string camera_info_topic = this->get_parameter("camera_info_topic").as_string();
     std::string depth_camera_info_topic = this->get_parameter("depth_camera_info_topic").as_string();
     bool use_color_camera_info = this->get_parameter("use_color_camera_info").as_bool();
+    use_color_camera_info_flag_ = use_color_camera_info;
     std::string mask_topic = this->get_parameter("mask_topic").as_string();
     std::string camera_topic = this->get_parameter("camera_topic").as_string();
     std::string depth_topic = this->get_parameter("depth_topic").as_string();
@@ -97,6 +109,14 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     std::string output_detected_all_pointcloud_topic = this->get_parameter("output_detected_all_pointcloud_topic").as_string();
     enable_detected_all_points_ = this->get_parameter("enable_detected_all_points").as_bool();
     debug_overlay_ = this->get_parameter("debug_overlay").as_bool();
+    // 曲がり度・マスク描画パラメータ
+    curvature_method_ = this->get_parameter("curvature_method").as_string();
+    curvature_weight_skeleton_ = this->get_parameter("curvature_weight_skeleton").as_double();
+    curvature_weight_pca_ = this->get_parameter("curvature_weight_pca").as_double();
+    mask_overlay_alpha_ = this->get_parameter("mask_overlay_alpha").as_double();
+    // HUD
+    hud_alpha_ = this->get_parameter("hud_alpha").as_double();
+    hud_font_scale_ = this->get_parameter("hud_font_scale").as_double();
 
     // ===== 必須パラメータのバリデーション =====
     bool config_error = false;
@@ -939,6 +959,36 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     
     // オフスクリーンバッファを作成（クローンではなく新規作成）
     cv::Mat output_image = color_image.clone();
+
+    // セグメンテーションマスクの薄色オーバーレイ（🟢緑）
+    try {
+        cv::Mat mask_copy;
+        {
+            std::lock_guard<std::mutex> lk(image_data_mutex_);
+            if (!latest_mask_.empty()) {
+                mask_copy = latest_mask_.clone();
+            }
+        }
+        if (!mask_copy.empty()) {
+            if (mask_copy.size() != output_image.size()) {
+                cv::resize(mask_copy, mask_copy, output_image.size(), 0, 0, cv::INTER_NEAREST);
+            }
+            cv::Mat bin;
+            if (mask_copy.type() != CV_8U) {
+                mask_copy.convertTo(bin, CV_8U);
+            } else {
+                bin = mask_copy;
+            }
+            cv::threshold(bin, bin, 127, 255, cv::THRESH_BINARY);
+            double alpha = std::clamp(mask_overlay_alpha_, 0.0, 1.0);
+            cv::Mat tint(output_image.size(), output_image.type(), cv::Scalar(0, 255, 0));
+            cv::Mat blended;
+            cv::addWeighted(output_image, 1.0 - alpha, tint, alpha, 0.0, blended);
+            blended.copyTo(output_image, bin);
+        }
+    } catch (...) {
+        // 無視（可視化のみ）
+    }
     
     // FPS計算用（FPSMeterを使用）
     static auto last_time = std::chrono::high_resolution_clock::now();
@@ -1113,6 +1163,29 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             
             // バウンディングボックス描画
             cv::rectangle(output_image, aspara_info.smooth_bbox, color, thickness);
+
+            // 推定根本2D位置（analyzer側の推定z0とヒストで得たXに相当）を可視化
+            // 既に3Dの根本は aspara_info.root_position_3d に格納。2Dへ投影して赤丸を描画
+            if (latest_camera_info_) {
+                const auto& rp = aspara_info.root_position_3d;
+                if (std::isfinite(rp.z) && rp.z > 0.0) {
+                    double fx = latest_camera_info_->k[0];
+                    double fy = latest_camera_info_->k[4];
+                    double cx = latest_camera_info_->k[2];
+                    double cy = latest_camera_info_->k[5];
+                    int u = static_cast<int>(std::round(fx * (rp.x / rp.z) + cx));
+                    int v = static_cast<int>(std::round(fy * (rp.y / rp.z) + cy));
+                    if (u >= 0 && u < output_image.cols && v >= 0 && v < output_image.rows) {
+                        cv::circle(output_image, cv::Point(u, v), 6, cv::Scalar(0, 0, 255), -1);
+                        // 根本座標注記とZ±窓の表示
+                        double pm_cm = aspara_filter_distance_ * 100.0;
+                        std::string rp_txt = cv::format("X:%.3f Y:%.3f Z:%.3f m   B1%.0fcm", rp.x, rp.y, rp.z, pm_cm);
+                        int text_x = std::min(output_image.cols - 10, u + 10);
+                        int text_y = std::max(12, v - 10);
+                        fluent::text::draw(output_image, rp_txt, cv::Point(text_x, text_y), cv::Scalar(0, 0, 255), 0.5, 1);
+                    }
+                }
+            }
             
             // ラベル描画（長さ/真直度/処理時間を含む）
             double length_cm = aspara_info.length * 100.0;
@@ -1267,37 +1340,131 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                     cv::rectangle(overlay_panel, cv::Rect(0,0,panel.width,panel.height), cv::Scalar(0,0,0), -1);
                                     cv::addWeighted(overlay_panel, 0.5, roi_img, 0.5, 0.0, roi_img);
 
-                                    // PC1, PC2をパネルに正規化して描画（点を大きく）
-                                    // 範囲
-                                    float min1=1e9f, max1=-1e9f, min2=1e9f, max2=-1e9f;
-                                    for (int i = 0; i < proj.rows; ++i) {
-                                        float v1 = sgn * proj.at<float>(i,0);
-                                        float v2 = proj.at<float>(i,1);
-                                        min1 = std::min(min1, v1); max1 = std::max(max1, v1);
-                                        min2 = std::min(min2, v2); max2 = std::max(max2, v2);
+                                    // 画像座標系で投影して描画する関数（PCA不使用）
+                                    auto drawCloudToPanel = [&](const sensor_msgs::msg::PointCloud2& pc2,
+                                                               const cv::Rect& roi_rect,
+                                                               const cv::Rect& pnl_rect,
+                                                               int& out_count) {
+                                        out_count = 0;
+                                        if (!caminfo_copy || pc2.data.empty()) return;
+                                        double fx = caminfo_copy->k[0];
+                                        double fy = caminfo_copy->k[4];
+                                        double cx = caminfo_copy->k[2];
+                                        double cy = caminfo_copy->k[5];
+                                        bool has_rgb = false;
+                                        for (const auto& f : pc2.fields) if (f.name == "rgb") { has_rgb = true; break; }
+                                        const uint8_t* data_ptr = pc2.data.data();
+                                        size_t step = pc2.point_step;
+                                        size_t n = pc2.width * pc2.height;
+                                        auto putDot = [&](int px, int py, const cv::Vec3b& c){
+                                            for (int dy=-1; dy<=1; ++dy) {
+                                                for (int dx=-1; dx<=1; ++dx) {
+                                                    int xx = px+dx, yy = py+dy;
+                                                    if (xx > pnl_rect.x && xx < pnl_rect.x + pnl_rect.width-1 &&
+                                                        yy > pnl_rect.y && yy < pnl_rect.y + pnl_rect.height-1) {
+                                                        output_image.at<cv::Vec3b>(yy, xx) = c;
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        for (size_t i = 0; i < n; ++i) {
+                                            const uint8_t* pt = data_ptr + i * step;
+                                            float x, y, z; std::memcpy(&x, pt + 0, 4); std::memcpy(&y, pt + 4, 4); std::memcpy(&z, pt + 8, 4);
+                                            if (!std::isfinite(z) || z <= 0.0f) continue;
+                                            double u = fx * (static_cast<double>(x) / static_cast<double>(z)) + cx;
+                                            double v = fy * (static_cast<double>(y) / static_cast<double>(z)) + cy;
+                                            if (u < roi_rect.x || u >= roi_rect.x + roi_rect.width ||
+                                                v < roi_rect.y || v >= roi_rect.y + roi_rect.height) continue;
+                                            int px = pnl_rect.x + 1 + static_cast<int>((u - roi_rect.x) / roi_rect.width * (pnl_rect.width - 2));
+                                            int py = pnl_rect.y + 1 + static_cast<int>((v - roi_rect.y) / roi_rect.height * (pnl_rect.height - 2));
+                                            cv::Vec3b c(0,255,0);
+                                            if (has_rgb && step >= 16) {
+                                                float rgbf; std::memcpy(&rgbf, pt + 12, 4);
+                                                uint32_t rgb; std::memcpy(&rgb, &rgbf, 4);
+                                                uint8_t r = (rgb >> 16) & 0xff, g = (rgb >> 8) & 0xff, b = rgb & 0xff;
+                                                c = cv::Vec3b(b,g,r);
+                                            }
+                                            putDot(px, py, c);
+                                            ++out_count;
+                                        }
+                                    };
+
+                                    // 左枠: RAW（asparagus_pointcloud）を投影描画
+                                    int raw_drawn = 0;
+                                    if (it_sel != snapshot_list.end() && !it_sel->asparagus_pointcloud.data.empty()) {
+                                        drawCloudToPanel(it_sel->asparagus_pointcloud, roi, panel, raw_drawn);
                                     }
-                                    float range1 = std::max(1e-3f, max1 - min1);
-                                    float range2 = std::max(1e-3f, max2 - min2);
-                                    auto putDot = [&](int px, int py, const cv::Vec3b& c){
-                                        for (int dy=-1; dy<=1; ++dy) {
-                                            for (int dx=-1; dx<=1; ++dx) {
-                                                int xx = px+dx, yy = py+dy;
-                                                if (xx > panel_x && xx < panel_x + panel.width-1 && yy > panel_y && yy < panel_y + panel.height-1) {
-                                                    output_image.at<cv::Vec3b>(yy, xx) = c;
+                                    // 左枠ラベル（総点数）
+                                    {
+                                        int raw_total = 0;
+                                        if (it_sel != snapshot_list.end() && !it_sel->asparagus_pointcloud.data.empty()) {
+                                            raw_total = static_cast<int>(it_sel->asparagus_pointcloud.width * it_sel->asparagus_pointcloud.height);
+                                        }
+                                        std::string lbl = cv::format("RAW: %d", raw_total);
+                                        int ty = std::max(12, panel_y - 6);
+                                        fluent::text::draw(output_image, lbl, cv::Point(panel_x+2, ty), cv::Scalar(255,255,255), 0.5, 1);
+                                    }
+
+                                    // 左パネルに下部帯ヒストグラム（常時表示）
+                                    try {
+                                        if (color_copy_for_panel) {
+                                            cv::Mat color_mat_h; 
+                                            try { color_mat_h = cv_bridge::toCvCopy(color_copy_for_panel, sensor_msgs::image_encodings::BGR8)->image; } catch (...) {}
+                                            if (!color_mat_h.empty()) {
+                                                cv::Mat hsv; cv::cvtColor(color_mat_h, hsv, cv::COLOR_BGR2HSV);
+                                                double bottom_ratio = this->get_parameter("hist_band_bottom_ratio").as_double();
+                                                double top_ratio = this->get_parameter("hist_band_top_ratio").as_double();
+                                                double hmin = this->has_parameter("root_hsv_h_min") ? this->get_parameter("root_hsv_h_min").as_double() : 35.0;
+                                                double hmax = this->has_parameter("root_hsv_h_max") ? this->get_parameter("root_hsv_h_max").as_double() : 85.0;
+                                                double smin = this->has_parameter("root_hsv_s_min") ? this->get_parameter("root_hsv_s_min").as_double() : 0.25;
+                                                double vmin = this->has_parameter("root_hsv_v_min") ? this->get_parameter("root_hsv_v_min").as_double() : 0.20;
+                                                auto roi_c = roi & cv::Rect(0,0,color_mat_h.cols, color_mat_h.rows);
+                                                int y0c = roi_c.y + static_cast<int>(std::floor(roi_c.height * (1.0 - top_ratio)));
+                                                int y1c = roi_c.y + static_cast<int>(std::floor(roi_c.height * (1.0 - bottom_ratio)));
+                                                y0c = std::clamp(y0c, roi_c.y, roi_c.y + roi_c.height - 1);
+                                                y1c = std::clamp(y1c, roi_c.y, roi_c.y + roi_c.height - 1);
+                                                if (y1c < y0c) std::swap(y0c, y1c);
+                                                int bins = std::max(4, roi_c.width / 4);
+                                                std::vector<int> hist(bins, 0);
+                                                for (int v = y0c; v <= y1c; ++v) {
+                                                    for (int u = roi_c.x; u < roi_c.x + roi_c.width; ++u) {
+                                                        cv::Vec3b px = hsv.at<cv::Vec3b>(v,u);
+                                                        double H = (px[0] * 2.0);
+                                                        double S = px[1] / 255.0; double V = px[2] / 255.0;
+                                                        if (!(H>=hmin && H<=hmax && S>=smin && V>=vmin)) continue;
+                                                        int b = std::clamp((u - roi_c.x) * bins / std::max(1, roi_c.width), 0, bins-1);
+                                                        hist[b]++;
+                                                    }
+                                                }
+                                                int maxv = *std::max_element(hist.begin(), hist.end());
+                                                if (maxv > 0) {
+                                                    int gh = std::min(40, panel.height/4);
+                                                    int gy = panel.y + panel.height - gh - 2;
+                                                    int gx = panel.x + 2;
+                                                    int gw = panel.width - 4;
+                                                    for (int i = 0; i < bins; ++i) {
+                                                        int x0 = gx + i * gw / bins;
+                                                        int x1 = gx + (i+1) * gw / bins - 1;
+                                                        int h = static_cast<int>(std::round((hist[i] / (double)maxv) * gh));
+                                                        cv::rectangle(output_image, cv::Rect(x0, gy + gh - h, x1 - x0 + 1, h), cv::Scalar(0,255,0), -1);
+                                                    }
+                                                    fluent::text::draw(output_image, "🟢領域", cv::Point(panel.x+4, gy-4), cv::Scalar(0,255,0), 0.5, 1);
+                                                    // 上部ステータスに"🟢領域"インジケータを、点群と同じ処理（下部帯+HSV/Seg）に基づき表示
+                                                    int green_sum = 0; for (int v = y0c; v <= y1c; ++v) for (int u = roi_c.x; u < roi_c.x + roi_c.width; ++u) {
+                                                        cv::Vec3b px = hsv.at<cv::Vec3b>(v,u); double H = (px[0] * 2.0); double S = px[1] / 255.0; double V = px[2] / 255.0;
+                                                        if (H>=hmin && H<=hmax && S>=smin && V>=vmin) green_sum++; }
+                                                    bool region_ok = green_sum > std::max(10, roi_c.width * (y1c - y0c + 1) / 200); // しきい値: 帯面積の約0.5%以上
+                                                    int hud_x0 = 10 + 60 * 4; // 検出/深度/カメラ/点群 の次に配置
+                                                    int hud_y0 = 6 + 22 + 14; // 黒帯の下と同じ高さ
+                                                    cv::Scalar c = region_ok ? cv::Scalar(0,255,0) : cv::Scalar(0,0,255);
+                                                    cv::circle(output_image, cv::Point(hud_x0, hud_y0-5), 6, c, -1);
+                                                    fluent::text::draw(output_image, "領域", cv::Point(hud_x0 + 14, hud_y0), cv::Scalar(255,255,255), 0.5, 1);
                                                 }
                                             }
                                         }
-                                    };
-                                    for (int i = 0; i < proj.rows; ++i) {
-                                        float v1 = sgn * proj.at<float>(i,0);
-                                        float v2 = proj.at<float>(i,1);
-                                        int py = panel_y + panel.height - 1 - static_cast<int>((v1 - min1) / range1 * (panel.height - 2)); // 下→上
-                                        int px = panel_x + 1 + static_cast<int>((v2 - min2) / range2 * (panel.width - 2));
-                                        cv::Vec3b c = (i < static_cast<int>(colors.size())) ? colors[i] : cv::Vec3b(0,255,0);
-                                        putDot(px, py, c);
-                                    }
+                                    } catch (...) {}
 
-                                    // 右側にも同じプレビューを描画（同時表示）
+                                    // 右側プレビュー：フィルタ済み点群（denoised）を表示
                                     int panel_x_r = std::min(output_image.cols - panel_w - 5, roi.x + roi.width + 8);
                                     if (panel_x_r + panel_w <= output_image.cols - 1) {
                                         cv::Rect panel_r(panel_x_r, panel_y, panel_w, std::min(panel_h, output_image.rows - panel_y - 5));
@@ -1305,24 +1472,23 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                         cv::Mat ov_r; roi_r.copyTo(ov_r);
                                         cv::rectangle(ov_r, cv::Rect(0,0,panel_r.width,panel_r.height), cv::Scalar(0,0,0), -1);
                                         cv::addWeighted(ov_r, 0.5, roi_r, 0.5, 0.0, roi_r);
-                                        auto putDotR = [&](int px, int py, const cv::Vec3b& c){
-                                            for (int dy=-1; dy<=1; ++dy) {
-                                                for (int dx=-1; dx<=1; ++dx) {
-                                                    int xx = px+dx, yy = py+dy;
-                                                    if (xx > panel_x_r && xx < panel_x_r + panel_r.width-1 && yy > panel_y && yy < panel_y + panel_r.height-1) {
-                                                        output_image.at<cv::Vec3b>(yy, xx) = c;
-                                                    }
-                                                }
-                                            }
-                                        };
-                                        for (int i = 0; i < proj.rows; ++i) {
-                                            float v1 = sgn * proj.at<float>(i,0);
-                                            float v2 = proj.at<float>(i,1);
-                                            int py = panel_y + panel_r.height - 1 - static_cast<int>((v1 - min1) / range1 * (panel_r.height - 2));
-                                            int px = panel_x_r + 1 + static_cast<int>((v2 - min2) / range2 * (panel_r.width - 2));
-                                            cv::Vec3b c = (i < static_cast<int>(colors.size())) ? colors[i] : cv::Vec3b(0,255,0);
-                                            putDotR(px, py, c);
+
+                                        // 右枠: FILTERED（filtered_pointcloud）を投影描画
+                                        int filt_drawn = 0;
+                                        if (it_sel != snapshot_list.end() && !it_sel->filtered_pointcloud.data.empty()) {
+                                            drawCloudToPanel(it_sel->filtered_pointcloud, roi, panel_r, filt_drawn);
                                         }
+                                        // 右枠ラベル（総点数）
+                                        {
+                                            int filt_total = 0;
+                                            if (it_sel != snapshot_list.end() && !it_sel->filtered_pointcloud.data.empty()) {
+                                                filt_total = static_cast<int>(it_sel->filtered_pointcloud.width * it_sel->filtered_pointcloud.height);
+                                            }
+                                            std::string lbl = cv::format("FILT: %d", filt_total);
+                                            int ty = std::max(12, panel_y - 6);
+                                            fluent::text::draw(output_image, lbl, cv::Point(panel_x_r+2, ty), cv::Scalar(255,255,0), 0.5, 1);
+                                        }
+
                                     }
                                 }
                             }
@@ -1444,30 +1610,157 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         }
         if (has_distance) {
             std::string cursor_info = cv::format("(%.2f, %.2f, %.2f) %.1fcm", x_m, y_m, z_m, distance_m * 100.0);
-            fluent::text::draw(output_image, cursor_info,
-                               cv::Point(smooth_cursor_position_.x + 25, smooth_cursor_position_.y - 25),
+        fluent::text::draw(output_image, cursor_info, 
+                          cv::Point(smooth_cursor_position_.x + 25, smooth_cursor_position_.y - 25),
                                cursor_color, 0.5, 1);
         }
     }
 
-    // 骨格オーバーレイ（選択アスパラのみ）
-    if (snapshot_selected_id != -1) {
-        auto it_sel = std::find_if(snapshot_list.begin(), snapshot_list.end(),
-            [&](const AsparaInfo& a){ return a.id == snapshot_selected_id; });
-        if (it_sel != snapshot_list.end() && !it_sel->skeleton_points.empty()) {
-            // ライン
-            cv::Scalar bone_color(255, 0, 255); // ピンク
-            for (size_t i = 1; i < it_sel->skeleton_points.size(); ++i) {
-                const auto& p0 = it_sel->skeleton_points[i-1].image_point;
-                const auto& p1 = it_sel->skeleton_points[i].image_point;
-                cv::line(output_image, p0, p1, bone_color, 2, cv::LINE_AA);
-            }
-            // 先端/根元マーカー
-            if (it_sel->skeleton_points.size() >= 2) {
-                cv::circle(output_image, it_sel->skeleton_points.front().image_point, 6, cv::Scalar(0,255,255), -1); // 根元=黄色
-                cv::circle(output_image, it_sel->skeleton_points.back().image_point, 6, cv::Scalar(0,0,255), -1);   // 先端=赤
+    // 骨格オーバーレイ（全アスパラ表示。選択は太線で強調）
+    int selected_skeleton_points = 0;
+    for (const auto& a : snapshot_list) {
+        if (a.skeleton_points.empty()) continue;
+        bool is_selected = (a.id == snapshot_selected_id);
+        if (is_selected) {
+            selected_skeleton_points = static_cast<int>(a.skeleton_points.size());
+            // デバッグ：各骨格点の座標を表示
+            for (size_t i = 0; i < a.skeleton_points.size(); ++i) {
+                const auto& sp = a.skeleton_points[i];
+                RCLCPP_INFO(this->get_logger(), 
+                    "[SKELETON_DRAW] Point %zu: image(%.1f,%.1f) world(%.3f,%.3f,%.3f)",
+                    i, sp.image_point.x, sp.image_point.y,
+                    sp.world_point.x, sp.world_point.y, sp.world_point.z);
             }
         }
+        cv::Scalar bone_color = is_selected ? cv::Scalar(255, 0, 255) : cv::Scalar(180, 120, 200);
+        int thickness = is_selected ? 2 : 1;
+        
+        // 全ての骨格点を個別に描画（線が描けない場合の確認用）
+        for (size_t i = 0; i < a.skeleton_points.size(); ++i) {
+            const auto& p = a.skeleton_points[i].image_point;
+            // 各点を小さな円で描画
+            cv::circle(output_image, p, 3, cv::Scalar(0, 255, 0), -1);
+            if (is_selected) {
+                // 選択中なら点番号も表示
+                std::string pt_num = std::to_string(i);
+                cv::putText(output_image, pt_num, 
+                    cv::Point(p.x + 5, p.y - 5),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255), 1);
+            }
+        }
+        
+        // 線で結ぶ
+        for (size_t i = 1; i < a.skeleton_points.size(); ++i) {
+            const auto& p0 = a.skeleton_points[i-1].image_point;
+            const auto& p1 = a.skeleton_points[i].image_point;
+            cv::line(output_image, p0, p1, bone_color, thickness, cv::LINE_AA);
+        }
+        
+        // 始点と終点を強調
+        if (a.skeleton_points.size() >= 2) {
+            int r = is_selected ? 6 : 4;
+            cv::circle(output_image, a.skeleton_points.front().image_point, r, cv::Scalar(0,255,255), -1);
+            cv::circle(output_image, a.skeleton_points.back().image_point,  r, cv::Scalar(0,0,255),   -1);
+        }
+    }
+    
+    
+    // 選択中のアスパラガスの点群を2D投影して描画
+    int drawn_points = 0;
+    int total_points = 0;
+    for (const auto& a : snapshot_list) {
+        if (a.id != snapshot_selected_id) continue;  // 選択中のアスパラのみ
+        if (a.asparagus_pointcloud.data.empty()) continue;
+        
+        // カメラ情報を取得
+        sensor_msgs::msg::CameraInfo::SharedPtr caminfo_for_pc;
+        {
+            std::lock_guard<std::mutex> lock(aspara_list_mutex_);
+            caminfo_for_pc = latest_camera_info_;
+        }
+        if (!caminfo_for_pc) continue;
+        
+        // PointCloud2をPCLに変換
+        pcl::PointCloud<pcl::PointXYZRGB> cloud;
+        try {
+            // フィールドの確認とデータ解析
+            bool has_rgb = false;
+            for (const auto& field : a.asparagus_pointcloud.fields) {
+                if (field.name == "rgb") {
+                    has_rgb = true;
+                    break;
+                }
+            }
+            
+            // データから点群を取り出す
+            const uint8_t* data_ptr = a.asparagus_pointcloud.data.data();
+            size_t point_step = a.asparagus_pointcloud.point_step;
+            size_t num_points = a.asparagus_pointcloud.width * a.asparagus_pointcloud.height;
+            total_points = static_cast<int>(num_points);
+            
+            for (size_t i = 0; i < num_points; ++i) {
+                const uint8_t* pt = data_ptr + i * point_step;
+                
+                // xyz座標を取得 (float32)
+                float x, y, z;
+                std::memcpy(&x, pt + 0, 4);
+                std::memcpy(&y, pt + 4, 4);
+                std::memcpy(&z, pt + 8, 4);
+                
+                // 無効な点はスキップ
+                if (!std::isfinite(z) || z <= 0.0f) continue;
+                
+                // カメラ内部パラメータで2D投影
+                if (caminfo_for_pc) {
+                    double fx = caminfo_for_pc->k[0];
+                    double fy = caminfo_for_pc->k[4];
+                    double cx = caminfo_for_pc->k[2];
+                    double cy = caminfo_for_pc->k[5];
+                    
+                    // 3D点を2D画像座標に投影
+                    double u = fx * (x / z) + cx;
+                    double v = fy * (y / z) + cy;
+                    
+                    // 画像範囲内チェック
+                    if (u >= 0 && u < output_image.cols && v >= 0 && v < output_image.rows) {
+                        // 色情報を取得（あれば）
+                        cv::Scalar pt_color(100, 255, 100);  // デフォルト：緑
+                        if (has_rgb && point_step >= 16) {
+                            float rgb_float;
+                            std::memcpy(&rgb_float, pt + 12, 4);
+                            uint32_t rgb;
+                            std::memcpy(&rgb, &rgb_float, 4);
+                            uint8_t r = (rgb >> 16) & 0xff;
+                            uint8_t g = (rgb >> 8) & 0xff;
+                            uint8_t b = rgb & 0xff;
+                            pt_color = cv::Scalar(b, g, r);
+                        }
+                        
+                        // 点を描画（選択中なので少し大きめに）
+                        cv::circle(output_image, cv::Point(static_cast<int>(u), static_cast<int>(v)), 
+                                  2, pt_color, -1, cv::LINE_AA);
+                        drawn_points++;
+                    }
+                }
+            }
+            
+            // 点群描画数のデバッグログ
+            RCLCPP_INFO(this->get_logger(), 
+                "[POINTCLOUD_DRAW] Drew %d/%d points for aspara ID %d", 
+                drawn_points, total_points, a.id);
+                
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(this->get_logger(), 
+                "[POINTCLOUD_DRAW] Failed to project pointcloud for aspara %d: %s", 
+                a.id, e.what());
+        }
+    }
+    
+    // ポイント数を画面に表示（左側パネル）
+    if (total_points > 0) {
+        std::string points_info = cv::format("Points: %d/%d", drawn_points, total_points);
+        cv::Point text_pos(10, output_image.rows - 40);
+        fluent::text::draw(output_image, points_info, text_pos, cv::Scalar(0, 255, 255), 0.6, 2);
     }
     
     // FPS表示を簡略化（重い処理を削除）
@@ -1494,34 +1787,21 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     }
     
     // ===== 画面左上に情報表示 =====
-    // 背景パネル（半透明の黒）
-    cv::Mat overlay = output_image.clone();
-    cv::rectangle(overlay, cv::Rect(5, 5, 600, 115), cv::Scalar(0, 0, 0), -1);  // 高さを増やして点群処理情報を収納
-    cv::addWeighted(overlay, 0.6, output_image, 0.4, 0, output_image);
-    if (debug_overlay_) {
-        // 入力サイズとスケールを出す
-        int cw = latest_color_image_ ? static_cast<int>(latest_color_image_->width) : 0;
-        int ch = latest_color_image_ ? static_cast<int>(latest_color_image_->height) : 0;
-        int dw = latest_depth_image_ ? static_cast<int>(latest_depth_image_->width) : 0;
-        int dh = latest_depth_image_ ? static_cast<int>(latest_depth_image_->height) : 0;
-        int pw = latest_pointcloud_ ? static_cast<int>(latest_pointcloud_->width) : 0;
-        int ph = latest_pointcloud_ ? static_cast<int>(latest_pointcloud_->height) : 0;
-        double kx = (cw>0)? static_cast<double>(pw)/cw : 0.0;
-        double ky = (ch>0)? static_cast<double>(ph)/ch : 0.0;
-        std::string sz = cv::format("[C:%dx%d D:%dx%d RP:%dx%d] k=(%.2f,%.2f)", cw,ch,dw,dh,pw,ph,kx,ky);
-        fluent::text::draw(output_image, sz, cv::Point(15, 14), cv::Scalar(200,200,200), 0.5, 1);
-    }
+    // 背景パネルは削除（ユーザー要望により）
+    int hud_x = 6;  // 左端に寄せる
+    int hud_y = 6;  // 上端に寄せる（さらに上）
+    // デバッグオーバーレイは削除（ユーザー要望により）
     
     // 入力ノードの生存ステータス（ノードの接続状態を表示）
-    // 仕様: 日本語表記、左に●、右にラベル。生存=緑、死亡=赤。
+    // 左上に直接表示（背景なし）
     auto now_steady2 = std::chrono::steady_clock::now();
     auto alive_within = std::chrono::milliseconds(1500); // 1.5秒以内に受信していれば生存
     bool det_alive = detection_node_seen_ && (now_steady2 - last_detection_msg_time_ <= alive_within);
     bool depth_alive = depth_node_seen_ && (now_steady2 - last_depth_msg_time_ <= alive_within);
     bool cam_alive = camera_node_seen_ && (now_steady2 - last_color_msg_time_ <= alive_within);
 
-    int status_y = 22;
-    int status_x = 15;
+    int status_y = hud_y + 22 + 14;  // 黒帯の下に配置
+    int status_x = 10;  // 画面左端近く
     auto draw_status = [&](const std::string& label_jp, bool alive) {
         // ●を左側に描画
         cv::Scalar color = alive ? cv::Scalar(0,255,0) : cv::Scalar(0,0,255); // 緑/赤
@@ -1566,15 +1846,32 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     // カメラ名を取得
     static std::string camera_name = this->get_parameter("camera_name").as_string();
     
-    // 1行目: カメラ名とFPS情報を一列に表示
-    int y_offset = 34; // 1行目との縦方向の間隔をやや詰める（約半分）
-    std::string fps_line = cv::format("[%s] FPS: C=%.0f D=%.0f Det=%.0f Out=%.0f",
+    // 1行目: 背景の半透明黒パネル（上部の一帯）
+    int hud_w = std::min(420, output_image.cols - 12);
+    int hud_h = 22; // 一行分の黒帯のみ
+    cv::Rect hud_rect(hud_x, hud_y, hud_w, hud_h);
+    {
+        cv::Mat roi = output_image(hud_rect);
+        cv::Mat ov; roi.copyTo(ov);
+        cv::rectangle(ov, cv::Rect(0,0,hud_rect.width,hud_rect.height), cv::Scalar(0,0,0), -1);
+        double a = std::clamp(hud_alpha_, 0.0, 1.0);
+        cv::addWeighted(ov, a, roi, 1.0 - a, 0.0, roi);
+    }
+
+
+
+    
+    // 黒帯の中に小さめでカメラ名+FPS
+    std::string fps_line = cv::format("[%s] FPS C:%.0f D:%.0f Det:%.0f Out:%.0f",
                                        camera_name.c_str(), color_fps, depth_fps, detection_fps, display_fps);
-    fluent::text::draw(output_image, fps_line, cv::Point(15, y_offset),
-                text_color, 0.5, 1);
+    int line_y = hud_y + hud_h - 6;
+    fluent::text::draw(output_image, fps_line, cv::Point(hud_x + 8, line_y), text_color, std::max(0.35, hud_font_scale_ * 0.85), 1);
+
+    // 以降の行は黒帯の下から積む
+    int y_offset = hud_y + hud_h + 6;
     
     // 2行目: フレーム番号、検出数、分析時間
-    y_offset += 22;
+    y_offset += 20  ;
     std::string info_line;
     double analysis_ms = last_analysis_time_ms_.load();
     if (snapshot_list.empty()) {
@@ -1585,22 +1882,22 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                               (unsigned long)total_frame_count, snapshot_list.size(), analysis_ms);
     }
     cv::Scalar info_color = snapshot_list.empty() ? cv::Scalar(128, 128, 128) : cv::Scalar(0, 255, 0);
-    fluent::text::draw(output_image, info_line, cv::Point(15, y_offset),
-                info_color, 0.5, 1);
+    fluent::text::draw(output_image, info_line, cv::Point(hud_x + 8, y_offset),
+                info_color, hud_font_scale_, 1);
     
     // 3行目: 点群処理情報
-    y_offset += 22;
+    y_offset += 16;
     float pointcloud_fps = pointcloud_fps_meter_ ? pointcloud_fps_meter_->getCurrentFPS() : 0.0f;
     double pointcloud_ms = last_pointcloud_time_ms_.load();
     std::string pointcloud_line = cv::format("Pointcloud: %.1f FPS | %.1fms", pointcloud_fps, pointcloud_ms);
     if (have_pc && fallback_active) {
         pointcloud_line += " [fallback]";
     }
-    fluent::text::draw(output_image, pointcloud_line, cv::Point(15, y_offset),
-                text_color, 0.5, 1);
+    fluent::text::draw(output_image, pointcloud_line, cv::Point(hud_x + 8, y_offset),
+                text_color, hud_font_scale_, 1);
 
     // 4行目: システム負荷情報（CPU/MEM のみ。GPUは非表示）
-    y_offset += 22;
+    y_offset += 16;
     static auto last_sys_update = std::chrono::steady_clock::now();
     static float cpu_usage_pct = 0.0f;
     static int mem_used_mb = 0, mem_total_mb = 0;
@@ -1648,7 +1945,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     // 描画テキスト生成
     std::string sys_line = cv::format("CPU: %.0f%% | MEM: %d/%d MB",
                                cpu_usage_pct, mem_used_mb, mem_total_mb);
-    fluent::text::draw(output_image, sys_line, cv::Point(15, y_offset), text_color, 0.5, 1);
+    fluent::text::draw(output_image, sys_line, cv::Point(hud_x + 8, y_offset), text_color, hud_font_scale_, 1);
     
     // FPS値に応じて色付け（オプション）
     if (display_fps < 15.0f) {
