@@ -28,7 +28,7 @@ fv_aspara_analyzer_d405:
     pointcloud_topic: "/fv/d405/registered_points"               # 3D点群データ（depth_image_proc出力）
     camera_info_topic: "/fv/d405/color/camera_info"              # カラーカメラキャリブレーション情報
     depth_camera_info_topic: "/fv/d405/depth/camera_info"        # 深度カメラキャリブレーション情報
-    use_color_camera_info: true              # RealSense整列時はtrue
+    use_color_camera_info: true              # 深度をカラーへ整列している場合はtrue（カラー内参を使用）。未整列の生深度の場合はfalse（深度内参を使用）
     camera_topic: "/fv/d405/color/image_raw"                     # カラー画像
     depth_topic: "/fv/d405/depth/image_rect_raw"                 # 深度画像
     mask_topic: "/fv/d405/segmentation_mask/image"               # セグメンテーションマスク
