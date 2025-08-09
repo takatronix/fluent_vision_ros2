@@ -1239,10 +1239,10 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     std::string info_line;
     double analysis_ms = last_analysis_time_ms_.load();
     if (snapshot_list.empty()) {
-        info_line = cv::format("Frame: %lu | Not Detected | Analysis: %.1fms", 
+        info_line = cv::format("フレーム: %lu | 未検出 | 分析: %.1fms", 
                               (unsigned long)total_frame_count, analysis_ms);
     } else {
-        info_line = cv::format("Frame: %lu | Detected: %zu | Analysis: %.1fms", 
+        info_line = cv::format("フレーム: %lu | 検出数: %zu | 分析: %.1fms", 
                               (unsigned long)total_frame_count, snapshot_list.size(), analysis_ms);
     }
     cv::Scalar info_color = snapshot_list.empty() ? cv::Scalar(128, 128, 128) : cv::Scalar(0, 255, 0);
@@ -1303,25 +1303,64 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             mem_used_mb = std::max(0, mem_total_mb - mem_avail_mb);
         }
 
-        // GPU via nvidia-smi (optional)
+        // GPU via NVIDIA (nvidia-smi) or Intel Arc (intel_gpu_top), optional
         gpu_util_pct = -1; gpu_mem_used_mb = -1; gpu_mem_total_mb = -1;
-        FILE* pipe = popen("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null", "r");
-        if (pipe) {
-            char buffer[256];
-            if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                int util=0, used=0, total=0;
-                if (sscanf(buffer, "%d, %d, %d", &util, &used, &total) == 3) {
-                    gpu_util_pct = util; gpu_mem_used_mb = used; gpu_mem_total_mb = total;
+        {
+            // Try NVIDIA first
+            FILE* pipe = popen("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null", "r");
+            if (pipe) {
+                char buffer[256];
+                if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                    int util=0, used=0, total=0;
+                    if (sscanf(buffer, "%d, %d, %d", &util, &used, &total) == 3) {
+                        gpu_util_pct = util; gpu_mem_used_mb = used; gpu_mem_total_mb = total;
+                    }
                 }
+                pclose(pipe);
             }
-            pclose(pipe);
+        }
+        if (gpu_util_pct < 0) {
+            // Try Intel Arc via intel_gpu_top JSON (average busy across engines). Requires intel-gpu-tools
+            // One-shot sample (~200ms)
+            FILE* pipe = popen("intel_gpu_top -J -s 200 -n 1 2>/dev/null", "r");
+            if (pipe) {
+                std::string out; char buf[512]; size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) out.append(buf, buf + n);
+                pclose(pipe);
+                // Ad-hoc parse: find all occurrences of "\"busy\": <number>"
+                size_t pos = 0; int count = 0; double sum = 0.0;
+                while (true) {
+                    pos = out.find("\"busy\"", pos);
+                    if (pos == std::string::npos) break;
+                    size_t colon = out.find(':', pos);
+                    if (colon == std::string::npos) break;
+                    // advance past colon
+                    size_t start = out.find_first_of("0123456789", colon + 1);
+                    if (start == std::string::npos) { pos += 6; continue; }
+                    size_t end = start;
+                    while (end < out.size() && (isdigit(out[end]) || out[end]=='.')) end++;
+                    try {
+                        double val = std::stod(out.substr(start, end - start));
+                        // Filter unreasonable values
+                        if (val >= 0.0 && val <= 100.0) { sum += val; count++; }
+                    } catch (...) {}
+                    pos = end;
+                }
+                if (count > 0) {
+                    gpu_util_pct = static_cast<int>(std::round(sum / count));
+                }
+                // intel_gpu_top JSON does not provide VRAM usage in a simple way; keep N/A
+            }
         }
     }
     // 描画テキスト生成
     std::string sys_line;
-    if (gpu_util_pct >= 0) {
+    if (gpu_util_pct >= 0 && gpu_mem_used_mb >= 0 && gpu_mem_total_mb >= 0) {
         sys_line = cv::format("CPU: %.0f%% | GPU: %d%% | MEM: %d/%d MB | VRAM: %d/%d MB",
                                cpu_usage_pct, gpu_util_pct, mem_used_mb, mem_total_mb, gpu_mem_used_mb, gpu_mem_total_mb);
+    } else if (gpu_util_pct >= 0) {
+        sys_line = cv::format("CPU: %.0f%% | GPU: %d%% | MEM: %d/%d MB | VRAM: N/A",
+                               cpu_usage_pct, gpu_util_pct, mem_used_mb, mem_total_mb);
     } else {
         sys_line = cv::format("CPU: %.0f%% | MEM: %d/%d MB | GPU: N/A",
                                cpu_usage_pct, mem_used_mb, mem_total_mb);
