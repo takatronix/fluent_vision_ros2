@@ -111,15 +111,11 @@ ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
 
 
 # 物体検出 D415 ノード起動
-echo "🔍 Starting Object Detector D415 node..."
-echo "   Model: YOLOv10 (/models/v2_nano_best_fp16_dynamic.xml)"
 ros2 run fv_object_detector fv_object_detector_node \
     --ros-args --params-file "fv_object_detector_d415.yaml" \
     -r __node:=fv_object_detector_d415 &
 
 # 物体検出 D405 ノード起動
-echo "🔍 Starting Object Detector D405 node..."
-echo "   Model: YOLOv10 (/models/v2_nano_best_fp16_dynamic.xml)"
 ros2 run fv_object_detector fv_object_detector_node \
     --ros-args --params-file "fv_object_detector_d405.yaml" \
     -r __node:=fv_object_detector_d405 &

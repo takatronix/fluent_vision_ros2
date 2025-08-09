@@ -37,6 +37,11 @@ fv_object_detector_d405:
     show_stats_on_image: true   # 画像上に統計情報表示
     publish_annotated_image: true  # アノテーション付き画像パブリッシュ
     
+    # ===== QoS設定 =====
+    qos:
+      queue_size: 10
+      reliability: "best_effort"   # 省リソース運用。必要なら "reliable" に変更
+    
     # ===== YOLOv10モデル設定 =====
     model:
       type: "yolov10"                               # モデルタイプ：YOLOv10

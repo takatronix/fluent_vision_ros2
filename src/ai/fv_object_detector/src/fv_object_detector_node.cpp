@@ -27,6 +27,7 @@
 #include <chrono>
 #include <string>
 #include <vector>
+#include <rclcpp/qos.hpp>
 
 /**
  * @class FVObjectDetectorNode
@@ -80,6 +81,16 @@ public:
         enable_visualization_ = this->get_parameter("enable_visualization").as_bool();
         show_stats_on_image_ = this->get_parameter("show_stats_on_image").as_bool();
         publish_annotated_image_ = this->get_parameter("publish_annotated_image").as_bool();
+
+        // QoS設定を読み込み
+        int qos_queue_size = this->declare_parameter("qos.queue_size", 10);
+        std::string qos_reliability = this->declare_parameter("qos.reliability", std::string("best_effort"));
+        rclcpp::QoS qos = rclcpp::QoS(rclcpp::KeepLast(qos_queue_size));
+        if (qos_reliability == "best_effort") {
+            qos.best_effort();
+        } else {
+            qos.reliable();
+        }
         
         RCLCPP_INFO(this->get_logger(), "Input topic: %s", input_topic_.c_str());
         RCLCPP_INFO(this->get_logger(), "Output image topic: %s", output_image_topic_.c_str());
@@ -96,19 +107,19 @@ public:
             tracker_ = std::make_unique<fv_object_detector::ObjectTracker>();
         }
         
-        // サブスクライバーを設定
+        // サブスクライバーを設定（QoSはパラメータから）
         image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-            input_topic_, rclcpp::SensorDataQoS(),
+            input_topic_, qos,
             std::bind(&FVObjectDetectorNode::imageCallback, this, std::placeholders::_1));
         
         // パブリッシャーを設定
         if (enable_visualization_) {
             image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-                output_image_topic_, rclcpp::SensorDataQoS());
+                output_image_topic_, qos);
         }
         
         detections_pub_ = this->create_publisher<vision_msgs::msg::Detection2DArray>(
-            output_detections_topic_, rclcpp::QoS(10).best_effort());
+            output_detections_topic_, qos);
         
         // サービスを設定（一時的に無効化）
         // set_detection_state_srv_ = this->create_service<fv_object_detector::srv::SetDetectionState>(
