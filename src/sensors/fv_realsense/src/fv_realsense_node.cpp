@@ -566,7 +566,7 @@ void FVDepthCameraNode::initializePublishers()
     // Basic publishers
     if (stream_config_.color_enabled) {
         color_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.color, rclcpp::SensorDataQoS());
+            topic_config_.color, qos);
         RCLCPP_INFO(this->get_logger(), "📷 Color publisher created: %s, ptr: %p", 
             topic_config_.color.c_str(), static_cast<void*>(color_pub_.get()));
         
@@ -574,7 +574,7 @@ void FVDepthCameraNode::initializePublishers()
             // Create compressed image publisher directly
             std::string compressed_topic = topic_config_.color + "/compressed";
             color_compressed_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
-                compressed_topic, rclcpp::SensorDataQoS());
+                compressed_topic, qos);
             RCLCPP_INFO(this->get_logger(), "📷 Compressed publisher created: %s", 
                 compressed_topic.c_str());
         }
@@ -582,25 +582,25 @@ void FVDepthCameraNode::initializePublishers()
     
     if (stream_config_.depth_enabled) {
         depth_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.depth, rclcpp::SensorDataQoS());
+            topic_config_.depth, qos);
     }
     
     if (stream_config_.depth_colormap_enabled) {
         depth_colormap_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.depth_colormap, rclcpp::SensorDataQoS());
+            topic_config_.depth_colormap, qos);
     }
     
     if (stream_config_.pointcloud_enabled) {
         pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            topic_config_.pointcloud, rclcpp::SensorDataQoS());
+            topic_config_.pointcloud, qos);
     }
     
     // Camera info publishers
     if (camera_info_config_.enable_camera_info) {
         color_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            topic_config_.color_camera_info, rclcpp::SensorDataQoS());
+            topic_config_.color_camera_info, qos);
         depth_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            topic_config_.depth_camera_info, rclcpp::SensorDataQoS());
+            topic_config_.depth_camera_info, qos);
         RCLCPP_INFO(this->get_logger(), "📋 Camera info publishers created: %s, %s", 
             topic_config_.color_camera_info.c_str(), 
             topic_config_.depth_camera_info.c_str());

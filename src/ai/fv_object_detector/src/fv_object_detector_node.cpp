@@ -98,17 +98,17 @@ public:
         
         // サブスクライバーを設定
         image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-            input_topic_, 10,
+            input_topic_, rclcpp::SensorDataQoS(),
             std::bind(&FVObjectDetectorNode::imageCallback, this, std::placeholders::_1));
         
         // パブリッシャーを設定
         if (enable_visualization_) {
             image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-                output_image_topic_, 10);
+                output_image_topic_, rclcpp::SensorDataQoS());
         }
         
         detections_pub_ = this->create_publisher<vision_msgs::msg::Detection2DArray>(
-            output_detections_topic_, 10);
+            output_detections_topic_, rclcpp::QoS(10).best_effort());
         
         // サービスを設定（一時的に無効化）
         // set_detection_state_srv_ = this->create_service<fv_object_detector::srv::SetDetectionState>(

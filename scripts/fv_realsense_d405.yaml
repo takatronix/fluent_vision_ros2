@@ -90,7 +90,7 @@ fv_realsense_d405:
     # ===== QoS設定（高速配信） =====
     qos:
       queue_size: 10                   # キューサイズ10（バッファリング）
-      reliability: "best_effort"       # ベストエフォート（高速配信）
+      reliability: "best_effort"       # ベストエフォート（軽量）
       durability: "volatile"           # 揮発性（履歴なし）
       history: "keep_last"             # 最新のみ保持
       
