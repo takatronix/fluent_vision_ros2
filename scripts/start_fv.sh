@@ -91,6 +91,9 @@ ros2 run fv_realsense fv_realsense_node \
 # -----------------------------------------------------------------
 ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
   -p use_sensor_data_qos:=true \
+  -p qos_overrides./rgb/image_rect_color.reliability:=best_effort \
+  -p qos_overrides./rgb/camera_info.reliability:=best_effort \
+  -p qos_overrides./depth_registered/image_rect.reliability:=best_effort \
   -r rgb/image_rect_color:=/fv/d405/color/image_raw \
   -r rgb/camera_info:=/fv/d405/color/camera_info \
   -r depth_registered/image_rect:=/fv/d405/depth/image_rect_raw \
@@ -101,6 +104,9 @@ ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
 # -----------------------------------------------------------------
 ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
   -p use_sensor_data_qos:=true \
+  -p qos_overrides./rgb/image_rect_color.reliability:=best_effort \
+  -p qos_overrides./rgb/camera_info.reliability:=best_effort \
+  -p qos_overrides./depth_registered/image_rect.reliability:=best_effort \
   -r rgb/image_rect_color:=/fv/d415/color/image_raw \
   -r rgb/camera_info:=/fv/d415/color/camera_info \
   -r depth_registered/image_rect:=/fv/d415/depth/image_rect_raw \
