@@ -14,7 +14,8 @@
 # 共有メモリ転送を有効化（高速画像転送）
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export FASTRTPS_DEFAULT_PROFILES_FILE=../fastdds_shared_memory.xml
-export RMW_FASTRTPS_USE_QOS_FROM_XML=1
+# QoSはコード/YAMLの設定を使う（XMLの上書きを無効化）
+export RMW_FASTRTPS_USE_QOS_FROM_XML=0
 
 
 # 注: スクリプト内での source は行いません（起動を速くするため）。
@@ -89,6 +90,7 @@ ros2 run fv_realsense fv_realsense_node \
 # [2.a] D405 の depth_image_proc の起動
 # -----------------------------------------------------------------
 ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
+  -p use_sensor_data_qos:=true \
   -r rgb/image_rect_color:=/fv/d405/color/image_raw \
   -r rgb/camera_info:=/fv/d405/color/camera_info \
   -r depth_registered/image_rect:=/fv/d405/depth/image_rect_raw \
@@ -98,6 +100,7 @@ ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
 # [2.b] D415 の depth_image_proc の起動
 # -----------------------------------------------------------------
 ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
+  -p use_sensor_data_qos:=true \
   -r rgb/image_rect_color:=/fv/d415/color/image_raw \
   -r rgb/camera_info:=/fv/d415/color/camera_info \
   -r depth_registered/image_rect:=/fv/d415/depth/image_rect_raw \
