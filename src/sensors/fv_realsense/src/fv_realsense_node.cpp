@@ -268,6 +268,11 @@ void FVDepthCameraNode::loadParameters()
     RCLCPP_INFO(this->get_logger(), "✅ Parameters loaded successfully");
     RCLCPP_INFO(this->get_logger(), "📺 Color topic: %s", topic_config_.color.c_str());
     RCLCPP_INFO(this->get_logger(), "📺 Depth topic: %s", topic_config_.depth.c_str());
+
+    // ===== 初期モードの設定（デフォルト: 2 フル機能） =====
+    int initial_mode = this->declare_parameter("initial_mode", 2);
+    current_mode_.store(initial_mode);
+    RCLCPP_INFO(this->get_logger(), "🎛️ Initial mode set to: %d (0=off,1=color-only,2=full)", initial_mode);
 }
 
 bool FVDepthCameraNode::initializeRealSense()

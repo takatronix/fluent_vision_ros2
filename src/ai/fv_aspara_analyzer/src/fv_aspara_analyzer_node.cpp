@@ -1235,11 +1235,12 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 }
             }
         }
-        std::string cursor_info = has_distance ?
-            cv::format("(%.2f, %.2f, %.2f) %.1fcm", x_m, y_m, z_m, distance_m * 100.0) : std::string("(--, --, --) N/A");
-        fluent::text::draw(output_image, cursor_info,
-                           cv::Point(smooth_cursor_position_.x + 25, smooth_cursor_position_.y - 25),
-                           cursor_color, 0.5, 1);
+        if (has_distance) {
+            std::string cursor_info = cv::format("(%.2f, %.2f, %.2f) %.1fcm", x_m, y_m, z_m, distance_m * 100.0);
+            fluent::text::draw(output_image, cursor_info,
+                               cv::Point(smooth_cursor_position_.x + 25, smooth_cursor_position_.y - 25),
+                               cursor_color, 0.5, 1);
+        }
     }
     
     // FPS表示を簡略化（重い処理を削除）

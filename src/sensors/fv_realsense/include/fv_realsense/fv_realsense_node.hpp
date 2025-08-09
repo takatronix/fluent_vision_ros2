@@ -158,7 +158,7 @@ private:
     rclcpp::Time latest_frame_stamp_;
     
     // Mode control
-    std::atomic<int> current_mode_{1};  // デフォルトは基本動作モード
+    std::atomic<int> current_mode_{1};  // デフォルトは基本動作モード（パラメータinitial_modeで上書き）
 
     // Point marker for display modes
     struct PointMarker {

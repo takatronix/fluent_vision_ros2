@@ -46,7 +46,7 @@ fv_realsense_d405:
       depth_enabled: true           # 深度ストリーム有効
       infrared_enabled: false       # 赤外線ストリーム無効（省電力）
       pointcloud_enabled: true       # 点群生成有効
-      depth_colormap_enabled: false  # 深度カラーマップ有効
+      depth_colormap_enabled: true  # 深度カラーマップ有効
       sync_enabled: true            # 深度・カラー同期有効（重要！）
       align_to_color: true          # 深度をカラーへ整列（ROI色付け整合）
     
@@ -98,6 +98,7 @@ fv_realsense_d405:
     services:
       get_distance_enabled: true       # 距離取得サービス有効
       get_camera_info_enabled: true    # カメラ情報取得サービス有効
+      set_mode_enabled: true           # 動作モード変更サービス（保険）
     
     # ===== TF（座標変換）設定 =====
     tf:
@@ -109,13 +110,16 @@ fv_realsense_d405:
     
     # ===== トピック設定（D405専用） =====
     topics:
-      color: "fv/d405/color/image_raw"                    # カラー画像トピック
-      depth: "fv/d405/depth/image_rect_raw"               # 深度画像トピック
-      color_compressed: "fv/d405/color/image_raw/compressed"  # 圧縮カラー画像トピック
-      depth_colormap: "fv/d405/depth/colormap"            # 深度カラーマップトピック
-      pointcloud: "fv/d405/points"                        # 点群トピック
-      color_camera_info: "fv/d405/color/camera_info"      # カラーカメラ情報トピック
-      depth_camera_info: "fv/d405/depth/camera_info"      # 深度カメラ情報トピック
+      color: "/fv/d405/color/image_raw"                    # カラー画像トピック（絶対名）
+      depth: "/fv/d405/depth/image_rect_raw"               # 深度画像トピック（絶対名）
+      color_compressed: "/fv/d405/color/image_raw/compressed"  # 圧縮カラー画像トピック（絶対名）
+      depth_colormap: "/fv/d405/depth/colormap"            # 深度カラーマップトピック（絶対名）
+      pointcloud: "/fv/d405/points"                        # 点群トピック（絶対名）
+      color_camera_info: "/fv/d405/color/camera_info"      # カラーカメラ情報トピック（絶対名）
+      depth_camera_info: "/fv/d405/depth/camera_info"      # 深度カメラ情報トピック（絶対名）
+    # ===== 初期モード =====
+    # 0: 停止, 1: カラーのみ, 2: フル（カラー+深度）
+    initial_mode: 2
       
       # デフォルトトピック無効化（名前空間競合回避）
       enable_default_topics: false     # デフォルトトピック無効
