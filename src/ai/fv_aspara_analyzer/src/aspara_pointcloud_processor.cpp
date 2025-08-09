@@ -10,8 +10,15 @@ AsparaPointcloudProcessor::AsparaPointcloudProcessor(FvAsparaAnalyzerNode* node_
     : node_(node_ptr)
 {
     // パブリッシャー初期化
+    // YAMLの output_filtered_pointcloud_topic を使用（未設定時は従来名）
+    std::string filtered_topic = "output_filtered_pointcloud";
+    try {
+        if (node_->has_parameter("output_filtered_pointcloud_topic")) {
+            filtered_topic = node_->get_parameter("output_filtered_pointcloud_topic").as_string();
+        }
+    } catch (...) {}
     filtered_pointcloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-        "output_filtered_pointcloud", 10);
+        filtered_topic, 10);
     annotated_image_pub_ = node_->create_publisher<sensor_msgs::msg::Image>(
         "output_annotated_image", 10);
     // マーカートピックはパラメータ化

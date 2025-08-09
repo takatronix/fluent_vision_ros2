@@ -48,34 +48,37 @@
     
     # 検出・フィルタリング設定
     min_confidence: 0.3                    # 最小検出信頼度（0.0-1.0）
-    pointcloud_distance_min: 0.1           # 点群処理最小距離（10cm）
-    pointcloud_distance_max: 2.0           # 点群処理最大距離（2m）
-    aspara_filter_distance: 0.05           # アスパラガス根元からのフィルタ距離（5cm）
+    pointcloud_distance_min: 0.05           # 点群処理最小距離（5cm）
+    pointcloud_distance_max: 1.0           # 点群処理最大距離（2m）
+    aspara_filter_distance: 0.30           # アスパラ根元からの距離窓（m）D405と統一
     depth_unit_m_16u: 0.001                # 16UC1深度単位（D415は1mm/Unit）
     enable_pointcloud_processing: true     # ポイントクラウド処理を有効化（非同期処理でカクつき解決）
     detection_timeout_seconds: 1.5         # 検出がない場合の表示タイムアウト（秒）
+    disable_filtered_fallback: true       # フィルタ結果が空でもフォールバックせず空点群を公開
+    simple_z_back_cut: true               # z0から一定距離後ろを強制カット
+    z_back_cut_m: 0.15                    # simple_z_back_cutがtrueの場合のカット距離[m]
     
     # ===== 根本推定・抽出帯パラメータ（表示/抽出の安定化） =====
-    band_alpha: 0.20                       # ROI幅に対する中央帯の割合（20%）
-    hist_band_bottom_ratio: 0.05           # 下部帯の下側比率（5%）
-    hist_band_top_ratio: 0.08              # 下部帯の上側比率（8%）
+    band_alpha: 1.0                        # 中央帯無効化（まずz窓だけ確認）
+    hist_band_bottom_ratio: 0.04           # 下部帯の下側比率（4%）
+    hist_band_top_ratio: 0.12              # 下部帯の上側比率（12%）
     root_depth_percentile: 0.10            # z0推定のパーセンタイル（p10）
-    root_use_segmentation: true            # セグメントマスクを優先使用
+    root_use_segmentation: false           # まず色/Segを無効化（安定確認後にON）
     root_hsv_h_min: 35.0                   # 緑抽出HSV下限（H）
     root_hsv_h_max: 85.0                   # 緑抽出HSV上限（H）
     root_hsv_s_min: 0.25                   # 緑抽出HSV下限（S）
     root_hsv_v_min: 0.20                   # 緑抽出HSV下限（V）
     root_y_offset_ratio: 0.05              # 根本Yを矩形下端から固定する比率（5%）
-    root_lateral_radius_m: 0.02            # 根本X中心からの横方向半径（2cm）
+    root_lateral_radius_m: 1.0            # 横半径無効化（広め）
 
     # ===== ノイズ除去パラメータ =====
     
     # 統計的外れ値除去フィルタ
-    noise_reduction_neighbors: 50          # 統計フィルタの近傍点数（推奨：30-100）
-    noise_reduction_std_dev: 1.0           # 標準偏差倍率（推奨：0.5-2.0）
+    noise_reduction_neighbors: 10          # 点数回復のため緩め
+    noise_reduction_std_dev: 2.0           # 点数回復のため広め
     
     # ボクセルグリッドフィルタ（ダウンサンプリング）
-    voxel_leaf_size: 0.010                 # ボクセルサイズ（10mm、推奨：3-10mm）
+    voxel_leaf_size: 0.006                 # ボクセルサイズ（6mm、点数回復のため緩め）
 
     # ===== アスパラガス品質評価パラメータ =====
     

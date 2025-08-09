@@ -706,9 +706,18 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             // さらに根本X周りの横方向半径で制限（背景面の混入抑制）
             double lateral_radius_m = node_ && node_->has_parameter("root_lateral_radius_m") ?
                 node_->get_parameter("root_lateral_radius_m").get_value<double>() : 0.02; // 2cm
+            // シンプル背面カット（z0+cut以降を除去）
+            bool simple_cut = node_ && node_->has_parameter("simple_z_back_cut") ?
+                node_->get_parameter("simple_z_back_cut").get_value<bool>() : true;
+            double z_back = node_ && node_->has_parameter("z_back_cut_m") ?
+                node_->get_parameter("z_back_cut_m").get_value<double>() : 0.15;
             for (const auto& p : denoised_cloud->points) {
                 if (!std::isfinite(p.z) || p.z <= 0.0f) continue;
-                if (std::fabs(p.z - z0) > dist_window) continue;
+                if (simple_cut) {
+                    if ((p.z - z0) > z_back) continue; // 背面カットのみ
+                } else {
+                    if (std::fabs(p.z - z0) > dist_window) continue;
+                }
                 // 横方向の半径制限（xのみ）。根本X中心から±半径以内のみ採用
                 if (std::isfinite(aspara_info.root_position_3d.x) && lateral_radius_m > 0.0) {
                     if (std::fabs(static_cast<double>(p.x) - aspara_info.root_position_3d.x) > lateral_radius_m) continue;
@@ -757,7 +766,14 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             }
         }
         // 右用点群をパブリッシュ（空なら従来のdenoised）
-        pcl::PointCloud<pcl::PointXYZRGB>::Ptr to_publish = (foreground->points.empty() ? denoised_cloud : foreground);
+        bool disable_fb = false;
+        try {
+            if (node_->has_parameter("disable_filtered_fallback")) {
+                disable_fb = node_->get_parameter("disable_filtered_fallback").get_value<bool>();
+            }
+        } catch (...) {}
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr to_publish =
+            (foreground->points.empty() && !disable_fb) ? denoised_cloud : foreground;
         pointcloud_processor_->publishFilteredPointCloud(
             to_publish,
             frame_id_to_use, aspara_info.id, depth_image->header.stamp);

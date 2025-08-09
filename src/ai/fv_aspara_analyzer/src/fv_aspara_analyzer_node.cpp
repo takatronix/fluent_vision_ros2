@@ -88,6 +88,10 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<double>("hud_alpha", 0.45);
     this->declare_parameter<double>("hud_font_scale", 0.45);
     this->declare_parameter<double>("foreground_depth_margin", 0.04); // 右点群の前景マージン[m]
+    this->declare_parameter<bool>("disable_filtered_fallback", false); // フィルタ空時のフォールバック無効化
+    // シンプルZ背面カット
+    this->declare_parameter<bool>("simple_z_back_cut", true);
+    this->declare_parameter<double>("z_back_cut_m", 0.15);
     this->declare_parameter<double>("detection_timeout_seconds", 3.0);  // デフォルト3秒
     this->declare_parameter<std::string>("camera_name", "Camera");  // カメラ名
     // ルート描画Y固定のオフセット比率（矩形下端からの%）
