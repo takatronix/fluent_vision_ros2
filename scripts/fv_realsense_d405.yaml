@@ -38,7 +38,7 @@ fv_realsense_d405:
       depth_width: 640              # 深度画像幅（ピクセル）
       depth_height: 480             # 深度画像高さ（ピクセル）
       depth_fps: 15                 # 深度画像フレームレート
-      depth_scale: 0.001            # 深度スケール（1mm単位）
+      depth_scale: 0.0001           # 深度スケール（0.1mm単位, D405 正）
     
     # ===== ストリーム設定（D405全機能） =====
     streams:
@@ -123,15 +123,10 @@ fv_realsense_d405:
     organized_pointcloud:
       enabled: true
       decimation: 2
-      rgb: false
+      rgb: true
     # ===== 初期モード =====
     # 0: 停止, 1: カラーのみ, 2: フル（カラー+深度）
     initial_mode: 2
-      
-      # デフォルトトピック無効化（名前空間競合回避）
-      enable_default_topics: false     # デフォルトトピック無効
-      default_color_topic: ""          # デフォルトカラートピック（空）
-      default_depth_topic: ""          # デフォルト深度トピック（空）
 
 # =============================================================================
 # パラメータ調整ガイド

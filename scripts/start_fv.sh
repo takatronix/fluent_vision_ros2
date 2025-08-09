@@ -17,3 +17,12 @@ fi
 bash ./scripts/stop_fv.sh
 bash ./scripts/start_fv415.sh
 bash ./scripts/start_fv405.sh
+
+# Start Foxglove Bridge (optional)
+if ros2 pkg prefix foxglove_bridge >/dev/null 2>&1; then
+  echo "🚀 Starting foxglove_bridge..."
+  # Note: ros2 launch does not take --ros-args; run without use_sim_time args
+  ros2 launch foxglove_bridge foxglove_bridge_launch.xml &
+else
+  echo "⚠️ foxglove_bridge package not found; skipping"
+fi

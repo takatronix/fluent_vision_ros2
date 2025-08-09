@@ -61,25 +61,7 @@ else
     --ros-args -r __node:=fv_realsense_d405 &
 fi
 
-# 3) depth_image_proc — D405
-echo "[start_fv] Starting depth_image_proc_d405..."
-ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
-  -p use_sim_time:=${USE_SIM} \
-  -r rgb/image_rect_color:=/fv/d405/color/image_raw \
-  -r rgb/camera_info:=/fv/d405/color/camera_info \
-  -r depth_registered/image_rect:=/fv/d405/depth/image_rect_raw \
-  -r points:=/fv/d405/registered_points \
-  -r __node:=depth_image_proc_d405 &
-
-# 4) depth_image_proc — D415
-echo "[start_fv] Starting depth_image_proc_d415..."
-ros2 run depth_image_proc point_cloud_xyzrgb_node --ros-args \
-  -p use_sim_time:=${USE_SIM} \
-  -r rgb/image_rect_color:=/fv/d415/color/image_raw \
-  -r rgb/camera_info:=/fv/d415/color/camera_info \
-  -r depth_registered/image_rect:=/fv/d415/depth/image_rect_raw \
-  -r points:=/fv/d415/registered_points \
-  -r __node:=depth_image_proc_d415 &
+# depth_image_proc は不要（fv_realsenseが /fv/*/registered_points を直接Publish）
 
 # 5) Object detector (D415/D405) — optional, skip if launch file missing
 if ros2 pkg prefix fv_object_detector >/dev/null 2>&1; then

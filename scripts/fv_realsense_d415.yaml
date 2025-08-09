@@ -98,6 +98,7 @@ fv_realsense_d415:
     services:
       get_distance_enabled: true       # 距離取得サービス有効
       get_camera_info_enabled: true    # カメラ情報取得サービス有効
+      set_mode_enabled: true           # 表示モード切替サービス有効（HUD確認用）
     
     # ===== TF（座標変換）設定 =====
     tf:
@@ -122,12 +123,11 @@ fv_realsense_d415:
     organized_pointcloud:
       enabled: true
       decimation: 2
-      rgb: false
-      
-      # デフォルトトピック無効化（名前空間競合回避）
-      enable_default_topics: false     # デフォルトトピック無効
-      default_color_topic: ""          # デフォルトカラートピック（空）
-      default_depth_topic: ""          # デフォルト深度トピック（空）
+      rgb: true
+    
+    # ===== 初期モード =====
+    # 0: 停止, 1: カーソルのみ, 2: フル（カーソル+座標+距離表示）
+    initial_mode: 2
 
 # =============================================================================
 # パラメータ調整ガイド

@@ -272,11 +272,6 @@ void FVDepthCameraNode::loadParameters()
     organized_pointcloud_decimation_ = this->declare_parameter("organized_pointcloud.decimation", 1);
     organized_pointcloud_rgb_ = this->declare_parameter("organized_pointcloud.rgb", true);
 
-    // Organized cloud parameters
-    organized_pointcloud_enabled_ = this->declare_parameter("organized_pointcloud.enabled", false);
-    organized_pointcloud_decimation_ = this->declare_parameter("organized_pointcloud.decimation", 1);
-    organized_pointcloud_rgb_ = this->declare_parameter("organized_pointcloud.rgb", true);
-
     RCLCPP_INFO(this->get_logger(), "✅ Parameters loaded successfully");
     RCLCPP_INFO(this->get_logger(), "📺 Color topic: %s", topic_config_.color.c_str());
     RCLCPP_INFO(this->get_logger(), "📺 Depth topic: %s", topic_config_.depth.c_str());
@@ -618,7 +613,9 @@ void FVDepthCameraNode::initializePublishers()
             // try to build from color topic prefix if absolute path not provided
             reg_topic = "/fv/d415/registered_points";
         }
-        registered_points_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(reg_topic, qos);
+        // QoS: BEST_EFFORT, small queue
+        auto oqos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
+        registered_points_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(reg_topic, oqos);
         RCLCPP_INFO(this->get_logger(), "📌 Organized cloud publisher: %s", reg_topic.c_str());
     }
     
@@ -642,7 +639,7 @@ void FVDepthCameraNode::initializeServices()
     
     if (services_config_.get_distance_enabled) {
         get_distance_service_ = this->create_service<fv_realsense::srv::GetDistance>(
-            "get_distance",
+            "~/get_distance",
             std::bind(&FVDepthCameraNode::handleGetDistance, this, 
                 std::placeholders::_1, std::placeholders::_2));
         RCLCPP_INFO(this->get_logger(), "📏 GetDistance service initialized");
@@ -650,7 +647,7 @@ void FVDepthCameraNode::initializeServices()
     
     if (services_config_.get_camera_info_enabled) {
         get_camera_info_service_ = this->create_service<fv_realsense::srv::GetCameraInfo>(
-            "get_camera_info",
+            "~/get_camera_info",
             std::bind(&FVDepthCameraNode::handleGetCameraInfo, this, 
                 std::placeholders::_1, std::placeholders::_2));
         RCLCPP_INFO(this->get_logger(), "📋 GetCameraInfo service initialized");
@@ -658,7 +655,7 @@ void FVDepthCameraNode::initializeServices()
     
     if (services_config_.set_mode_enabled) {
         set_mode_service_ = this->create_service<fv_realsense::srv::SetMode>(
-            "set_mode",
+            "~/set_mode",
             std::bind(&FVDepthCameraNode::handleSetMode, this, 
                 std::placeholders::_1, std::placeholders::_2));
         RCLCPP_INFO(this->get_logger(), "🎛️ SetMode service initialized");
@@ -856,8 +853,9 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
         cv::Mat color_image(cv::Size(color_intrinsics_.width, color_intrinsics_.height), 
                            CV_8UC3, (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
         
-        // マーカーを描画
+        // マーカーとHUDを描画
         drawMarker(color_image);
+        drawHUD(color_image);
         
         auto color_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", color_image).toImageMsg();
         color_msg->header.stamp = now;
@@ -912,6 +910,11 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
 
     // Publish organized registered_points (optional)
     if (current_mode == 2 && organized_pointcloud_enabled_ && registered_points_pub_ && depth_frame) {
+        // Publish only if there are subscribers to reduce CPU
+        if (registered_points_pub_->get_subscription_count() == 0) {
+            // Skip generation when nobody listens
+            return;
+        }
         try {
             int dw = depth_intrinsics_.width;
             int dh = depth_intrinsics_.height;
@@ -1046,6 +1049,20 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
         publish_count = 0;
         last_publish_log = current_time;
     }
+}
+void FVDepthCameraNode::drawHUD(cv::Mat& frame) const
+{
+    // 左上にモード表示
+    int mode = current_mode_.load();
+    const char* mode_text = (mode == 0) ? "Mode: Off" : (mode == 1) ? "Mode: Cursor" : "Mode: Full";
+    // 半透明黒背景
+    cv::Rect bg(8, 8, 180, 26);
+    cv::Mat roi = frame(bg);
+    cv::Mat overlay; roi.copyTo(overlay);
+    cv::rectangle(overlay, bg, cv::Scalar(0,0,0), -1);
+    cv::addWeighted(overlay, 0.4, roi, 0.6, 0.0, roi);
+    // テキスト
+    cv::putText(frame, mode_text, cv::Point(16, 26), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255,255,255), 1, cv::LINE_AA);
 }
 
 void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const rs2::frame& depth_frame)

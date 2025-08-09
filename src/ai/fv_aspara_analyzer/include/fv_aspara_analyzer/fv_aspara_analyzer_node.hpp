@@ -272,6 +272,7 @@ public:
     bool detection_node_seen_ {false};                                ///< 検出ノードから一度でも受信したか
     bool depth_node_seen_ {false};                                     ///< 深度ノードから一度でも受信したか
     bool camera_node_seen_ {false};                                    ///< カメラノードから一度でも受信したか
+    std::atomic<bool> last_pointcloud_was_organized_{false};          ///< 直近の点群がorganized(height>1)か
 
 };
 

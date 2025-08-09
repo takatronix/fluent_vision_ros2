@@ -670,6 +670,8 @@ void FvAsparaAnalyzerNode::pointcloudCallback(const sensor_msgs::msg::PointCloud
 {
     RCLCPP_WARN_ONCE(this->get_logger(), "Pointcloud callback received first pointcloud");
     latest_pointcloud_ = msg;
+    // organized: height > 1
+    last_pointcloud_was_organized_.store(msg->height > 1);
 }
 
 /**
@@ -1296,13 +1298,14 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
 
     // 点群（organized）受信状態を表示（organizedでなければ🔴）
     bool organized_cloud_ok = false;
-    if (latest_pointcloud_) {
-        // organized: height > 1
+    bool fallback_active = false;
+    bool have_pc = static_cast<bool>(latest_pointcloud_);
+    if (have_pc) {
         bool is_organized = latest_pointcloud_->height > 1;
-        // recent within 1.5s
         rclcpp::Time now_rcl = this->now();
         bool is_recent = (now_rcl - latest_pointcloud_->header.stamp).seconds() <= 1.5;
         organized_cloud_ok = is_organized && is_recent;
+        fallback_active = (!is_organized || !is_recent);
     }
     draw_status("点群", organized_cloud_ok);
 
@@ -1352,6 +1355,9 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     float pointcloud_fps = pointcloud_fps_meter_ ? pointcloud_fps_meter_->getCurrentFPS() : 0.0f;
     double pointcloud_ms = last_pointcloud_time_ms_.load();
     std::string pointcloud_line = cv::format("Pointcloud: %.1f FPS | %.1fms", pointcloud_fps, pointcloud_ms);
+    if (have_pc && fallback_active) {
+        pointcloud_line += " [fallback]";
+    }
     fluent::text::draw(output_image, pointcloud_line, cv::Point(15, y_offset),
                 text_color, 0.5, 1);
 

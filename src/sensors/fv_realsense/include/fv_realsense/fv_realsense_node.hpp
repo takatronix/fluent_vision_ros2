@@ -216,6 +216,7 @@ private:
     // Display methods
     void clickEventCallback(const geometry_msgs::msg::Point::SharedPtr msg);
     void drawMarker(cv::Mat& frame) const;
+    void drawHUD(cv::Mat& frame) const;
     void initializeSubscribers();
 };
 
