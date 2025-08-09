@@ -21,6 +21,8 @@
 /**:
   ros__parameters:
     # ===== システム情報 =====
+    camera_name: "D415"  # 画面表示用のカメラ名
+    # ===== システム情報 =====
     camera_name: "D415"  # カメラ名称（画面表示用）
     
     # ===== トピック設定（D415カメラ用） =====
@@ -74,9 +76,9 @@
     # ===== QoS設定（入力/出力） =====
     qos:
       input_queue_size: 10
-      input_reliability: "reliable"
+      input_reliability: "best_effort"
       output_queue_size: 10
-      output_reliability: "reliable"
+      output_reliability: "best_effort"
 
     # ===== 点群合成パラメータ =====
     

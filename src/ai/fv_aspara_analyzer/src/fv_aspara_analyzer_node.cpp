@@ -14,6 +14,9 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <fstream>
+#include <sstream>
+#include <cstdio>
 
 namespace fv_aspara_analyzer
 {
@@ -261,6 +264,12 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     cursor_auto_hide_ms_ = 5000;  // 5秒デフォルト
     last_detection_time_ = std::chrono::steady_clock::now();
 
+    // ステータスタイムスタンプ初期化
+    auto now_st = std::chrono::steady_clock::now();
+    last_detection_msg_time_ = now_st;
+    last_depth_msg_time_ = now_st;
+    last_color_msg_time_ = now_st;
+
     // ===== フォント初期化 =====
     RCLCPP_INFO(this->get_logger(), "Japanese font support is now built into the new Fluent API");
     
@@ -314,6 +323,10 @@ FvAsparaAnalyzerNode::~FvAsparaAnalyzerNode() {}
  */
 void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2DArray::SharedPtr msg)
 {
+    // ノード生存監視（検出ノード）
+    detection_node_seen_ = true;
+    last_detection_msg_time_ = std::chrono::steady_clock::now();
+
     // 全体処理時間計測開始
     auto callback_start = std::chrono::high_resolution_clock::now();
     detection_stopwatch_.reset();
@@ -323,10 +336,11 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
         detection_fps_meter_->tick(this->now());
     }
     
-    // 必要なデータの可用性チェック
+    // 深度/CameraInfoが未到着でも2D検出の処理は継続する（描画のため）
+    bool have_depth_and_info = true;
     if (!latest_depth_image_ || !latest_camera_info_) {
+        have_depth_and_info = false;
         RCLCPP_WARN_ONCE(this->get_logger(), "Required data not available yet. Waiting for depth and camera info...");
-        return;
     }
 
     // 新しい検出結果を準備（アスパラ本体のみ、クラスID=0）
@@ -693,6 +707,9 @@ void FvAsparaAnalyzerNode::maskCallback(const sensor_msgs::msg::Image::SharedPtr
 void FvAsparaAnalyzerNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
     RCLCPP_WARN_ONCE(this->get_logger(), "Image callback received first image");
+    // ノード生存監視（カメラノード）
+    camera_node_seen_ = true;
+    last_color_msg_time_ = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(image_data_mutex_);  // 分離したmutexを使用
         latest_color_image_ = msg;
@@ -715,6 +732,9 @@ void FvAsparaAnalyzerNode::imageCallback(const sensor_msgs::msg::Image::SharedPt
 void FvAsparaAnalyzerNode::depthCallback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
     RCLCPP_WARN_ONCE(this->get_logger(), "Depth callback received first depth image");
+    // ノード生存監視（深度ノード）
+    depth_node_seen_ = true;
+    last_depth_msg_time_ = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(image_data_mutex_);  // 分離したmutexを使用
         latest_depth_image_ = msg;
@@ -1068,7 +1088,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         aspara_info.frame_count++;
     }
 
-    if (!snapshot_list.empty() && latest_camera_info_) {
+    if (!snapshot_list.empty()) {
         last_detection_time = current_time;
         
         // 各検出されたアスパラガスを描画
@@ -1163,9 +1183,31 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     // ===== 画面左上に情報表示 =====
     // 背景パネル（半透明の黒）
     cv::Mat overlay = output_image.clone();
-    cv::rectangle(overlay, cv::Rect(5, 5, 600, 95), cv::Scalar(0, 0, 0), -1);  // 高さを増やして点群処理情報を収納
+    cv::rectangle(overlay, cv::Rect(5, 5, 600, 115), cv::Scalar(0, 0, 0), -1);  // 高さを増やして点群処理情報を収納
     cv::addWeighted(overlay, 0.6, output_image, 0.4, 0, output_image);
     
+    // 入力ノードの生存ステータス（ノードの接続状態を表示）
+    // 仕様: 日本語表記、左に●、右にラベル。生存=緑、死亡=赤。
+    auto now_steady2 = std::chrono::steady_clock::now();
+    auto alive_within = std::chrono::milliseconds(1500); // 1.5秒以内に受信していれば生存
+    bool det_alive = detection_node_seen_ && (now_steady2 - last_detection_msg_time_ <= alive_within);
+    bool depth_alive = depth_node_seen_ && (now_steady2 - last_depth_msg_time_ <= alive_within);
+    bool cam_alive = camera_node_seen_ && (now_steady2 - last_color_msg_time_ <= alive_within);
+
+    int status_y = 22;
+    int status_x = 15;
+    auto draw_status = [&](const std::string& label_jp, bool alive) {
+        // ●を左側に描画
+        cv::Scalar color = alive ? cv::Scalar(0,255,0) : cv::Scalar(0,0,255); // 緑/赤
+        cv::circle(output_image, cv::Point(status_x, status_y-5), 6, color, -1);
+        // テキストは●の右側に
+        fluent::text::draw(output_image, label_jp, cv::Point(status_x + 14, status_y), cv::Scalar(255,255,255), 0.5, 1);
+        status_x += 120; // 次の項目へ余白
+    };
+    draw_status("検出", det_alive);
+    draw_status("深度", depth_alive);
+    draw_status("カメラ", cam_alive);
+
     // フレーム番号（常に更新される値）
     static uint64_t total_frame_count = 0;
     total_frame_count++;
@@ -1186,7 +1228,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     static std::string camera_name = this->get_parameter("camera_name").as_string();
     
     // 1行目: カメラ名とFPS情報を一列に表示
-    int y_offset = 25;
+    int y_offset = 45;
     std::string fps_line = cv::format("[%s] FPS: C=%.0f D=%.0f Det=%.0f Out=%.0f",
                                        camera_name.c_str(), color_fps, depth_fps, detection_fps, display_fps);
     fluent::text::draw(output_image, fps_line, cv::Point(15, y_offset),
@@ -1214,6 +1256,77 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     std::string pointcloud_line = cv::format("Pointcloud: %.1f FPS | %.1fms", pointcloud_fps, pointcloud_ms);
     fluent::text::draw(output_image, pointcloud_line, cv::Point(15, y_offset),
                 text_color, 0.5, 1);
+
+    // 4行目: システム負荷情報（CPU/GPU/MEM）
+    y_offset += 22;
+    static auto last_sys_update = std::chrono::steady_clock::now();
+    static float cpu_usage_pct = 0.0f;
+    static int mem_used_mb = 0, mem_total_mb = 0;
+    static int gpu_util_pct = -1, gpu_mem_used_mb = -1, gpu_mem_total_mb = -1;
+    auto now_sys = std::chrono::steady_clock::now();
+    if (now_sys - last_sys_update > std::chrono::milliseconds(1000)) {
+        last_sys_update = now_sys;
+        // CPU usage from /proc/stat
+        static uint64_t last_user=0,last_nice=0,last_system=0,last_idle=0,last_iowait=0,last_irq=0,last_softirq=0,last_steal=0;
+        std::ifstream stat_file("/proc/stat");
+        std::string line;
+        if (std::getline(stat_file, line)) {
+            std::istringstream iss(line);
+            std::string cpu;
+            uint64_t user,nice,system,idle,iowait,irq,softirq,steal;
+            if (iss >> cpu >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal) {
+                uint64_t idle_all = idle + iowait;
+                uint64_t non_idle = user + nice + system + irq + softirq + steal;
+                uint64_t total = idle_all + non_idle;
+                uint64_t last_idle_all = last_idle + last_iowait;
+                uint64_t last_non_idle = last_user + last_nice + last_system + last_irq + last_softirq + last_steal;
+                uint64_t last_total = last_idle_all + last_non_idle;
+                uint64_t totald = (total > last_total) ? (total - last_total) : 0;
+                uint64_t idled = (idle_all > last_idle_all) ? (idle_all - last_idle_all) : 0;
+                cpu_usage_pct = (totald > 0) ? static_cast<float>(100.0 * (totald - idled) / (double)totald) : cpu_usage_pct;
+                last_user=user; last_nice=nice; last_system=system; last_idle=idle; last_iowait=iowait; last_irq=irq; last_softirq=softirq; last_steal=steal;
+            }
+        }
+
+        // Memory from /proc/meminfo
+        std::ifstream meminfo("/proc/meminfo");
+        std::string key; long value; std::string unit;
+        long mem_total_kb = 0, mem_available_kb = 0;
+        while (meminfo >> key >> value >> unit) {
+            if (key == "MemTotal:") mem_total_kb = value;
+            else if (key == "MemAvailable:") mem_available_kb = value;
+            if (mem_total_kb && mem_available_kb) break;
+        }
+        if (mem_total_kb > 0) {
+            mem_total_mb = static_cast<int>(mem_total_kb / 1024);
+            int mem_avail_mb = static_cast<int>(mem_available_kb / 1024);
+            mem_used_mb = std::max(0, mem_total_mb - mem_avail_mb);
+        }
+
+        // GPU via nvidia-smi (optional)
+        gpu_util_pct = -1; gpu_mem_used_mb = -1; gpu_mem_total_mb = -1;
+        FILE* pipe = popen("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null", "r");
+        if (pipe) {
+            char buffer[256];
+            if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                int util=0, used=0, total=0;
+                if (sscanf(buffer, "%d, %d, %d", &util, &used, &total) == 3) {
+                    gpu_util_pct = util; gpu_mem_used_mb = used; gpu_mem_total_mb = total;
+                }
+            }
+            pclose(pipe);
+        }
+    }
+    // 描画テキスト生成
+    std::string sys_line;
+    if (gpu_util_pct >= 0) {
+        sys_line = cv::format("CPU: %.0f%% | GPU: %d%% | MEM: %d/%d MB | VRAM: %d/%d MB",
+                               cpu_usage_pct, gpu_util_pct, mem_used_mb, mem_total_mb, gpu_mem_used_mb, gpu_mem_total_mb);
+    } else {
+        sys_line = cv::format("CPU: %.0f%% | MEM: %d/%d MB | GPU: N/A",
+                               cpu_usage_pct, mem_used_mb, mem_total_mb);
+    }
+    fluent::text::draw(output_image, sys_line, cv::Point(15, y_offset), text_color, 0.5, 1);
     
     // FPS値に応じて色付け（オプション）
     if (display_fps < 15.0f) {

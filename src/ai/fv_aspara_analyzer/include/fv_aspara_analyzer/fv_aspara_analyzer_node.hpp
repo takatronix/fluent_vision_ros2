@@ -265,6 +265,14 @@ public:
     std::chrono::steady_clock::time_point last_detection_time_;                             ///< 最後にアスパラを検出した時刻
     int cursor_auto_hide_ms_;                                                               ///< カーソル自動消去時間（ミリ秒）
 
+    // ===== ノード接続状態監視（ステータス用） =====
+    std::chrono::steady_clock::time_point last_detection_msg_time_;  ///< 最後に検出メッセージを受信した時刻
+    std::chrono::steady_clock::time_point last_depth_msg_time_;      ///< 最後に深度メッセージを受信した時刻
+    std::chrono::steady_clock::time_point last_color_msg_time_;      ///< 最後にカラー画像メッセージを受信した時刻
+    bool detection_node_seen_ {false};                                ///< 検出ノードから一度でも受信したか
+    bool depth_node_seen_ {false};                                     ///< 深度ノードから一度でも受信したか
+    bool camera_node_seen_ {false};                                    ///< カメラノードから一度でも受信したか
+
 };
 
 } // namespace fv_aspara_analyzer
