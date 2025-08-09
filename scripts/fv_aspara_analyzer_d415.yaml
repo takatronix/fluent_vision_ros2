@@ -71,6 +71,13 @@
     straightness_threshold: 0.7            # 真っ直ぐ度閾値（70%以上で収穫可能）
     cutting_target_length: 0.23            # 切断対象判定長さ（23cm以上）
 
+    # ===== QoS設定（入力/出力） =====
+    qos:
+      input_queue_size: 10
+      input_reliability: "reliable"
+      output_queue_size: 10
+      output_reliability: "reliable"
+
     # ===== 点群合成パラメータ =====
     
     # 高品質点群合成設定

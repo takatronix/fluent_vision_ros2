@@ -51,6 +51,13 @@ fv_aspara_analyzer_d405:
     aspara_filter_distance: 0.05           # アスパラガス根元からのフィルタ距離（5cm）
     depth_unit_m_16u: 0.0001               # 16UC1深度単位（D405は0.1mm/Unit）
 
+    # ===== QoS設定（入力/出力） =====
+    qos:
+      input_queue_size: 10
+      input_reliability: "reliable"
+      output_queue_size: 10
+      output_reliability: "reliable"
+
     # ===== ノイズ除去パラメータ =====
     
     # 統計的外れ値除去フィルタ

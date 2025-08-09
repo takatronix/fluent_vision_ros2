@@ -37,7 +37,7 @@ fv_object_detector_d415:
     # ===== QoS設定 =====
     qos:
       queue_size: 10
-      reliability: "best_effort"   # 省リソース運用。必要なら "reliable" に変更
+      reliability: "reliable"      # RealSense(カメラ)に合わせて信頼性重視
     
     # ===== YOLOv10モデル設定 =====
     model:
