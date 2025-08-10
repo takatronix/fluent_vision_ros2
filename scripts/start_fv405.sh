@@ -12,14 +12,7 @@
 
 WS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 
-# DDS/RMW設定（複数マシン通信を有効に）
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-# ローカルホスト限定を明示的にOFF（外部と通信できるように）
-export ROS_LOCALHOST_ONLY=0
-# Fast DDSのプロファイルで共有メモリ専用に固定すると外部通信できないため無効化
-unset FASTRTPS_DEFAULT_PROFILES_FILE
-# QoSはコード/YAMLの設定を使う（XMLの上書きを無効化）
-export RMW_FASTRTPS_USE_QOS_FROM_XML=0
+
 
 # 環境の読み込み（スクリプトの位置からWS_ROOTを解決）
 if [ -f "$WS_ROOT/install/setup.bash" ]; then
