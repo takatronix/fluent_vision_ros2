@@ -102,7 +102,9 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     // 領域認識（色/セグ）ON/OFF
     this->declare_parameter<bool>("enable_region_recognition", false);
     // 左側プレビュー（Depth/PointCloud）表示ON/OFF
-    this->declare_parameter<bool>("preview_panel_enabled", false);
+    this->declare_parameter<bool>("preview_panel_enabled", false); // 互換用（未使用）
+    this->declare_parameter<bool>("left_panel_enabled", false);
+    this->declare_parameter<bool>("right_panel_enabled", true);
     // ROI下部帯のDepthスキャン画像を表示
     this->declare_parameter<bool>("depth_scan_preview_enabled", true);
     // 曲がり度メソッドと重み
@@ -1398,7 +1400,9 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         }
 
         // === 選択アスパラのボクセルプレビュー（左隣に半透明の黒枠パネル） ===
-        if (snapshot_selected_id != -1 && this->get_parameter("preview_panel_enabled").as_bool()) {
+        bool left_on  = this->has_parameter("left_panel_enabled") ? this->get_parameter("left_panel_enabled").as_bool() : false;
+        bool right_on = this->has_parameter("right_panel_enabled") ? this->get_parameter("right_panel_enabled").as_bool() : true;
+        if (snapshot_selected_id != -1 && (left_on || right_on)) {
             // 深度・カメラ情報を取得
             sensor_msgs::msg::Image::SharedPtr depth_copy;
             sensor_msgs::msg::Image::SharedPtr color_copy_for_panel;
@@ -1613,20 +1617,22 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                         }
                                     };
 
-                                    // 左枠: RAW（asparagus_pointcloud）を投影描画
+                                    if (left_on) {
+                                        // 左枠: RAW（asparagus_pointcloud）を投影描画
                                     int raw_drawn = 0;
                                     if (it_sel != snapshot_list.end() && !it_sel->asparagus_pointcloud.data.empty()) {
                                         drawCloudToPanel(it_sel->asparagus_pointcloud, roi, panel, raw_drawn);
                                     }
-                                    // 左枠ラベル（総点数）
-                                    {
-                                        int raw_total = 0;
-                                        if (it_sel != snapshot_list.end() && !it_sel->asparagus_pointcloud.data.empty()) {
-                                            raw_total = static_cast<int>(it_sel->asparagus_pointcloud.width * it_sel->asparagus_pointcloud.height);
+                                        // 左枠ラベル（総点数）
+                                        {
+                                            int raw_total = 0;
+                                            if (it_sel != snapshot_list.end() && !it_sel->asparagus_pointcloud.data.empty()) {
+                                                raw_total = static_cast<int>(it_sel->asparagus_pointcloud.width * it_sel->asparagus_pointcloud.height);
+                                            }
+                                            std::string lbl = cv::format("RAW: %d", raw_total);
+                                            int ty = std::max(12, panel_y - 6);
+                                            fluent::text::draw(output_image, lbl, cv::Point(panel_x+2, ty), cv::Scalar(255,255,255), 0.5, 1);
                                         }
-                                        std::string lbl = cv::format("RAW: %d", raw_total);
-                                        int ty = std::max(12, panel_y - 6);
-                                        fluent::text::draw(output_image, lbl, cv::Point(panel_x+2, ty), cv::Scalar(255,255,255), 0.5, 1);
                                     }
 
                                     // 左パネルに下部帯ヒストグラム（常時表示）
@@ -1681,7 +1687,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
 
                                     // 右側プレビュー：フィルタ済み点群（denoised）を表示
                                     int panel_x_r = std::min(output_image.cols - panel_w - 5, roi.x + roi.width + 8);
-                                    if (panel_x_r + panel_w <= output_image.cols - 1) {
+                                    if (right_on && panel_x_r + panel_w <= output_image.cols - 1) {
                                         cv::Rect panel_r(panel_x_r, panel_y, panel_w, std::min(panel_h, output_image.rows - panel_y - 5));
                                         cv::Mat roi_r = output_image(panel_r);
                                         cv::Mat ov_r; roi_r.copyTo(ov_r);

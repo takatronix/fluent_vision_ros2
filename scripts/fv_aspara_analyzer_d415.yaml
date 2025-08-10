@@ -67,8 +67,9 @@
     root_depth_percentile: 0.10            # z0推定のパーセンタイル（p10）
     root_use_segmentation: false           # まず色/Segを無効化（安定確認後にON）
     enable_region_recognition: false       # 色/マスクによる領域認識の使用可否（UI/抽出で利用）
-    preview_panel_enabled: false            # 左側のDepth/点群プレビューを有効化
-    depth_scan_preview_enabled: false       # ROI下部帯のDepthスキャン可視化を有効
+    left_panel_enabled: false              # 左パネル（RAW点群）
+    right_panel_enabled: true              # 右パネル（FILTERED点群）
+    depth_scan_preview_enabled: true       # ROI下部帯のDepthスキャン可視化を有効
     mask_overlay_enabled: false            # 画面上の緑マスク背景を無効化
     root_hsv_h_min: 35.0                   # 緑抽出HSV下限（H）
     root_hsv_h_max: 85.0                   # 緑抽出HSV上限（H）

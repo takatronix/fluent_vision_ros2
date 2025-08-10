@@ -23,8 +23,10 @@
   ros__parameters:
     # ===== システム情報 =====
     camera_name: "D405"  # 画面表示用のカメラ名
-
-    preview_panel_enabled: false            # 左側のDepth/点群プレビューを有効化
+    
+    left_panel_enabled: false              # 左パネル（RAW点群）
+    right_panel_enabled: true              # 右パネル（FILTERED点群）
+    depth_scan_preview_enabled: true       # ROI下部帯のDepthスキャン可視化を有効
     mask_overlay_enabled: false            # 画面上の緑マスク背景を無効化
 
     # ===== トピック設定（D405カメラ用） =====
