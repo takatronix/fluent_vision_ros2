@@ -1529,13 +1529,15 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                     int panel_x = std::max(5, roi.x - panel_w - 8);
                                     int panel_y = std::max(5, roi.y);
                                     cv::Rect panel(panel_x, panel_y, panel_w, std::min(panel_h, output_image.rows - panel_y - 5));
-                                    cv::Mat roi_img = output_image(panel);
-                                    cv::Mat overlay_panel; roi_img.copyTo(overlay_panel);
-                                    cv::rectangle(overlay_panel, cv::Rect(0,0,panel.width,panel.height), cv::Scalar(0,0,0), -1);
-                                    cv::addWeighted(overlay_panel, 0.5, roi_img, 0.5, 0.0, roi_img);
+                                    if (left_on) {
+                                        cv::Mat roi_img = output_image(panel);
+                                        cv::Mat overlay_panel; roi_img.copyTo(overlay_panel);
+                                        cv::rectangle(overlay_panel, cv::Rect(0,0,panel.width,panel.height), cv::Scalar(0,0,0), -1);
+                                        cv::addWeighted(overlay_panel, 0.5, roi_img, 0.5, 0.0, roi_img);
+                                    }
 
                                     // Depth ROI (Jet) preview in left panel background
-                                    try {
+                                    if (left_on) try {
                                         cv::Mat depth_roi = depth_mat(droi).clone();
                                         if (!depth_roi.empty()) {
                                             cv::Mat depth_u8;
@@ -1560,8 +1562,9 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                             cv::Mat depth_color;
                                             cv::applyColorMap(depth_u8, depth_color, cv::COLORMAP_JET);
                                             cv::Mat depth_resized;
-                                            cv::resize(depth_color, depth_resized, roi_img.size(), 0, 0, cv::INTER_NEAREST);
+                                            cv::resize(depth_color, depth_resized, cv::Size(panel.width, panel.height), 0, 0, cv::INTER_NEAREST);
                                             // Lightly blend to keep overlays readable
+                                            cv::Mat roi_img = output_image(panel);
                                             cv::addWeighted(depth_resized, 0.6, roi_img, 0.4, 0.0, roi_img);
                                         }
                                     } catch (...) {
@@ -1635,8 +1638,8 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                         }
                                     }
 
-                                    // 左パネルに下部帯ヒストグラム（常時表示）
-                                     try {
+                                    // 左パネルに下部帯ヒストグラム（left_on時のみ）
+                                    if (left_on) try {
                                         if (this->get_parameter("depth_scan_preview_enabled").as_bool() && color_copy_for_panel) {
                                             cv::Mat color_mat_h; 
                                             try { color_mat_h = cv_bridge::toCvCopy(color_copy_for_panel, sensor_msgs::image_encodings::BGR8)->image; } catch (...) {}
