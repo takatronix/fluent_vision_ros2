@@ -1842,7 +1842,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             // デバッグ：各骨格点の座標を表示
             for (size_t i = 0; i < a.skeleton_points.size(); ++i) {
                 const auto& sp = a.skeleton_points[i];
-                RCLCPP_INFO(this->get_logger(), 
+                RCLCPP_DEBUG(this->get_logger(), 
                     "[SKELETON_DRAW] Point %zu: image(%.1f,%.1f) world(%.3f,%.3f,%.3f)",
                     i, sp.image_point.x, sp.image_point.y,
                     sp.world_point.x, sp.world_point.y, sp.world_point.z);
