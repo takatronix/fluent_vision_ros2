@@ -115,6 +115,8 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<std::string>("length_method", "auto");
     // 参照用の直線（根本→先端を直線で結ぶ）の表示有無（既定ON）
     this->declare_parameter<bool>("show_pca_reference_line", true);
+    // 根本判定を画像Yで行う（画面下=根本）か 3D Yで行うか（既定: 画像Y）
+    this->declare_parameter<bool>("root_by_image_y", true);
     // 骨格抽出（宣言しないとスレッド側の has_parameter が false になり直線PCAにフォールバックする）
     this->declare_parameter<bool>("enable_pca_skeleton", true);
     this->declare_parameter<bool>("skeleton_enabled", true);
@@ -1529,7 +1531,12 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                     int panel_x = std::max(5, roi.x - panel_w - 8);
                                     int panel_y = std::max(5, roi.y);
                                     cv::Rect panel(panel_x, panel_y, panel_w, std::min(panel_h, output_image.rows - panel_y - 5));
-                                    if (left_on) {
+                                    // 左側に十分な空きがある場合のみ描画（画面外やROIと重なるなら非表示）
+                                    bool left_ok = left_on &&
+                                                   panel_x >= 0 && panel_y >= 0 &&
+                                                   (panel_x + panel_w) <= std::max(0, roi.x - 2) &&
+                                                   (panel_y + panel.height) <= output_image.rows - 1;
+                                    if (left_ok) {
                                         cv::Mat roi_img = output_image(panel);
                                         cv::Mat overlay_panel; roi_img.copyTo(overlay_panel);
                                         cv::rectangle(overlay_panel, cv::Rect(0,0,panel.width,panel.height), cv::Scalar(0,0,0), -1);
@@ -1537,7 +1544,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                     }
 
                                     // Depth ROI (Jet) preview in left panel background
-                                    if (left_on) try {
+                                    if (left_ok) try {
                                         cv::Mat depth_roi = depth_mat(droi).clone();
                                         if (!depth_roi.empty()) {
                                             cv::Mat depth_u8;
@@ -1620,7 +1627,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                         }
                                     };
 
-                                    if (left_on) {
+                                    if (left_ok) {
                                         // 左枠: RAW（asparagus_pointcloud）を投影描画
                                     int raw_drawn = 0;
                                     if (it_sel != snapshot_list.end() && !it_sel->asparagus_pointcloud.data.empty()) {
@@ -1638,8 +1645,8 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                         }
                                     }
 
-                                    // 左パネルに下部帯ヒストグラム（left_on時のみ）
-                                    if (left_on) try {
+                                    // 左パネルに下部帯ヒストグラム（left_ok時のみ）
+                                    if (left_ok) try {
                                         if (this->get_parameter("depth_scan_preview_enabled").as_bool() && color_copy_for_panel) {
                                             cv::Mat color_mat_h; 
                                             try { color_mat_h = cv_bridge::toCvCopy(color_copy_for_panel, sensor_msgs::image_encodings::BGR8)->image; } catch (...) {}
@@ -1690,7 +1697,12 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
 
                                     // 右側プレビュー：フィルタ済み点群（denoised）を表示
                                     int panel_x_r = std::min(output_image.cols - panel_w - 5, roi.x + roi.width + 8);
-                                    if (right_on && panel_x_r + panel_w <= output_image.cols - 1) {
+                                    // 右側に十分な空きがある場合のみ描画（画面外やROIと重なるなら非表示）
+                                    bool right_ok = right_on &&
+                                                    (panel_x_r >= std::min(output_image.cols - panel_w - 5, roi.x + roi.width + 8)) &&
+                                                    (panel_x_r >= roi.x + roi.width + 2) &&
+                                                    (panel_x_r + panel_w <= output_image.cols - 1);
+                                    if (right_ok) {
                                         cv::Rect panel_r(panel_x_r, panel_y, panel_w, std::min(panel_h, output_image.rows - panel_y - 5));
                                         cv::Mat roi_r = output_image(panel_r);
                                         cv::Mat ov_r; roi_r.copyTo(ov_r);
