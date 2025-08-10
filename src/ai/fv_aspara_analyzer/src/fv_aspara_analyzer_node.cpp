@@ -9,8 +9,7 @@
 
 #include "fv_aspara_analyzer/fv_aspara_analyzer_node.hpp"
 #include "fv_aspara_analyzer/aspara_analyzer_thread.hpp"
-#include <fluent.hpp>
-#include <fluent_cloud/io/depth_to_cloud.hpp>
+#include "fluent_lib/fluent.hpp"
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
@@ -20,6 +19,10 @@
 
 namespace fv_aspara_analyzer
 {
+// Shorten Fluent namespaces locally for readability
+namespace fi = fluent_image;           // images
+namespace flr = fluent_lib::ros;       // ROS helpers
+namespace fu = fluent::utils;          // utils (FPS, Stopwatch)
 
 /**
  * @brief コンストラクタ
@@ -79,6 +82,13 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<bool>("enable_detected_all_points", false);
     this->declare_parameter<std::string>("output_annotated_image_topic", "");
     this->declare_parameter<bool>("debug_overlay", true);
+    this->declare_parameter<bool>("mask_overlay_enabled", false);
+    // 領域認識（色/セグ）ON/OFF
+    this->declare_parameter<bool>("enable_region_recognition", false);
+    // 左側プレビュー（Depth/PointCloud）表示ON/OFF
+    this->declare_parameter<bool>("preview_panel_enabled", false);
+    // ROI下部帯のDepthスキャン画像を表示
+    this->declare_parameter<bool>("depth_scan_preview_enabled", true);
     // 曲がり度メソッドと重み
     this->declare_parameter<std::string>("curvature_method", "hybrid_max");
     this->declare_parameter<double>("curvature_weight_skeleton", 0.6);
@@ -113,6 +123,10 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     std::string output_detected_all_pointcloud_topic = this->get_parameter("output_detected_all_pointcloud_topic").as_string();
     enable_detected_all_points_ = this->get_parameter("enable_detected_all_points").as_bool();
     debug_overlay_ = this->get_parameter("debug_overlay").as_bool();
+    bool enable_region_recognition = this->get_parameter("enable_region_recognition").as_bool();
+    bool mask_overlay_enabled = this->get_parameter("mask_overlay_enabled").as_bool();
+    bool preview_panel_enabled = this->get_parameter("preview_panel_enabled").as_bool();
+    bool depth_scan_preview_enabled = this->get_parameter("depth_scan_preview_enabled").as_bool();
     // 曲がり度・マスク描画パラメータ
     curvature_method_ = this->get_parameter("curvature_method").as_string();
     curvature_weight_skeleton_ = this->get_parameter("curvature_weight_skeleton").as_double();
@@ -313,14 +327,16 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     analyzer_thread_ = std::make_unique<AnalyzerThread>(this);
     RCLCPP_INFO(this->get_logger(), "Aspara analyzer thread initialized");
     
+    // 短縮APIによるサブスク生成はコンストラクタ内のshared_from_this()起因の不具合を避けるため無効化
+    // 既に上で標準create_subscriptionにより購読を作成済み
+
     // ===== 高頻度出力タイマー（15FPS for smooth animation）=====
     auto timer_callback = [this]() {
         if (latest_color_image_) {
             publishCurrentImage();
         }
     };
-    animation_timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(33), timer_callback);  // 30FPS (1000ms/30=33ms)
+    animation_timer_ = flr::make_timer(this, std::chrono::milliseconds(33), timer_callback);
     RCLCPP_WARN(this->get_logger(), "Animation timer created (30 FPS smooth animation)");
     
     // ===== 初期化完了ログ =====
@@ -942,27 +958,22 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         last_publish_log = now;
     }
     
-    auto pub_start = std::chrono::high_resolution_clock::now();
+    fu::Stopwatch total_sw;
     
     if (!latest_color_image_) {
         return;
     }
     
-    // カラー画像をcv::Matに変換
-    auto cvt_start = std::chrono::high_resolution_clock::now();
-    cv::Mat color_image;
-    try {
-        cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(latest_color_image_, sensor_msgs::image_encodings::BGR8);
-        color_image = cv_ptr->image;
-    } catch (cv_bridge::Exception& e) {
-        RCLCPP_ERROR(this->get_logger(), "CV bridge exception: %s", e.what());
-        return;
-    }
-    auto cvt_end = std::chrono::high_resolution_clock::now();
-    double cvt_ms = std::chrono::duration<double, std::milli>(cvt_end - cvt_start).count();
+    // カラー画像をBGR8に正規化（FluentImage）
+    fu::Stopwatch cvt_sw;
+    fi::Image color_fi(*latest_color_image_);
+    color_fi = color_fi.to_bgr8();
+    cv::Mat color_image = static_cast<cv::Mat&>(color_fi);
+    double cvt_ms = cvt_sw.elapsed_ms();
     
-    // オフスクリーンバッファを作成（クローンではなく新規作成）
-    cv::Mat output_image = color_image.clone();
+    // オフスクリーンキャンバス（FluentImage）を作成し、以降の描画はこの単一バッファに統一
+    fi::Image canvas(color_image.clone(), "BGR8");
+    cv::Mat &output_image = static_cast<cv::Mat&>(canvas);
 
     // セグメンテーションマスクの薄色オーバーレイ（🟢緑）
     try {
@@ -973,7 +984,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 mask_copy = latest_mask_.clone();
             }
         }
-        if (!mask_copy.empty()) {
+        if (this->get_parameter("mask_overlay_enabled").as_bool() && !mask_copy.empty()) {
             if (mask_copy.size() != output_image.size()) {
                 cv::resize(mask_copy, mask_copy, output_image.size(), 0, 0, cv::INTER_NEAREST);
             }
@@ -1010,7 +1021,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     
     // 検出結果の描画
     // try_lockを使用してロック競合を回避
-    auto snap_start = std::chrono::high_resolution_clock::now();
+    fu::Stopwatch snap_sw;
     std::vector<AsparaInfo> snapshot_list;
     int snapshot_selected_id = -1;
     
@@ -1107,8 +1118,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         persistent_selected_id = -1;
     }
     
-    auto snap_end = std::chrono::high_resolution_clock::now();
-    double snap_ms = std::chrono::duration<double, std::milli>(snap_end - snap_start).count();
+    double snap_ms = snap_sw.elapsed_ms();
     
     // 2) スムージング状態を静的変数で保持
     static std::map<int, cv::Rect> smooth_bbox_map;
@@ -1168,6 +1178,29 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             // バウンディングボックス描画
             cv::rectangle(output_image, aspara_info.smooth_bbox, color, thickness);
 
+            // ヒストグラム帯（高さ8px）を矩形下に貼り付け（常時表示）
+            try {
+                if (!aspara_info.depth_histogram_strip.empty()) {
+                    const int strip_h = 8;
+                    const cv::Rect &bbox = aspara_info.smooth_bbox;
+                    if (bbox.width > 1 && bbox.height > 1) {
+                        cv::Mat strip_resized;
+                        cv::resize(aspara_info.depth_histogram_strip, strip_resized, cv::Size(bbox.width, strip_h), 0, 0, cv::INTER_NEAREST);
+                        if (strip_resized.type() != CV_8UC1) {
+                            cv::Mat tmp; strip_resized.convertTo(tmp, CV_8UC1); strip_resized = tmp;
+                        }
+                        cv::Mat strip_bgr; cv::cvtColor(strip_resized, strip_bgr, cv::COLOR_GRAY2BGR);
+                        int sx = std::clamp(bbox.x, 0, std::max(0, output_image.cols - 1));
+                        int sy = std::clamp(bbox.y + bbox.height + 4, 0, std::max(0, output_image.rows - 1));
+                        int sw = std::min(strip_bgr.cols, output_image.cols - sx);
+                        int sh = std::min(strip_bgr.rows, output_image.rows - sy);
+                        if (sw > 0 && sh > 0) {
+                            strip_bgr(cv::Rect(0, 0, sw, sh)).copyTo(output_image(cv::Rect(sx, sy, sw, sh)));
+                        }
+                    }
+                }
+            } catch (...) {}
+
             // 推定根本2D位置（analyzer側の推定z0とヒストで得たXに相当）を可視化
             // 既に3Dの根本は aspara_info.root_position_3d に格納。2Dへ投影して赤丸を描画
             if (latest_camera_info_) {
@@ -1183,7 +1216,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                         cv::circle(output_image, cv::Point(u, v), 6, cv::Scalar(0, 0, 255), -1);
                         // 根本座標注記とZ±窓の表示
                         double pm_cm = aspara_filter_distance_ * 100.0;
-                        std::string rp_txt = cv::format("X:%.3f Y:%.3f Z:%.3f m   B1%.0fcm", rp.x, rp.y, rp.z, pm_cm);
+                        std::string rp_txt = cv::format("X:%.3f Y:%.3f Z:%.3f m  +/-%.0fcm", rp.x, rp.y, rp.z, pm_cm);
                         int text_x = std::min(output_image.cols - 10, u + 10);
                         int text_y = std::max(12, v - 10);
                         fluent::text::draw(output_image, rp_txt, cv::Point(text_x, text_y), cv::Scalar(0, 0, 255), 0.5, 1);
@@ -1212,7 +1245,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         }
 
         // === 選択アスパラのボクセルプレビュー（左隣に半透明の黒枠パネル） ===
-        if (snapshot_selected_id != -1) {
+        if (snapshot_selected_id != -1 && this->get_parameter("preview_panel_enabled").as_bool()) {
             // 深度・カメラ情報を取得
             sensor_msgs::msg::Image::SharedPtr depth_copy;
             sensor_msgs::msg::Image::SharedPtr color_copy_for_panel;
@@ -1344,6 +1377,40 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                     cv::rectangle(overlay_panel, cv::Rect(0,0,panel.width,panel.height), cv::Scalar(0,0,0), -1);
                                     cv::addWeighted(overlay_panel, 0.5, roi_img, 0.5, 0.0, roi_img);
 
+                                    // Depth ROI (Jet) preview in left panel background
+                                    try {
+                                        cv::Mat depth_roi = depth_mat(droi).clone();
+                                        if (!depth_roi.empty()) {
+                                            cv::Mat depth_u8;
+                                            // Build mask for valid (>0) pixels when 16U
+                                            if (depth_is_16u) {
+                                                cv::Mat mask = depth_roi > 0;
+                                                double dmin=0.0, dmax=0.0;
+                                                cv::minMaxLoc(depth_roi, &dmin, &dmax, nullptr, nullptr, mask);
+                                                if (!(dmax > dmin)) { dmin = 0.0; dmax = 10000.0; }
+                                                cv::Mat depth_f; depth_roi.convertTo(depth_f, CV_32F);
+                                                cv::Mat depth_norm;
+                                                depth_norm = (depth_f - static_cast<float>(dmin)) * (255.0f / static_cast<float>(dmax - dmin + 1e-6f));
+                                                depth_norm.setTo(0, ~mask);
+                                                depth_norm.convertTo(depth_u8, CV_8U);
+                                            } else {
+                                                // 32F meters -> normalize within ROI
+                                                double dmin=0.0, dmax=0.0; cv::minMaxLoc(depth_roi, &dmin, &dmax);
+                                                if (!(dmax > dmin)) { dmin = 0.0; dmax = 2.0; }
+                                                cv::Mat depth_norm = (depth_roi - dmin) * (255.0 / (dmax - dmin + 1e-6));
+                                                depth_norm.convertTo(depth_u8, CV_8U);
+                                            }
+                                            cv::Mat depth_color;
+                                            cv::applyColorMap(depth_u8, depth_color, cv::COLORMAP_JET);
+                                            cv::Mat depth_resized;
+                                            cv::resize(depth_color, depth_resized, roi_img.size(), 0, 0, cv::INTER_NEAREST);
+                                            // Lightly blend to keep overlays readable
+                                            cv::addWeighted(depth_resized, 0.6, roi_img, 0.4, 0.0, roi_img);
+                                        }
+                                    } catch (...) {
+                                        // ignore preview errors
+                                    }
+
                                     // 画像座標系で投影して描画する関数（PCA不使用）
                                     auto drawCloudToPanel = [&](const sensor_msgs::msg::PointCloud2& pc2,
                                                                const cv::Rect& roi_rect,
@@ -1410,8 +1477,8 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                     }
 
                                     // 左パネルに下部帯ヒストグラム（常時表示）
-                                    try {
-                                        if (color_copy_for_panel) {
+                                     try {
+                                        if (this->get_parameter("depth_scan_preview_enabled").as_bool() && color_copy_for_panel) {
                                             cv::Mat color_mat_h; 
                                             try { color_mat_h = cv_bridge::toCvCopy(color_copy_for_panel, sensor_msgs::image_encodings::BGR8)->image; } catch (...) {}
                                             if (!color_mat_h.empty()) {
@@ -1452,17 +1519,8 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                                         int h = static_cast<int>(std::round((hist[i] / (double)maxv) * gh));
                                                         cv::rectangle(output_image, cv::Rect(x0, gy + gh - h, x1 - x0 + 1, h), cv::Scalar(0,255,0), -1);
                                                     }
-                                                    fluent::text::draw(output_image, "🟢領域", cv::Point(panel.x+4, gy-4), cv::Scalar(0,255,0), 0.5, 1);
-                                                    // 上部ステータスに"🟢領域"インジケータを、点群と同じ処理（下部帯+HSV/Seg）に基づき表示
-                                                    int green_sum = 0; for (int v = y0c; v <= y1c; ++v) for (int u = roi_c.x; u < roi_c.x + roi_c.width; ++u) {
-                                                        cv::Vec3b px = hsv.at<cv::Vec3b>(v,u); double H = (px[0] * 2.0); double S = px[1] / 255.0; double V = px[2] / 255.0;
-                                                        if (H>=hmin && H<=hmax && S>=smin && V>=vmin) green_sum++; }
-                                                    bool region_ok = green_sum > std::max(10, roi_c.width * (y1c - y0c + 1) / 200); // しきい値: 帯面積の約0.5%以上
-                                                    int hud_x0 = 10 + 60 * 4; // 検出/深度/カメラ/点群 の次に配置
-                                                    int hud_y0 = 6 + 22 + 14; // 黒帯の下と同じ高さ
-                                                    cv::Scalar c = region_ok ? cv::Scalar(0,255,0) : cv::Scalar(0,0,255);
-                                                    cv::circle(output_image, cv::Point(hud_x0, hud_y0-5), 6, c, -1);
-                                                    fluent::text::draw(output_image, "領域", cv::Point(hud_x0 + 14, hud_y0), cv::Scalar(255,255,255), 0.5, 1);
+                                                     fluent::text::draw(output_image, "帯スキャン", cv::Point(panel.x+4, gy-4), cv::Scalar(0,255,0), 0.5, 1);
+                                                     // HUDインジケータは非表示
                                                 }
                                             }
                                         }
@@ -1902,53 +1960,17 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
 
     // 4行目: システム負荷情報（CPU/MEM のみ。GPUは非表示）
     y_offset += 16;
+    static fluent::utils::SystemMonitor sysmon;
     static auto last_sys_update = std::chrono::steady_clock::now();
-    static float cpu_usage_pct = 0.0f;
-    static int mem_used_mb = 0, mem_total_mb = 0;
+    static fluent::utils::SystemStats last_stats;
     auto now_sys = std::chrono::steady_clock::now();
     if (now_sys - last_sys_update > std::chrono::milliseconds(1000)) {
         last_sys_update = now_sys;
-        // CPU usage from /proc/stat
-        static uint64_t last_user=0,last_nice=0,last_system=0,last_idle=0,last_iowait=0,last_irq=0,last_softirq=0,last_steal=0;
-        std::ifstream stat_file("/proc/stat");
-        std::string line;
-        if (std::getline(stat_file, line)) {
-            std::istringstream iss(line);
-            std::string cpu;
-            uint64_t user,nice,system,idle,iowait,irq,softirq,steal;
-            if (iss >> cpu >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal) {
-                uint64_t idle_all = idle + iowait;
-                uint64_t non_idle = user + nice + system + irq + softirq + steal;
-                uint64_t total = idle_all + non_idle;
-                uint64_t last_idle_all = last_idle + last_iowait;
-                uint64_t last_non_idle = last_user + last_nice + last_system + last_irq + last_softirq + last_steal;
-                uint64_t last_total = last_idle_all + last_non_idle;
-                uint64_t totald = (total > last_total) ? (total - last_total) : 0;
-                uint64_t idled = (idle_all > last_idle_all) ? (idle_all - last_idle_all) : 0;
-                cpu_usage_pct = (totald > 0) ? static_cast<float>(100.0 * (totald - idled) / (double)totald) : cpu_usage_pct;
-                last_user=user; last_nice=nice; last_system=system; last_idle=idle; last_iowait=iowait; last_irq=irq; last_softirq=softirq; last_steal=steal;
-            }
-        }
-
-        // Memory from /proc/meminfo
-        std::ifstream meminfo("/proc/meminfo");
-        std::string key; long value; std::string unit;
-        long mem_total_kb = 0, mem_available_kb = 0;
-        while (meminfo >> key >> value >> unit) {
-            if (key == "MemTotal:") mem_total_kb = value;
-            else if (key == "MemAvailable:") mem_available_kb = value;
-            if (mem_total_kb && mem_available_kb) break;
-        }
-        if (mem_total_kb > 0) {
-            mem_total_mb = static_cast<int>(mem_total_kb / 1024);
-            int mem_avail_mb = static_cast<int>(mem_available_kb / 1024);
-            mem_used_mb = std::max(0, mem_total_mb - mem_avail_mb);
-        }
-
+        last_stats = sysmon.sample();
     }
     // 描画テキスト生成
     std::string sys_line = cv::format("CPU: %.0f%% | MEM: %d/%d MB",
-                               cpu_usage_pct, mem_used_mb, mem_total_mb);
+                               last_stats.cpu_usage_pct, last_stats.mem_used_mb, last_stats.mem_total_mb);
     fluent::text::draw(output_image, sys_line, cv::Point(hud_x + 8, y_offset), text_color, hud_font_scale_, 1);
     
     // FPS値に応じて色付け（オプション）
@@ -1959,29 +1981,18 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     }
     
     // 画像をパブリッシュ
-    auto pub_msg_start = std::chrono::high_resolution_clock::now();
+    fu::Stopwatch pub_sw;
     try {
-        sensor_msgs::msg::Image::SharedPtr msg = cv_bridge::CvImage(
-            latest_color_image_->header,
-            sensor_msgs::image_encodings::BGR8,
-            output_image).toImageMsg();
-        
-        annotated_image_pub_->publish(*msg);
+        // 画像メッセージに変換（FluentImage）→ヘッダ付与→publish（ワンライナー）
+        flr::publish(annotated_image_pub_, fi::make(output_image), latest_color_image_->header);
         
         // 圧縮画像もパブリッシュ
-        auto compressed_msg = std::make_shared<sensor_msgs::msg::CompressedImage>();
-        compressed_msg->header = latest_color_image_->header;
-        compressed_msg->format = "jpeg";
-        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};  // JPEG品質85%
-        cv::imencode(".jpg", output_image, compressed_msg->data, params);
-        annotated_image_compressed_pub_->publish(*compressed_msg);
+        flr::publish_compressed(annotated_image_compressed_pub_, canvas, latest_color_image_->header, 85, "jpeg");
     } catch (cv_bridge::Exception& e) {
         RCLCPP_ERROR(this->get_logger(), "CV bridge exception in publishCurrentImage: %s", e.what());
     }
-    
-    auto pub_end = std::chrono::high_resolution_clock::now();
-    double pub_ms = std::chrono::duration<double, std::milli>(pub_end - pub_msg_start).count();
-    double total_ms = std::chrono::duration<double, std::milli>(pub_end - pub_start).count();
+    double pub_ms = pub_sw.elapsed_ms();
+    double total_ms = total_sw.elapsed_ms();
     
     // 処理時間が10ms以上の場合のみログ出力
     if (total_ms > 10.0) {
