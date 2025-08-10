@@ -873,6 +873,9 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                     if (dir.y() > 0) dir = -dir; // root(下)→tip(上)
 
                     aspara_info.skeleton_points.clear();
+                    int empty_radius_hits = 0;
+                    int nn_fallback_hits = 0;
+                    int dir_update_hits = 0;
                     for (int i = 0; i < skel_n; ++i) {
                         // 近傍検索
                         std::vector<int> idx; std::vector<float> dist; pcl::PointXYZRGB q; q.x = cur.x(); q.y = cur.y(); q.z = cur.z();
@@ -886,6 +889,15 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                                 centroid += Eigen::Vector3f(p.x, p.y, p.z);
                             }
                             centroid /= static_cast<float>(idx.size());
+                        } else {
+                            // 半径内ゼロ → 最近傍フォールバック
+                            ++empty_radius_hits;
+                            std::vector<int> kidx; std::vector<float> kdist;
+                            if (kdt->nearestKSearch(q, 1, kidx, kdist) > 0 && !kidx.empty()) {
+                                const auto &p = foreground->points[kidx[0]];
+                                centroid = Eigen::Vector3f(p.x, p.y, p.z);
+                                ++nn_fallback_hits;
+                            }
                         }
                         // 局所PCAで進行方向を更新
                         if (idx.size() >= 5) {
@@ -897,6 +909,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es_l(cov_l);
                             Eigen::Vector3f u = es_l.eigenvectors().col(2).normalized();
                             if (u.dot(dir) < 0) u = -u; // 方向連続性
+                            if ((u - dir).norm() > 1e-6f) ++dir_update_hits;
                             dir = u;
                         }
                         cur = centroid + dir * static_cast<float>(step_m);
@@ -907,6 +920,8 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                         SkeletonPoint sp; sp.image_point = uv; sp.world_point.x = pxyz.x; sp.world_point.y = pxyz.y; sp.world_point.z = pxyz.z; sp.distance_from_base = static_cast<float>(i) / std::max(1, (skel_n - 1));
                         aspara_info.skeleton_points.push_back(sp);
                     }
+                    RCLCPP_DEBUG(node_->get_logger(), "[SKELETON] method=iterative_local empty_radius=%d nn_fallback=%d dir_updates=%d",
+                                 empty_radius_hits, nn_fallback_hits, dir_update_hits);
 
                     // 根本=最下端（yが最大）
                     if (!aspara_info.skeleton_points.empty()) {
