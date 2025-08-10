@@ -1679,9 +1679,30 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                             if (it_sel != snapshot_list.end() && !it_sel->filtered_pointcloud.data.empty()) {
                                                 filt_total = static_cast<int>(it_sel->filtered_pointcloud.width * it_sel->filtered_pointcloud.height);
                                             }
-                                            std::string lbl = cv::format("FILT: %d", filt_total);
+                                            // 右パネル上部にサマリを表示
                                             int ty = std::max(12, panel_y - 6);
-                                            fluent::text::draw(output_image, lbl, cv::Point(panel_x_r+2, ty), cv::Scalar(255,255,0), 0.5, 1);
+                                            // 1行目: 点群数
+                                            std::string line1 = cv::format("FILT: %d", filt_total);
+                                            fluent::text::draw(output_image, line1, cv::Point(panel_x_r+2, ty), cv::Scalar(255,255,0), 0.5, 1);
+                                            // 2行目以降: ID / 長さ / 真直度 / グレード / 時間
+                                            if (it_sel != snapshot_list.end()) {
+                                                auto gradeToLabel = [](AsparaguGrade g){
+                                                    switch (g) {
+                                                        case AsparaguGrade::A_GRADE: return "A";
+                                                        case AsparaguGrade::B_GRADE: return "B";
+                                                        case AsparaguGrade::C_GRADE: return "C";
+                                                        case AsparaguGrade::OUT_OF_SPEC: return "NG";
+                                                        default: return "?";
+                                                    }
+                                                };
+                                                double len_cm = static_cast<double>(it_sel->length) * 100.0;
+                                                double str_pct = static_cast<double>(it_sel->straightness) * 100.0;
+                                                double time_ms = it_sel->processing_times.total_ms;
+                                                std::string line2 = cv::format("ID:%d  L:%.1fcm  S:%.0f%%", it_sel->id, len_cm, str_pct);
+                                                std::string line3 = cv::format("GRADE:%s  TIME:%.1fms", gradeToLabel(it_sel->grade), time_ms);
+                                                fluent::text::draw(output_image, line2, cv::Point(panel_x_r+2, ty+16), cv::Scalar(255,255,255), 0.5, 1);
+                                                fluent::text::draw(output_image, line3, cv::Point(panel_x_r+2, ty+32), cv::Scalar(200,200,200), 0.5, 1);
+                                            }
                                         }
 
                                     }

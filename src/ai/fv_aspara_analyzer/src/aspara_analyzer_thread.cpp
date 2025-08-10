@@ -326,8 +326,8 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         aspara_info.processing_times.filter_bbox_ms = filter_stopwatch.elapsed_ms();
         
         if (verbose_logging) {
-        RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
-            "[POINTCLOUD] Generated %zu points from depth image", filtered_cloud->points.size());
+            RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"),
+                "[POINTCLOUD] Generated %zu points from depth image", filtered_cloud->points.size());
         }
         
         if (filtered_cloud->points.empty()) {
@@ -434,8 +434,8 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             pcl::PointCloud<pcl::PointXYZRGB>::Ptr skeleton_cloud = filtered_cloud;
             
             // デバッグ：filtered_cloudの内容確認
-            RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"),
-                "[SKELETON] Using filtered_cloud with %zu points", skeleton_cloud->points.size());
+                RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"),
+                    "[SKELETON] Using filtered_cloud with %zu points", skeleton_cloud->points.size());
             
             // PCA直線の端点を計算（フォールバック用）
             Eigen::Vector3f end_tip, end_root;
@@ -488,7 +488,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 valid_count++;
             }
             
-            RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"),
+            RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"),
                 "[SKELETON] Valid points: %d, Y range: [%.3f, %.3f]", 
                 valid_count, y_min, y_max);
             
@@ -563,7 +563,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                     cv::Point2f uv = pointcloud_processor_->project3DTo2D(pxyz, *camera_info);
                     
                     // デバッグ: 投影結果を確認
-                    RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"),
+                    RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"),
                         "[SKELETON] Slice %d: Y[%.3f-%.3f] points=%zu -> 3D(%.3f,%.3f,%.3f) -> 2D(%.1f,%.1f)",
                         i, y_lower, y_upper, slice_points.size(),
                         pxyz.x, pxyz.y, pxyz.z, uv.x, uv.y);
@@ -579,7 +579,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 }
                 
                 // 骨格点数を出力
-                RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"),
+                RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"),
                     "[SKELETON] Generated %zu skeleton points", skel.size());
             }
             
