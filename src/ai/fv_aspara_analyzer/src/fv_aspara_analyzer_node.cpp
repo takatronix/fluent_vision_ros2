@@ -109,6 +109,16 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<std::string>("curvature_method", "hybrid_max");
     this->declare_parameter<double>("curvature_weight_skeleton", 0.6);
     this->declare_parameter<double>("curvature_weight_pca", 0.4);
+    // 骨格抽出（宣言しないとスレッド側の has_parameter が false になり直線PCAにフォールバックする）
+    this->declare_parameter<bool>("enable_pca_skeleton", true);
+    this->declare_parameter<bool>("skeleton_enabled", true);
+    this->declare_parameter<std::string>("skeleton_method", "iterative_local"); // pca_line / iterative_local / slice_centroid
+    this->declare_parameter<int>("skeleton_points_count", 9);
+    this->declare_parameter<double>("skeleton_step_m", 0.01);
+    this->declare_parameter<double>("skeleton_radius_m", 0.015);
+    this->declare_parameter<double>("skeleton_window_m", 0.06);
+    this->declare_parameter<double>("skeleton_trim_low", 0.10);
+    this->declare_parameter<double>("skeleton_trim_high", 0.90);
     // マスク描画のアルファ
     this->declare_parameter<double>("mask_overlay_alpha", 0.25);
     this->declare_parameter<double>("hud_alpha", 0.45);
