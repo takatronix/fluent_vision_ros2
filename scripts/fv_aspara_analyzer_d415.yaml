@@ -181,10 +181,10 @@
     # 骨格ポイント設定
     enable_pca_skeleton: true                # PCAベース骨格生成を有効化
     skeleton_enabled: true                   # 骨格ポイント抽出有効
-    skeleton_points_count: 11                # 骨格ポイント数（曲がり追従性向上）
-    skeleton_method: "iterative_local"      # 骨格生成: iterative_local で曲がり追従
-    skeleton_step_m: 0.010                   # ステップ長[m]（約1.0cm：追従性向上）
-    skeleton_radius_m: 0.015                 # 近傍半径[m]（1.5cm：捕捉範囲拡大）
+    skeleton_points_count: 9                 # 骨格点を減らして安定化
+    skeleton_method: "iterative_local"      # 骨格生成: iterative_local
+    skeleton_step_m: 0.022                   # ステップ長[m]（約2.2cm：到達長=約17.6cm）
+    skeleton_radius_m: 0.018                 # 近傍半径[m]（1.8cm）
     skeleton_window_m: 0.06                  # 縦方向の窓を拡大して曲がりに追従
     skeleton_extraction_method: "pca_centerline"  # 抽出手法
     
