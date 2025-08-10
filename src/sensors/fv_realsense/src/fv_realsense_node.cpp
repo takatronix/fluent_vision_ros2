@@ -1070,7 +1070,7 @@ void FVDepthCameraNode::drawHUD(cv::Mat& frame) const
 
 void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const rs2::frame& depth_frame)
 {
-    RCLCPP_INFO(this->get_logger(), "🔍 publishPointCloud called");
+    RCLCPP_DEBUG(this->get_logger(), "🔍 publishPointCloud called");
     
     // Point cloud requires both color and depth frames
     if (!color_frame || !depth_frame) {
@@ -1087,7 +1087,7 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
     
     // Check publisher status
     size_t sub_count = pointcloud_pub_->get_subscription_count();
-    RCLCPP_INFO(this->get_logger(), "📊 Point cloud publisher - subscribers: %zu", sub_count);
+    RCLCPP_DEBUG(this->get_logger(), "📊 Point cloud publisher - subscribers: %zu", sub_count);
     
     // Create point cloud
     pcl::PointCloud<pcl::PointXYZRGB> cloud;
@@ -1098,7 +1098,7 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
     cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), 
                        CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
     
-    RCLCPP_INFO(this->get_logger(), "📐 Images - color: %dx%d, depth: %dx%d", 
+    RCLCPP_DEBUG(this->get_logger(), "📐 Images - color: %dx%d, depth: %dx%d", 
         color_image.cols, color_image.rows, depth_image.cols, depth_image.rows);
     
     // Convert to point cloud
@@ -1133,7 +1133,7 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
         }
     }
     
-    RCLCPP_INFO(this->get_logger(), "☁️ Point cloud - valid: %d, skipped: %d, total: %zu", 
+    RCLCPP_DEBUG(this->get_logger(), "☁️ Point cloud - valid: %d, skipped: %d, total: %zu", 
         valid_points, skipped_points, cloud.points.size());
     
     cloud.width = cloud.points.size();
@@ -1146,9 +1146,9 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
     cloud_msg.header.stamp = rclcpp::Clock(RCL_SYSTEM_TIME).now();
     cloud_msg.header.frame_id = tf_config_.color_optical_frame;
     
-    RCLCPP_INFO(this->get_logger(), "📤 Publishing point cloud with %zu points", cloud.points.size());
+    RCLCPP_DEBUG(this->get_logger(), "📤 Publishing point cloud with %zu points", cloud.points.size());
     pointcloud_pub_->publish(cloud_msg);
-    RCLCPP_INFO(this->get_logger(), "✅ Point cloud published successfully");
+    RCLCPP_DEBUG(this->get_logger(), "✅ Point cloud published successfully");
 }
 
 cv::Mat FVDepthCameraNode::createDepthColormap(const rs2::frame& depth_frame)
