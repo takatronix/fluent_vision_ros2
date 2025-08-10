@@ -24,7 +24,7 @@ public:
   Image() = default;
   Image(const cv::Mat &mat, std::string encoding = "bgr8")
     : mat_(mat), encoding_(std::move(encoding)) {}
-  Image(cv::Mat &&mat, std::string encoding = "BGR8")
+  Image(cv::Mat &&mat, std::string encoding = "bgr8")
     : mat_(std::move(mat)), encoding_(std::move(encoding)) {}
 
   // Construct from ROS Image (cv_bridge inside). Copies data.
@@ -138,7 +138,7 @@ public:
 
 private:
   cv::Mat mat_;
-  std::string encoding_ {"BGR8"};
+  std::string encoding_ {"bgr8"};
 
   static std::string lower(const std::string &s) {
     std::string t = s; std::transform(t.begin(), t.end(), t.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); }); return t;
@@ -150,7 +150,7 @@ template <typename F>
 auto operator|(const Image &img, F &&f) -> decltype(f(img)) { return f(img); }
 
 // Overloads for common sources (cv::Mat, ROS Image)
-inline Image make(const cv::Mat &m, const std::string &enc = "BGR8") { return Image(m, enc); }
+inline Image make(const cv::Mat &m, const std::string &enc = "bgr8") { return Image(m, enc); }
 inline Image make(const sensor_msgs::msg::Image &msg) { return Image(msg); }
 
 } // namespace fluent_image

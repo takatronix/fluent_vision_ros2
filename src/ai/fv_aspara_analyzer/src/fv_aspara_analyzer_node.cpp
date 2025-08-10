@@ -1004,7 +1004,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     if (static_cast<cv::Mat&>(canvas_draw_).empty() ||
         static_cast<cv::Mat&>(canvas_draw_).cols != color_image.cols ||
         static_cast<cv::Mat&>(canvas_draw_).rows != color_image.rows) {
-        canvas_draw_ = fi::Image(color_image.clone(), "BGR8");
+        canvas_draw_ = fi::Image(color_image.clone(), "bgr8");
     } else {
         static_cast<cv::Mat&>(canvas_draw_) = color_image.clone();
     }
@@ -1219,9 +1219,22 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                     cv::line(output_image, cv::Point(bbox.x, y1), cv::Point(bbox.x + bbox.width - 1, y1), cv::Scalar(255, 255, 0), 1);
                     cv::line(output_image, cv::Point(bbox.x, ymid), cv::Point(bbox.x + bbox.width - 1, ymid), cv::Scalar(80, 255, 80), 1);
                     // 赤い丸（推定z0の現在位置）: ヒストグラムから受け取った正規化位置を静止表示
-                    int px = bbox.x + 1 + static_cast<int>(std::clamp(aspara_info.z0_norm, 0.0f, 1.0f) * std::max(1, bbox.width - 2));
+                    bool drew = false;
                     if (aspara_info.z0_norm >= 0.0f) {
+                        int px = bbox.x + 1 + static_cast<int>(std::clamp(aspara_info.z0_norm, 0.0f, 1.0f) * std::max(1, bbox.width - 2));
                         cv::circle(output_image, cv::Point(px, ymid), 6, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+                        drew = true;
+                    }
+                    // フォールバック: 3D根本投影x位置が使えるならそこに赤丸
+                    if (!drew && latest_camera_info_) {
+                        const auto &rp = aspara_info.root_position_3d;
+                        if (std::isfinite(rp.z) && rp.z > 0.0) {
+                            double fx = latest_camera_info_->k[0];
+                            double cx = latest_camera_info_->k[2];
+                            int u = static_cast<int>(std::round(fx * (rp.x / rp.z) + cx));
+                            int px = std::clamp(u, bbox.x + 1, bbox.x + bbox.width - 2);
+                            cv::circle(output_image, cv::Point(px, ymid), 6, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+                        }
                     }
                 }
             }
@@ -2039,8 +2052,12 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     // 画像をパブリッシュ（同一pubキャンバスから非圧縮/圧縮を出力）
     fu::Stopwatch pub_sw;
     try {
-        flr::publish(annotated_image_pub_, pub_canvas, latest_color_image_->header);
-        flr::publish_compressed(annotated_image_compressed_pub_, pub_canvas, latest_color_image_->header, 85, "jpeg");
+        if (annotated_image_pub_ && annotated_image_pub_->get_subscription_count() > 0) {
+            flr::publish(annotated_image_pub_, pub_canvas, latest_color_image_->header);
+        }
+        if (annotated_image_compressed_pub_ && annotated_image_compressed_pub_->get_subscription_count() > 0) {
+            flr::publish_compressed(annotated_image_compressed_pub_, pub_canvas, latest_color_image_->header, 85, "jpeg");
+        }
     } catch (cv_bridge::Exception& e) {
         RCLCPP_ERROR(this->get_logger(), "CV bridge exception in publishCurrentImage: %s", e.what());
     }
