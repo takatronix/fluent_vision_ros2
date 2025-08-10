@@ -415,6 +415,17 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 L_skeleton = computeCurveLengthFromSkeleton(aspara_info.skeleton_points);
             }
             length = static_cast<float>((L_skeleton > 0.0) ? L_skeleton : m.length_m);
+            // 計測校正: スケールとオフセット（既定: scale=1.0, offset=0.0 [m]）
+            double length_scale = 1.0;
+            double length_offset = 0.0;
+            try { if (node_->has_parameter("length_scale")) {
+                length_scale = node_->get_parameter("length_scale").get_value<double>();
+            } } catch (...) {}
+            try { if (node_->has_parameter("length_offset_m")) {
+                length_offset = node_->get_parameter("length_offset_m").get_value<double>();
+            } } catch (...) {}
+            length = static_cast<float>(length * length_scale + length_offset);
+            if (!(length > 0.0f)) length = 0.0f;
             aspara_info.diameter = static_cast<float>(m.diameter_m);
             aspara_info.curvature = static_cast<float>(m.curvature_ratio);
             aspara_info.processing_times.measurement_ms = measurement_stopwatch.elapsed_ms();
@@ -893,17 +904,15 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                         aspara_info.skeleton_points.push_back(sp);
                     }
 
-                    // 根本=最下端（yが最大）を採用
-                    Eigen::Vector3f root3;
+                    // 根本=最下端（yが最大）を採用（重複定義を避けて直接代入）
                     {
                         const auto& first = aspara_info.skeleton_points.front().world_point;
                         const auto& last  = aspara_info.skeleton_points.back().world_point;
-                        if (last.y > first.y) { root3 = Eigen::Vector3f(last.x, last.y, last.z); }
-                        else { root3 = Eigen::Vector3f(first.x, first.y, first.z); }
+                        const auto& base  = (last.y > first.y) ? last : first;
+                        aspara_info.root_position_3d.x = base.x;
+                        aspara_info.root_position_3d.y = base.y;
+                        aspara_info.root_position_3d.z = base.z;
                     }
-                    aspara_info.root_position_3d.x = root3.x();
-                    aspara_info.root_position_3d.y = root3.y();
-                    aspara_info.root_position_3d.z = root3.z();
                 }
             }
         }

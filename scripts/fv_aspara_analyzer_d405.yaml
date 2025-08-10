@@ -95,6 +95,9 @@ fv_aspara_analyzer_d405:
 
     # ===== アスパラガス品質評価パラメータ =====
     enable_metrics: true                  # メトリクス計算を有効化
+    # 長さ校正
+    length_scale: 1.0                     # 長さスケール係数（1.0=無補正）
+    length_offset_m: 0.0                  # 長さオフセット[m]（0.0=無補正）
     
     # 収穫適性判定基準
     harvest_min_length: 0.23               # 収穫最小長さ（23cm）
