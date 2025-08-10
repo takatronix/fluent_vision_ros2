@@ -845,6 +845,21 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             foreground->height = 1;
             foreground->is_dense = false;
 
+            // 根本クリップ（根本より下側の点群を除去）
+            bool root_clip_enable = node_ && node_->has_parameter("root_clip_enable") ? node_->get_parameter("root_clip_enable").get_value<bool>() : true;
+            double root_clip_margin = node_ && node_->has_parameter("root_clip_margin_m") ? node_->get_parameter("root_clip_margin_m").get_value<double>() : 0.02;
+            if (root_clip_enable && std::isfinite(aspara_info.root_position_3d.y)) {
+                pcl::PointCloud<pcl::PointXYZRGB>::Ptr clipped(new pcl::PointCloud<pcl::PointXYZRGB>);
+                clipped->points.reserve(foreground->points.size());
+                const float y_threshold = static_cast<float>(aspara_info.root_position_3d.y - root_clip_margin);
+                for (const auto &p : foreground->points) {
+                    if (!std::isfinite(p.y)) continue;
+                    if (p.y >= y_threshold) clipped->points.push_back(p);
+                }
+                clipped->width = clipped->points.size(); clipped->height = 1; clipped->is_dense = false;
+                if (!clipped->points.empty()) foreground.swap(clipped);
+            }
+
             // 骨格生成: method切替（pca_line / iterative_local）
             if (!foreground->points.empty()) {
                 std::string method = "pca_line";

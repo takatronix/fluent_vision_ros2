@@ -111,6 +111,8 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<double>("curvature_weight_pca", 0.4);
     // 長さ推定メソッド（auto: 骨格とPCAの大きい方 / skeleton / pca）
     this->declare_parameter<std::string>("length_method", "auto");
+    // 参照用の直線（根本→先端を直線で結ぶ）の表示有無（既定ON）
+    this->declare_parameter<bool>("show_pca_reference_line", true);
     // 骨格抽出（宣言しないとスレッド側の has_parameter が false になり直線PCAにフォールバックする）
     this->declare_parameter<bool>("enable_pca_skeleton", true);
     this->declare_parameter<bool>("skeleton_enabled", true);
@@ -1891,10 +1893,13 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             cv::circle(output_image, a.skeleton_points.front().image_point, r, cv::Scalar(0,0,255),   -1);
             cv::circle(output_image, a.skeleton_points.back().image_point,  r, cv::Scalar(0,255,255), -1);
 
-            // 根本→先端の直線も重ねて描画（シアン、細線）
-            const auto& p_root = a.skeleton_points.front().image_point;
-            const auto& p_tip  = a.skeleton_points.back().image_point;
-            cv::line(output_image, p_root, p_tip, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+            // 根本→先端の直線参照はパラメータで表示切替
+            bool show_ref = this->has_parameter("show_pca_reference_line") ? this->get_parameter("show_pca_reference_line").as_bool() : true;
+            if (show_ref) {
+                const auto& p_root = a.skeleton_points.front().image_point;
+                const auto& p_tip  = a.skeleton_points.back().image_point;
+                cv::line(output_image, p_root, p_tip, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+            }
         }
     }
     
