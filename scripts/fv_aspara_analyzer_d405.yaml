@@ -108,9 +108,9 @@ fv_aspara_analyzer_d405:
     straightness_threshold: 0.7            # 真っ直ぐ度閾値（70%以上で収穫可能）
     straightness_kappa_ref: 0.03           # 真直度正規化の基準曲率
     enable_pca_skeleton: true              # PCAベース骨格生成を有効化
-    skeleton_points_count: 7               # 骨格ポイント数（5〜10）
-    skeleton_radius_m: 0.012               # 骨格点抽出の半径[m]
-    skeleton_window_m: 0.04                # 軸方向の近傍幅[m]
+    skeleton_points_count: 9               # 骨格ポイント数（9に増加: 曲がり追従性向上）
+    skeleton_radius_m: 0.010               # 局所重心の窓を少し絞る
+    skeleton_window_m: 0.06                # 縦方向の窓を拡大して曲がりに追従
 
 # =============================================================================
 # D405 vs D415 の違い

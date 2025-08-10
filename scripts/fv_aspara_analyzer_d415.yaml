@@ -180,9 +180,9 @@
     # 骨格ポイント設定
     enable_pca_skeleton: true                # PCAベース骨格生成を有効化
     skeleton_enabled: true                   # 骨格ポイント抽出有効
-    skeleton_points_count: 7                 # 骨格ポイント数（5〜10）
-    skeleton_radius_m: 0.012                 # 骨格点抽出の半径[m]
-    skeleton_window_m: 0.04                  # 軸方向の近傍幅[m]
+    skeleton_points_count: 9                 # 骨格ポイント数（9に増加: 曲がり追従性向上）
+    skeleton_radius_m: 0.010                 # 局所重心の窓を少し絞る
+    skeleton_window_m: 0.06                  # 縦方向の窓を拡大して曲がりに追従
     skeleton_extraction_method: "pca_centerline"  # 抽出手法
     
     # 骨格表示設定

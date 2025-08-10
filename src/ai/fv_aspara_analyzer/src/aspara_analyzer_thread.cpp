@@ -491,9 +491,12 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 end_root = Eigen::Vector3f(0, 0.1, 1);
             }
             
-            // 骨格サンプル（5点） - 点群の実際の広がりから直接サンプリング
+            // 骨格サンプル（N点） - 点群の実際の広がりから直接サンプリング（曲がり対応）
             std::vector<SkeletonPoint> skel;
-            const int NUM = 5;
+            int NUM = 7;
+            try { if (node_->has_parameter("skeleton_points_count")) {
+                NUM = std::max(2, node_->get_parameter("skeleton_points_count").get_value<int>());
+            } } catch (...) {}
             
             // 点群のY座標（高さ）の最小値と最大値を取得
             float y_min = std::numeric_limits<float>::max();
@@ -515,27 +518,13 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             if (y_range <= 0.0f) {
                 RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"),
                     "[SKELETON] Invalid Y range: %.3f", y_range);
-                // フォールバック：PCA直線を使用
+                // フォールバック：PCA直線を使用（最小限）
                 for (int i = 0; i < NUM; ++i) {
-                    float alpha = static_cast<float>(i) / (NUM - 1);
+                    float alpha = static_cast<float>(i) / std::max(1, (NUM - 1));
                     Eigen::Vector3f p = end_root * (1.0f - alpha) + end_tip * alpha;
-                    pcl::PointXYZRGB pxyz; 
-                    pxyz.x = p.x(); 
-                    pxyz.y = p.y(); 
-                    pxyz.z = p.z();
-                    
+                    pcl::PointXYZRGB pxyz; pxyz.x = p.x(); pxyz.y = p.y(); pxyz.z = p.z();
                     cv::Point2f uv = pointcloud_processor_->project3DTo2D(pxyz, *camera_info);
-                    if (uv.x < 0 || uv.y < 0 || !std::isfinite(uv.x) || !std::isfinite(uv.y)) {
-                        uv.x = std::max(0.0f, std::min(uv.x, static_cast<float>(camera_info->width - 1)));
-                        uv.y = std::max(0.0f, std::min(uv.y, static_cast<float>(camera_info->height - 1)));
-                    }
-                    
-                    SkeletonPoint sp;
-                    sp.image_point = uv;
-                    sp.world_point.x = pxyz.x; 
-                    sp.world_point.y = pxyz.y; 
-                    sp.world_point.z = pxyz.z;
-                    sp.distance_from_base = alpha;
+                    SkeletonPoint sp; sp.image_point = uv; sp.world_point.x = pxyz.x; sp.world_point.y = pxyz.y; sp.world_point.z = pxyz.z; sp.distance_from_base = alpha;
                     skel.push_back(sp);
                 }
             } else {
@@ -596,15 +585,24 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                     skel.push_back(skeleton_point);
                 }
                 
-                // 骨格点数を出力
                 RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"),
                     "[SKELETON] Generated %zu skeleton points", skel.size());
             }
             
             aspara_info.skeleton_points = skel;
-            RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"),
+            RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"),
                 "[SKELETON] Generated %zu skeleton points for aspara ID %d",
                 skel.size(), aspara_info.id);
+
+            // 根本=最下端（yが最大）を採用
+            if (!aspara_info.skeleton_points.empty()) {
+                const auto &first = aspara_info.skeleton_points.front().world_point;
+                const auto &last  = aspara_info.skeleton_points.back().world_point;
+                const auto &base  = (last.y > first.y) ? last : first;
+                aspara_info.root_position_3d.x = base.x;
+                aspara_info.root_position_3d.y = base.y;
+                aspara_info.root_position_3d.z = base.z;
+            }
         } catch (const std::exception& e) {
             RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), "PCA skeleton failed: %s", e.what());
         }
