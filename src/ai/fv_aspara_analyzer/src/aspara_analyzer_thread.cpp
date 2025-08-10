@@ -947,14 +947,25 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                     RCLCPP_DEBUG(node_->get_logger(), "[SKELETON] method=iterative_local empty_radius=%d nn_fallback=%d dir_updates=%d",
                                  empty_radius_hits, nn_fallback_hits, dir_update_hits);
 
-                    // 根本=最下端（yが最大）
+                    // 根本=最下端。画像Yで根本判定（既定）/ 3D Yで判定を切替
                     if (!aspara_info.skeleton_points.empty()) {
-                        const auto &first = aspara_info.skeleton_points.front().world_point;
-                        const auto &last  = aspara_info.skeleton_points.back().world_point;
-                        const auto &base  = (last.y > first.y) ? last : first;
-                        aspara_info.root_position_3d.x = base.x;
-                        aspara_info.root_position_3d.y = base.y;
-                        aspara_info.root_position_3d.z = base.z;
+                        bool by_img = node_ && node_->has_parameter("root_by_image_y") ? node_->get_parameter("root_by_image_y").get_value<bool>() : true;
+                        if (by_img) {
+                            const auto &pf = aspara_info.skeleton_points.front().image_point;
+                            const auto &pl = aspara_info.skeleton_points.back().image_point;
+                            const auto &base = (pl.y > pf.y) ? aspara_info.skeleton_points.back().world_point
+                                                             : aspara_info.skeleton_points.front().world_point;
+                            aspara_info.root_position_3d.x = base.x;
+                            aspara_info.root_position_3d.y = base.y;
+                            aspara_info.root_position_3d.z = base.z;
+                        } else {
+                            const auto &first = aspara_info.skeleton_points.front().world_point;
+                            const auto &last  = aspara_info.skeleton_points.back().world_point;
+                            const auto &base  = (last.y > first.y) ? last : first;
+                            aspara_info.root_position_3d.x = base.x;
+                            aspara_info.root_position_3d.y = base.y;
+                            aspara_info.root_position_3d.z = base.z;
+                        }
                     }
                 } else if (method == "slice_centroid") {
                     // 新規: 高さ方向スライス重心
@@ -968,12 +979,23 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                         aspara_info.skeleton_points.push_back(sp);
                     }
                     if (!aspara_info.skeleton_points.empty()) {
-                        const auto &first = aspara_info.skeleton_points.front().world_point;
-                        const auto &last  = aspara_info.skeleton_points.back().world_point;
-                        const auto &base  = (last.y > first.y) ? last : first;
-                        aspara_info.root_position_3d.x = base.x;
-                        aspara_info.root_position_3d.y = base.y;
-                        aspara_info.root_position_3d.z = base.z;
+                        bool by_img = node_ && node_->has_parameter("root_by_image_y") ? node_->get_parameter("root_by_image_y").get_value<bool>() : true;
+                        if (by_img) {
+                            const auto &pf = aspara_info.skeleton_points.front().image_point;
+                            const auto &pl = aspara_info.skeleton_points.back().image_point;
+                            const auto &base = (pl.y > pf.y) ? aspara_info.skeleton_points.back().world_point
+                                                             : aspara_info.skeleton_points.front().world_point;
+                            aspara_info.root_position_3d.x = base.x;
+                            aspara_info.root_position_3d.y = base.y;
+                            aspara_info.root_position_3d.z = base.z;
+                        } else {
+                            const auto &first = aspara_info.skeleton_points.front().world_point;
+                            const auto &last  = aspara_info.skeleton_points.back().world_point;
+                            const auto &base  = (last.y > first.y) ? last : first;
+                            aspara_info.root_position_3d.x = base.x;
+                            aspara_info.root_position_3d.y = base.y;
+                            aspara_info.root_position_3d.z = base.z;
+                        }
                     }
                 } else {
                     // 既存: グローバルPCA軸に沿った直線サンプル
