@@ -109,6 +109,7 @@ fv_aspara_analyzer_d405:
     straightness_kappa_ref: 0.03           # 真直度正規化の基準曲率
     enable_pca_skeleton: true              # PCAベース骨格生成を有効化
     skeleton_points_count: 9               # 骨格ポイント数（9に増加: 曲がり追従性向上）
+    skeleton_method: "slice_centroid"      # 骨格生成ロジック: pca_line / iterative_local / slice_centroid
     skeleton_radius_m: 0.010               # 局所重心の窓を少し絞る
     skeleton_window_m: 0.06                # 縦方向の窓を拡大して曲がりに追従
 

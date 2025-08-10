@@ -71,6 +71,7 @@ add_executable(fv_aspara_analyzer_node
   src/aspara_selection.cpp             # アスパラ選択管理クラス
   src/aspara_analyzer_thread.cpp       # アスパラ解析専用スレッド
   src/aspara_pointcloud_processor.cpp  # 点群処理専用クラス
+  src/aspara_analysis_logic.cpp        # 分析ロジック（曲がり対応の骨格など）
 )
 
 

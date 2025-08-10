@@ -67,8 +67,8 @@
     root_depth_percentile: 0.10            # z0推定のパーセンタイル（p10）
     root_use_segmentation: false           # まず色/Segを無効化（安定確認後にON）
     enable_region_recognition: false       # 色/マスクによる領域認識の使用可否（UI/抽出で利用）
-    preview_panel_enabled: true            # 左側のDepth/点群プレビューを有効化
-    depth_scan_preview_enabled: true       # ROI下部帯のDepthスキャン可視化を有効
+    preview_panel_enabled: false            # 左側のDepth/点群プレビューを有効化
+    depth_scan_preview_enabled: false       # ROI下部帯のDepthスキャン可視化を有効
     mask_overlay_enabled: false            # 画面上の緑マスク背景を無効化
     root_hsv_h_min: 35.0                   # 緑抽出HSV下限（H）
     root_hsv_h_max: 85.0                   # 緑抽出HSV上限（H）
@@ -181,6 +181,7 @@
     enable_pca_skeleton: true                # PCAベース骨格生成を有効化
     skeleton_enabled: true                   # 骨格ポイント抽出有効
     skeleton_points_count: 9                 # 骨格ポイント数（9に増加: 曲がり追従性向上）
+    skeleton_method: "slice_centroid"       # 骨格生成ロジック: pca_line / iterative_local / slice_centroid
     skeleton_radius_m: 0.010                 # 局所重心の窓を少し絞る
     skeleton_window_m: 0.06                  # 縦方向の窓を拡大して曲がりに追従
     skeleton_extraction_method: "pca_centerline"  # 抽出手法

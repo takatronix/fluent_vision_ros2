@@ -2,9 +2,11 @@
 #include "fv_aspara_analyzer/fv_aspara_analyzer_node.hpp"
 #include "fv_aspara_analyzer/aspara_pointcloud_processor.hpp"
 #include "fluent_lib/fluent.hpp"
+#include "fv_aspara_analyzer/aspara_analysis_logic.hpp"
 #include <iostream>
 #include <chrono>
 #include <algorithm>
+#include <pcl/search/kdtree.h>
 
 namespace fv_aspara_analyzer {
 
@@ -494,9 +496,12 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             // 骨格サンプル（N点） - 点群の実際の広がりから直接サンプリング（曲がり対応）
             std::vector<SkeletonPoint> skel;
             int NUM = 7;
-            try { if (node_->has_parameter("skeleton_points_count")) {
-                NUM = std::max(2, node_->get_parameter("skeleton_points_count").get_value<int>());
-            } } catch (...) {}
+            try {
+                if (node_->has_parameter("skeleton_points_count")) {
+                    int param_n = node_->get_parameter("skeleton_points_count").get_value<int>();
+                    NUM = std::max(2, static_cast<int>(param_n));
+                }
+            } catch (...) {}
             
             // 点群のY座標（高さ）の最小値と最大値を取得
             float y_min = std::numeric_limits<float>::max();
@@ -831,92 +836,139 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             foreground->height = 1;
             foreground->is_dense = false;
 
-            // 本当の根本/先端＋中間（PCA主軸で等間隔にサンプリングして局所重心を取る）
+            // 骨格生成: method切替（pca_line / iterative_local）
             if (!foreground->points.empty()) {
-                // PCA
-                Eigen::Vector4f mean4; pcl::compute3DCentroid(*foreground, mean4);
-                Eigen::Matrix3f cov; pcl::computeCovarianceMatrixNormalized(*foreground, Eigen::Vector4f(mean4[0],mean4[1],mean4[2],1.0f), cov);
-                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
-                Eigen::Vector3f u = es.eigenvectors().col(2).normalized(); // 最大固有値の固有ベクトル
-                Eigen::Vector3f c(mean4[0], mean4[1], mean4[2]);
+                std::string method = "pca_line";
+                try { if (node_->has_parameter("skeleton_method")) method = node_->get_parameter("skeleton_method").get_value<std::string>(); } catch (...) {}
 
-                // t分布（外れ値5%トリム）
-                std::vector<float> ts; ts.reserve(foreground->points.size());
-                for (const auto& p : foreground->points) {
-                    if (!std::isfinite(p.z) || p.z <= 0.0f) continue;
-                    Eigen::Vector3f v(p.x, p.y, p.z);
-                    ts.push_back(u.dot(v - c));
+                // 共通: サンプル点数
+                int skel_n = 5;
+                if (node_ && node_->has_parameter("skeleton_points_count")) {
+                    skel_n = std::max<int>(2, static_cast<int>(node_->get_parameter("skeleton_points_count").get_value<int>()));
                 }
-                if (!ts.empty()) {
-                    size_t q05i = static_cast<size_t>(ts.size() * 0.05f);
-                    size_t q95i = static_cast<size_t>(ts.size() * 0.95f);
-                    std::nth_element(ts.begin(), ts.begin()+q05i, ts.end());
-                    float tmin = ts[q05i];
-                    std::nth_element(ts.begin(), ts.begin()+q95i, ts.end());
-                    float tmax = ts[q95i];
 
-                    // サンプリング点数
-                    int skel_n = 5;
-                    if (node_ && node_->has_parameter("skeleton_points_count")) {
-                        skel_n = std::max<int>(2, static_cast<int>(node_->get_parameter("skeleton_points_count").get_value<int>()));
-                    }
-                    // トリム率（外れ端除去）
-                    double trim_low = node_ && node_->has_parameter("skeleton_trim_low") ?
-                        node_->get_parameter("skeleton_trim_low").get_value<double>() : 0.10; // 10%
-                    double trim_high = node_ && node_->has_parameter("skeleton_trim_high") ?
-                        node_->get_parameter("skeleton_trim_high").get_value<double>() : 0.90; // 90%
+                if (method == "iterative_local") {
+                    // 逐次追従: KDTree + 局所PCA
+                    pcl::search::KdTree<pcl::PointXYZRGB>::Ptr kdt(new pcl::search::KdTree<pcl::PointXYZRGB>);
+                    kdt->setInputCloud(foreground);
+                    double step_m = 0.02;  // 2cm
+                    double radius_m = 0.010; // 1cm
+                    try { if (node_->has_parameter("skeleton_step_m")) step_m = node_->get_parameter("skeleton_step_m").get_value<double>(); } catch (...) {}
+                    try { if (node_->has_parameter("skeleton_radius_m")) radius_m = node_->get_parameter("skeleton_radius_m").get_value<double>(); } catch (...) {}
 
-                    // 10-90%トリムで堅牢な端点を推定
-                    size_t qLowIdx = static_cast<size_t>(std::clamp(trim_low, 0.0, 0.49) * ts.size());
-                    size_t qHighIdx = static_cast<size_t>(std::clamp(trim_high, 0.51, 1.0) * ts.size());
-                    qLowIdx = std::min(qLowIdx, ts.size() - 1);
-                    qHighIdx = std::min(std::max(qHighIdx, qLowIdx + 1), ts.size() - 1);
-                    std::nth_element(ts.begin(), ts.begin()+qLowIdx, ts.end());
-                    float tmin_trim = ts[qLowIdx];
-                    std::nth_element(ts.begin(), ts.begin()+qHighIdx, ts.end());
-                    float tmax_trim = ts[qHighIdx];
-
-                    // 端点の3D座標
-                    Eigen::Vector3f tip3 = c + u * tmin_trim;
-                    Eigen::Vector3f root3 = c + u * tmax_trim;
-                    // 根本は推定root_position_3dに近い側に合わせる
+                    // 開始点
+                    Eigen::Vector3f cur;
                     if (std::isfinite(aspara_info.root_position_3d.x) && std::isfinite(aspara_info.root_position_3d.y) && std::isfinite(aspara_info.root_position_3d.z)) {
-                        Eigen::Vector3f rootHint(aspara_info.root_position_3d.x, aspara_info.root_position_3d.y, aspara_info.root_position_3d.z);
-                        double d_tip = (tip3 - rootHint).norm();
-                        double d_root = (root3 - rootHint).norm();
-                        if (d_tip < d_root) {
-                            // ひっくり返して root3 を根本に
-                            std::swap(tip3, root3);
-                            std::swap(tmin_trim, tmax_trim);
-                        }
+                        cur = Eigen::Vector3f(aspara_info.root_position_3d.x, aspara_info.root_position_3d.y, aspara_info.root_position_3d.z);
                     } else {
-                        // Y最大を根本とみなす（RealSense座標系）
-                        if (tip3.y() > root3.y()) std::swap(tip3, root3), std::swap(tmin_trim, tmax_trim);
+                        float best_y = -std::numeric_limits<float>::infinity(); pcl::PointXYZRGB best;
+                        for (const auto &pt : foreground->points) { if (pt.y > best_y) { best_y = pt.y; best = pt; } }
+                        cur = Eigen::Vector3f(best.x, best.y, best.z);
                     }
+                    // 初期方向: 全体PCA軸
+                    Eigen::Vector4f mean4; pcl::compute3DCentroid(*foreground, mean4);
+                    Eigen::Matrix3f cov; pcl::computeCovarianceMatrixNormalized(*foreground, Eigen::Vector4f(mean4[0],mean4[1],mean4[2],1.0f), cov);
+                    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+                    Eigen::Vector3f dir = es.eigenvectors().col(2).normalized();
+                    if (dir.y() > 0) dir = -dir; // root(下)→tip(上)
 
                     aspara_info.skeleton_points.clear();
                     for (int i = 0; i < skel_n; ++i) {
-                        float alpha = (skel_n == 1) ? 0.0f : static_cast<float>(i) / static_cast<float>(skel_n - 1);
-                        float ti = tmax_trim * (1.0f - alpha) + tmin_trim * alpha; // 根本→先端
-                        Eigen::Vector3f pt = c + u * ti;
-                        SkeletonPoint sp;
-                        sp.world_point.x = pt.x(); sp.world_point.y = pt.y(); sp.world_point.z = pt.z();
-                        sp.distance_from_base = alpha;
-                        if (camera_info) {
-                            cv::Point2f uv = pointcloud_processor_->project3DTo2D(pcl::PointXYZRGB(pt.x(), pt.y(), pt.z()), *camera_info);
-                            sp.image_point = uv;
+                        // 近傍検索
+                        std::vector<int> idx; std::vector<float> dist; pcl::PointXYZRGB q; q.x = cur.x(); q.y = cur.y(); q.z = cur.z();
+                        kdt->radiusSearch(q, static_cast<float>(radius_m), idx, dist);
+                        // 近傍重心
+                        Eigen::Vector3f centroid = cur;
+                        if (!idx.empty()) {
+                            centroid.setZero();
+                            for (int id : idx) {
+                                const auto &p = foreground->points[id];
+                                centroid += Eigen::Vector3f(p.x, p.y, p.z);
+                            }
+                            centroid /= static_cast<float>(idx.size());
                         }
+                        // 局所PCAで進行方向を更新
+                        if (idx.size() >= 5) {
+                            Eigen::Matrix3f cov_l = Eigen::Matrix3f::Zero();
+                            for (int id : idx) {
+                                const auto &p = foreground->points[id];
+                                Eigen::Vector3f v(p.x, p.y, p.z); Eigen::Vector3f d = v - centroid; cov_l += d * d.transpose();
+                            }
+                            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es_l(cov_l);
+                            Eigen::Vector3f u = es_l.eigenvectors().col(2).normalized();
+                            if (u.dot(dir) < 0) u = -u; // 方向連続性
+                            dir = u;
+                        }
+                        cur = centroid + dir * static_cast<float>(step_m);
+
+                        // 追加
+                        pcl::PointXYZRGB pxyz; pxyz.x = centroid.x(); pxyz.y = centroid.y(); pxyz.z = centroid.z();
+                        cv::Point2f uv = pointcloud_processor_->project3DTo2D(pxyz, *camera_info);
+                        SkeletonPoint sp; sp.image_point = uv; sp.world_point.x = pxyz.x; sp.world_point.y = pxyz.y; sp.world_point.z = pxyz.z; sp.distance_from_base = static_cast<float>(i) / std::max(1, (skel_n - 1));
                         aspara_info.skeleton_points.push_back(sp);
                     }
 
-                    // 根本=最下端（yが最大）を採用（重複定義を避けて直接代入）
-                    {
-                        const auto& first = aspara_info.skeleton_points.front().world_point;
-                        const auto& last  = aspara_info.skeleton_points.back().world_point;
-                        const auto& base  = (last.y > first.y) ? last : first;
+                    // 根本=最下端（yが最大）
+                    if (!aspara_info.skeleton_points.empty()) {
+                        const auto &first = aspara_info.skeleton_points.front().world_point;
+                        const auto &last  = aspara_info.skeleton_points.back().world_point;
+                        const auto &base  = (last.y > first.y) ? last : first;
                         aspara_info.root_position_3d.x = base.x;
                         aspara_info.root_position_3d.y = base.y;
                         aspara_info.root_position_3d.z = base.z;
+                    }
+                } else if (method == "slice_centroid") {
+                    // 新規: 高さ方向スライス重心
+                    aspara_info.skeleton_points.clear();
+                    auto res = computeSkeletonBySliceCentroid(foreground, skel_n);
+                    for (int i = 0; i < static_cast<int>(res.points.size()); ++i) {
+                        const auto &pt = res.points[i];
+                        float alpha = (res.points.size()>1) ? static_cast<float>(i) / static_cast<float>(res.points.size()-1) : 0.0f;
+                        SkeletonPoint sp; sp.world_point.x = pt.x(); sp.world_point.y = pt.y(); sp.world_point.z = pt.z(); sp.distance_from_base = alpha;
+                        if (camera_info) { cv::Point2f uv = pointcloud_processor_->project3DTo2D(pcl::PointXYZRGB(pt.x(), pt.y(), pt.z()), *camera_info); sp.image_point = uv; }
+                        aspara_info.skeleton_points.push_back(sp);
+                    }
+                    if (!aspara_info.skeleton_points.empty()) {
+                        const auto &first = aspara_info.skeleton_points.front().world_point;
+                        const auto &last  = aspara_info.skeleton_points.back().world_point;
+                        const auto &base  = (last.y > first.y) ? last : first;
+                        aspara_info.root_position_3d.x = base.x;
+                        aspara_info.root_position_3d.y = base.y;
+                        aspara_info.root_position_3d.z = base.z;
+                    }
+                } else {
+                    // 既存: グローバルPCA軸に沿った直線サンプル
+                    Eigen::Vector4f mean4; pcl::compute3DCentroid(*foreground, mean4);
+                    Eigen::Matrix3f cov; pcl::computeCovarianceMatrixNormalized(*foreground, Eigen::Vector4f(mean4[0],mean4[1],mean4[2],1.0f), cov);
+                    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+                    Eigen::Vector3f u = es.eigenvectors().col(2).normalized();
+                    Eigen::Vector3f c(mean4[0], mean4[1], mean4[2]);
+                    std::vector<float> ts; ts.reserve(foreground->points.size());
+                    for (const auto& p : foreground->points) { if (!std::isfinite(p.z) || p.z <= 0.0f) continue; Eigen::Vector3f v(p.x, p.y, p.z); ts.push_back(u.dot(v - c)); }
+                    if (!ts.empty()) {
+                        double trim_low = node_ && node_->has_parameter("skeleton_trim_low") ? node_->get_parameter("skeleton_trim_low").get_value<double>() : 0.10;
+                        double trim_high = node_ && node_->has_parameter("skeleton_trim_high") ? node_->get_parameter("skeleton_trim_high").get_value<double>() : 0.90;
+                        size_t qLowIdx = static_cast<size_t>(std::clamp(trim_low, 0.0, 0.49) * ts.size());
+                        size_t qHighIdx = static_cast<size_t>(std::clamp(trim_high, 0.51, 1.0) * ts.size());
+                        qLowIdx = std::min(qLowIdx, ts.size() - 1);
+                        qHighIdx = std::min(std::max(qHighIdx, qLowIdx + 1), ts.size() - 1);
+                        std::nth_element(ts.begin(), ts.begin()+qLowIdx, ts.end()); float tmin_trim = ts[qLowIdx];
+                        std::nth_element(ts.begin(), ts.begin()+qHighIdx, ts.end()); float tmax_trim = ts[qHighIdx];
+                        Eigen::Vector3f tip3 = c + u * tmin_trim; Eigen::Vector3f root3 = c + u * tmax_trim;
+                        if (std::isfinite(aspara_info.root_position_3d.x) && std::isfinite(aspara_info.root_position_3d.y) && std::isfinite(aspara_info.root_position_3d.z)) {
+                            Eigen::Vector3f rootHint(aspara_info.root_position_3d.x, aspara_info.root_position_3d.y, aspara_info.root_position_3d.z);
+                            double d_tip = (tip3 - rootHint).norm(); double d_root = (root3 - rootHint).norm(); if (d_tip < d_root) { std::swap(tip3, root3); std::swap(tmin_trim, tmax_trim); }
+                        } else { if (tip3.y() > root3.y()) { std::swap(tip3, root3); std::swap(tmin_trim, tmax_trim); } }
+                        aspara_info.skeleton_points.clear();
+                        for (int i = 0; i < skel_n; ++i) {
+                            float alpha = (skel_n == 1) ? 0.0f : static_cast<float>(i) / static_cast<float>(skel_n - 1);
+                            float ti = tmax_trim * (1.0f - alpha) + tmin_trim * alpha;
+                            Eigen::Vector3f pt = c + u * ti; SkeletonPoint sp; sp.world_point.x = pt.x(); sp.world_point.y = pt.y(); sp.world_point.z = pt.z(); sp.distance_from_base = alpha;
+                            if (camera_info) { cv::Point2f uv = pointcloud_processor_->project3DTo2D(pcl::PointXYZRGB(pt.x(), pt.y(), pt.z()), *camera_info); sp.image_point = uv; }
+                            aspara_info.skeleton_points.push_back(sp);
+                        }
+                        const auto& first = aspara_info.skeleton_points.front().world_point; const auto& last  = aspara_info.skeleton_points.back().world_point;
+                        const auto& base  = (last.y > first.y) ? last : first; aspara_info.root_position_3d.x = base.x; aspara_info.root_position_3d.y = base.y; aspara_info.root_position_3d.z = base.z;
                     }
                 }
             }
