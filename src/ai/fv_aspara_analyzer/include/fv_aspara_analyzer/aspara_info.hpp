@@ -93,7 +93,7 @@ struct AsparaInfo
     sensor_msgs::msg::PointCloud2 filtered_pointcloud;  ///< フィルタリング済み3D点群
     sensor_msgs::msg::PointCloud2 asparagus_pointcloud; ///< ROI抽出後の生点群（フィルター前）
     geometry_msgs::msg::Point root_position_3d; ///< 根元の3D座標
-    float length;                              ///< アスパラガスの長さ（mm）
+    float length;                              ///< アスパラガスの長さ（メートル）
     float straightness;                        ///< 真っ直ぐ度（0.0-1.0）
     bool is_harvestable;                       ///< 収穫可能フラグ
     
@@ -110,6 +110,10 @@ struct AsparaInfo
     
     // 骨格ポイント配列（5-10点）
     std::vector<SkeletonPoint> skeleton_points; ///< 骨格ポイント配列（頂点から根元まで）
+
+    // 2Dアウトライン（画像座標系）
+    // 前景点群を画像へ投影し、凸包（または近似輪郭）を格納する
+    std::vector<cv::Point2f> outline_polygon_2d;
 
     // ルート推定用ヒストグラム表示（高さ8pxの帯画像）。幅は矩形幅に合わせて更新
     cv::Mat depth_histogram_strip;

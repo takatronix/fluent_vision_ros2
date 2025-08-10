@@ -59,7 +59,7 @@ fv_aspara_analyzer_d405:
     depth_unit_m_16u: 0.0001               # 16UC1深度単位（D405は0.1mm/Unit）
     disable_filtered_fallback: true        # フィルタ結果が空でもフォールバックせず空点群を公開
     simple_z_back_cut: true                # z0から一定距離後ろを強制カット
-    z_back_cut_m: 0.10                     # 背面カット距離[m]（10cm）
+    z_back_cut_m: 0.12                     # 背面カット距離[m]（12cm）
     filtered_points_max: 3000              # 右パネル点群の上限（0=無制限）
 
     # ===== 根本推定・抽出帯パラメータ（表示/抽出の安定化） =====
@@ -87,18 +87,24 @@ fv_aspara_analyzer_d405:
     # ===== ノイズ除去パラメータ =====
     
     # 統計的外れ値除去フィルタ
-    noise_reduction_neighbors: 5           # 点数確保のためさらに緩め
-    noise_reduction_std_dev: 3.0           # 点数確保のためさらに広め
+    noise_reduction_neighbors: 20          # D405でも最低限の外れ値除去
+    noise_reduction_std_dev: 1.0           # ノイズ除去の標準偏差しきい値
     
     # ボクセルグリッドフィルタ（ダウンサンプリング）
-    voxel_leaf_size: 0.003                 # ボクセルサイズ（3mm、点数最大化）
+    voxel_leaf_size: 0.004                 # ボクセルサイズ（4mm、速度と精度のバランス）
 
     # ===== アスパラガス品質評価パラメータ =====
+    enable_metrics: true                  # メトリクス計算を有効化
     
     # 収穫適性判定基準
     harvest_min_length: 0.23               # 収穫最小長さ（23cm）
     harvest_max_length: 0.50               # 収穫最大長さ（50cm）
     straightness_threshold: 0.7            # 真っ直ぐ度閾値（70%以上で収穫可能）
+    straightness_kappa_ref: 0.03           # 真直度正規化の基準曲率
+    enable_pca_skeleton: true              # PCAベース骨格生成を有効化
+    skeleton_points_count: 7               # 骨格ポイント数（5〜10）
+    skeleton_radius_m: 0.012               # 骨格点抽出の半径[m]
+    skeleton_window_m: 0.04                # 軸方向の近傍幅[m]
 
 # =============================================================================
 # D405 vs D415 の違い

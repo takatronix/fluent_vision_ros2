@@ -56,7 +56,7 @@
     detection_timeout_seconds: 1.5         # 検出がない場合の表示タイムアウト（秒）
     disable_filtered_fallback: true       # フィルタ結果が空でもフォールバックせず空点群を公開
     simple_z_back_cut: true               # z0から一定距離後ろを強制カット
-    z_back_cut_m: 0.05                    # 背面カット距離（5cm）
+    z_back_cut_m: 0.18                    # 背面カット距離（18cm）
     filtered_points_max: 10000            # 右パネル点群の上限（0=無制限）
     
     # ===== 根本推定・抽出帯パラメータ（表示/抽出の安定化） =====
@@ -80,18 +80,20 @@
     # ===== ノイズ除去パラメータ =====
     
     # 統計的外れ値除去フィルタ
-    noise_reduction_neighbors: 10          # 点数回復のため緩め
-    noise_reduction_std_dev: 2.0           # 点数回復のため広め
+    noise_reduction_neighbors: 20          # ノイズ除去強度（近接より弱め）
+    noise_reduction_std_dev: 1.0           # ノイズ除去の標準偏差しきい値
     
     # ボクセルグリッドフィルタ（ダウンサンプリング）
-    voxel_leaf_size: 0.006                 # ボクセルサイズ（6mm、点数回復のため緩め）
+    voxel_leaf_size: 0.006                 # ボクセルサイズ（6mm）
 
     # ===== アスパラガス品質評価パラメータ =====
+    enable_metrics: true                   # メトリクス計算を有効化
     
     # 収穫適性判定基準
     harvest_min_length: 0.23               # 収穫最小長さ（23cm）
     harvest_max_length: 0.50               # 収穫最大長さ（50cm）
     straightness_threshold: 0.7            # 真っ直ぐ度閾値（70%以上で収穫可能）
+    straightness_kappa_ref: 0.03           # 真直度正規化の基準曲率
     cutting_target_length: 0.23            # 切断対象判定長さ（23cm以上）
 
     # ===== QoS設定（入力/出力） =====
@@ -170,8 +172,11 @@
     # ===== 骨格ポイント抽出パラメータ =====
     
     # 骨格ポイント設定
+    enable_pca_skeleton: true                # PCAベース骨格生成を有効化
     skeleton_enabled: true                   # 骨格ポイント抽出有効
-    skeleton_points_count: 5                 # 骨格ポイント数（5または10）
+    skeleton_points_count: 7                 # 骨格ポイント数（5〜10）
+    skeleton_radius_m: 0.012                 # 骨格点抽出の半径[m]
+    skeleton_window_m: 0.04                  # 軸方向の近傍幅[m]
     skeleton_extraction_method: "pca_centerline"  # 抽出手法
     
     # 骨格表示設定
