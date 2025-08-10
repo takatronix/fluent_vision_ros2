@@ -109,6 +109,8 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<std::string>("curvature_method", "hybrid_max");
     this->declare_parameter<double>("curvature_weight_skeleton", 0.6);
     this->declare_parameter<double>("curvature_weight_pca", 0.4);
+    // 長さ推定メソッド（auto: 骨格とPCAの大きい方 / skeleton / pca）
+    this->declare_parameter<std::string>("length_method", "auto");
     // 骨格抽出（宣言しないとスレッド側の has_parameter が false になり直線PCAにフォールバックする）
     this->declare_parameter<bool>("enable_pca_skeleton", true);
     this->declare_parameter<bool>("skeleton_enabled", true);

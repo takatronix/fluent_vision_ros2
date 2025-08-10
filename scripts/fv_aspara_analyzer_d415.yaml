@@ -88,6 +88,7 @@
 
     # ===== アスパラガス品質評価パラメータ =====
     enable_metrics: true                   # メトリクス計算を有効化
+    length_method: "auto"                 # 長さ推定: auto/skeleton/pca
     # 長さ校正
     length_scale: 1.0                      # 長さスケール係数（1.0=無補正）
     length_offset_m: 0.0                   # 長さオフセット[m]（0.0=無補正）

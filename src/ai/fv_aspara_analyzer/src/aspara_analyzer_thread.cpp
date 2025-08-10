@@ -411,12 +411,21 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             double kappa_ref = 0.03;
             try { if (node_->has_parameter("straightness_kappa_ref")) kappa_ref = node_->get_parameter("straightness_kappa_ref").get_value<double>(); } catch (...) {}
             straightness = static_cast<float>(std::clamp(1.0 - m.curvature_ratio / std::max(1e-6, kappa_ref), 0.0, 1.0));
-            // スケルトンが生成されていれば曲線長を優先、無ければPCA長
+            // 長さ推定メソッド: auto/skeleton/pca
+            std::string length_method = "auto";
+            try { if (node_->has_parameter("length_method")) length_method = node_->get_parameter("length_method").get_value<std::string>(); } catch (...) {}
             double L_skeleton = 0.0;
             if (!aspara_info.skeleton_points.empty()) {
                 L_skeleton = computeCurveLengthFromSkeleton(aspara_info.skeleton_points);
             }
-            length = static_cast<float>((L_skeleton > 0.0) ? L_skeleton : m.length_m);
+            double L_pca = m.length_m;
+            if (length_method == "skeleton") {
+                length = static_cast<float>((L_skeleton > 0.0) ? L_skeleton : 0.0);
+            } else if (length_method == "pca") {
+                length = static_cast<float>(L_pca);
+            } else { // auto: 大きい方を採用（骨格の点間サンプリング不足で短くなるのを回避）
+                length = static_cast<float>(std::max(L_skeleton, L_pca));
+            }
             // 計測校正: スケールとオフセット（既定: scale=1.0, offset=0.0 [m]）
             double length_scale = 1.0;
             double length_offset = 0.0;
