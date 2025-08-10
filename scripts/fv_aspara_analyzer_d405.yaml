@@ -24,8 +24,8 @@ fv_aspara_analyzer_d405:
     # ===== システム情報 =====
     camera_name: "D405"  # 画面表示用のカメラ名
 
-    preview_panel_enabled: true            # 左側のDepth/点群プレビューを有効化
-    mask_overlay_enabled: true            # 画面上の緑マスク背景を無効化
+    preview_panel_enabled: false            # 左側のDepth/点群プレビューを有効化
+    mask_overlay_enabled: false            # 画面上の緑マスク背景を無効化
 
     # ===== トピック設定（D405カメラ用） =====
     
