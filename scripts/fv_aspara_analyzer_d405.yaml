@@ -28,6 +28,7 @@
     right_panel_enabled: true              # 右パネル（FILTERED点群）
     depth_scan_preview_enabled: true       # ROI下部帯のDepthスキャン可視化を有効
     mask_overlay_enabled: false            # 画面上の緑マスク背景を無効化
+    auto_select_single: true               # 単一検出時の自動選択（ON/OFF）
 
     # ===== トピック設定（D405カメラ用） =====
     
@@ -50,6 +51,20 @@
     enable_detected_all_points: false  # 重い処理のためデフォルト無効（必要時のみ有効化）
     output_marker_topic: "/fv/d405/aspara_analysis/markers"  # MarkerArray出力
     output_annotated_image_topic: "/fv/d405/aspara_analysis/result"          # 注釈付き可視化画像
+
+    # ===== 情報ウィンドウ（右パネル上に重ねるUI） =====
+    info_window_enabled: true              # 情報ウィンドウON/OFF
+    info_window_alpha: 0.5                 # 背景の黒半透明アルファ
+    info_font_scale: 0.5                   # テキストのフォント倍率
+    info_line_height: 18                   # 行高(px)
+    info_show_id: true
+    info_show_length: true
+    info_show_diameter: false
+    info_show_straightness: true
+    info_show_grade: true
+    info_show_harvestable: true
+    info_show_distance: true
+    info_show_debug_points: false
 
     # ===== 基本処理パラメータ =====
     
@@ -113,6 +128,13 @@
     harvest_max_length: 0.50               # 収穫最大長さ（50cm）
     straightness_threshold: 0.7            # 真っ直ぐ度閾値（70%以上で収穫可能）
     straightness_kappa_ref: 0.03           # 真直度正規化の基準曲率
+    # ===== 表示の安全レンジ（この範囲外は非表示） =====
+    display_length_min_m: 0.08
+    display_length_max_m: 0.60
+    display_diameter_min_m: 0.006
+    display_diameter_max_m: 0.020
+    display_straightness_min: 0.0
+    display_straightness_max: 1.0
     enable_pca_skeleton: true              # PCAベース骨格生成を有効化
     skeleton_points_count: 9               # 骨格ポイント数を減らして安定化
     skeleton_method: "iterative_local"     # 骨格生成: iterative_local で曲がり追従
