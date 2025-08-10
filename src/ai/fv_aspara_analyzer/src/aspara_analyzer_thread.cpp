@@ -426,6 +426,13 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             } } catch (...) {}
             length = static_cast<float>(length * length_scale + length_offset);
             if (!(length > 0.0f)) length = 0.0f;
+
+            // 長さの表示レンジ制限（外れ値抑制）
+            double length_min_m = 0.05; // 5cm
+            double length_max_m = 0.50; // 50cm（上限）
+            try { if (node_->has_parameter("length_min_m")) length_min_m = node_->get_parameter("length_min_m").get_value<double>(); } catch (...) {}
+            try { if (node_->has_parameter("length_max_m")) length_max_m = node_->get_parameter("length_max_m").get_value<double>(); } catch (...) {}
+            bool length_ok = (length >= static_cast<float>(length_min_m) && length <= static_cast<float>(length_max_m));
             aspara_info.diameter = static_cast<float>(m.diameter_m);
             aspara_info.curvature = static_cast<float>(m.curvature_ratio);
             aspara_info.processing_times.measurement_ms = measurement_stopwatch.elapsed_ms();
@@ -1049,6 +1056,20 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         // 曲がり度: スケルトン中心線ベース（既定）/ PCA比 などを組合せ
         if (enable_metrics) {
             aspara_info.length = length;             // m
+            aspara_info.length_valid = true;         // 既定true
+            // 異常値はUIで非表示にできるようにフラグ化
+            try {
+                bool enable_clip = true;
+                if (node_->has_parameter("length_clip_enable")) {
+                    enable_clip = node_->get_parameter("length_clip_enable").get_value<bool>();
+                }
+                if (enable_clip) {
+                    double min_m = 0.05, max_m = 0.50;
+                    if (node_->has_parameter("length_min_m")) min_m = node_->get_parameter("length_min_m").get_value<double>();
+                    if (node_->has_parameter("length_max_m")) max_m = node_->get_parameter("length_max_m").get_value<double>();
+                    aspara_info.length_valid = (aspara_info.length >= static_cast<float>(min_m) && aspara_info.length <= static_cast<float>(max_m));
+                }
+            } catch (...) {}
             aspara_info.straightness = straightness; // 0..1
             aspara_info.is_harvestable = is_harvestable;
             // グレード判定

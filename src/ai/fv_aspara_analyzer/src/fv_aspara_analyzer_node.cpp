@@ -1361,7 +1361,13 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             double length_cm = aspara_info.length * 100.0;
             double straight_pct = aspara_info.straightness * 100.0;
             double total_ms = aspara_info.processing_times.total_ms;
-            std::string label = cv::format("ID:%d  len:%.1fcm  str:%.0f%%  time:%.1fms", aspara_info.id, length_cm, straight_pct, total_ms);
+            // 異常値の場合は長さを表示しない
+            std::string label;
+            if (aspara_info.length_valid) {
+                label = cv::format("ID:%d  len:%.1fcm  str:%.0f%%  time:%.1fms", aspara_info.id, length_cm, straight_pct, total_ms);
+            } else {
+                label = cv::format("ID:%d  len:--  str:%.0f%%  time:%.1fms", aspara_info.id, straight_pct, total_ms);
+            }
             int baseline;
             cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
             
@@ -1849,20 +1855,14 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             }
         }
         cv::Scalar bone_color = is_selected ? cv::Scalar(255, 0, 255) : cv::Scalar(180, 120, 200);
-        int thickness = is_selected ? 2 : 1;
+        // 要望: ピンクの線は半分の細さに（選択時も1px）
+        int thickness = 1;
         
-        // 全ての骨格点を個別に描画（線が描けない場合の確認用）
+        // 全ての骨格点を個別に描画（小さな青丸）
         for (size_t i = 0; i < a.skeleton_points.size(); ++i) {
             const auto& p = a.skeleton_points[i].image_point;
-            // 各点を小さな円で描画
-            cv::circle(output_image, p, 3, cv::Scalar(0, 255, 0), -1);
-            if (is_selected) {
-                // 選択中なら点番号も表示
-                std::string pt_num = std::to_string(i);
-                cv::putText(output_image, pt_num, 
-                    cv::Point(p.x + 5, p.y - 5),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(255, 255, 255), 1);
-            }
+            // BGR: 青(255,0,0)、半径2px
+            cv::circle(output_image, p, 2, cv::Scalar(255, 0, 0), -1);
         }
         
         // 線で結ぶ
@@ -1877,6 +1877,11 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             int r = is_selected ? 6 : 4;
             cv::circle(output_image, a.skeleton_points.front().image_point, r, cv::Scalar(0,255,255), -1);
             cv::circle(output_image, a.skeleton_points.back().image_point,  r, cv::Scalar(0,0,255),   -1);
+
+            // 根本→先端の直線も重ねて描画（シアン、細線）
+            const auto& p_root = a.skeleton_points.front().image_point;
+            const auto& p_tip  = a.skeleton_points.back().image_point;
+            cv::line(output_image, p_root, p_tip, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
         }
     }
     

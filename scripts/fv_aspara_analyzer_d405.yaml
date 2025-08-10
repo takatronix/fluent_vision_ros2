@@ -98,6 +98,9 @@ fv_aspara_analyzer_d405:
     # 長さ校正
     length_scale: 1.0                     # 長さスケール係数（1.0=無補正）
     length_offset_m: 0.0                  # 長さオフセット[m]（0.0=無補正）
+    length_clip_enable: true              # 長さの表示レンジ制限を有効化
+    length_min_m: 0.08                    # 最小長さ[m]（8cm未満は無効扱い）
+    length_max_m: 0.40                    # 最大長さ[m]（40cm超は無効扱い）
     
     # 収穫適性判定基準
     harvest_min_length: 0.23               # 収穫最小長さ（23cm）

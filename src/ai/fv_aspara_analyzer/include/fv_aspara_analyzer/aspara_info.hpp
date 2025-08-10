@@ -94,6 +94,7 @@ struct AsparaInfo
     sensor_msgs::msg::PointCloud2 asparagus_pointcloud; ///< ROI抽出後の生点群（フィルター前）
     geometry_msgs::msg::Point root_position_3d; ///< 根元の3D座標
     float length;                              ///< アスパラガスの長さ（メートル）
+    bool length_valid = true;                  ///< 長さが表示許容レンジ内か
     float straightness;                        ///< 真っ直ぐ度（0.0-1.0）
     bool is_harvestable;                       ///< 収穫可能フラグ
     
