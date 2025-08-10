@@ -116,6 +116,7 @@ struct AsparaInfo
     // 帯スキャンの最近距離z0（m）と、その横位置（0..1、<0で無効）。
     float z0_m {0.0f};
     float z0_norm { -1.0f };
+    float z0_x_norm { -1.0f };              ///< 画面x基準の正規化位置（0..1）
 
     // 画像スナップショット（FluentImageベース）
     fluent_image::Image source_image;   ///< 切り出し前（元のカラー画像）

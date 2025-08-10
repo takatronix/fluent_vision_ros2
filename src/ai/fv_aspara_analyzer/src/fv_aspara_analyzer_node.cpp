@@ -1259,6 +1259,77 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                         if (sw > 0 && sh > 0) {
                             strip_bgr(cv::Rect(0, 0, sw, sh)).copyTo(output_image(cv::Rect(sx, sy, sw, sh)));
                         }
+
+                        // 追加: 参照しているDepth帯の「実際の画像」もヒストグラムの下に貼り付け
+                        // 近いほど明るくなる正規化（16Uは>0マスク）で 16px 高に整形
+                        if (this->get_parameter("depth_scan_preview_enabled").as_bool()) {
+                            sensor_msgs::msg::Image::SharedPtr depth_copy;
+                            sensor_msgs::msg::Image::SharedPtr color_copy;
+                            {
+                                std::lock_guard<std::mutex> lk(image_data_mutex_);
+                                depth_copy = latest_depth_image_;
+                                color_copy = latest_color_image_;
+                            }
+                            if (depth_copy) {
+                                try {
+                                    cv::Mat depth_mat;
+                                    bool depth_is_16u = false;
+                                    if (depth_copy->encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
+                                        depth_mat = cv_bridge::toCvCopy(depth_copy, sensor_msgs::image_encodings::TYPE_16UC1)->image;
+                                        depth_is_16u = true;
+                                    } else if (depth_copy->encoding == sensor_msgs::image_encodings::TYPE_32FC1) {
+                                        depth_mat = cv_bridge::toCvCopy(depth_copy, sensor_msgs::image_encodings::TYPE_32FC1)->image;
+                                    }
+                                    if (!depth_mat.empty()) {
+                                        int cw = color_copy ? static_cast<int>(color_copy->width) : output_image.cols;
+                                        int ch = color_copy ? static_cast<int>(color_copy->height) : output_image.rows;
+                                        int dw = depth_mat.cols, dh = depth_mat.rows;
+                                        double sx_scale = cw > 0 ? static_cast<double>(dw) / cw : 1.0;
+                                        double sy_scale = ch > 0 ? static_cast<double>(dh) / ch : 1.0;
+                                        cv::Rect droi(
+                                            std::clamp(static_cast<int>(std::round(bbox.x * sx_scale)), 0, dw-1),
+                                            std::clamp(static_cast<int>(std::round(bbox.y * sy_scale)), 0, dh-1),
+                                            std::clamp(static_cast<int>(std::round(bbox.width * sx_scale)), 1, dw),
+                                            std::clamp(static_cast<int>(std::round(bbox.height * sy_scale)), 1, dh)
+                                        );
+                                        droi.width = std::min(droi.width, dw - droi.x);
+                                        droi.height = std::min(droi.height, dh - droi.y);
+                                        // 帯の上下境界（ノードパラメータ）
+                                        double bottom_ratio = this->get_parameter("hist_band_bottom_ratio").as_double();
+                                        double top_ratio    = this->get_parameter("hist_band_top_ratio").as_double();
+                                        int y0d = droi.y + static_cast<int>(std::floor(droi.height * (1.0 - top_ratio)));
+                                        int y1d = droi.y + static_cast<int>(std::floor(droi.height * (1.0 - bottom_ratio)));
+                                        y0d = std::clamp(y0d, droi.y, droi.y + droi.height - 1);
+                                        y1d = std::clamp(y1d, droi.y, droi.y + droi.height - 1);
+                                        if (y1d < y0d) std::swap(y0d, y1d);
+                                        cv::Mat band = depth_mat(cv::Rect(droi.x, y0d, droi.width, std::max(1, y1d - y0d + 1))).clone();
+                                        // 正規化（近距離ほど明）
+                                        cv::Mat band_u8;
+                                        if (depth_is_16u) {
+                                            cv::Mat mask = band > 0;
+                                            double dmin=0.0, dmax=0.0; cv::minMaxLoc(band, &dmin, &dmax, nullptr, nullptr, mask);
+                                            if (!(dmax > dmin)) { dmin = 0.0; dmax = 10000.0; }
+                                            cv::Mat band_f; band.convertTo(band_f, CV_32F);
+                                            cv::Mat norm = (band_f - static_cast<float>(dmin)) * (255.0f / static_cast<float>(dmax - dmin + 1e-6f));
+                                            norm.setTo(0, ~mask);
+                                            norm.convertTo(band_u8, CV_8U);
+                                        } else {
+                                            double dmin=0.0, dmax=0.0; cv::minMaxLoc(band, &dmin, &dmax);
+                                            if (!(dmax > dmin)) { dmin = 0.0; dmax = 2.0; }
+                                            cv::Mat norm = (band - dmin) * (255.0 / (dmax - dmin + 1e-6));
+                                            norm.convertTo(band_u8, CV_8U);
+                                        }
+                                        // 近距離ほど明くする（上下反転ではなくレンジに依存）
+                                        cv::Mat band_bgr; cv::cvtColor(band_u8, band_bgr, cv::COLOR_GRAY2BGR);
+                                        cv::Mat band_resized; cv::resize(band_bgr, band_resized, cv::Size(sw, 16), 0, 0, cv::INTER_NEAREST);
+                                        int sy2 = sy + sh + 2;
+                                        if (sy2 + band_resized.rows <= output_image.rows) {
+                                            band_resized.copyTo(output_image(cv::Rect(sx, sy2, band_resized.cols, band_resized.rows)));
+                                        }
+                                    }
+                                } catch (...) {}
+                            }
+                        }
                     }
                 }
             } catch (...) {}

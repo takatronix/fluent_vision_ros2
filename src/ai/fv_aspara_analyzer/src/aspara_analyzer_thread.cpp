@@ -654,14 +654,10 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             y1 = std::clamp(y1, roi.y, roi.y + roi.height - 1);
             if (y1 < y0) std::swap(y0, y1);
 
-            // 下部帯の有効depth収集（距離[m]ベクトル）
-            std::vector<float> band_depths;
-            band_depths.reserve((y1 - y0 + 1) * roi.width);
+            // 色/セグメント判定ヘルパ（この後の全処理で利用）
             auto is_green = [&](int u, int v) -> bool {
-                // 仕様: root_use_segmentation=false の場合はHSVも含め完全に色判定をオフ
-                if (!use_seg) return true;
-                // セグメンテーションマスクがあればそれを使用
-                if (!mask_mat.empty()) {
+                if (!use_seg) return true;                     // 完全オフ
+                if (!mask_mat.empty()) {                        // マスク優先
                     if (!color_mat.empty() && mask_mat.size()!=color_mat.size()) {
                         int um = std::clamp(static_cast<int>(std::round(u * (mask_mat.cols / static_cast<double>(color_mat.cols)))), 0, mask_mat.cols-1);
                         int vm = std::clamp(static_cast<int>(std::round(v * (mask_mat.rows / static_cast<double>(color_mat.rows)))), 0, mask_mat.rows-1);
@@ -669,97 +665,107 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                     }
                     return mask_mat.at<uint8_t>(v, u) > 127;
                 }
-                // マスクがない場合のみHSVを使う（use_seg=true 前提）
-                if (hsv.empty()) return true;
+                if (hsv.empty()) return true;                 // HSV無しなら許可
                 cv::Vec3b px = hsv.at<cv::Vec3b>(v, u);
                 double H = (px[0] * 2.0);
                 double S = px[1] / 255.0;
                 double V = px[2] / 255.0;
                 return (H>=hmin && H<=hmax && S>=smin && V>=vmin);
             };
-            // 常にDepth画像（16U/32F）から帯の深度をサンプリング（点群ベースは廃止して一貫化）
+
+            // ==== 下部帯のDepthを2D（列ごと）に評価して、見た目と一致する帯ストリップを作成 ====
+            // ROI（カラー座標）→ Depth座標へスケーリング
             cv::Mat depth_mat;
             if (depth_image->encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
                 depth_mat = cv_bridge::toCvCopy(depth_image, sensor_msgs::image_encodings::TYPE_16UC1)->image;
             } else if (depth_image->encoding == sensor_msgs::image_encodings::TYPE_32FC1) {
                 depth_mat = cv_bridge::toCvCopy(depth_image, sensor_msgs::image_encodings::TYPE_32FC1)->image;
             }
-            double depth_scale = (depth_mat.type()==CV_16UC1) ? node_->depth_unit_m_16u_ : 1.0;
-            for (int v = y0; v <= y1; ++v) {
-                if (v<0 || v>=depth_mat.rows) continue;
-                for (int u = roi.x; u < roi.x + roi.width; ++u) {
-                    if (u<0 || u>=depth_mat.cols) continue;
-                    // 色/セグ領域判定が有効な場合のみフィルタ（無効なら全ピクセル採用）
-                    if (enable_region && !color_mat.empty() && !is_green(u,v)) continue;
+            const int cw = (!color_mat.empty()) ? color_mat.cols : depth_mat.cols; // 保険
+            const int ch = (!color_mat.empty()) ? color_mat.rows : depth_mat.rows;
+            const int dw = depth_mat.cols, dh = depth_mat.rows;
+            const double sx = cw > 0 ? static_cast<double>(dw) / cw : 1.0;
+            const double sy = ch > 0 ? static_cast<double>(dh) / ch : 1.0;
+            cv::Rect droi(
+                std::clamp(static_cast<int>(std::round(roi.x * sx)), 0, dw-1),
+                std::clamp(static_cast<int>(std::round(roi.y * sy)), 0, dh-1),
+                std::clamp(static_cast<int>(std::round(roi.width * sx)), 1, dw),
+                std::clamp(static_cast<int>(std::round(roi.height * sy)), 1, dh)
+            );
+            droi.width = std::min(droi.width, dw - droi.x);
+            droi.height = std::min(droi.height, dh - droi.y);
+            int y0d = droi.y + static_cast<int>(std::floor(droi.height * (1.0 - top_ratio)));
+            int y1d = droi.y + static_cast<int>(std::floor(droi.height * (1.0 - bottom_ratio)));
+            y0d = std::clamp(y0d, droi.y, droi.y + droi.height - 1);
+            y1d = std::clamp(y1d, droi.y, droi.y + droi.height - 1);
+            if (y1d < y0d) std::swap(y0d, y1d);
+            // 列ごとの最小（近距離）深度を計算
+            std::vector<float> col_min_z(droi.width, std::numeric_limits<float>::infinity());
+            const double depth_scale = (depth_mat.type()==CV_16UC1) ? node_->depth_unit_m_16u_ : 1.0;
+            for (int ux = droi.x; ux < droi.x + droi.width; ++ux) {
+                float zmin_col = std::numeric_limits<float>::infinity();
+                for (int vy = y0d; vy <= y1d; ++vy) {
                     float z = 0.0f;
                     if (depth_mat.type()==CV_16UC1) {
-                        uint16_t mm = depth_mat.at<uint16_t>(v,u);
+                        uint16_t mm = depth_mat.at<uint16_t>(vy, ux);
                         if (mm==0) continue;
                         z = static_cast<float>(mm) * static_cast<float>(depth_scale);
                     } else {
-                        float m = depth_mat.at<float>(v,u);
+                        float m = depth_mat.at<float>(vy, ux);
                         if (!std::isfinite(m) || m<=0.0f) continue;
                         z = m;
                     }
-                    band_depths.push_back(z);
+                    // オプションの色/セグ制限
+                    if (enable_region && !color_mat.empty()) {
+                        int uc = std::clamp(static_cast<int>(std::round(ux / sx)), 0, cw-1);
+                        int vc = std::clamp(static_cast<int>(std::round(vy / sy)), 0, ch-1);
+                        if (!is_green(uc, vc)) continue;
+                    }
+                    if (z < zmin_col) zmin_col = z;
                 }
+                col_min_z[ux - droi.x] = zmin_col;
             }
-            // 深度ヒストグラム生成（0.2m..2.0m、bin=64）し最短ピークを採用
-            float z0 = 0.0f;
+            // 近距離の列x*を採用
+            int best_xi = -1; float best_z = std::numeric_limits<float>::infinity();
+            for (int i = 0; i < static_cast<int>(col_min_z.size()); ++i) {
+                float z = col_min_z[i];
+                if (std::isfinite(z) && z > 0.0f && z < best_z) { best_z = z; best_xi = i; }
+            }
+            float z0 = best_z;
             int bins = 64; float zmin=0.2f, zmax=2.0f; if (node_) { try{
                 if (node_->has_parameter("hist_z_min_m")) zmin = node_->get_parameter("hist_z_min_m").get_value<double>();
                 if (node_->has_parameter("hist_z_max_m")) zmax = node_->get_parameter("hist_z_max_m").get_value<double>();
                 if (node_->has_parameter("hist_bins")) bins = node_->get_parameter("hist_bins").get_value<int>();
             }catch(...){} }
             bins = std::max(8, std::min(256, bins));
-            std::vector<int> hist(bins, 0);
-            int best_v = 0; // for strip normalization
-            if (!band_depths.empty() && zmax>zmin) {
-                float invw = static_cast<float>(bins) / (zmax - zmin);
-                for (float z : band_depths) {
-                    if (!std::isfinite(z)) continue; if (z<zmin || z>zmax) continue;
-                    int bi = static_cast<int>((z - zmin) * invw);
-                    bi = std::max(0, std::min(bins-1, bi));
-                    hist[bi]++;
-                }
-                // 最短側から最もカウントが多いピークを採用
-                int best_i = -1; best_v = -1;
-                for (int i=0;i<bins;i++){ if (hist[i]>best_v){ best_v=hist[i]; best_i=i; } }
-                if (best_i>=0) z0 = zmin + (best_i + 0.5f) * ((zmax - zmin) / bins);
-            } else {
-                // フォールバック: 全体最浅
-                z0 = std::numeric_limits<float>::max();
-                for (const auto& p : denoised_cloud->points) if (std::isfinite(p.z) && p.z>0.0f) z0 = std::min(z0, p.z);
-            }
+            // zレンジ（表示用）
+            int best_v = 1; // 正規化用ダミー
+            if (!std::isfinite(zmin) || !std::isfinite(zmax) || !(zmax>zmin)) { zmin = 0.2f; zmax = 2.0f; }
 
             // ヒストグラムストリップ画像を8px高で作成（UI用にAsparaInfoへ格納）
             try {
                 const int strip_h = 8; int strip_w = std::max(16, roi.width);
                 cv::Mat strip(strip_h, strip_w, CV_8UC1, cv::Scalar(0));
-                if (best_v>0) {
-                    // 正規化描画
-                    for (int x=0;x<strip_w;x++){
-                        float z = zmin + (static_cast<float>(x)+0.5f)*(zmax-zmin)/strip_w;
-                        int bi = static_cast<int>(((z - zmin)/(zmax - zmin)) * bins);
-                        bi = std::max(0,std::min(bins-1,bi));
-                        // 近距離＝明（反転なし）にしたい場合はそのまま。遠距離明→近距離暗にしたければ 255 - yv に変更。
-                        float v = static_cast<float>(hist[bi]) / static_cast<float>(best_v);
-                        uint8_t yv = static_cast<uint8_t>(std::round(v * 255.0f));
-                        strip.col(x).setTo(yv);
-                    }
-                    // 推定z0位置に白ライン
-                    int zx = static_cast<int>(((z0 - zmin)/(zmax - zmin)) * strip_w);
-                    if (zx>=0 && zx<strip_w) strip.col(zx).setTo(255);
+                // 明度 = 近距離ほど明（列ごとの z を使って BGR化しやすいストリップに）
+                for (int x=0; x<strip_w; ++x) {
+                    // 表示列x→Depth列ux
+                    int ux = droi.x + std::clamp(static_cast<int>(std::round(x * sx)), 0, droi.width-1);
+                    float z = col_min_z[std::clamp(ux - droi.x, 0, droi.width-1)];
+                    float bright = 0.0f;
+                    if (std::isfinite(z) && z>0.0f) bright = std::clamp((zmax - z) / (zmax - zmin), 0.0f, 1.0f);
+                    uint8_t yv = static_cast<uint8_t>(std::round(bright * 255.0f));
+                    strip.col(x).setTo(yv);
                 }
+                // 推定z0位置に白ライン（列ベース）
+                int zx = (best_xi >= 0) ? static_cast<int>(std::round((static_cast<float>(best_xi) / std::max(1, droi.width-1)) * strip_w)) : -1;
+                if (zx>=0 && zx<strip_w) strip.col(zx).setTo(255);
                 aspara_info.depth_histogram_strip = strip;
                 // z0の正規化位置（0..1）を保存（UI側の赤丸表示用）
-                if (zmax>zmin) {
-                    float zn = (z0 - zmin) / (zmax - zmin);
+                if (best_xi >= 0) {
                     aspara_info.z0_m = z0;
-                    aspara_info.z0_norm = std::clamp(zn, 0.0f, 1.0f);
-                } else {
-                    aspara_info.z0_norm = -1.0f;
-                }
+                    aspara_info.z0_x_norm = static_cast<float>(best_xi) / static_cast<float>(std::max(1, droi.width-1));
+                    aspara_info.z0_norm = aspara_info.z0_x_norm; // UIは横位置を使う
+                } else { aspara_info.z0_norm = -1.0f; aspara_info.z0_x_norm = -1.0f; }
             } catch (...) {}
 
             // 中央帯境界

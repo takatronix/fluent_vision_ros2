@@ -74,7 +74,7 @@ fv_aspara_analyzer_d405:
     root_hsv_h_max: 360.0                  # 色フィルタ実質無効化（全許容）
     root_hsv_s_min: 0.0                    # 色フィルタ実質無効化（全許容）
     root_hsv_v_min: 0.0                    # 色フィルタ実質無効化（全許容）
-    root_y_offset_ratio: 0.05              # 根本Yを矩形下端から固定する比率（5%）
+    root_y_offset_ratio: 0.10              # 根本Yを矩形下端から固定する比率（5%）
     root_lateral_radius_m: 0.20           # 横半径を4cmに（しっかり中心帯に絞る）
 
     # ===== QoS設定（入力/出力） =====

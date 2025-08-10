@@ -61,6 +61,7 @@
     
     # ===== 根本推定・抽出帯パラメータ（表示/抽出の安定化） =====
     band_alpha: 1.0                        # 中央帯無効化（点数確保）
+
     hist_band_bottom_ratio: 0.04           # 下部帯の下側比率（4%）
     hist_band_top_ratio: 0.12              # 下部帯の上側比率（12%）
     root_depth_percentile: 0.10            # z0推定のパーセンタイル（p10）
@@ -73,7 +74,7 @@
     root_hsv_h_max: 85.0                   # 緑抽出HSV上限（H）
     root_hsv_s_min: 0.25                   # 緑抽出HSV下限（S）
     root_hsv_v_min: 0.20                   # 緑抽出HSV下限（V）
-    root_y_offset_ratio: 0.05              # 根本Yを矩形下端から固定する比率（5%）
+    root_y_offset_ratio: 0.08              # 根本Yを矩形下端から固定する比率（5%）
     root_lateral_radius_m: 0.20           # 横半径を20cmに拡大（点数確保）
 
     # ===== ノイズ除去パラメータ =====
