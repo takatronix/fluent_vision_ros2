@@ -839,39 +839,53 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                     std::nth_element(ts.begin(), ts.begin()+q95i, ts.end());
                     float tmax = ts[q95i];
 
-                    // サンプリング点数と半径
+                    // サンプリング点数
                     int skel_n = 5;
                     if (node_ && node_->has_parameter("skeleton_points_count")) {
                         skel_n = std::max<int>(2, static_cast<int>(node_->get_parameter("skeleton_points_count").get_value<int>()));
                     }
-                    double R = node_ && node_->has_parameter("skeleton_radius_m") ?
-                        node_->get_parameter("skeleton_radius_m").get_value<double>() : 0.01; // 1cm
-                    double W = node_ && node_->has_parameter("skeleton_window_m") ?
-                        node_->get_parameter("skeleton_window_m").get_value<double>() : 0.03; // 軸方向±3cm
+                    // トリム率（外れ端除去）
+                    double trim_low = node_ && node_->has_parameter("skeleton_trim_low") ?
+                        node_->get_parameter("skeleton_trim_low").get_value<double>() : 0.10; // 10%
+                    double trim_high = node_ && node_->has_parameter("skeleton_trim_high") ?
+                        node_->get_parameter("skeleton_trim_high").get_value<double>() : 0.90; // 90%
+
+                    // 10-90%トリムで堅牢な端点を推定
+                    size_t qLowIdx = static_cast<size_t>(std::clamp(trim_low, 0.0, 0.49) * ts.size());
+                    size_t qHighIdx = static_cast<size_t>(std::clamp(trim_high, 0.51, 1.0) * ts.size());
+                    qLowIdx = std::min(qLowIdx, ts.size() - 1);
+                    qHighIdx = std::min(std::max(qHighIdx, qLowIdx + 1), ts.size() - 1);
+                    std::nth_element(ts.begin(), ts.begin()+qLowIdx, ts.end());
+                    float tmin_trim = ts[qLowIdx];
+                    std::nth_element(ts.begin(), ts.begin()+qHighIdx, ts.end());
+                    float tmax_trim = ts[qHighIdx];
+
+                    // 端点の3D座標
+                    Eigen::Vector3f tip3 = c + u * tmin_trim;
+                    Eigen::Vector3f root3 = c + u * tmax_trim;
+                    // 根本は推定root_position_3dに近い側に合わせる
+                    if (std::isfinite(aspara_info.root_position_3d.x) && std::isfinite(aspara_info.root_position_3d.y) && std::isfinite(aspara_info.root_position_3d.z)) {
+                        Eigen::Vector3f rootHint(aspara_info.root_position_3d.x, aspara_info.root_position_3d.y, aspara_info.root_position_3d.z);
+                        double d_tip = (tip3 - rootHint).norm();
+                        double d_root = (root3 - rootHint).norm();
+                        if (d_tip < d_root) {
+                            // ひっくり返して root3 を根本に
+                            std::swap(tip3, root3);
+                            std::swap(tmin_trim, tmax_trim);
+                        }
+                    } else {
+                        // Y最大を根本とみなす（RealSense座標系）
+                        if (tip3.y() > root3.y()) std::swap(tip3, root3), std::swap(tmin_trim, tmax_trim);
+                    }
 
                     aspara_info.skeleton_points.clear();
                     for (int i = 0; i < skel_n; ++i) {
                         float alpha = (skel_n == 1) ? 0.0f : static_cast<float>(i) / static_cast<float>(skel_n - 1);
-                        float ti = tmin + alpha * (tmax - tmin);
-                        // 近傍収集
-                        Eigen::Vector3f sum = Eigen::Vector3f::Zero();
-                        int count = 0;
-                        for (const auto& p : foreground->points) {
-                            if (!std::isfinite(p.z) || p.z <= 0.0f) continue;
-                            Eigen::Vector3f v(p.x, p.y, p.z);
-                            float t = u.dot(v - c);
-                            if (std::fabs(t - ti) > W) continue; // 軸方向窓
-                            // 垂直距離
-                            Eigen::Vector3f d = (v - c) - u * t;
-                            if (d.norm() > R) continue;
-                            sum += v; ++count;
-                        }
-                        Eigen::Vector3f pt;
-                        if (count > 0) pt = sum / static_cast<float>(count); else pt = (c + u * ti);
+                        float ti = tmax_trim * (1.0f - alpha) + tmin_trim * alpha; // 根本→先端
+                        Eigen::Vector3f pt = c + u * ti;
                         SkeletonPoint sp;
                         sp.world_point.x = pt.x(); sp.world_point.y = pt.y(); sp.world_point.z = pt.z();
                         sp.distance_from_base = alpha;
-                        // 2D投影（表示用）
                         if (camera_info) {
                             cv::Point2f uv = pointcloud_processor_->project3DTo2D(pcl::PointXYZRGB(pt.x(), pt.y(), pt.z()), *camera_info);
                             sp.image_point = uv;
