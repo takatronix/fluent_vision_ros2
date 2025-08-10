@@ -1884,11 +1884,12 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             cv::line(output_image, p0, p1, bone_color, thickness, cv::LINE_AA);
         }
         
-        // 始点と終点を強調
+        // 始点(根本)と終点(先端)を強調
         if (a.skeleton_points.size() >= 2) {
             int r = is_selected ? 6 : 4;
-            cv::circle(output_image, a.skeleton_points.front().image_point, r, cv::Scalar(0,255,255), -1);
-            cv::circle(output_image, a.skeleton_points.back().image_point,  r, cv::Scalar(0,0,255),   -1);
+            // 根本=frontを赤、先端=backを黄に変更
+            cv::circle(output_image, a.skeleton_points.front().image_point, r, cv::Scalar(0,0,255),   -1);
+            cv::circle(output_image, a.skeleton_points.back().image_point,  r, cv::Scalar(0,255,255), -1);
 
             // 根本→先端の直線も重ねて描画（シアン、細線）
             const auto& p_root = a.skeleton_points.front().image_point;
