@@ -29,6 +29,28 @@ static double computeCurveLengthFromSkeleton(
     return total;
 }
 
+// ユーティリティ: スケルトン由来の曲率比を計算
+// 定義: polyline_length / chord_length - 1 を曲率比とする（直線=0、曲がるほど増加）
+static double computeSkeletonCurvatureRatio(
+    const std::vector<SkeletonPoint>& skel)
+{
+    if (skel.size() < 3) return 0.0;
+    // ポリライン長
+    const double L_poly = computeCurveLengthFromSkeleton(skel);
+    if (!(L_poly > 0.0)) return 0.0;
+    // 弦長（始端→終端の直線距離）
+    const auto& p0 = skel.front().world_point;
+    const auto& pN = skel.back().world_point;
+    const Eigen::Vector3d v0(p0.x, p0.y, p0.z);
+    const Eigen::Vector3d vN(pN.x, pN.y, pN.z);
+    const double L_chord = (vN - v0).norm();
+    if (!(L_chord >= 0.0)) return 0.0;
+    // 数値安定化（極端に短い場合）
+    if (L_poly < 1e-6) return 0.0;
+    const double kappa = std::max(0.0, (L_poly - L_chord) / L_poly);
+    return kappa;
+}
+
 // PCA系のローバーレベル計算は FluentCloud に統合済みのため、このファイルでは保持しない
 
 }
@@ -407,10 +429,43 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             // メトリクスは denoised 基準
             auto metric_cloud = denoised_cloud;
             auto m = fluent_cloud::compute_pca_metrics(metric_cloud);
+
+            // ---- 曲がり度（曲率）推定: skeleton / pca / hybrid ----
+            // PCA由来の曲率比
+            const double curvature_pca = std::max(0.0, static_cast<double>(m.curvature_ratio));
+            // スケルトン由来の曲率比（スケルトンが未生成なら0）
+            double curvature_skel = 0.0;
+            if (!aspara_info.skeleton_points.empty()) {
+                curvature_skel = computeSkeletonCurvatureRatio(aspara_info.skeleton_points);
+            }
+            // パラメータ取得
+            std::string curvature_method = "hybrid_max";
+            double w_skel = 0.6, w_pca = 0.4;
+            try { if (node_->has_parameter("curvature_method")) curvature_method = node_->get_parameter("curvature_method").get_value<std::string>(); } catch (...) {}
+            try { if (node_->has_parameter("curvature_weight_skeleton")) w_skel = node_->get_parameter("curvature_weight_skeleton").get_value<double>(); } catch (...) {}
+            try { if (node_->has_parameter("curvature_weight_pca")) w_pca = node_->get_parameter("curvature_weight_pca").get_value<double>(); } catch (...) {}
+            // 正規化（和が0ならデフォルト）
+            if (w_skel < 0.0) w_skel = 0.0; if (w_pca < 0.0) w_pca = 0.0;
+            const double w_sum = (w_skel + w_pca) > 0.0 ? (w_skel + w_pca) : 1.0;
+            const double wn_skel = (w_skel + w_pca) > 0.0 ? (w_skel / w_sum) : 0.6;
+            const double wn_pca  = (w_skel + w_pca) > 0.0 ? (w_pca  / w_sum) : 0.4;
+
+            double curvature_combined = curvature_pca;
+            if (curvature_method == "skeleton") {
+                curvature_combined = (curvature_skel > 0.0) ? curvature_skel : curvature_pca;
+            } else if (curvature_method == "pca") {
+                curvature_combined = curvature_pca;
+            } else if (curvature_method == "hybrid_weighted") {
+                curvature_combined = wn_skel * curvature_skel + wn_pca * curvature_pca;
+            } else { // "hybrid_max"（既定）
+                curvature_combined = std::max(curvature_skel, curvature_pca);
+            }
+
             // 直線度に正規化係数（デフォルト0.03）
             double kappa_ref = 0.03;
             try { if (node_->has_parameter("straightness_kappa_ref")) kappa_ref = node_->get_parameter("straightness_kappa_ref").get_value<double>(); } catch (...) {}
-            straightness = static_cast<float>(std::clamp(1.0 - m.curvature_ratio / std::max(1e-6, kappa_ref), 0.0, 1.0));
+            straightness = static_cast<float>(std::clamp(1.0 - curvature_combined / std::max(1e-6, kappa_ref), 0.0, 1.0));
+
             // 長さ推定メソッド: auto/skeleton/pca
             std::string length_method = "auto";
             try { if (node_->has_parameter("length_method")) length_method = node_->get_parameter("length_method").get_value<std::string>(); } catch (...) {}
@@ -445,7 +500,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             try { if (node_->has_parameter("length_max_m")) length_max_m = node_->get_parameter("length_max_m").get_value<double>(); } catch (...) {}
             bool length_ok = (length >= static_cast<float>(length_min_m) && length <= static_cast<float>(length_max_m));
             aspara_info.diameter = static_cast<float>(m.diameter_m);
-            aspara_info.curvature = static_cast<float>(m.curvature_ratio);
+            aspara_info.curvature = static_cast<float>(curvature_combined);
             aspara_info.processing_times.measurement_ms = measurement_stopwatch.elapsed_ms();
         }
         

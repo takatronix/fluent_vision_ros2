@@ -14,18 +14,20 @@ if [ -f "$WS_ROOT/install/setup.bash" ]; then
   set -u
 fi
 
+"${WS_ROOT:?}/scripts/stop_fv" || true
+
 # DDS/RMW設定（複数マシン通信を有効に）
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 # ローカルホスト限定を明示的にOFF（外部と通信できるように）
 export ROS_LOCALHOST_ONLY=0
-export ROS_LOCALHOST_ONLY=0
-# Fast DDSのプロファイルで共有メモリ専用に固定すると外部通信できないため無効化
+# XMLプロファイルは使わない（全環境で同じデフォルト挙動に合わせる）
 unset FASTRTPS_DEFAULT_PROFILES_FILE
-# QoSはコード/YAMLの設定を使う（XMLの上書きを無効化）
+unset FASTDDS_DEFAULT_PROFILES_FILE
+
+# QoSはコード/YAMLの設定を使う（XMLでQoSを上書きしない）
 export RMW_FASTRTPS_USE_QOS_FROM_XML=0
 
 
-bash ./scripts/stop_fv
 bash ./scripts/start_fv415.sh
 bash ./scripts/start_fv405.sh
 

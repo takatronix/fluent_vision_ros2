@@ -1211,12 +1211,26 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         for (auto& aspara_info : snapshot_list) {
             bool is_selected = (aspara_info.id == snapshot_selected_id);
             
-            // 描画設定
-            cv::Scalar color = is_selected ? cv::Scalar(0, 255, 0) : cv::Scalar(128, 128, 128);
+            // グレード別色分け
+            auto gradeToColor = [](AsparaguGrade g) -> cv::Scalar {
+                switch (g) {
+                    case AsparaguGrade::A_GRADE: return cv::Scalar(0, 255, 0);      // 緑 (BGR)
+                    case AsparaguGrade::B_GRADE: return cv::Scalar(0, 255, 255);    // 黄
+                    case AsparaguGrade::C_GRADE: return cv::Scalar(0, 128, 255);    // オレンジ
+                    case AsparaguGrade::OUT_OF_SPEC: return cv::Scalar(0, 0, 255);  // 赤
+                    case AsparaguGrade::UNKNOWN:
+                    default: return cv::Scalar(0, 255, 0);
+                }
+            };
+            cv::Scalar grade_color = gradeToColor(aspara_info.grade);
+            // 未選択時は彩度を落とす
+            if (!is_selected) {
+                grade_color = cv::Scalar(grade_color[0] * 0.5, grade_color[1] * 0.5, grade_color[2] * 0.5);
+            }
             int thickness = is_selected ? 2 : 1;
             
-            // バウンディングボックス描画
-            cv::rectangle(output_image, aspara_info.smooth_bbox, color, thickness);
+            // バウンディングボックス描画（グレード色）
+            cv::rectangle(output_image, aspara_info.smooth_bbox, grade_color, thickness);
 
             // [可視化] ルート推定の帯スキャン位置をROI上に可視化（横線2本＋中央線、赤丸は静止表示）
             if (this->get_parameter("depth_scan_preview_enabled").as_bool()) {
@@ -1375,30 +1389,107 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 }
             }
             
-            // ラベル描画（長さ/真直度/処理時間を含む）
-            double length_cm = aspara_info.length * 100.0;
-            double straight_pct = aspara_info.straightness * 100.0;
-            double total_ms = aspara_info.processing_times.total_ms;
-            // 異常値の場合は長さを表示しない
-            std::string label;
-            if (aspara_info.length_valid) {
-                label = cv::format("ID:%d  len:%.1fcm  str:%.0f%%  time:%.1fms", aspara_info.id, length_cm, straight_pct, total_ms);
-            } else {
-                label = cv::format("ID:%d  len:--  str:%.0f%%  time:%.1fms", aspara_info.id, straight_pct, total_ms);
+            // ラベル描画（上部・簡易）
+            {
+                double length_cm = aspara_info.length * 100.0;
+                double straight_pct = aspara_info.straightness * 100.0;
+                double total_ms = aspara_info.processing_times.total_ms;
+                std::string label;
+                if (aspara_info.length_valid) {
+                    label = cv::format("ID:%d  len:%.1fcm  str:%.0f%%  time:%.1fms", aspara_info.id, length_cm, straight_pct, total_ms);
+                } else {
+                    label = cv::format("ID:%d  len:--  str:%.0f%%  time:%.1fms", aspara_info.id, straight_pct, total_ms);
+                }
+                int baseline = 0;
+                cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+                cv::Point text_pos(aspara_info.smooth_bbox.x, aspara_info.smooth_bbox.y - 5);
+                // 背景ボックス
+                cv::rectangle(output_image, 
+                    cv::Rect(aspara_info.smooth_bbox.x, text_pos.y - text_size.height - 3, 
+                             aspara_info.smooth_bbox.width, text_size.height + 6),
+                    grade_color, -1);
+                // テキスト（黒）
+                fluent::text::draw(output_image, label, cv::Point(text_pos.x + 3, text_pos.y), 
+                    cv::Scalar(0, 0, 0), 0.5, 1);
             }
-            int baseline;
-            cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
-            
-            // 背景ボックス（アスパラ矩形と同じ幅）
-            cv::Point text_pos(aspara_info.smooth_bbox.x, aspara_info.smooth_bbox.y - 5);
-            cv::rectangle(output_image, 
-                cv::Rect(aspara_info.smooth_bbox.x, text_pos.y - text_size.height - 3, 
-                        aspara_info.smooth_bbox.width, text_size.height + 6),
-                color, -1);
-            
-            // テキスト（黒文字）
-            fluent::text::draw(output_image, label, cv::Point(text_pos.x + 3, text_pos.y), 
-                cv::Scalar(0, 0, 0), 0.5, 1);
+
+            // 矩形内詳細情報（選択中のみ）
+            if (is_selected) {
+                auto gradeToLabel = [](AsparaguGrade g){
+                    switch (g) {
+                        case AsparaguGrade::A_GRADE: return "A";
+                        case AsparaguGrade::B_GRADE: return "B";
+                        case AsparaguGrade::C_GRADE: return "C";
+                        case AsparaguGrade::OUT_OF_SPEC: return "NG";
+                        default: return "-";
+                    }
+                };
+                // 計測値
+                const int raw_pts  = static_cast<int>(aspara_info.asparagus_pointcloud.width);
+                const int filt_pts = static_cast<int>(aspara_info.filtered_pointcloud.width);
+                const double len_cm = aspara_info.length * 100.0;
+                const double dia_mm = aspara_info.diameter * 1000.0;
+                const double str_pct = aspara_info.straightness * 100.0;
+                const double t_ms = aspara_info.processing_times.total_ms;
+                const int spikes = static_cast<int>(aspara_info.spike_parts.size());
+                // 距離（根本3D座標からの距離）
+                double dist_m = 0.0;
+                if (std::isfinite(aspara_info.root_position_3d.x) && std::isfinite(aspara_info.root_position_3d.y) && std::isfinite(aspara_info.root_position_3d.z)) {
+                    dist_m = std::sqrt(
+                        aspara_info.root_position_3d.x * aspara_info.root_position_3d.x +
+                        aspara_info.root_position_3d.y * aspara_info.root_position_3d.y +
+                        aspara_info.root_position_3d.z * aspara_info.root_position_3d.z);
+                }
+                // 分析状態
+                bool analyzing = (t_ms <= 0.0) && analyzer_thread_ && analyzer_thread_->isProcessing();
+                // 表示行
+                std::vector<std::string> lines;
+                lines.push_back(cv::format("ID:%d [選択中]", aspara_info.id));
+                lines.push_back(cv::format("信頼: %.0f%%", aspara_info.confidence * 100.0));
+                if (dist_m > 0.0) lines.push_back(cv::format("距離: %.2fm", dist_m));
+                if (raw_pts > 0 || filt_pts > 0) lines.push_back(cv::format("点群: %d/%d", raw_pts, filt_pts));
+                if (analyzing) {
+                    lines.push_back("分析中...");
+                } else {
+                    lines.push_back(cv::format("分析: %.1fms", t_ms));
+                }
+                if (aspara_info.length_valid && t_ms > 0.0) {
+                    lines.push_back(cv::format("長さ: %.1fcm", len_cm));
+                } else if (t_ms > 0.0) {
+                    lines.push_back("長さ: --");
+                }
+                if (t_ms > 0.0) {
+                    if (dia_mm > 0.0) lines.push_back(cv::format("太さ: %.0fmm", dia_mm));
+                    lines.push_back(cv::format("真直: %.0f%%", str_pct));
+                    lines.push_back(cv::format("グレード: %s", gradeToLabel(aspara_info.grade)));
+                }
+                if (spikes > 0) lines.push_back(cv::format("穂: %d個", spikes));
+
+                // パネル描画（矩形内左上に半透明背景）
+                const int pad = 6;
+                const int lh = 18; // 行高
+                int panel_w = 0;
+                for (const auto &ln : lines) {
+                    int base = 0; cv::Size ts = cv::getTextSize(ln, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &base);
+                    panel_w = std::max(panel_w, ts.width);
+                }
+                panel_w += pad * 2;
+                int panel_h = static_cast<int>(lines.size()) * lh + pad * 2;
+                cv::Rect bbox = aspara_info.smooth_bbox & cv::Rect(0, 0, output_image.cols, output_image.rows);
+                cv::Rect panel(bbox.x + 2, bbox.y + 2, std::min(panel_w, std::max(10, bbox.width - 4)), std::min(panel_h, std::max(10, bbox.height - 4)));
+                // 半透明黒背景
+                cv::Mat roi_img = output_image(panel);
+                cv::Mat overlay_panel; roi_img.copyTo(overlay_panel);
+                cv::rectangle(overlay_panel, cv::Rect(0,0,panel.width,panel.height), cv::Scalar(0,0,0), -1);
+                cv::addWeighted(overlay_panel, 0.45, roi_img, 0.55, 0.0, roi_img);
+                // テキスト描画（白）
+                int tx = panel.x + pad;
+                int ty = panel.y + pad + 12;
+                for (const auto &ln : lines) {
+                    fluent::text::draw(output_image, ln, cv::Point(tx, ty), cv::Scalar(255,255,255), 0.5, 1);
+                    ty += lh;
+                }
+            }
         }
 
         // === 選択アスパラのボクセルプレビュー（左隣に半透明の黒枠パネル） ===
@@ -1704,46 +1795,17 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                                     (panel_x_r + panel_w <= output_image.cols - 1);
                                     if (right_ok) {
                                         cv::Rect panel_r(panel_x_r, panel_y, panel_w, std::min(panel_h, output_image.rows - panel_y - 5));
-                                        cv::Mat roi_r = output_image(panel_r);
-                                        cv::Mat ov_r; roi_r.copyTo(ov_r);
-                                        cv::rectangle(ov_r, cv::Rect(0,0,panel_r.width,panel_r.height), cv::Scalar(0,0,0), -1);
-                                        cv::addWeighted(ov_r, 0.5, roi_r, 0.5, 0.0, roi_r);
-
-                                        // 右枠: FILTERED（filtered_pointcloud）を投影描画
+                                        // 半透明黒オーバーレイは残す（テキストは描画しない）
+                                        {
+                                            cv::Mat roi_r = output_image(panel_r);
+                                            cv::Mat ov_r; roi_r.copyTo(ov_r);
+                                            cv::rectangle(ov_r, cv::Rect(0,0,panel_r.width,panel_r.height), cv::Scalar(0,0,0), -1);
+                                            cv::addWeighted(ov_r, 0.5, roi_r, 0.5, 0.0, roi_r);
+                                        }
+                                        // 右枠: FILTERED（filtered_pointcloud）の点群のみ描画
                                         int filt_drawn = 0;
                                         if (it_sel != snapshot_list.end() && !it_sel->filtered_pointcloud.data.empty()) {
                                             drawCloudToPanel(it_sel->filtered_pointcloud, roi, panel_r, filt_drawn);
-                                        }
-                                        // 右枠ラベル（総点数）
-                                        {
-                                            int filt_total = 0;
-                                            if (it_sel != snapshot_list.end() && !it_sel->filtered_pointcloud.data.empty()) {
-                                                filt_total = static_cast<int>(it_sel->filtered_pointcloud.width * it_sel->filtered_pointcloud.height);
-                                            }
-                                            // 右パネル上部にサマリを表示
-                                            int ty = std::max(12, panel_y - 6);
-                                            // 1行目: 点群数
-                                            std::string line1 = cv::format("FILT: %d", filt_total);
-                                            fluent::text::draw(output_image, line1, cv::Point(panel_x_r+2, ty), cv::Scalar(255,255,0), 0.5, 1);
-                                            // 2行目以降: ID / 長さ / 真直度 / グレード / 時間
-                                            if (it_sel != snapshot_list.end()) {
-                                                auto gradeToLabel = [](AsparaguGrade g){
-                                                    switch (g) {
-                                                        case AsparaguGrade::A_GRADE: return "A";
-                                                        case AsparaguGrade::B_GRADE: return "B";
-                                                        case AsparaguGrade::C_GRADE: return "C";
-                                                        case AsparaguGrade::OUT_OF_SPEC: return "NG";
-                                                        default: return "?";
-                                                    }
-                                                };
-                                                double len_cm = static_cast<double>(it_sel->length) * 100.0;
-                                                double str_pct = static_cast<double>(it_sel->straightness) * 100.0;
-                                                double time_ms = it_sel->processing_times.total_ms;
-                                                std::string line2 = cv::format("ID:%d  L:%.1fcm  S:%.0f%%", it_sel->id, len_cm, str_pct);
-                                                std::string line3 = cv::format("GRADE:%s  TIME:%.1fms", gradeToLabel(it_sel->grade), time_ms);
-                                                fluent::text::draw(output_image, line2, cv::Point(panel_x_r+2, ty+16), cv::Scalar(255,255,255), 0.5, 1);
-                                                fluent::text::draw(output_image, line3, cv::Point(panel_x_r+2, ty+32), cv::Scalar(200,200,200), 0.5, 1);
-                                            }
                                         }
 
                                     }
