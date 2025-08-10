@@ -50,26 +50,31 @@
     min_confidence: 0.3                    # 最小検出信頼度（0.0-1.0）
     pointcloud_distance_min: 0.05           # 点群処理最小距離（5cm）
     pointcloud_distance_max: 1.0           # 点群処理最大距離（2m）
-    aspara_filter_distance: 0.30           # アスパラ根元からの距離窓（m）D405と統一
+    aspara_filter_distance: 0.35           # アスパラ根元からの距離窓（m）点数確保
     depth_unit_m_16u: 0.001                # 16UC1深度単位（D415は1mm/Unit）
     enable_pointcloud_processing: true     # ポイントクラウド処理を有効化（非同期処理でカクつき解決）
     detection_timeout_seconds: 1.5         # 検出がない場合の表示タイムアウト（秒）
     disable_filtered_fallback: true       # フィルタ結果が空でもフォールバックせず空点群を公開
     simple_z_back_cut: true               # z0から一定距離後ろを強制カット
-    z_back_cut_m: 0.15                    # simple_z_back_cutがtrueの場合のカット距離[m]
+    z_back_cut_m: 0.05                    # 背面カット距離（5cm）
+    filtered_points_max: 10000            # 右パネル点群の上限（0=無制限）
     
     # ===== 根本推定・抽出帯パラメータ（表示/抽出の安定化） =====
-    band_alpha: 1.0                        # 中央帯無効化（まずz窓だけ確認）
+    band_alpha: 1.0                        # 中央帯無効化（点数確保）
     hist_band_bottom_ratio: 0.04           # 下部帯の下側比率（4%）
     hist_band_top_ratio: 0.12              # 下部帯の上側比率（12%）
     root_depth_percentile: 0.10            # z0推定のパーセンタイル（p10）
     root_use_segmentation: false           # まず色/Segを無効化（安定確認後にON）
+    enable_region_recognition: false       # 色/マスクによる領域認識の使用可否（UI/抽出で利用）
+    preview_panel_enabled: true            # 左側のDepth/点群プレビューを有効化
+    depth_scan_preview_enabled: true       # ROI下部帯のDepthスキャン可視化を有効
+    mask_overlay_enabled: false            # 画面上の緑マスク背景を無効化
     root_hsv_h_min: 35.0                   # 緑抽出HSV下限（H）
     root_hsv_h_max: 85.0                   # 緑抽出HSV上限（H）
     root_hsv_s_min: 0.25                   # 緑抽出HSV下限（S）
     root_hsv_v_min: 0.20                   # 緑抽出HSV下限（V）
     root_y_offset_ratio: 0.05              # 根本Yを矩形下端から固定する比率（5%）
-    root_lateral_radius_m: 1.0            # 横半径無効化（広め）
+    root_lateral_radius_m: 0.20           # 横半径を20cmに拡大（点数確保）
 
     # ===== ノイズ除去パラメータ =====
     

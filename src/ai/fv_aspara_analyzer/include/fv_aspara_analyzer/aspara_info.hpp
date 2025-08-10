@@ -15,6 +15,8 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <vector>
+// Fluent image wrapper
+#include <fluent_lib/fluent_image/image.hpp>
 
 namespace fv_aspara_analyzer
 {
@@ -108,6 +110,17 @@ struct AsparaInfo
     
     // 骨格ポイント配列（5-10点）
     std::vector<SkeletonPoint> skeleton_points; ///< 骨格ポイント配列（頂点から根元まで）
+
+    // ルート推定用ヒストグラム表示（高さ8pxの帯画像）。幅は矩形幅に合わせて更新
+    cv::Mat depth_histogram_strip;
+    // 帯スキャンの最近距離z0（m）と、その横位置（0..1、<0で無効）。
+    float z0_m {0.0f};
+    float z0_norm { -1.0f };
+
+    // 画像スナップショット（FluentImageベース）
+    fluent_image::Image source_image;   ///< 切り出し前（元のカラー画像）
+    fluent_image::Image analysis_image; ///< 解析用（ROIなど）
+    fluent_image::Image canvas_image;   ///< 描画済み（最終）
     
     rclcpp::Time last_update_time;             ///< 最後の更新時刻
     ProcessingTimes processing_times;          ///< 処理時間記録

@@ -272,6 +272,10 @@ void FVDepthCameraNode::loadParameters()
     organized_pointcloud_decimation_ = this->declare_parameter("organized_pointcloud.decimation", 1);
     organized_pointcloud_rgb_ = this->declare_parameter("organized_pointcloud.rgb", true);
 
+    // Point cloud clipping distances (if provided in YAML under pointcloud.*)
+    min_distance_m_ = this->declare_parameter("pointcloud.min_distance", 0.1);
+    max_distance_m_ = this->declare_parameter("pointcloud.max_distance", 3.0);
+
     RCLCPP_INFO(this->get_logger(), "✅ Parameters loaded successfully");
     RCLCPP_INFO(this->get_logger(), "📺 Color topic: %s", topic_config_.color.c_str());
     RCLCPP_INFO(this->get_logger(), "📺 Depth topic: %s", topic_config_.depth.c_str());
@@ -950,6 +954,15 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
                 for (int u = 0; u < dw; u += step) {
                     uint16_t d = depth_image.at<uint16_t>(v, u);
                     float z = (d > 0) ? d * depth_scale_ : std::numeric_limits<float>::quiet_NaN();
+                    // Distance clipping (z-based)
+                    if (d == 0 || z <= min_distance_m_ || z >= max_distance_m_) {
+                        // write NaNs and continue to keep organized structure
+                        float nanv = std::numeric_limits<float>::quiet_NaN();
+                        memcpy(dst+0,&nanv,4); memcpy(dst+4,&nanv,4); memcpy(dst+8,&nanv,4);
+                        if (include_rgb) { float nanrgb = std::numeric_limits<float>::quiet_NaN(); memcpy(dst+12,&nanrgb,4); }
+                        dst += point_step;
+                        continue;
+                    }
                     float x = std::numeric_limits<float>::quiet_NaN();
                     float y = std::numeric_limits<float>::quiet_NaN();
                     if (d > 0) {
@@ -1094,8 +1107,8 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
     for (int y = 0; y < depth_intrinsics_.height; y += 2) {
         for (int x = 0; x < depth_intrinsics_.width; x += 2) {
             float depth = depth_image.at<uint16_t>(y, x) * depth_scale_;
-            
-            if (depth > 0.1f && depth < 10.0f) {
+            // Apply clipping based on configured distances
+            if (depth > min_distance_m_ && depth < max_distance_m_) {
                 float pixel[2] = {static_cast<float>(x), static_cast<float>(y)};
                 float point[3];
                 

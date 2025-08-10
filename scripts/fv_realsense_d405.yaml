@@ -54,7 +54,7 @@ fv_realsense_d405:
     pointcloud:
       # 距離フィルタリング（メートル）
       min_distance: 0.1             # 最小距離 10cm（近すぎるノイズ除去）
-      max_distance: 3.0             # 最大距離 3m（遠くのノイズ除去）
+      max_distance: 1.2             # 最大距離 1.2m（点数確保のため少し広げる）
       
       # 空間フィルタリング
       spatial_filter_enabled: true     # 空間フィルタ有効
@@ -122,7 +122,7 @@ fv_realsense_d405:
     # ===== Organized点群出力設定 =====
     organized_pointcloud:
       enabled: true
-      decimation: 2
+      decimation: 1
       rgb: true
     # ===== 初期モード =====
     # 0: 停止, 1: カラーのみ, 2: フル（カラー+深度）

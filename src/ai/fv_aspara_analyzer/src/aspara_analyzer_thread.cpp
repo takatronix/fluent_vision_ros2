@@ -1,10 +1,7 @@
 #include "fv_aspara_analyzer/aspara_analyzer_thread.hpp"
 #include "fv_aspara_analyzer/fv_aspara_analyzer_node.hpp"
 #include "fv_aspara_analyzer/aspara_pointcloud_processor.hpp"
-#include "../../../common/fluent_lib/legacy/fluent_cloud/include/fluent_cloud/io/depth_to_cloud.hpp"
-#include "../../../common/fluent_lib/legacy/fluent_cloud/include/fluent_cloud/filters/statistical_outlier_removal.hpp"
-#include "../../../common/fluent_lib/legacy/fluent_cloud/include/fluent_cloud/filters/voxel_grid.hpp"
-#include <fluent.hpp>
+#include "fluent_lib/fluent.hpp"
 #include <iostream>
 #include <chrono>
 #include <algorithm>
@@ -12,49 +9,26 @@
 namespace fv_aspara_analyzer {
 
 namespace {
-// ユーティリティ: スケルトンから曲がり度を計算
-static double computeCurvatureFromSkeleton(
-    const std::vector<SkeletonPoint>& skel,
-    double& out_arc_excess,
-    double& out_rms_norm)
+// 廃止: 個別の曲がり度計算は FluentCloud メトリクスに統合
+
+// ユーティリティ: スケルトンの曲線長を計算
+static double computeCurveLengthFromSkeleton(
+    const std::vector<SkeletonPoint>& skel)
 {
-    out_arc_excess = 0.0;
-    out_rms_norm = 0.0;
-    if (skel.size() < 3) return 0.0;
-
-    // Lchord
-    const auto& p0 = skel.front().world_point;
-    const auto& p1 = skel.back().world_point;
-    Eigen::Vector3d a(p0.x, p0.y, p0.z);
-    Eigen::Vector3d b(p1.x, p1.y, p1.z);
-    double Lchord = (b - a).norm();
-    if (Lchord <= 1e-6) return 0.0;
-
-    // Lpoly
-    double Lpoly = 0.0;
+    if (skel.size() < 2) return 0.0;
+    double total = 0.0;
     for (size_t i = 1; i < skel.size(); ++i) {
-        const auto& q0 = skel[i - 1].world_point;
-        const auto& q1 = skel[i].world_point;
-        Eigen::Vector3d v0(q0.x, q0.y, q0.z);
-        Eigen::Vector3d v1(q1.x, q1.y, q1.z);
-        Lpoly += (v1 - v0).norm();
+        const auto& a = skel[i - 1].world_point;
+        const auto& b = skel[i].world_point;
+        Eigen::Vector3d va(a.x, a.y, a.z);
+        Eigen::Vector3d vb(b.x, b.y, b.z);
+        total += (vb - va).norm();
     }
-    out_arc_excess = std::max(0.0, (Lpoly - Lchord) / Lchord);
-
-    // RMS perpendicular to chord
-    Eigen::Vector3d dir = (b - a).normalized();
-    double sum2 = 0.0; size_t n = 0;
-    for (const auto& sp : skel) {
-        Eigen::Vector3d p(sp.world_point.x, sp.world_point.y, sp.world_point.z);
-        Eigen::Vector3d d = p - a;
-        Eigen::Vector3d perp = d - dir * d.dot(dir);
-        double dist = perp.norm();
-        sum2 += dist * dist; ++n;
-    }
-    double rms = (n > 0) ? std::sqrt(sum2 / static_cast<double>(n)) : 0.0;
-    out_rms_norm = rms / Lchord;
-    return std::max(out_arc_excess, out_rms_norm);
+    return total;
 }
+
+// PCA系のローバーレベル計算は FluentCloud に統合済みのため、このファイルでは保持しない
+
 }
 
 AnalyzerThread::AnalyzerThread(FvAsparaAnalyzerNode* node_ptr)
@@ -123,10 +97,11 @@ void AnalyzerThread::workerLoop()
             processing_in_progress_ = true;
             
             try {
+                // [AT-START] 解析開始（スレッド内）
+                // 目的: 以降の処理をアスパラ1本分に対して完結に行う
                 auto analysis_start = std::chrono::steady_clock::now();
-            RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"), "Starting analysis for asparagus ID %d", aspara_copy.id);
-                
-                // アスパラの点群分析をスレッド内で直接実行（重い処理）
+                RCLCPP_DEBUG(rclcpp::get_logger("analyzer_thread"), "Starting analysis for asparagus ID %d", aspara_copy.id);
+                // 実測用の開始時刻
                 auto start_time = std::chrono::high_resolution_clock::now();
                 
                 // processAsparagu処理をここで直接実行
@@ -227,7 +202,17 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             "[POINTCLOUD] Data available: depth_encoding=%s, color_encoding=%s", 
             depth_image->encoding.c_str(), color_image->encoding.c_str());
 
-        // 可能ならregistered_points（organized cloud）からROIスライス、なければ深度→点群変換
+        // Feature switches (default off for simplicity/perf)
+        bool enable_metrics = node_ && node_->has_parameter("enable_metrics") ?
+            node_->get_parameter("enable_metrics").get_value<bool>() : true;
+        bool enable_pca_skeleton = node_ && node_->has_parameter("enable_pca_skeleton") ?
+            node_->get_parameter("enable_pca_skeleton").get_value<bool>() : false;
+        bool verbose_logging = node_ && node_->has_parameter("verbose_logging") ?
+            node_->get_parameter("verbose_logging").get_value<bool>() : false;
+
+                // [AT-ROI] ROI点群の取得
+                // 方針: organizedなregistered_pointsがあればそこからスライス（高速）
+                //       無ければ深度+カラーからDepthToCloudで生成（フォールバック）
         fluent::utils::Stopwatch filter_stopwatch;
         // まずはregistered_pointsの有無を確認
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
@@ -270,6 +255,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         }
 
         if (!sliced_from_registered) {
+            // [AT-ROI-FALLBACK] 深度→点群のフォールバック経路
             RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"),
                 "[FALLBACK] organized cloud not available. Building ROI cloud from depth image (slow path)");
             // 深度画像とカラー画像をOpenCV形式に変換し、従来ルートでROI点群を生成
@@ -339,8 +325,10 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             "[POINTCLOUD] convertAsparagusROI returned successfully");
         aspara_info.processing_times.filter_bbox_ms = filter_stopwatch.elapsed_ms();
         
+        if (verbose_logging) {
         RCLCPP_INFO(rclcpp::get_logger("analyzer_thread"), 
             "[POINTCLOUD] Generated %zu points from depth image", filtered_cloud->points.size());
+        }
         
         if (filtered_cloud->points.empty()) {
             RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), 
@@ -348,7 +336,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             return;
         }
 
-        // ノイズ除去（Fluent libのフィルタを使用）
+        // [AT-FILTER] ノイズ除去（Voxel → SOR）
         fluent::utils::Stopwatch noise_stopwatch;
         
         // ボクセルグリッドフィルタでダウンサンプリング（fluent_cloud）
@@ -409,20 +397,38 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), "Failed to build filtered_pointcloud msg for aspara %d", aspara_info.id);
         }
 
-        // アスパラガス特性を計算
-        fluent::utils::Stopwatch measurement_stopwatch;
-        auto root_position = pointcloud_processor_->estimateRootPosition(denoised_cloud);
-        float straightness = pointcloud_processor_->calculateStraightness(denoised_cloud);
-        float length = pointcloud_processor_->calculateLength(denoised_cloud);
-        aspara_info.processing_times.measurement_ms = measurement_stopwatch.elapsed_ms();
+        // [AT-METRICS] アスパラガス特性（長さ・真っ直ぐ度など）
+        float straightness = 0.0f;
+        float length = 0.0f;
+        if (enable_metrics) {
+            fluent::utils::Stopwatch measurement_stopwatch;
+            // メトリクスは denoised 基準
+            auto metric_cloud = denoised_cloud;
+            auto m = fluent_cloud::compute_pca_metrics(metric_cloud);
+            // 直線度に正規化係数（デフォルト0.03）
+            double kappa_ref = 0.03;
+            try { if (node_->has_parameter("straightness_kappa_ref")) kappa_ref = node_->get_parameter("straightness_kappa_ref").get_value<double>(); } catch (...) {}
+            straightness = static_cast<float>(std::clamp(1.0 - m.curvature_ratio / std::max(1e-6, kappa_ref), 0.0, 1.0));
+            // スケルトンが生成されていれば曲線長を優先、無ければPCA長
+            double L_skeleton = 0.0;
+            if (!aspara_info.skeleton_points.empty()) {
+                L_skeleton = computeCurveLengthFromSkeleton(aspara_info.skeleton_points);
+            }
+            length = static_cast<float>((L_skeleton > 0.0) ? L_skeleton : m.length_m);
+            aspara_info.diameter = static_cast<float>(m.diameter_m);
+            aspara_info.curvature = static_cast<float>(m.curvature_ratio);
+            aspara_info.processing_times.measurement_ms = measurement_stopwatch.elapsed_ms();
+        }
         
-        // 可視化用PCAラインを生成 + 骨格エンドポイント推定
+        // [AT-SKELETON] 可視化用 PCA ライン / 骨格生成（必要時のみ）
+        if (enable_pca_skeleton) {
         fluent::utils::Stopwatch pca_stopwatch;
         auto pca_line = pointcloud_processor_->generatePCALine(denoised_cloud);
         aspara_info.processing_times.pca_calculation_ms = pca_stopwatch.elapsed_ms();
+        }
 
         // PCA主軸に沿った直線の端点（tip/root）を推定し、骨格点列を作成
-        try {
+        if (enable_pca_skeleton) try {
             // 骨格生成には、実際にasparagus_pointcloudとして保存される点群（filtered_cloud）を使用
             // これはROI抽出後の生データで、2D投影が正しく機能している
             pcl::PointCloud<pcl::PointXYZRGB>::Ptr skeleton_cloud = filtered_cloud;
@@ -586,30 +592,40 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         }
 
         // 収穫適性を判定
-        bool is_harvestable = (length >= node_->harvest_min_length_ && 
+        bool is_harvestable = false;
+        if (enable_metrics) {
+            is_harvestable = (length >= node_->harvest_min_length_ && 
                               length <= node_->harvest_max_length_ && 
                               straightness >= node_->straightness_threshold_);
+        }
 
         // 可視化処理時間の計測
         fluent::utils::Stopwatch vis_stopwatch;
         
         // ROI深度統計ログはfallback経路で実施済み
 
-        // 右パネル用: ROI下部帯からz0推定 → |z-z0|<=±aspara_filter_distance で抽出 + 中央帯
+        // 右パネル用: ROI下部帯(高さ10%)の深度ヒストグラムから最短ピークz0を推定
         const std::string frame_id_to_use = frame_id;
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr foreground(new pcl::PointCloud<pcl::PointXYZRGB>);
-        if (!denoised_cloud->points.empty()) {
+        // フィルタ基底はROI生点群を優先（点数確保）。無い場合はdenoisedにフォールバック
+        pcl::PointCloud<pcl::PointXYZRGB>::Ptr base_cloud = (!filtered_cloud->points.empty()) ? filtered_cloud : denoised_cloud;
+        if (!base_cloud->points.empty()) {
             // パラメータ
+            // デフォルトは帯無効（距離のみ）
             double band_alpha = node_ && node_->has_parameter("band_alpha") ?
-                node_->get_parameter("band_alpha").get_value<double>() : 0.30; // 中央帯幅
+                node_->get_parameter("band_alpha").get_value<double>() : 1.00; // 1.0で帯カット無効
             double bottom_ratio = node_ && node_->has_parameter("hist_band_bottom_ratio") ?
                 node_->get_parameter("hist_band_bottom_ratio").get_value<double>() : 0.05;
             double top_ratio = node_ && node_->has_parameter("hist_band_top_ratio") ?
                 node_->get_parameter("hist_band_top_ratio").get_value<double>() : 0.10;
             double percentile = node_ && node_->has_parameter("root_depth_percentile") ?
                 node_->get_parameter("root_depth_percentile").get_value<double>() : 0.10;
+            // デフォルトは色/セグ判定オフ（距離のみ）
             bool use_seg = node_ && node_->has_parameter("root_use_segmentation") ?
-                node_->get_parameter("root_use_segmentation").get_value<bool>() : true;
+                node_->get_parameter("root_use_segmentation").get_value<bool>() : false;
+            // グローバルな領域認識のON/OFF
+            bool enable_region = node_ && node_->has_parameter("enable_region_recognition") ?
+                node_->get_parameter("enable_region_recognition").get_value<bool>() : false;
             // HSV閾値
             double hmin = 35.0, hmax = 85.0, smin = 0.25, vmin = 0.20;
             if (node_) {
@@ -620,17 +636,16 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             }
             double dist_window = node_ ? node_->aspara_filter_distance_ : 0.05; // ±距離窓
 
-            // 画像データ（カラー/マスク）
-            cv::Mat color_mat, mask_mat;
-            {
+            // 画像データ（カラー/マスク）: 簡易モードでは取得しない
+            cv::Mat color_mat, mask_mat, hsv;
+            if (use_seg && enable_region) {
                 std::lock_guard<std::mutex> lk(node_->image_data_mutex_);
                 if (node_->latest_color_image_) {
                     color_mat = cv_bridge::toCvCopy(node_->latest_color_image_, sensor_msgs::image_encodings::BGR8)->image;
+                    cv::cvtColor(color_mat, hsv, cv::COLOR_BGR2HSV);
                 }
                 if (!node_->latest_mask_.empty()) mask_mat = node_->latest_mask_.clone();
             }
-            cv::Mat hsv;
-            if (!color_mat.empty()) cv::cvtColor(color_mat, hsv, cv::COLOR_BGR2HSV);
 
             const cv::Rect& roi = aspara_info.bounding_box_2d;
             int y0 = roi.y + static_cast<int>(std::floor(roi.height * (1.0 - top_ratio)));
@@ -639,19 +654,22 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             y1 = std::clamp(y1, roi.y, roi.y + roi.height - 1);
             if (y1 < y0) std::swap(y0, y1);
 
-            // 下部帯の有効depth収集（seg/緑優先）
+            // 下部帯の有効depth収集（距離[m]ベクトル）
             std::vector<float> band_depths;
             band_depths.reserve((y1 - y0 + 1) * roi.width);
             auto is_green = [&](int u, int v) -> bool {
-                if (use_seg && !mask_mat.empty()) {
-                    if (mask_mat.size()!=color_mat.size()) {
-                        // サイズ差は最近傍で参照
+                // 仕様: root_use_segmentation=false の場合はHSVも含め完全に色判定をオフ
+                if (!use_seg) return true;
+                // セグメンテーションマスクがあればそれを使用
+                if (!mask_mat.empty()) {
+                    if (!color_mat.empty() && mask_mat.size()!=color_mat.size()) {
                         int um = std::clamp(static_cast<int>(std::round(u * (mask_mat.cols / static_cast<double>(color_mat.cols)))), 0, mask_mat.cols-1);
                         int vm = std::clamp(static_cast<int>(std::round(v * (mask_mat.rows / static_cast<double>(color_mat.rows)))), 0, mask_mat.rows-1);
                         return mask_mat.at<uint8_t>(vm, um) > 127;
                     }
                     return mask_mat.at<uint8_t>(v, u) > 127;
                 }
+                // マスクがない場合のみHSVを使う（use_seg=true 前提）
                 if (hsv.empty()) return true;
                 cv::Vec3b px = hsv.at<cv::Vec3b>(v, u);
                 double H = (px[0] * 2.0);
@@ -659,8 +677,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 double V = px[2] / 255.0;
                 return (H>=hmin && H<=hmax && S>=smin && V>=vmin);
             };
-
-            // depth画像（16U/32F）から帯の深度をサンプリング（カラーに整列前提）
+            // 常にDepth画像（16U/32F）から帯の深度をサンプリング（点群ベースは廃止して一貫化）
             cv::Mat depth_mat;
             if (depth_image->encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
                 depth_mat = cv_bridge::toCvCopy(depth_image, sensor_msgs::image_encodings::TYPE_16UC1)->image;
@@ -672,7 +689,8 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 if (v<0 || v>=depth_mat.rows) continue;
                 for (int u = roi.x; u < roi.x + roi.width; ++u) {
                     if (u<0 || u>=depth_mat.cols) continue;
-                    if (!color_mat.empty() && !is_green(u,v)) continue;
+                    // 色/セグ領域判定が有効な場合のみフィルタ（無効なら全ピクセル採用）
+                    if (enable_region && !color_mat.empty() && !is_green(u,v)) continue;
                     float z = 0.0f;
                     if (depth_mat.type()==CV_16UC1) {
                         uint16_t mm = depth_mat.at<uint16_t>(v,u);
@@ -686,15 +704,63 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                     band_depths.push_back(z);
                 }
             }
+            // 深度ヒストグラム生成（0.2m..2.0m、bin=64）し最短ピークを採用
             float z0 = 0.0f;
-            if (!band_depths.empty()) {
-                std::nth_element(band_depths.begin(), band_depths.begin() + static_cast<long>(percentile * (band_depths.size()-1)), band_depths.end());
-                z0 = band_depths[static_cast<long>(percentile * (band_depths.size()-1))];
+            int bins = 64; float zmin=0.2f, zmax=2.0f; if (node_) { try{
+                if (node_->has_parameter("hist_z_min_m")) zmin = node_->get_parameter("hist_z_min_m").get_value<double>();
+                if (node_->has_parameter("hist_z_max_m")) zmax = node_->get_parameter("hist_z_max_m").get_value<double>();
+                if (node_->has_parameter("hist_bins")) bins = node_->get_parameter("hist_bins").get_value<int>();
+            }catch(...){} }
+            bins = std::max(8, std::min(256, bins));
+            std::vector<int> hist(bins, 0);
+            int best_v = 0; // for strip normalization
+            if (!band_depths.empty() && zmax>zmin) {
+                float invw = static_cast<float>(bins) / (zmax - zmin);
+                for (float z : band_depths) {
+                    if (!std::isfinite(z)) continue; if (z<zmin || z>zmax) continue;
+                    int bi = static_cast<int>((z - zmin) * invw);
+                    bi = std::max(0, std::min(bins-1, bi));
+                    hist[bi]++;
+                }
+                // 最短側から最もカウントが多いピークを採用
+                int best_i = -1; best_v = -1;
+                for (int i=0;i<bins;i++){ if (hist[i]>best_v){ best_v=hist[i]; best_i=i; } }
+                if (best_i>=0) z0 = zmin + (best_i + 0.5f) * ((zmax - zmin) / bins);
             } else {
                 // フォールバック: 全体最浅
                 z0 = std::numeric_limits<float>::max();
                 for (const auto& p : denoised_cloud->points) if (std::isfinite(p.z) && p.z>0.0f) z0 = std::min(z0, p.z);
             }
+
+            // ヒストグラムストリップ画像を8px高で作成（UI用にAsparaInfoへ格納）
+            try {
+                const int strip_h = 8; int strip_w = std::max(16, roi.width);
+                cv::Mat strip(strip_h, strip_w, CV_8UC1, cv::Scalar(0));
+                if (best_v>0) {
+                    // 正規化描画
+                    for (int x=0;x<strip_w;x++){
+                        float z = zmin + (static_cast<float>(x)+0.5f)*(zmax-zmin)/strip_w;
+                        int bi = static_cast<int>(((z - zmin)/(zmax - zmin)) * bins);
+                        bi = std::max(0,std::min(bins-1,bi));
+                        // 近距離＝明（反転なし）にしたい場合はそのまま。遠距離明→近距離暗にしたければ 255 - yv に変更。
+                        float v = static_cast<float>(hist[bi]) / static_cast<float>(best_v);
+                        uint8_t yv = static_cast<uint8_t>(std::round(v * 255.0f));
+                        strip.col(x).setTo(yv);
+                    }
+                    // 推定z0位置に白ライン
+                    int zx = static_cast<int>(((z0 - zmin)/(zmax - zmin)) * strip_w);
+                    if (zx>=0 && zx<strip_w) strip.col(zx).setTo(255);
+                }
+                aspara_info.depth_histogram_strip = strip;
+                // z0の正規化位置（0..1）を保存（UI側の赤丸表示用）
+                if (zmax>zmin) {
+                    float zn = (z0 - zmin) / (zmax - zmin);
+                    aspara_info.z0_m = z0;
+                    aspara_info.z0_norm = std::clamp(zn, 0.0f, 1.0f);
+                } else {
+                    aspara_info.z0_norm = -1.0f;
+                }
+            } catch (...) {}
 
             // 中央帯境界
             int band_half = static_cast<int>(std::round(roi.width * band_alpha * 0.5));
@@ -704,14 +770,15 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
 
             // z0±dist_window かつ 中央帯 かつ セグメント/緑画素 に限定
             // さらに根本X周りの横方向半径で制限（背景面の混入抑制）
+            // デフォルトは横半径制限オフ
             double lateral_radius_m = node_ && node_->has_parameter("root_lateral_radius_m") ?
-                node_->get_parameter("root_lateral_radius_m").get_value<double>() : 0.02; // 2cm
+                node_->get_parameter("root_lateral_radius_m").get_value<double>() : 0.0;
             // シンプル背面カット（z0+cut以降を除去）
             bool simple_cut = node_ && node_->has_parameter("simple_z_back_cut") ?
                 node_->get_parameter("simple_z_back_cut").get_value<bool>() : true;
             double z_back = node_ && node_->has_parameter("z_back_cut_m") ?
                 node_->get_parameter("z_back_cut_m").get_value<double>() : 0.15;
-            for (const auto& p : denoised_cloud->points) {
+            for (const auto& p : base_cloud->points) {
                 if (!std::isfinite(p.z) || p.z <= 0.0f) continue;
                 if (simple_cut) {
                     if ((p.z - z0) > z_back) continue; // 背面カットのみ
@@ -725,7 +792,10 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 cv::Point2f uv = pointcloud_processor_->project3DTo2D(p, *camera_info);
                 if (!std::isfinite(uv.x) || !std::isfinite(uv.y)) continue;
                 if (uv.x < roi.x || uv.x >= roi.x + roi.width || uv.y < roi.y || uv.y >= roi.y + roi.height) continue;
-                if (uv.x < band_left || uv.x > band_right) continue;
+                // 中央帯カットは band_alpha < 0.99 のときだけ有効
+                if (band_alpha < 0.99) {
+                    if (uv.x < band_left || uv.x > band_right) continue;
+                }
                 if (!color_mat.empty()) {
                     int uu = static_cast<int>(std::round(uv.x));
                     int vv = static_cast<int>(std::round(uv.y));
@@ -739,30 +809,82 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             foreground->height = 1;
             foreground->is_dense = false;
 
-            // 根本3D推定（xは帯の横ピーク、yは下辺、z=z0）
-            // 横ヒストグラム（緑/seg限定）
-            int bins = std::max(1, roi.width / 4);
-            std::vector<int> hist(bins, 0);
-            for (int v = y0; v <= y1; ++v) {
-                for (int u = roi.x; u < roi.x + roi.width; ++u) {
-                    if (!color_mat.empty() && !is_green(u,v)) continue;
-                    int b = std::clamp((u - roi.x) * bins / std::max(1, roi.width), 0, bins-1);
-                    hist[b]++;
+            // 本当の根本/先端＋中間（PCA主軸で等間隔にサンプリングして局所重心を取る）
+            if (!foreground->points.empty()) {
+                // PCA
+                Eigen::Vector4f mean4; pcl::compute3DCentroid(*foreground, mean4);
+                Eigen::Matrix3f cov; pcl::computeCovarianceMatrixNormalized(*foreground, Eigen::Vector4f(mean4[0],mean4[1],mean4[2],1.0f), cov);
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+                Eigen::Vector3f u = es.eigenvectors().col(2).normalized(); // 最大固有値の固有ベクトル
+                Eigen::Vector3f c(mean4[0], mean4[1], mean4[2]);
+
+                // t分布（外れ値5%トリム）
+                std::vector<float> ts; ts.reserve(foreground->points.size());
+                for (const auto& p : foreground->points) {
+                    if (!std::isfinite(p.z) || p.z <= 0.0f) continue;
+                    Eigen::Vector3f v(p.x, p.y, p.z);
+                    ts.push_back(u.dot(v - c));
                 }
-            }
-            int best_b = std::distance(hist.begin(), std::max_element(hist.begin(), hist.end()));
-            int root_u = roi.x + (best_b * roi.width) / bins + (roi.width / bins)/2;
-            // Yは矩形の最下端から一定割合上を固定（深度ノイズで揺れないように）
-            double y_offset_ratio = node_ && node_->has_parameter("root_y_offset_ratio") ?
-                node_->get_parameter("root_y_offset_ratio").get_value<double>() : 0.05;
-            int root_v = roi.y + roi.height - 1 - static_cast<int>(std::round(roi.height * y_offset_ratio));
-            // 3D backproject
-            if (camera_info) {
-                double fx = camera_info->k[0], fy = camera_info->k[4];
-                double cx = camera_info->k[2], cy = camera_info->k[5];
-                aspara_info.root_position_3d.x = (static_cast<double>(root_u) - cx) * z0 / fx;
-                aspara_info.root_position_3d.y = (static_cast<double>(root_v) - cy) * z0 / fy;
-                aspara_info.root_position_3d.z = z0;
+                if (!ts.empty()) {
+                    size_t q05i = static_cast<size_t>(ts.size() * 0.05f);
+                    size_t q95i = static_cast<size_t>(ts.size() * 0.95f);
+                    std::nth_element(ts.begin(), ts.begin()+q05i, ts.end());
+                    float tmin = ts[q05i];
+                    std::nth_element(ts.begin(), ts.begin()+q95i, ts.end());
+                    float tmax = ts[q95i];
+
+                    // サンプリング点数と半径
+                    int skel_n = 5;
+                    if (node_ && node_->has_parameter("skeleton_points_count")) {
+                        skel_n = std::max<int>(2, static_cast<int>(node_->get_parameter("skeleton_points_count").get_value<int>()));
+                    }
+                    double R = node_ && node_->has_parameter("skeleton_radius_m") ?
+                        node_->get_parameter("skeleton_radius_m").get_value<double>() : 0.01; // 1cm
+                    double W = node_ && node_->has_parameter("skeleton_window_m") ?
+                        node_->get_parameter("skeleton_window_m").get_value<double>() : 0.03; // 軸方向±3cm
+
+                    aspara_info.skeleton_points.clear();
+                    for (int i = 0; i < skel_n; ++i) {
+                        float alpha = (skel_n == 1) ? 0.0f : static_cast<float>(i) / static_cast<float>(skel_n - 1);
+                        float ti = tmin + alpha * (tmax - tmin);
+                        // 近傍収集
+                        Eigen::Vector3f sum = Eigen::Vector3f::Zero();
+                        int count = 0;
+                        for (const auto& p : foreground->points) {
+                            if (!std::isfinite(p.z) || p.z <= 0.0f) continue;
+                            Eigen::Vector3f v(p.x, p.y, p.z);
+                            float t = u.dot(v - c);
+                            if (std::fabs(t - ti) > W) continue; // 軸方向窓
+                            // 垂直距離
+                            Eigen::Vector3f d = (v - c) - u * t;
+                            if (d.norm() > R) continue;
+                            sum += v; ++count;
+                        }
+                        Eigen::Vector3f pt;
+                        if (count > 0) pt = sum / static_cast<float>(count); else pt = (c + u * ti);
+                        SkeletonPoint sp;
+                        sp.world_point.x = pt.x(); sp.world_point.y = pt.y(); sp.world_point.z = pt.z();
+                        sp.distance_from_base = alpha;
+                        // 2D投影（表示用）
+                        if (camera_info) {
+                            cv::Point2f uv = pointcloud_processor_->project3DTo2D(pcl::PointXYZRGB(pt.x(), pt.y(), pt.z()), *camera_info);
+                            sp.image_point = uv;
+                        }
+                        aspara_info.skeleton_points.push_back(sp);
+                    }
+
+                    // 根本=最下端（yが最大）を採用
+                    Eigen::Vector3f root3;
+                    {
+                        const auto& first = aspara_info.skeleton_points.front().world_point;
+                        const auto& last  = aspara_info.skeleton_points.back().world_point;
+                        if (last.y > first.y) { root3 = Eigen::Vector3f(last.x, last.y, last.z); }
+                        else { root3 = Eigen::Vector3f(first.x, first.y, first.z); }
+                    }
+                    aspara_info.root_position_3d.x = root3.x();
+                    aspara_info.root_position_3d.y = root3.y();
+                    aspara_info.root_position_3d.z = root3.z();
+                }
             }
         }
         // 右用点群をパブリッシュ（空なら従来のdenoised）
@@ -774,6 +896,25 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         } catch (...) {}
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr to_publish =
             (foreground->points.empty() && !disable_fb) ? denoised_cloud : foreground;
+        // 上限点数（単純サブサンプリング）。デフォルト0=無制限
+        size_t max_points = 0;
+        try {
+            if (node_->has_parameter("filtered_points_max")) {
+                int v = node_->get_parameter("filtered_points_max").get_value<int>();
+                if (v > 0) max_points = static_cast<size_t>(v);
+            }
+        } catch (...) {}
+        if (max_points > 0 && to_publish->points.size() > max_points) {
+            size_t stride = (to_publish->points.size() + max_points - 1) / max_points;
+            pcl::PointCloud<pcl::PointXYZRGB>::Ptr limited(new pcl::PointCloud<pcl::PointXYZRGB>);
+            limited->points.reserve(max_points);
+            for (size_t i = 0; i < to_publish->points.size(); i += stride) {
+                limited->points.push_back(to_publish->points[i]);
+            }
+            limited->width = limited->points.size();
+            limited->height = 1; limited->is_dense = false;
+            to_publish = limited;
+        }
         pointcloud_processor_->publishFilteredPointCloud(
             to_publish,
             frame_id_to_use, aspara_info.id, depth_image->header.stamp);
@@ -862,12 +1003,14 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         
         // TFの代わりにMarkerで可視化
         // PCA主軸方向をMarker姿勢に反映
-        geometry_msgs::msg::Vector3 axis_dir_msg;
+        geometry_msgs::msg::Vector3 axis_dir_msg; axis_dir_msg.x = 0; axis_dir_msg.y = 0; axis_dir_msg.z = 1;
+        if (enable_pca_skeleton) {
         try {
             pcl::PCA<pcl::PointXYZRGB> pca_axis; pca_axis.setInputCloud(denoised_cloud);
             Eigen::Vector3f axis = pca_axis.getEigenVectors().col(0).normalized();
             axis_dir_msg.x = axis.x(); axis_dir_msg.y = axis.y(); axis_dir_msg.z = axis.z();
-        } catch (...) { axis_dir_msg.x = 0; axis_dir_msg.y = 0; axis_dir_msg.z = 1; }
+            } catch (...) {}
+        }
 
         // 画像上の赤丸と一致させるため、帯ベース推定の根本座標を使用
         pointcloud_processor_->publishAsparaMarker(
@@ -875,16 +1018,42 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         
         // アスパラ情報を更新
         // 曲がり度: スケルトン中心線ベース（既定）/ PCA比 などを組合せ
-        double arc_excess = 0.0, rms_norm = 0.0;
-        double curvature_skel = computeCurvatureFromSkeleton(aspara_info.skeleton_points, arc_excess, rms_norm); // 0..大
-        // PCA直線性を補助に（1.0=直線）。曲がり度へ変換
-        double curvature_pca = 1.0 - static_cast<double>(straightness);
-        // ハイブリッド: 最大値（安全側）。将来YAMLで切替予定
-        double curvature_hybrid = std::max(curvature_skel, curvature_pca);
-
-        aspara_info.length = length;
-        aspara_info.straightness = static_cast<float>(1.0 - curvature_hybrid);
-        aspara_info.is_harvestable = is_harvestable;
+        if (enable_metrics) {
+            aspara_info.length = length;             // m
+            aspara_info.straightness = straightness; // 0..1
+            aspara_info.is_harvestable = is_harvestable;
+            // グレード判定
+            double len_a = 0.23, len_b = 0.20, len_ng = 0.18;    // [m]
+            double st_a = 0.70, st_b = 0.60;                     // [-]
+            double dia_a_min = 0.008, dia_a_max = 0.014;         // [m]
+            double dia_b_min = 0.007, dia_b_max = 0.016;         // [m]
+            try {
+                if (node_->has_parameter("grade_length_a_min_m")) len_a = node_->get_parameter("grade_length_a_min_m").get_value<double>();
+                if (node_->has_parameter("grade_length_b_min_m")) len_b = node_->get_parameter("grade_length_b_min_m").get_value<double>();
+                if (node_->has_parameter("grade_length_ng_min_m")) len_ng = node_->get_parameter("grade_length_ng_min_m").get_value<double>();
+                if (node_->has_parameter("grade_straightness_a_min")) st_a = node_->get_parameter("grade_straightness_a_min").get_value<double>();
+                if (node_->has_parameter("grade_straightness_b_min")) st_b = node_->get_parameter("grade_straightness_b_min").get_value<double>();
+                if (node_->has_parameter("grade_diameter_a_min_m")) dia_a_min = node_->get_parameter("grade_diameter_a_min_m").get_value<double>();
+                if (node_->has_parameter("grade_diameter_a_max_m")) dia_a_max = node_->get_parameter("grade_diameter_a_max_m").get_value<double>();
+                if (node_->has_parameter("grade_diameter_b_min_m")) dia_b_min = node_->get_parameter("grade_diameter_b_min_m").get_value<double>();
+                if (node_->has_parameter("grade_diameter_b_max_m")) dia_b_max = node_->get_parameter("grade_diameter_b_max_m").get_value<double>();
+            } catch (...) {}
+            auto &info = aspara_info;
+            // NG先判定
+            if (info.length < len_ng || info.diameter < 0.006 || info.diameter > 0.018) {
+                info.grade = AsparaguGrade::OUT_OF_SPEC;
+            } else if (info.length >= len_a && info.straightness >= st_a && info.diameter >= dia_a_min && info.diameter <= dia_a_max) {
+                info.grade = AsparaguGrade::A_GRADE;
+            } else if (info.length >= len_b && info.straightness >= st_b && info.diameter >= dia_b_min && info.diameter <= dia_b_max) {
+                info.grade = AsparaguGrade::B_GRADE;
+            } else {
+                info.grade = AsparaguGrade::C_GRADE;
+            }
+        } else {
+            aspara_info.length = 0.0f;
+            aspara_info.straightness = 0.0f;
+            aspara_info.is_harvestable = false;
+        }
         // root_position_3d は帯ベース推定で既に設定済み（上書きしない）
         
         // 全体処理時間を記録
@@ -945,6 +1114,8 @@ void AnalyzerThread::updateAnalysisResult(const AsparaInfo& aspara_info, long pr
         it->root_position_3d = aspara_info.root_position_3d;
         it->filtered_pointcloud = aspara_info.filtered_pointcloud;
         it->skeleton_points = aspara_info.skeleton_points;  // 骨格ポイントも更新
+        // ヒストグラム帯も転送
+        it->depth_histogram_strip = aspara_info.depth_histogram_strip;
         
         std::cout << "Aspara ID " << aspara_info.id << " analysis updated: "
                   << "Length=" << aspara_info.length << "m, "

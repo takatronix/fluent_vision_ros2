@@ -21,6 +21,7 @@
 #include "fluent_lib/ros/timer.hpp"
 #include "fluent_lib/ros/params.hpp"
 #include "fluent_lib/ros/param_binder.hpp"
+#include "fluent_lib/ros/param_dict.hpp"
 #include "fluent_lib/ros/pubsub.hpp"
 #include "fluent_lib/ros/log.hpp"
 #include "fluent_lib/ros/qos.hpp"
@@ -33,6 +34,7 @@
 // UI
 #include "fluent_lib/ui/anim.hpp"
 #include "fluent_lib/ui/renderer.hpp"
+#include "fluent_lib/ui/panel.hpp"
 // Node
 #include "fluent_lib/ros/fluent_node.hpp"
 // Image

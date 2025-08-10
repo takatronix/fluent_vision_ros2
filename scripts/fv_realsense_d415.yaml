@@ -122,7 +122,7 @@ fv_realsense_d415:
     # ===== Organized点群出力設定 =====
     organized_pointcloud:
       enabled: true
-      decimation: 2
+      decimation: 1
       rgb: true
     
     # ===== 初期モード =====

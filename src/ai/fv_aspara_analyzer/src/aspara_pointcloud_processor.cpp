@@ -1,6 +1,6 @@
 #include "fv_aspara_analyzer/aspara_pointcloud_processor.hpp"
 #include "fv_aspara_analyzer/fv_aspara_analyzer_node.hpp"
-#include <fluent.hpp>
+#include "fluent_lib/fluent.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -9,25 +9,25 @@ namespace fv_aspara_analyzer {
 AsparaPointcloudProcessor::AsparaPointcloudProcessor(FvAsparaAnalyzerNode* node_ptr)
     : node_(node_ptr)
 {
-    // パブリッシャー初期化
-    // YAMLの output_filtered_pointcloud_topic を使用（未設定時は従来名）
-    std::string filtered_topic = "output_filtered_pointcloud";
-    try {
-        if (node_->has_parameter("output_filtered_pointcloud_topic")) {
-            filtered_topic = node_->get_parameter("output_filtered_pointcloud_topic").as_string();
-        }
-    } catch (...) {}
-    filtered_pointcloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-        filtered_topic, 10);
-    annotated_image_pub_ = node_->create_publisher<sensor_msgs::msg::Image>(
-        "output_annotated_image", 10);
-    // マーカートピックはパラメータ化
-    std::string marker_topic = node_->declare_parameter<std::string>(
-        "output_marker_topic", "aspara_markers");
-    markers_pub_ = node_->create_publisher<visualization_msgs::msg::MarkerArray>(
-        marker_topic, 10);
+    // パブリッシャー初期化（shared_from_this()を使わず、直接パラメータを読む）
+    auto get_str = [&](const char* name, const char* defv){
+        try { if (node_->has_parameter(name)) {
+            auto v = node_->get_parameter(name).get_value<std::string>();
+            if (!v.empty()) return v; }
+        } catch (...) {}
+        return std::string(defv);
+    };
+    std::string filtered_topic  = get_str("output_filtered_pointcloud_topic", "output_filtered_pointcloud");
+    std::string annotated_topic = get_str("output_annotated_image_topic",   "output_annotated_image");
+    std::string marker_topic    = get_str("output_marker_topic",            "aspara_markers");
+
+    filtered_pointcloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(filtered_topic, 10);
+    annotated_image_pub_     = node_->create_publisher<sensor_msgs::msg::Image>(annotated_topic, 10);
+    markers_pub_             = node_->create_publisher<visualization_msgs::msg::MarkerArray>(marker_topic, 10);
     // 表示寿命をパラメータ化
-    marker_lifetime_sec_ = node_->declare_parameter<double>("marker_lifetime_sec", 0.3);
+    try { if (node_->has_parameter("marker_lifetime_sec"))
+        marker_lifetime_sec_ = node_->get_parameter("marker_lifetime_sec").get_value<double>();
+    } catch (...) { marker_lifetime_sec_ = 0.3; }
     
     // TFブロードキャスター初期化
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(node_);
@@ -43,6 +43,7 @@ AsparaPointcloudProcessor::AsparaPointcloudProcessor(FvAsparaAnalyzerNode* node_
                 pointcloud_distance_min_, pointcloud_distance_max_, voxel_leaf_size_);
 }
 
+// 深度+カラー→ROI点群へ変換
 pcl::PointCloud<pcl::PointXYZRGB>::Ptr AsparaPointcloudProcessor::extractPointCloudFromDepth(
     const cv::Rect& bbox,
     const sensor_msgs::msg::Image::SharedPtr& depth_image,
@@ -55,109 +56,30 @@ pcl::PointCloud<pcl::PointXYZRGB>::Ptr AsparaPointcloudProcessor::extractPointCl
         return cloud;
     }
     
-    // 深度画像とカラー画像をOpenCV形式に変換
-    cv::Mat depth_mat;
-    cv::Mat color_mat;
-    
-    try {
-        // 深度画像の変換
-        cv_bridge::CvImagePtr depth_ptr;
-        if (depth_image->encoding == sensor_msgs::image_encodings::TYPE_16UC1) {
-            depth_ptr = cv_bridge::toCvCopy(depth_image, sensor_msgs::image_encodings::TYPE_16UC1);
-            depth_mat = depth_ptr->image;
-        } else if (depth_image->encoding == sensor_msgs::image_encodings::TYPE_32FC1) {
-            depth_ptr = cv_bridge::toCvCopy(depth_image, sensor_msgs::image_encodings::TYPE_32FC1);
-            depth_ptr->image.convertTo(depth_mat, CV_16UC1, 1000.0); // メートルをミリメートルに変換
-        } else {
-            RCLCPP_WARN(node_->get_logger(), "Unsupported depth encoding: %s", depth_image->encoding.c_str());
-            return cloud;
-        }
-        
-        // カラー画像の変換
-        cv_bridge::CvImagePtr color_ptr = cv_bridge::toCvCopy(color_image, sensor_msgs::image_encodings::BGR8);
-        color_mat = color_ptr->image;
-        
-    } catch (cv_bridge::Exception& e) {
-        RCLCPP_ERROR(node_->get_logger(), "CV bridge exception in extractPointCloudFromDepth: %s", e.what());
-        return cloud;
-    }
-    
-    // 画像サイズの一致確認
-    if (depth_mat.rows != color_mat.rows || depth_mat.cols != color_mat.cols) {
-        RCLCPP_WARN(node_->get_logger(), 
-                    "Depth and color image size mismatch: depth(%dx%d) vs color(%dx%d)",
-                    depth_mat.cols, depth_mat.rows, color_mat.cols, color_mat.rows);
-        return cloud;
-    }
+    // FluentCloud IOで深度→点群（ROI）を一括生成（自動変換・色付き）
+    const float depth_unit = static_cast<float>(node_->depth_unit_m_16u_);
     
     // カメラパラメータの取得と有効性チェック
     double fx = camera_info->k[0];
     double fy = camera_info->k[4];
-    double cx = camera_info->k[2];
-    double cy = camera_info->k[5];
+    // cx,cy はここでは未使用
     
-    // 0除算の回避
-    if (fx <= 0.0 || fy <= 0.0) {
-        RCLCPP_ERROR(node_->get_logger(), "Invalid camera parameters: fx=%.3f, fy=%.3f", fx, fy);
-        return cloud;
-    }
+    // 0除算の回避（DepthToCloudではfx,fyは使用しないが早期検証）
+    if (fx <= 0.0 || fy <= 0.0) { RCLCPP_ERROR(node_->get_logger(), "Invalid camera parameters: fx=%.3f, fy=%.3f", fx, fy); return cloud; }
     
-    // バウンディングボックスの有効性確認と範囲クリップ
+    // バウンディングボックスの有効性確認
     if (bbox.width <= 0 || bbox.height <= 0) {
         RCLCPP_WARN(node_->get_logger(), "Invalid bounding box size: %dx%d", bbox.width, bbox.height);
         return cloud;
     }
     
-    int x_start = std::max(0, bbox.x);
-    int y_start = std::max(0, bbox.y);
-    int x_end = std::min(depth_mat.cols, bbox.x + bbox.width);
-    int y_end = std::min(depth_mat.rows, bbox.y + bbox.height);
+    // ROIスライスしてDepthToCloudで生成（自動32F/BGR8変換・サイズ補正内蔵）
+    cv::Rect bbox_depth = bbox & cv::Rect(0, 0, static_cast<int>(depth_image->width), static_cast<int>(depth_image->height));
+    if (bbox_depth.area() <= 0) return cloud;
+    cloud = fluent_cloud::io::DepthToCloud::convertAsparagusROI(*depth_image, *color_image, bbox_depth, *camera_info, depth_unit);
     
-    // クリップ後のサイズ確認
-    if (x_start >= x_end || y_start >= y_end) {
-        RCLCPP_WARN(node_->get_logger(), 
-                    "Bounding box outside image bounds: bbox(%d,%d,%d,%d), image(%dx%d)",
-                    bbox.x, bbox.y, bbox.width, bbox.height, depth_mat.cols, depth_mat.rows);
-        return cloud;
-    }
-    
-    // バウンディングボックス内のピクセルのみを処理
-    for (int v = y_start; v < y_end; v++) {
-        for (int u = x_start; u < x_end; u++) {
-            // 深度値を取得（単位：mm）
-            uint16_t depth_mm = depth_mat.at<uint16_t>(v, u);
-            
-            // 無効な深度値をスキップ
-            if (depth_mm == 0) continue;
-            
-            // メートルに変換
-            float depth_m = depth_mm / 1000.0f;
-            
-            // 距離フィルタリング
-            if (depth_m < pointcloud_distance_min_ || depth_m > pointcloud_distance_max_) {
-                continue;
-            }
-            
-            // 3D座標を計算（カメラ座標系）
-            pcl::PointXYZRGB point;
-            point.z = depth_m;
-            point.x = (u - cx) * depth_m / fx;
-            point.y = (v - cy) * depth_m / fy;
-            
-            // カラー情報を追加
-            cv::Vec3b color = color_mat.at<cv::Vec3b>(v, u);
-            point.b = color[0];
-            point.g = color[1];
-            point.r = color[2];
-            
-            cloud->points.push_back(point);
-        }
-    }
-    
-    // 点群のメタデータを設定
-    cloud->width = cloud->points.size();
-    cloud->height = 1;
-    cloud->is_dense = false;
+    // メタデータ
+    if (cloud) { cloud->width = cloud->points.size(); cloud->height = 1; cloud->is_dense = false; }
     
     RCLCPP_DEBUG(node_->get_logger(), "Extracted %zu points from depth image bbox", cloud->points.size());
     
@@ -589,28 +511,84 @@ void AsparaPointcloudProcessor::publishAnnotatedImage(
 {
     RCLCPP_DEBUG(node_->get_logger(), "Publishing annotated image for aspara %d", aspara_info.id);
     cv::Mat annotated_image = image.clone();
-    
-    // バウンディングボックスを描画
-    cv::Scalar bbox_color = is_harvestable ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255); // 収穫可能：緑、不可：赤
+
+    // バウンディングボックス
+    const cv::Scalar ok = cv::Scalar(0,255,0), ng = cv::Scalar(0,0,255);
+    cv::Scalar bbox_color = is_harvestable ? ok : ng;
     cv::rectangle(annotated_image, aspara_info.bounding_box_2d, bbox_color, 3);
-    
-    // 基本的なテキスト描画のみ
-    std::string info_text = cv::format("ID:%d %.2f", aspara_info.id, aspara_info.confidence);
-    cv::putText(annotated_image, info_text, cv::Point(aspara_info.bounding_box_2d.x, aspara_info.bounding_box_2d.y - 10), 
-                cv::FONT_HERSHEY_SIMPLEX, 0.6, bbox_color, 2);
-    
-    std::string status_text = is_harvestable ? "収穫可能" : "未成熟";
-    std::string status_info = cv::format("L:%.1fcm S:%.2f %s", length * 100, straightness, status_text.c_str());
-    cv::putText(annotated_image, status_info, cv::Point(aspara_info.bounding_box_2d.x, aspara_info.bounding_box_2d.y + aspara_info.bounding_box_2d.height + 25), 
-                cv::FONT_HERSHEY_SIMPLEX, 0.6, bbox_color, 2);
-    
-    // 注釈付き画像をパブリッシュ
+
+    // ヒストグラム帯（高さ8px既定）を矩形下に貼り付け
+    try {
+        if (!aspara_info.depth_histogram_strip.empty()) {
+            int strip_h = 8; // avoid param read here to not require shared_from_this during early phase
+            strip_h = std::max(2, std::min(32, strip_h));
+            const cv::Rect &bbox = aspara_info.bounding_box_2d;
+            if (bbox.width > 1 && bbox.height > 1) {
+                cv::Mat strip_resized;
+                cv::resize(aspara_info.depth_histogram_strip, strip_resized, cv::Size(bbox.width, strip_h), 0, 0, cv::INTER_NEAREST);
+                if (strip_resized.type() != CV_8UC1) {
+                    cv::Mat tmp; strip_resized.convertTo(tmp, CV_8UC1); strip_resized = tmp;
+                }
+                cv::Mat strip_bgr; cv::cvtColor(strip_resized, strip_bgr, cv::COLOR_GRAY2BGR);
+                int sx = std::clamp(bbox.x, 0, std::max(0, annotated_image.cols - 1));
+                int sy = std::clamp(bbox.y + bbox.height + 4, 0, std::max(0, annotated_image.rows - 1));
+                int sw = std::min(strip_bgr.cols, annotated_image.cols - sx);
+                int sh = std::min(strip_bgr.rows, annotated_image.rows - sy);
+                if (sw > 0 && sh > 0) {
+                    strip_bgr(cv::Rect(0, 0, sw, sh)).copyTo(annotated_image(cv::Rect(sx, sy, sw, sh)));
+                }
+            }
+        }
+    } catch (...) {}
+
+    // UI行（デフォルト）
+    std::vector<std::string> lines{
+        "ID:${id} conf:${conf}",
+        "L:${length_cm}cm  S:${straightness}  ${grade_label}"
+    };
+    // アンカー/パディング（デフォルト）
+    std::string anchor = "below_bbox";
+    int padding = 8;
+
+    // 置換用の変数
+    auto to_string_f = [](double v, int prec){ char buf[64]; std::snprintf(buf, sizeof(buf), "%.*f", prec, v); return std::string(buf); };
+    std::map<std::string,std::string> vars = {
+        {"id", std::to_string(aspara_info.id)},
+        {"conf", to_string_f(aspara_info.confidence, 2)},
+        {"length_cm", to_string_f(length*100.0, 1)},
+        {"straightness", to_string_f(straightness, 2)},
+        {"grade_label", is_harvestable ? std::string("OK") : std::string("NG")}
+    };
+    auto subst = [&](std::string s){
+        for (auto &kv : vars) {
+            std::string key = std::string("${") + kv.first + "}";
+            size_t pos = 0;
+            while ((pos = s.find(key, pos)) != std::string::npos) {
+                s.replace(pos, key.size(), kv.second);
+                pos += kv.second.size();
+            }
+        }
+        return s;
+    };
+
+    // 開始位置の計算
+    int x = aspara_info.bounding_box_2d.x;
+    int y = aspara_info.bounding_box_2d.y + aspara_info.bounding_box_2d.height + padding + 20;
+    if (anchor == "top_left") { x = padding; y = padding + 24; }
+    else if (anchor == "top_right") { x = std::max(0, annotated_image.cols - 300); y = padding + 24; }
+
+    // 描画
+    int lh = 22;
+    for (size_t i=0; i<lines.size(); ++i) {
+        std::string text = subst(lines[i]);
+        cv::putText(annotated_image, text, cv::Point(x, y + static_cast<int>(i)*lh),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, bbox_color, 2);
+    }
+
+    // 出力
     try {
         sensor_msgs::msg::Image::SharedPtr msg = cv_bridge::CvImage(
-            std_msgs::msg::Header(),
-            sensor_msgs::image_encodings::BGR8,
-            annotated_image).toImageMsg();
-        
+            std_msgs::msg::Header(), sensor_msgs::image_encodings::BGR8, annotated_image).toImageMsg();
         annotated_image_pub_->publish(*msg);
     } catch (cv_bridge::Exception& e) {
         RCLCPP_ERROR(node_->get_logger(), "CV bridge exception in publishAnnotatedImage: %s", e.what());

@@ -206,6 +206,7 @@ public:
     sensor_msgs::msg::CameraInfo::SharedPtr latest_camera_info_;                             ///< 最新のカメラ情報
     sensor_msgs::msg::Image::SharedPtr latest_color_image_;                                  ///< 最新のカラー画像（image_data_mutexで保護）
     cv::Mat latest_mask_;                                                                    ///< 最新のマスク画像（image_data_mutexで保護）
+    fluent_image::Image seg_mask_image_;                                                     ///< FluentImage版セグメンテーション（受信時に即リサイズ格納）
     int selected_aspara_id_;                                                                 ///< 選択中のアスパラガスID（-1=未選択）
     pcl::PointCloud<pcl::PointXYZRGB>::Ptr selected_pointcloud_;                            ///< 選択中のアスパラガス点群
     std::map<int, AsparaInfo> tracked_asparagus_;                                            ///< 追跡中アスパラガス辞書
@@ -293,6 +294,16 @@ public:
     int hud_left_offset_ {10};                                          ///< HUD左オフセット(px)
     int hud_top_offset_ {50};                                           ///< HUD上オフセット(px)
     int hud_panel_height_ {115};                                        ///< HUDパネル高さ(px)
+
+    // ===== オフスクリーン描画バッファ（永続） =====
+    fluent_image::Image canvas_draw_;                                    ///< 描画用キャンバス（書き込み専用）
+    fluent_image::Image canvas_pub_;                                     ///< 出力用キャンバス（読み取り専用）
+    std::mutex canvas_mutex_;                                           ///< キャンバス用ミューテックス（swap保護）
+
+    // ===== 描画分離（ノード外ロジックとの分離を促進） =====
+private:
+    // セグメンテーションマスクを合成（薄い緑）
+    void applySegOverlay(cv::Mat &output_image);
 
 };
 

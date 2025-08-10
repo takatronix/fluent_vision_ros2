@@ -23,6 +23,22 @@ namespace fv_aspara_analyzer
 namespace fi = fluent_image;           // images
 namespace flr = fluent_lib::ros;       // ROS helpers
 namespace fu = fluent::utils;          // utils (FPS, Stopwatch)
+// ====== 局所描画ユーティリティ ======
+void FvAsparaAnalyzerNode::applySegOverlay(cv::Mat &output_image)
+{
+    if (!this->get_parameter("mask_overlay_enabled").as_bool()) return;
+    try {
+        cv::Mat mask = static_cast<cv::Mat&>(seg_mask_image_);
+        if (mask.empty() || mask.size() != output_image.size()) return;
+        cv::Mat bin;
+        if (mask.type() != CV_8U) mask.convertTo(bin, CV_8U); else bin = mask;
+        cv::threshold(bin, bin, 127, 255, cv::THRESH_BINARY);
+        double alpha = std::clamp(mask_overlay_alpha_, 0.0, 1.0);
+        cv::Mat tint(output_image.size(), output_image.type(), cv::Scalar(0, 255, 0));
+        cv::Mat blended; cv::addWeighted(output_image, 1.0 - alpha, tint, alpha, 0.0, blended);
+        blended.copyTo(output_image, bin);
+    } catch (...) {}
+}
 
 /**
  * @brief コンストラクタ
@@ -123,10 +139,7 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     std::string output_detected_all_pointcloud_topic = this->get_parameter("output_detected_all_pointcloud_topic").as_string();
     enable_detected_all_points_ = this->get_parameter("enable_detected_all_points").as_bool();
     debug_overlay_ = this->get_parameter("debug_overlay").as_bool();
-    bool enable_region_recognition = this->get_parameter("enable_region_recognition").as_bool();
-    bool mask_overlay_enabled = this->get_parameter("mask_overlay_enabled").as_bool();
-    bool preview_panel_enabled = this->get_parameter("preview_panel_enabled").as_bool();
-    bool depth_scan_preview_enabled = this->get_parameter("depth_scan_preview_enabled").as_bool();
+    // 使用箇所では毎回 get_parameter で参照するため、一時変数は作らない
     // 曲がり度・マスク描画パラメータ
     curvature_method_ = this->get_parameter("curvature_method").as_string();
     curvature_weight_skeleton_ = this->get_parameter("curvature_weight_skeleton").as_double();
@@ -261,11 +274,8 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
             output_detected_all_pointcloud_topic, rclcpp::QoS(5).reliability(rclcpp::ReliabilityPolicy::BestEffort));
     }
     
-    // QoS設定（画像は信頼性重視、遅延防止のためキューサイズ1）
-    auto qos = rclcpp::QoS(1)  // キューサイズを1に削減して遅延防止
-        .reliability(rclcpp::ReliabilityPolicy::Reliable)  // 画像は信頼性重視
-        .durability(rclcpp::DurabilityPolicy::Volatile)
-        .history(rclcpp::HistoryPolicy::KeepLast);
+    // QoS設定（画像はSensorDataQoS=BestEffort既定。一般的なビューアと相性が良い）
+    auto qos = rclcpp::SensorDataQoS();
     
     annotated_image_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
         output_annotated_image_topic, qos);
@@ -379,9 +389,7 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
     }
     
     // 深度/CameraInfoが未到着でも2D検出の処理は継続する（描画のため）
-    bool have_depth_and_info = true;
     if (!latest_depth_image_ || !latest_camera_info_) {
-        have_depth_and_info = false;
         RCLCPP_WARN_ONCE(this->get_logger(), "Required data not available yet. Waiting for depth and camera info...");
     }
 
@@ -730,17 +738,37 @@ void FvAsparaAnalyzerNode::pointcloudCallback(const sensor_msgs::msg::PointCloud
  */
 void FvAsparaAnalyzerNode::maskCallback(const sensor_msgs::msg::Image::SharedPtr msg)
 {
+    // 受信時にcv::Matへ変換し、カラー画像サイズに合わせてリサイズ→mono8で保持
     try {
-        cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::MONO8);
-        latest_mask_ = cv_ptr->image;
-    } catch (cv_bridge::Exception& e) {
-        RCLCPP_ERROR(this->get_logger(), "CV bridge exception: %s", e.what());
+        fluent_image::Image seg_in(*msg);
+        cv::Mat seg_mat = static_cast<cv::Mat&>(seg_in);
+        // 目標サイズ（最新カラーがあれば合わせる）
+        int target_w = 0, target_h = 0;
+        {
+            std::lock_guard<std::mutex> lk(image_data_mutex_);
+            if (latest_color_image_) {
+                target_w = static_cast<int>(latest_color_image_->width);
+                target_h = static_cast<int>(latest_color_image_->height);
+            }
+        }
+        if (target_w > 0 && target_h > 0 && (seg_mat.cols != target_w || seg_mat.rows != target_h)) {
+            cv::Mat resized; cv::resize(seg_mat, resized, cv::Size(target_w, target_h), 0, 0, cv::INTER_NEAREST);
+            seg_mat = resized;
+        }
+        // mono8へ
+        if (seg_mat.type() != CV_8UC1) {
+            cv::Mat gray;
+            if (seg_mat.type() == CV_8UC3) cv::cvtColor(seg_mat, gray, cv::COLOR_BGR2GRAY);
+            else if (seg_mat.type() == CV_8UC4) cv::cvtColor(seg_mat, gray, cv::COLOR_BGRA2GRAY);
+            else seg_mat.convertTo(gray, CV_8U);
+            seg_mask_image_ = fluent_image::make(gray, "mono8");
+        } else {
+            seg_mask_image_ = fluent_image::make(seg_mat, "mono8");
+        }
+    } catch (...) {
+        // 無視（描画時に存在チェック）
     }
-    
-    // FPS計測
-    if (segmentation_fps_meter_) {
-        segmentation_fps_meter_->tick(this->now());
-    }
+    if (segmentation_fps_meter_) segmentation_fps_meter_->tick(this->now());
 }
 
 /**
@@ -971,38 +999,32 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
     cv::Mat color_image = static_cast<cv::Mat&>(color_fi);
     double cvt_ms = cvt_sw.elapsed_ms();
     
-    // オフスクリーンキャンバス（FluentImage）を作成し、以降の描画はこの単一バッファに統一
-    fi::Image canvas(color_image.clone(), "BGR8");
+    // オフスクリーンキャンバス（永続）に描画（排他制御で一貫性を担保）
+    // ダブルバッファ: 描画は draw へ、publishは pub から。最後にswap。
+    if (static_cast<cv::Mat&>(canvas_draw_).empty() ||
+        static_cast<cv::Mat&>(canvas_draw_).cols != color_image.cols ||
+        static_cast<cv::Mat&>(canvas_draw_).rows != color_image.rows) {
+        canvas_draw_ = fi::Image(color_image.clone(), "BGR8");
+    } else {
+        static_cast<cv::Mat&>(canvas_draw_) = color_image.clone();
+    }
+    fi::Image &canvas = canvas_draw_;
     cv::Mat &output_image = static_cast<cv::Mat&>(canvas);
 
-    // セグメンテーションマスクの薄色オーバーレイ（🟢緑）
-    try {
-        cv::Mat mask_copy;
-        {
-            std::lock_guard<std::mutex> lk(image_data_mutex_);
-            if (!latest_mask_.empty()) {
-                mask_copy = latest_mask_.clone();
+    // セグメンテーションマスクの薄色オーバーレイ（🟢緑）: 受信時にBGR8サイズへ揃えてあるので即合成
+    if (this->get_parameter("mask_overlay_enabled").as_bool()) {
+        try {
+            cv::Mat mask = static_cast<cv::Mat&>(seg_mask_image_);
+            if (!mask.empty() && mask.size() == output_image.size()) {
+                cv::Mat bin;
+                if (mask.type() != CV_8U) mask.convertTo(bin, CV_8U); else bin = mask;
+                cv::threshold(bin, bin, 127, 255, cv::THRESH_BINARY);
+                double alpha = std::clamp(mask_overlay_alpha_, 0.0, 1.0);
+                cv::Mat tint(output_image.size(), output_image.type(), cv::Scalar(0, 255, 0));
+                cv::Mat blended; cv::addWeighted(output_image, 1.0 - alpha, tint, alpha, 0.0, blended);
+                blended.copyTo(output_image, bin);
             }
-        }
-        if (this->get_parameter("mask_overlay_enabled").as_bool() && !mask_copy.empty()) {
-            if (mask_copy.size() != output_image.size()) {
-                cv::resize(mask_copy, mask_copy, output_image.size(), 0, 0, cv::INTER_NEAREST);
-            }
-            cv::Mat bin;
-            if (mask_copy.type() != CV_8U) {
-                mask_copy.convertTo(bin, CV_8U);
-            } else {
-                bin = mask_copy;
-            }
-            cv::threshold(bin, bin, 127, 255, cv::THRESH_BINARY);
-            double alpha = std::clamp(mask_overlay_alpha_, 0.0, 1.0);
-            cv::Mat tint(output_image.size(), output_image.type(), cv::Scalar(0, 255, 0));
-            cv::Mat blended;
-            cv::addWeighted(output_image, 1.0 - alpha, tint, alpha, 0.0, blended);
-            blended.copyTo(output_image, bin);
-        }
-    } catch (...) {
-        // 無視（可視化のみ）
+        } catch (...) {}
     }
     
     // FPS計算用（FPSMeterを使用）
@@ -1178,11 +1200,38 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             // バウンディングボックス描画
             cv::rectangle(output_image, aspara_info.smooth_bbox, color, thickness);
 
+            // [可視化] ルート推定の帯スキャン位置をROI上に可視化（横線2本＋中央線、赤丸は静止表示）
+            if (this->get_parameter("depth_scan_preview_enabled").as_bool()) {
+                // 赤玉が左右に流れて見えないよう、帯スキャンはスムーズ矩形ではなく瞬時の矩形を使用
+                const cv::Rect &bbox = aspara_info.bounding_box_2d & cv::Rect(0,0,output_image.cols, output_image.rows);
+                if (bbox.width > 1 && bbox.height > 1) {
+                    // パラメータ（帯の下端/上端比率）
+                    double bottom_ratio = this->has_parameter("hist_band_bottom_ratio") ? this->get_parameter("hist_band_bottom_ratio").as_double() : 0.05;
+                    double top_ratio    = this->has_parameter("hist_band_top_ratio")    ? this->get_parameter("hist_band_top_ratio").as_double()    : 0.10;
+                    int y0 = bbox.y + static_cast<int>(std::floor(bbox.height * (1.0 - top_ratio)));
+                    int y1 = bbox.y + static_cast<int>(std::floor(bbox.height * (1.0 - bottom_ratio)));
+                    y0 = std::clamp(y0, bbox.y, bbox.y + bbox.height - 1);
+                    y1 = std::clamp(y1, bbox.y, bbox.y + bbox.height - 1);
+                    if (y1 < y0) std::swap(y0, y1);
+                    int ymid = (y0 + y1) / 2;
+                    // 横線（シアン）
+                    cv::line(output_image, cv::Point(bbox.x, y0), cv::Point(bbox.x + bbox.width - 1, y0), cv::Scalar(255, 255, 0), 1);
+                    cv::line(output_image, cv::Point(bbox.x, y1), cv::Point(bbox.x + bbox.width - 1, y1), cv::Scalar(255, 255, 0), 1);
+                    cv::line(output_image, cv::Point(bbox.x, ymid), cv::Point(bbox.x + bbox.width - 1, ymid), cv::Scalar(80, 255, 80), 1);
+                    // 赤い丸（推定z0の現在位置）: ヒストグラムから受け取った正規化位置を静止表示
+                    int px = bbox.x + 1 + static_cast<int>(std::clamp(aspara_info.z0_norm, 0.0f, 1.0f) * std::max(1, bbox.width - 2));
+                    if (aspara_info.z0_norm >= 0.0f) {
+                        cv::circle(output_image, cv::Point(px, ymid), 6, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
+                    }
+                }
+            }
+
             // ヒストグラム帯（高さ8px）を矩形下に貼り付け（常時表示）
             try {
                 if (!aspara_info.depth_histogram_strip.empty()) {
                     const int strip_h = 8;
-                    const cv::Rect &bbox = aspara_info.smooth_bbox;
+                    // 帯スキャンと同様に静止表示のため瞬時の矩形で配置
+                    const cv::Rect &bbox = aspara_info.bounding_box_2d;
                     if (bbox.width > 1 && bbox.height > 1) {
                         cv::Mat strip_resized;
                         cv::resize(aspara_info.depth_histogram_strip, strip_resized, cv::Size(bbox.width, strip_h), 0, 0, cv::INTER_NEAREST);
@@ -1980,14 +2029,18 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                     fps_bad, 0.7, 2);
     }
     
-    // 画像をパブリッシュ
+    // スワップしてから publish（出力用は読み取り専用）
+    {
+        std::lock_guard<std::mutex> lk(canvas_mutex_);
+        std::swap(canvas_pub_, canvas_draw_);
+    }
+    fi::Image &pub_canvas = canvas_pub_;
+    cv::Mat &pub_image = static_cast<cv::Mat&>(pub_canvas);
+    // 画像をパブリッシュ（同一pubキャンバスから非圧縮/圧縮を出力）
     fu::Stopwatch pub_sw;
     try {
-        // 画像メッセージに変換（FluentImage）→ヘッダ付与→publish（ワンライナー）
-        flr::publish(annotated_image_pub_, fi::make(output_image), latest_color_image_->header);
-        
-        // 圧縮画像もパブリッシュ
-        flr::publish_compressed(annotated_image_compressed_pub_, canvas, latest_color_image_->header, 85, "jpeg");
+        flr::publish(annotated_image_pub_, pub_canvas, latest_color_image_->header);
+        flr::publish_compressed(annotated_image_compressed_pub_, pub_canvas, latest_color_image_->header, 85, "jpeg");
     } catch (cv_bridge::Exception& e) {
         RCLCPP_ERROR(this->get_logger(), "CV bridge exception in publishCurrentImage: %s", e.what());
     }

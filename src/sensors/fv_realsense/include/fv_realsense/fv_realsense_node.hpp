@@ -180,6 +180,9 @@ private:
     rs2_intrinsics depth_intrinsics_;
     float depth_scale_ = 0.001f;
     float config_depth_scale_ = -1.0;  // 設定ファイルからのオーバーライド値（-1.0はセンサーから取得）
+    // Point cloud distance clipping (applies to registered_points and raw point cloud)
+    float min_distance_m_ = 0.1f;
+    float max_distance_m_ = 3.0f;
 
     // Methods
     void loadParameters();
