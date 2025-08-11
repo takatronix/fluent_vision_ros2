@@ -39,11 +39,11 @@
     # ===== UNetモデルパラメータ =====
     model:
       type: "unet"                                    # モデルタイプ：UNet
-      model_path: "/models/unet_asparagus_ch16_256_v1.0_ep20.xml"  # モデルファイルパス
+      model_path: "/models/unet_asparagus_ch16_256_v1.0_ep10.xml"  # モデルファイルパス
       device: "GPU"                                   # 推論デバイス（GPU/CPU/MYRIAD）
       input_width: 256                               # 入力画像幅（ピクセル）
       input_height: 256                              # 入力画像高さ（ピクセル）
-      confidence_threshold: 0.5                      # 信頼度閾値（0.0-1.0）
+      confidence_threshold: 0.8                      # 信頼度閾値（0.0-1.0）
     
     # ===== クラス設定 =====
     class_names: ["Background", "Asparagus"]         # クラス名（背景、アスパラガス）

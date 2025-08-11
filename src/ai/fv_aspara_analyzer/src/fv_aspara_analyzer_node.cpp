@@ -56,6 +56,8 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     
     // ===== パラメータ宣言 =====
     this->declare_parameter<double>("min_confidence", 0.5);                    // 最小信頼度閾値
+    this->declare_parameter<int>("min_bbox_width", 20);                        // 最小矩形幅[px]
+    this->declare_parameter<int>("min_bbox_height", 40);                       // 最小矩形高さ[px]
     this->declare_parameter<double>("pointcloud_distance_min", 0.1);           // 点群処理最小距離（10cm）
     this->declare_parameter<double>("pointcloud_distance_max", 2.0);           // 点群処理最大距離（2m）
     this->declare_parameter<double>("aspara_filter_distance", 0.05);           // アスパラガスフィルタ距離（5cm）
@@ -65,6 +67,43 @@ FvAsparaAnalyzerNode::FvAsparaAnalyzerNode() : Node("fv_aspara_analyzer")
     this->declare_parameter<double>("harvest_min_length", 0.23);               // 収穫最小長さ（23cm）
     this->declare_parameter<double>("harvest_max_length", 0.50);               // 収穫最大長さ（50cm）
     this->declare_parameter<double>("straightness_threshold", 0.7);            // 真っ直ぐ度閾値
+
+    // ===== 新パラメータスキーマ（ロジック別） =====
+    // 長さ
+    this->declare_parameter<std::string>("length.method", "auto");
+    this->declare_parameter<double>("length.scale", 1.0);
+    this->declare_parameter<double>("length.offset_m", 0.0);
+    this->declare_parameter<bool>("length.clip.enable", true);
+    this->declare_parameter<double>("length.clip.min_m", 0.05);
+    this->declare_parameter<double>("length.clip.max_m", 0.50);
+    this->declare_parameter<double>("length.pca.trim_low", 0.05);
+    this->declare_parameter<double>("length.pca.trim_high", 0.95);
+
+    // 曲率/直線度
+    this->declare_parameter<std::string>("curvature.method", "hybrid_max");
+    this->declare_parameter<double>("curvature.hybrid.weight_skeleton", 0.6);
+    this->declare_parameter<double>("curvature.hybrid.weight_pca", 0.4);
+    this->declare_parameter<double>("curvature.straightness.kappa_ref", 0.03);
+
+    // 骨格（共通）
+    this->declare_parameter<std::string>("skeleton.method", "iterative_local");
+    this->declare_parameter<int>("skeleton.points_count", 9);
+    this->declare_parameter<double>("skeleton.step_m", 0.02);
+    this->declare_parameter<double>("skeleton.radius_m", 0.018);
+    this->declare_parameter<double>("skeleton.window_m", 0.06);
+
+    // UI
+    this->declare_parameter<int>("ui.filtered_points_max", 0);
+    this->declare_parameter<bool>("info_show_confidence", true);
+    // Reference visuals
+    this->declare_parameter<bool>("show_reference_line", true);   // 直線（弦）表示ON/OFF（既定ON）
+    this->declare_parameter<bool>("show_reference_curve", false); // 参照曲線（骨格）表示ON/OFF（既定OFF）
+
+    // 表示レンジ（未宣言だと has_parameter が false になり YAML が無視されるため明示宣言）
+    this->declare_parameter<double>("display_length_min_m", 0.0);
+    this->declare_parameter<double>("display_length_max_m", 1.0);
+    this->declare_parameter<double>("display_diameter_min_m", 0.0);
+    this->declare_parameter<double>("display_diameter_max_m", 1.0);
     this->declare_parameter<bool>("enable_pointcloud_processing", true);       // ポイントクラウド処理有効化
     this->declare_parameter<double>("depth_unit_m_16u", 0.001);               // 16UC1深度の単位(m/units)
 
@@ -440,6 +479,10 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
                 static_cast<int>(detection.bbox.size_x),
                 static_cast<int>(detection.bbox.size_y)
             );
+            // 最小矩形フィルタリング
+            int min_w = this->get_parameter("min_bbox_width").as_int();
+            int min_h = this->get_parameter("min_bbox_height").as_int();
+            if (bbox.width < min_w || bbox.height < min_h) continue;
             
             new_detections.push_back(std::make_pair(bbox, confidence));
         }
@@ -556,9 +599,26 @@ void FvAsparaAnalyzerNode::detectionCallback(const vision_msgs::msg::Detection2D
                 }
                 cv::Mat color_mat = cv_bridge::toCvCopy(color_image, sensor_msgs::image_encodings::BGR8)->image;
                 if (!depth_mat.empty() && depth_mat.size() == color_mat.size()) {
-                    // 深度スケール推定
+                    // 深度スケール（D405のみ0.1mm/Unitへの自動上書きを許可）
                     double dmin, dmax; cv::minMaxLoc(depth_mat, &dmin, &dmax);
-                    float depth_scale_m = (depth_mat.type() == CV_16UC1 && dmax < 200) ? 0.0001f : 0.001f;
+                    float depth_scale_m = 0.001f; // D415既定は1mm/Unit
+                    if (depth_mat.type() != CV_16UC1) {
+                        depth_scale_m = 1.0f; // 32FC1は[m]
+                    } else {
+                        bool allow_override = false;
+                        try {
+                            if (this->has_parameter("camera_name")) {
+                                auto cam = this->get_parameter("camera_name").as_string();
+                                if (cam == std::string("D405")) allow_override = true;
+                            }
+                            if (!allow_override && this->has_parameter("depth_unit_auto_override")) {
+                                allow_override = this->get_parameter("depth_unit_auto_override").as_bool();
+                            }
+                        } catch (...) {}
+                        if (allow_override && dmax < 200) {
+                            depth_scale_m = 0.0001f;
+                        }
+                    }
                     // 結合点群
                     pcl::PointCloud<pcl::PointXYZRGB> all_cloud;
                     std::vector<AsparaInfo> asparas_copy;
@@ -1429,16 +1489,19 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 lines.push_back(cv::format("ID:%d [選択中]", aspara_info.id));
                 lines.push_back(cv::format("信頼: %.0f%%", aspara_info.confidence * 100.0));
                 if (dist_m > 0.0) lines.push_back(cv::format("距離: %.2fm", dist_m));
-                if (raw_pts > 0 || filt_pts > 0) lines.push_back(cv::format("点群: %d/%d", raw_pts, filt_pts));
+                // 要望: 点群数は先頭の生ROI点数のみ表示
+                lines.push_back(cv::format("点群: %d", raw_pts));
                 if (analyzing) {
                     lines.push_back("分析中...");
                 } else {
                     lines.push_back(cv::format("分析: %.1fms", t_ms));
                 }
-                if (aspara_info.length_valid && t_ms > 0.0) {
-                    lines.push_back(cv::format("長さ: %.1fcm", len_cm));
-                } else if (t_ms > 0.0) {
-                    lines.push_back("長さ: --");
+                // 表示レンジも考慮して長さ表示をフィルタ
+                double disp_len_min = this->has_parameter("display_length_min_m") ? this->get_parameter("display_length_min_m").as_double() : 0.0;
+                double disp_len_max = this->has_parameter("display_length_max_m") ? this->get_parameter("display_length_max_m").as_double() : std::numeric_limits<double>::infinity();
+                bool len_ok = aspara_info.length_valid && aspara_info.length >= disp_len_min && aspara_info.length <= disp_len_max;
+                if (t_ms > 0.0) {
+                    lines.push_back(len_ok ? cv::format("長さ: %.1fcm", len_cm) : "長さ: --");
                 }
                 if (t_ms > 0.0) {
                     if (dia_mm > 0.0) lines.push_back(cv::format("太さ: %.0fmm", dia_mm));
@@ -1771,6 +1834,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                         try {
                                             auto paramb = [this](const char* key, bool defv){return this->has_parameter(key)? this->get_parameter(key).as_bool() : defv;};
                                             bool show_id = paramb("info_show_id", true);
+                                            bool show_conf = paramb("info_show_confidence", true);
                                             bool show_length = paramb("info_show_length", true);
                                             bool show_diameter = paramb("info_show_diameter", true);
                                             bool show_straightness = paramb("info_show_straightness", true);
@@ -1781,9 +1845,38 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
 
                                             std::vector<std::string> lines;
                                             if (show_id) lines.push_back(cv::format("ID: %d", it_sel->id));
-                                            if (show_length && it_sel->length > 0) lines.push_back(cv::format("長さ: %.1fcm", it_sel->length * 100.0));
-                                            if (show_diameter && it_sel->diameter > 0) lines.push_back(cv::format("太さ: %.0fmm", it_sel->diameter * 1000.0));
+                                            if (show_conf) lines.push_back(cv::format("信頼度: %.0f%%", it_sel->confidence * 100.0));
+                                            // 表示制限（長さ/太さ）を尊重
+                                            double disp_len_min = this->has_parameter("display_length_min_m") ? this->get_parameter("display_length_min_m").as_double() : 0.0;
+                                            double disp_len_max = this->has_parameter("display_length_max_m") ? this->get_parameter("display_length_max_m").as_double() : std::numeric_limits<double>::infinity();
+                                            double disp_dia_min = this->has_parameter("display_diameter_min_m") ? this->get_parameter("display_diameter_min_m").as_double() : 0.0;
+                                            double disp_dia_max = this->has_parameter("display_diameter_max_m") ? this->get_parameter("display_diameter_max_m").as_double() : std::numeric_limits<double>::infinity();
+
+                                            bool len_ok = it_sel->length_valid && it_sel->length >= disp_len_min && it_sel->length <= disp_len_max;
+                                            bool dia_ok = (it_sel->diameter >= disp_dia_min && it_sel->diameter <= disp_dia_max);
+
+                                            if (show_length) {
+                                                if (len_ok) lines.push_back(cv::format("長さ: %.1fcm", it_sel->length * 100.0));
+                                                else        lines.push_back("長さ: --");
+                                            }
+                                            if (show_diameter) {
+                                                if (dia_ok && it_sel->diameter > 0) lines.push_back(cv::format("太さ: %.0fmm", it_sel->diameter * 1000.0));
+                                                else                               lines.push_back("太さ: --");
+                                            }
                                             if (show_straightness) lines.push_back(cv::format("曲がり度: %.0f", it_sel->straightness * 100.0));
+                                            // デバッグ表示が有効なとき、直線参照線（弦長）を表示
+                                            if (show_debug) {
+                                                double chord_cm = 0.0;
+                                                if (!it_sel->skeleton_points.empty()) {
+                                                    const auto &wf = it_sel->skeleton_points.front().world_point;
+                                                    const auto &wl = it_sel->skeleton_points.back().world_point;
+                                                    double dx = static_cast<double>(wf.x) - static_cast<double>(wl.x);
+                                                    double dy = static_cast<double>(wf.y) - static_cast<double>(wl.y);
+                                                    double dz = static_cast<double>(wf.z) - static_cast<double>(wl.z);
+                                                    chord_cm = std::sqrt(dx*dx + dy*dy + dz*dz) * 100.0;
+                                                }
+                                                lines.push_back(cv::format("参照直線: %.1fcm", chord_cm));
+                                            }
                                             if (show_grade) {
                                                 const char* gl = (it_sel->grade==AsparaguGrade::A_GRADE?"A": it_sel->grade==AsparaguGrade::B_GRADE?"B": it_sel->grade==AsparaguGrade::C_GRADE?"C":"NG");
                                                 lines.push_back(std::string("グレード: ") + gl);
@@ -1978,18 +2071,20 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         // 要望: ピンクの線は半分の細さに（選択時も1px）
         int thickness = 1;
         
-        // 全ての骨格点を個別に描画（小さな青丸）
-        for (size_t i = 0; i < a.skeleton_points.size(); ++i) {
-            const auto& p = a.skeleton_points[i].image_point;
-            // BGR: 青(255,0,0)、半径2px
-            cv::circle(output_image, p, 2, cv::Scalar(255, 0, 0), -1);
-        }
-        
-        // 線で結ぶ
-        for (size_t i = 1; i < a.skeleton_points.size(); ++i) {
-            const auto& p0 = a.skeleton_points[i-1].image_point;
-            const auto& p1 = a.skeleton_points[i].image_point;
-            cv::line(output_image, p0, p1, bone_color, thickness, cv::LINE_AA);
+        // 骨格曲線の表示はフラグで切替
+        bool show_curve = this->has_parameter("show_reference_curve") ? this->get_parameter("show_reference_curve").as_bool() : false;
+        if (show_curve) {
+            // 全ての骨格点を個別に描画（小さな青丸）
+            for (size_t i = 0; i < a.skeleton_points.size(); ++i) {
+                const auto& p = a.skeleton_points[i].image_point;
+                cv::circle(output_image, p, 2, cv::Scalar(255, 0, 0), -1);
+            }
+            // 線で結ぶ
+            for (size_t i = 1; i < a.skeleton_points.size(); ++i) {
+                const auto& p0 = a.skeleton_points[i-1].image_point;
+                const auto& p1 = a.skeleton_points[i].image_point;
+                cv::line(output_image, p0, p1, bone_color, thickness, cv::LINE_AA);
+            }
         }
         
         // 始点(根本)と終点(先端)を強調
@@ -2000,11 +2095,20 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             cv::circle(output_image, a.skeleton_points.back().image_point,  r, cv::Scalar(0,255,255), -1);
 
             // 根本→先端の直線参照はパラメータで表示切替
-            bool show_ref = this->has_parameter("show_pca_reference_line") ? this->get_parameter("show_pca_reference_line").as_bool() : true;
+            bool show_ref = this->has_parameter("show_reference_line") ? this->get_parameter("show_reference_line").as_bool() : true;
             if (show_ref) {
                 const auto& p_root = a.skeleton_points.front().image_point;
                 const auto& p_tip  = a.skeleton_points.back().image_point;
-                cv::line(output_image, p_root, p_tip, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+                // 参照直線は長さの基準にも使用するため、色は白に変更
+                cv::line(output_image, p_root, p_tip, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+                // [DEBUG] 直線参照線の長さ（3D弦長）を出力
+                const auto& w_root = a.skeleton_points.front().world_point;
+                const auto& w_tip  = a.skeleton_points.back().world_point;
+                double chord = std::sqrt(
+                    (w_root.x - w_tip.x)*(w_root.x - w_tip.x) +
+                    (w_root.y - w_tip.y)*(w_root.y - w_tip.y) +
+                    (w_root.z - w_tip.z)*(w_root.z - w_tip.z));
+                RCLCPP_DEBUG(this->get_logger(), "[REF_LINE] ID:%d chord_length=%.3fm (root-tip)", a.id, chord);
             }
         }
     }

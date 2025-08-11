@@ -29,6 +29,60 @@ static double computeCurveLengthFromSkeleton(
     return total;
 }
 
+// ユーティリティ: スケルトンの弦長（始端-終端の直線距離）
+static double computeChordLengthFromSkeleton(
+    const std::vector<SkeletonPoint>& skel)
+{
+    if (skel.size() < 2) return 0.0;
+    const auto &p0 = skel.front().world_point;
+    const auto &pN = skel.back().world_point;
+    Eigen::Vector3d v0(p0.x, p0.y, p0.z);
+    Eigen::Vector3d vN(pN.x, pN.y, pN.z);
+    return (vN - v0).norm();
+}
+
+// PCA主軸に沿った長さを任意のトリム率（分位）で計算
+// trim_low, trim_high は [0,1] 範囲、かつ trim_low < trim_high を想定
+static double computePcaLengthWithTrim(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr &cloud,
+    double trim_low,
+    double trim_high)
+{
+    if (!cloud || cloud->points.empty()) return 0.0;
+    trim_low  = std::clamp(trim_low,  0.0, 1.0);
+    trim_high = std::clamp(trim_high, 0.0, 1.0);
+    if (trim_high <= trim_low) return 0.0;
+
+    auto isFinite = [](const pcl::PointXYZRGB &p){
+        return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) && p.z > 0.0f;
+    };
+
+    Eigen::Vector4f mean4; pcl::compute3DCentroid(*cloud, mean4);
+    Eigen::Matrix3f cov; pcl::computeCovarianceMatrixNormalized(*cloud, Eigen::Vector4f(mean4[0],mean4[1],mean4[2],1.0f), cov);
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+    Eigen::Vector3f center(mean4[0], mean4[1], mean4[2]);
+    Eigen::Vector3f axis = es.eigenvectors().col(2).normalized();
+
+    std::vector<float> ts; ts.reserve(cloud->points.size());
+    for (const auto &p : cloud->points) if (isFinite(p)) {
+        Eigen::Vector3f v(p.x,p.y,p.z);
+        ts.push_back(axis.dot(v - center));
+    }
+    if (ts.empty()) return 0.0;
+
+    size_t n = ts.size();
+    size_t iLow  = static_cast<size_t>(std::floor(n * std::clamp(trim_low,  0.0, 0.99)));
+    size_t iHigh = static_cast<size_t>(std::floor(n * std::clamp(trim_high, 0.01, 1.0)));
+    iLow = std::min(iLow, n-1);
+    iHigh = std::min(std::max(iHigh, iLow+1), n-1);
+    std::nth_element(ts.begin(), ts.begin()+iLow, ts.end());
+    float tmin = ts[iLow];
+    std::nth_element(ts.begin(), ts.begin()+iHigh, ts.end());
+    float tmax = ts[iHigh];
+    if (tmax < tmin) std::swap(tmax, tmin);
+    return static_cast<double>(tmax - tmin);
+}
+
 // ユーティリティ: スケルトン由来の曲率比を計算
 // 定義: polyline_length / chord_length - 1 を曲率比とする（直線=0、曲がるほど増加）
 static double computeSkeletonCurvatureRatio(
@@ -323,9 +377,20 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             float depth_scale_m = static_cast<float>(node_->depth_unit_m_16u_);
             if (depth_mat.type() == CV_16UC1) {
                 double dmin, dmax; cv::minMaxLoc(depth_mat, &dmin, &dmax);
-                if (dmax < 200 && depth_scale_m > 0.0001f) {
+                // D405のRAW深度(Unit=0.1mm)向けの自動上書きはD405に限定
+                bool allow_override = false;
+                try {
+                    if (node_ && node_->has_parameter("camera_name")) {
+                        std::string cam = node_->get_parameter("camera_name").get_value<std::string>();
+                        if (cam == "D405") allow_override = true;
+                    }
+                    if (!allow_override && node_ && node_->has_parameter("depth_unit_auto_override")) {
+                        allow_override = node_->get_parameter("depth_unit_auto_override").get_value<bool>();
+                    }
+                } catch (...) {}
+                if (allow_override && dmax < 200 && depth_scale_m > 0.0001f) {
                     depth_scale_m = 0.0001f;
-                    RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), "[POINTCLOUD] override depth_scale=0.0001");
+                    RCLCPP_WARN(rclcpp::get_logger("analyzer_thread"), "[POINTCLOUD] override depth_scale=0.0001 (D405 mode)");
                 }
             }
             filtered_cloud = fluent_cloud::io::DepthToCloud::convertAsparagusROI(
@@ -438,12 +503,30 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             if (!aspara_info.skeleton_points.empty()) {
                 curvature_skel = computeSkeletonCurvatureRatio(aspara_info.skeleton_points);
             }
-            // パラメータ取得
+            // パラメータ取得（新キー優先、旧キー後方互換）
             std::string curvature_method = "hybrid_max";
             double w_skel = 0.6, w_pca = 0.4;
-            try { if (node_->has_parameter("curvature_method")) curvature_method = node_->get_parameter("curvature_method").get_value<std::string>(); } catch (...) {}
-            try { if (node_->has_parameter("curvature_weight_skeleton")) w_skel = node_->get_parameter("curvature_weight_skeleton").get_value<double>(); } catch (...) {}
-            try { if (node_->has_parameter("curvature_weight_pca")) w_pca = node_->get_parameter("curvature_weight_pca").get_value<double>(); } catch (...) {}
+            try {
+                if (node_->has_parameter("curvature.method")) {
+                    curvature_method = node_->get_parameter("curvature.method").get_value<std::string>();
+                } else if (node_->has_parameter("curvature_method")) {
+                    curvature_method = node_->get_parameter("curvature_method").get_value<std::string>();
+                }
+            } catch (...) {}
+            try {
+                if (node_->has_parameter("curvature.hybrid.weight_skeleton")) {
+                    w_skel = node_->get_parameter("curvature.hybrid.weight_skeleton").get_value<double>();
+                } else if (node_->has_parameter("curvature_weight_skeleton")) {
+                    w_skel = node_->get_parameter("curvature_weight_skeleton").get_value<double>();
+                }
+            } catch (...) {}
+            try {
+                if (node_->has_parameter("curvature.hybrid.weight_pca")) {
+                    w_pca = node_->get_parameter("curvature.hybrid.weight_pca").get_value<double>();
+                } else if (node_->has_parameter("curvature_weight_pca")) {
+                    w_pca = node_->get_parameter("curvature_weight_pca").get_value<double>();
+                }
+            } catch (...) {}
             // 正規化（和が0ならデフォルト）
             if (w_skel < 0.0) w_skel = 0.0; if (w_pca < 0.0) w_pca = 0.0;
             const double w_sum = (w_skel + w_pca) > 0.0 ? (w_skel + w_pca) : 1.0;
@@ -461,43 +544,94 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 curvature_combined = std::max(curvature_skel, curvature_pca);
             }
 
-            // 直線度に正規化係数（デフォルト0.03）
+            // 直線度に正規化係数（新キー: curvature.straightness.kappa_ref）
             double kappa_ref = 0.03;
-            try { if (node_->has_parameter("straightness_kappa_ref")) kappa_ref = node_->get_parameter("straightness_kappa_ref").get_value<double>(); } catch (...) {}
+            try {
+                if (node_->has_parameter("curvature.straightness.kappa_ref")) {
+                    kappa_ref = node_->get_parameter("curvature.straightness.kappa_ref").get_value<double>();
+                } else if (node_->has_parameter("straightness_kappa_ref")) {
+                    kappa_ref = node_->get_parameter("straightness_kappa_ref").get_value<double>();
+                }
+            } catch (...) {}
             straightness = static_cast<float>(std::clamp(1.0 - curvature_combined / std::max(1e-6, kappa_ref), 0.0, 1.0));
 
-            // 長さ推定メソッド: auto/skeleton/pca
+            // 長さ推定メソッド（新キー: length.method）: auto/skeleton/pca
             std::string length_method = "auto";
-            try { if (node_->has_parameter("length_method")) length_method = node_->get_parameter("length_method").get_value<std::string>(); } catch (...) {}
+            try {
+                if (node_->has_parameter("length.method")) {
+                    length_method = node_->get_parameter("length.method").get_value<std::string>();
+                } else if (node_->has_parameter("length_method")) {
+                    length_method = node_->get_parameter("length_method").get_value<std::string>();
+                }
+            } catch (...) {}
             double L_skeleton = 0.0;
             if (!aspara_info.skeleton_points.empty()) {
                 L_skeleton = computeCurveLengthFromSkeleton(aspara_info.skeleton_points);
             }
+            // PCA長さ: 新キー length.pca.trim_low/high があれば再計算
             double L_pca = m.length_m;
+            try {
+                bool has_low = node_->has_parameter("length.pca.trim_low");
+                bool has_high = node_->has_parameter("length.pca.trim_high");
+                if (has_low || has_high) {
+                    double tl = has_low  ? node_->get_parameter("length.pca.trim_low").get_value<double>()  : 0.05;
+                    double th = has_high ? node_->get_parameter("length.pca.trim_high").get_value<double>() : 0.95;
+                    L_pca = computePcaLengthWithTrim(metric_cloud, tl, th);
+                }
+            } catch (...) {}
+            // 参照直線（弦長）
+            double L_chord = 0.0;
+            if (!aspara_info.skeleton_points.empty()) {
+                L_chord = computeChordLengthFromSkeleton(aspara_info.skeleton_points);
+            }
             if (length_method == "skeleton") {
                 length = static_cast<float>((L_skeleton > 0.0) ? L_skeleton : 0.0);
+            } else if (length_method == "chord") {
+                // スケルトンの弦長（root-tipの直線距離）。スケルトンが無い場合はPCA長にフォールバック
+                double base = (L_chord > 0.0) ? L_chord : L_pca;
+                length = static_cast<float>(base);
             } else if (length_method == "pca") {
                 length = static_cast<float>(L_pca);
             } else { // auto: 大きい方を採用（骨格の点間サンプリング不足で短くなるのを回避）
                 length = static_cast<float>(std::max(L_skeleton, L_pca));
             }
-            // 計測校正: スケールとオフセット（既定: scale=1.0, offset=0.0 [m]）
+            // 計測校正: スケールとオフセット（新キー: length.scale, length.offset_m）
             double length_scale = 1.0;
             double length_offset = 0.0;
-            try { if (node_->has_parameter("length_scale")) {
-                length_scale = node_->get_parameter("length_scale").get_value<double>();
-            } } catch (...) {}
-            try { if (node_->has_parameter("length_offset_m")) {
-                length_offset = node_->get_parameter("length_offset_m").get_value<double>();
-            } } catch (...) {}
+            try {
+                if (node_->has_parameter("length.scale")) {
+                    length_scale = node_->get_parameter("length.scale").get_value<double>();
+                } else if (node_->has_parameter("length_scale")) {
+                    length_scale = node_->get_parameter("length_scale").get_value<double>();
+                }
+            } catch (...) {}
+            try {
+                if (node_->has_parameter("length.offset_m")) {
+                    length_offset = node_->get_parameter("length.offset_m").get_value<double>();
+                } else if (node_->has_parameter("length_offset_m")) {
+                    length_offset = node_->get_parameter("length_offset_m").get_value<double>();
+                }
+            } catch (...) {}
             length = static_cast<float>(length * length_scale + length_offset);
             if (!(length > 0.0f)) length = 0.0f;
 
-            // 長さの表示レンジ制限（外れ値抑制）
+            // 長さの表示レンジ制限（新キー: length.clip.min_m/max_m）
             double length_min_m = 0.05; // 5cm
             double length_max_m = 0.50; // 50cm（上限）
-            try { if (node_->has_parameter("length_min_m")) length_min_m = node_->get_parameter("length_min_m").get_value<double>(); } catch (...) {}
-            try { if (node_->has_parameter("length_max_m")) length_max_m = node_->get_parameter("length_max_m").get_value<double>(); } catch (...) {}
+            try {
+                if (node_->has_parameter("length.clip.min_m")) {
+                    length_min_m = node_->get_parameter("length.clip.min_m").get_value<double>();
+                } else if (node_->has_parameter("length_min_m")) {
+                    length_min_m = node_->get_parameter("length_min_m").get_value<double>();
+                }
+            } catch (...) {}
+            try {
+                if (node_->has_parameter("length.clip.max_m")) {
+                    length_max_m = node_->get_parameter("length.clip.max_m").get_value<double>();
+                } else if (node_->has_parameter("length_max_m")) {
+                    length_max_m = node_->get_parameter("length_max_m").get_value<double>();
+                }
+            } catch (...) {}
             bool length_ok = (length >= static_cast<float>(length_min_m) && length <= static_cast<float>(length_max_m));
             aspara_info.diameter = static_cast<float>(m.diameter_m);
             aspara_info.curvature = static_cast<float>(curvature_combined);
@@ -918,12 +1052,22 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             // 骨格生成: method切替（pca_line / iterative_local）
             if (!foreground->points.empty()) {
                 std::string method = "pca_line";
-                try { if (node_->has_parameter("skeleton_method")) method = node_->get_parameter("skeleton_method").get_value<std::string>(); } catch (...) {}
+                try {
+                    if (node_->has_parameter("skeleton.method")) {
+                        method = node_->get_parameter("skeleton.method").get_value<std::string>();
+                    } else if (node_->has_parameter("skeleton_method")) {
+                        method = node_->get_parameter("skeleton_method").get_value<std::string>();
+                    }
+                } catch (...) {}
 
                 // 共通: サンプル点数
                 int skel_n = 5;
-                if (node_ && node_->has_parameter("skeleton_points_count")) {
-                    skel_n = std::max<int>(2, static_cast<int>(node_->get_parameter("skeleton_points_count").get_value<int>()));
+                if (node_) {
+                    if (node_->has_parameter("skeleton.points_count")) {
+                        skel_n = std::max<int>(2, static_cast<int>(node_->get_parameter("skeleton.points_count").get_value<int>()));
+                    } else if (node_->has_parameter("skeleton_points_count")) {
+                        skel_n = std::max<int>(2, static_cast<int>(node_->get_parameter("skeleton_points_count").get_value<int>()));
+                    }
                 }
 
                 if (method == "iterative_local") {
@@ -932,8 +1076,32 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                     kdt->setInputCloud(foreground);
                     double step_m = 0.02;  // 2cm
                     double radius_m = 0.010; // 1cm
-                    try { if (node_->has_parameter("skeleton_step_m")) step_m = node_->get_parameter("skeleton_step_m").get_value<double>(); } catch (...) {}
-                    try { if (node_->has_parameter("skeleton_radius_m")) radius_m = node_->get_parameter("skeleton_radius_m").get_value<double>(); } catch (...) {}
+                    try {
+                        if (node_->has_parameter("skeleton.step_m")) {
+                            step_m = node_->get_parameter("skeleton.step_m").get_value<double>();
+                        } else if (node_->has_parameter("skeleton_step_m")) {
+                            step_m = node_->get_parameter("skeleton_step_m").get_value<double>();
+                        }
+                    } catch (...) {}
+                    try {
+                        if (node_->has_parameter("skeleton.radius_m")) {
+                            radius_m = node_->get_parameter("skeleton.radius_m").get_value<double>();
+                        } else if (node_->has_parameter("skeleton_radius_m")) {
+                            radius_m = node_->get_parameter("skeleton_radius_m").get_value<double>();
+                        }
+                    } catch (...) {}
+
+                    // 距離適応（z0で近遠判定）
+                    try {
+                        bool adapt = node_->has_parameter("distance_adaptive.enable") ? node_->get_parameter("distance_adaptive.enable").get_value<bool>() : false;
+                        double thr = node_->has_parameter("distance_adaptive.threshold_m") ? node_->get_parameter("distance_adaptive.threshold_m").get_value<double>() : 0.7;
+                        if (adapt && std::isfinite(z0) && z0 > thr) {
+                            // 遠距離時はステップ/半径/点数を増やして骨格を安定化
+                            if (node_->has_parameter("distance_adaptive.skeleton.step_m")) step_m = node_->get_parameter("distance_adaptive.skeleton.step_m").get_value<double>();
+                            if (node_->has_parameter("distance_adaptive.skeleton.radius_m")) radius_m = node_->get_parameter("distance_adaptive.skeleton.radius_m").get_value<double>();
+                            if (node_->has_parameter("distance_adaptive.skeleton.points_count")) skel_n = std::max<int>(2, static_cast<int>(node_->get_parameter("distance_adaptive.skeleton.points_count").get_value<int>()));
+                        }
+                    } catch (...) {}
 
                     // 開始点
                     Eigen::Vector3f cur;
@@ -955,19 +1123,28 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                     int empty_radius_hits = 0;
                     int nn_fallback_hits = 0;
                     int dir_update_hits = 0;
+                    // ロバスト化パラメータ
+                    int min_neighbors = node_ && node_->has_parameter("skeleton.min_neighbors") ? node_->get_parameter("skeleton.min_neighbors").get_value<int>() : 5;
+                    double max_turn_deg = node_ && node_->has_parameter("skeleton.max_turn_deg") ? node_->get_parameter("skeleton.max_turn_deg").get_value<double>() : 25.0;
+                    bool enforce_monotonic_y = node_ && node_->has_parameter("skeleton.enforce_monotonic_y") ? node_->get_parameter("skeleton.enforce_monotonic_y").get_value<bool>() : true;
                     for (int i = 0; i < skel_n; ++i) {
                         // 近傍検索
                         std::vector<int> idx; std::vector<float> dist; pcl::PointXYZRGB q; q.x = cur.x(); q.y = cur.y(); q.z = cur.z();
                         kdt->radiusSearch(q, static_cast<float>(radius_m), idx, dist);
-                        // 近傍重心
+                        // 近傍重心（ロバスト化: 中央値ベース）
                         Eigen::Vector3f centroid = cur;
                         if (!idx.empty()) {
-                            centroid.setZero();
+                            std::vector<float> xs; xs.reserve(idx.size());
+                            std::vector<float> ys; ys.reserve(idx.size());
+                            std::vector<float> zs; zs.reserve(idx.size());
                             for (int id : idx) {
                                 const auto &p = foreground->points[id];
-                                centroid += Eigen::Vector3f(p.x, p.y, p.z);
+                                xs.push_back(p.x); ys.push_back(p.y); zs.push_back(p.z);
                             }
-                            centroid /= static_cast<float>(idx.size());
+                            auto nth = [](std::vector<float>& v){ size_t m=v.size()/2; std::nth_element(v.begin(), v.begin()+m, v.end()); return v[m]; };
+                            centroid.x() = nth(xs);
+                            centroid.y() = nth(ys);
+                            centroid.z() = nth(zs);
                         } else {
                             // 半径内ゼロ → 最近傍フォールバック
                             ++empty_radius_hits;
@@ -979,7 +1156,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                             }
                         }
                         // 局所PCAで進行方向を更新
-                        if (idx.size() >= 5) {
+                        if (static_cast<int>(idx.size()) >= std::max(1, min_neighbors)) {
                             Eigen::Matrix3f cov_l = Eigen::Matrix3f::Zero();
                             for (int id : idx) {
                                 const auto &p = foreground->points[id];
@@ -988,8 +1165,22 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es_l(cov_l);
                             Eigen::Vector3f u = es_l.eigenvectors().col(2).normalized();
                             if (u.dot(dir) < 0) u = -u; // 方向連続性
+                            // 急激な方向変化を抑制（最大曲がり角制限）
+                            double cosang = std::clamp(static_cast<double>(dir.dot(u)), -1.0, 1.0);
+                            double ang = std::acos(cosang) * 180.0 / M_PI;
+                            if (ang > max_turn_deg) {
+                                double a = max_turn_deg / ang;
+                                Eigen::Vector3f blended = (dir * static_cast<float>(1.0 - a)) + (u * static_cast<float>(a));
+                                u = blended.normalized();
+                            }
                             if ((u - dir).norm() > 1e-6f) ++dir_update_hits;
                             dir = u;
+                        }
+                        // 単調性（y方向）を維持（根本yが大で上に向かう想定）
+                        if (enforce_monotonic_y) {
+                            if (centroid.y() > cur.y()) {
+                                centroid.y() = cur.y();
+                            }
                         }
                         cur = centroid + dir * static_cast<float>(step_m);
 
@@ -1089,7 +1280,7 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
                 }
             }
         }
-        // 右用点群をパブリッシュ（空なら従来のdenoised）
+            // 右用点群をパブリッシュ（空なら従来のdenoised）
         bool disable_fb = false;
         try {
             if (node_->has_parameter("disable_filtered_fallback")) {
@@ -1099,12 +1290,17 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
         pcl::PointCloud<pcl::PointXYZRGB>::Ptr to_publish =
             (foreground->points.empty() && !disable_fb) ? denoised_cloud : foreground;
         // 上限点数（単純サブサンプリング）。デフォルト0=無制限
-        size_t max_points = 0;
+            size_t max_points = 0;
         try {
-            if (node_->has_parameter("filtered_points_max")) {
-                int v = node_->get_parameter("filtered_points_max").get_value<int>();
+                int v = 0;
+                if (node_->has_parameter("ui.filtered_points_max")) {
+                    v = node_->get_parameter("ui.filtered_points_max").get_value<int>();
+                } else if (node_->has_parameter("filtered_points_max")) {
+                    v = node_->get_parameter("filtered_points_max").get_value<int>();
+                }
+                if (v > 0) {
                 if (v > 0) max_points = static_cast<size_t>(v);
-            }
+                }
         } catch (...) {}
         if (max_points > 0 && to_publish->points.size() > max_points) {
             size_t stride = (to_publish->points.size() + max_points - 1) / max_points;
@@ -1226,13 +1422,23 @@ void AnalyzerThread::processAsparagus(AsparaInfo& aspara_info)
             // 異常値はUIで非表示にできるようにフラグ化
             try {
                 bool enable_clip = true;
-                if (node_->has_parameter("length_clip_enable")) {
+                if (node_->has_parameter("length.clip.enable")) {
+                    enable_clip = node_->get_parameter("length.clip.enable").get_value<bool>();
+                } else if (node_->has_parameter("length_clip_enable")) {
                     enable_clip = node_->get_parameter("length_clip_enable").get_value<bool>();
                 }
                 if (enable_clip) {
                     double min_m = 0.05, max_m = 0.50;
-                    if (node_->has_parameter("length_min_m")) min_m = node_->get_parameter("length_min_m").get_value<double>();
-                    if (node_->has_parameter("length_max_m")) max_m = node_->get_parameter("length_max_m").get_value<double>();
+                    if (node_->has_parameter("length.clip.min_m")) {
+                        min_m = node_->get_parameter("length.clip.min_m").get_value<double>();
+                    } else if (node_->has_parameter("length_min_m")) {
+                        min_m = node_->get_parameter("length_min_m").get_value<double>();
+                    }
+                    if (node_->has_parameter("length.clip.max_m")) {
+                        max_m = node_->get_parameter("length.clip.max_m").get_value<double>();
+                    } else if (node_->has_parameter("length_max_m")) {
+                        max_m = node_->get_parameter("length_max_m").get_value<double>();
+                    }
                     aspara_info.length_valid = (aspara_info.length >= static_cast<float>(min_m) && aspara_info.length <= static_cast<float>(max_m));
                 }
             } catch (...) {}
@@ -1325,6 +1531,7 @@ void AnalyzerThread::updateAnalysisResult(const AsparaInfo& aspara_info, long pr
         // まだ画面に表示中 → リアルタイム更新
         it->processing_times = aspara_info.processing_times;
         it->length = aspara_info.length;
+        it->length_valid = aspara_info.length_valid;
         it->straightness = aspara_info.straightness;
         it->is_harvestable = aspara_info.is_harvestable;
         it->root_position_3d = aspara_info.root_position_3d;

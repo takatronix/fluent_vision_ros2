@@ -25,8 +25,10 @@
     left_panel_enabled: false              # 左パネル（RAW点群）
     right_panel_enabled: true              # 右パネル（FILTERED点群）
     depth_scan_preview_enabled: true       # ROI下部帯のDepthスキャン可視化を有効
-    mask_overlay_enabled: false            # 画面上の緑マスク背景を無効化
+    mask_overlay_enabled: true            # 画面上の緑マスク背景を無効化
     auto_select_single: true               # 単一検出時の自動選択（ON/OFF）
+    show_reference_line: true
+    show_reference_curve: true
 
     # ===== トピック設定（D415カメラ用） =====
     
@@ -71,6 +73,8 @@
     
     # 検出・フィルタリング設定
     min_confidence: 0.3                    # 最小検出信頼度（0.0-1.0）
+    min_bbox_width: 20                    # 最小矩形幅[px]
+    min_bbox_height: 40                   # 最小矩形高さ[px]
     pointcloud_distance_min: 0.05           # 点群処理最小距離（5cm）
     pointcloud_distance_max: 1.0           # 点群処理最大距離（2m）
     aspara_filter_distance: 0.35           # アスパラ根元からの距離窓（m）点数確保
@@ -80,10 +84,10 @@
     disable_filtered_fallback: true       # フィルタ結果が空でもフォールバックせず空点群を公開
     simple_z_back_cut: true               # z0から一定距離後ろを強制カット
     z_back_cut_m: 0.18                    # 背面カット距離（18cm）
-    filtered_points_max: 10000            # 右パネル点群の上限（0=無制限）
+    ui.filtered_points_max: 10000         # 右パネル点群の上限（0=無制限）
     
     # ===== 根本推定・抽出帯パラメータ（表示/抽出の安定化） =====
-    band_alpha: 1.0                        # 中央帯無効化（点数確保）
+    band_alpha: 0.60                       # 中央帯に絞って背景混入を抑制
 
     hist_band_bottom_ratio: 0.04           # 下部帯の下側比率（4%）
     hist_band_top_ratio: 0.12              # 下部帯の上側比率（12%）
@@ -95,7 +99,13 @@
     root_hsv_s_min: 0.25                   # 緑抽出HSV下限（S）
     root_hsv_v_min: 0.20                   # 緑抽出HSV下限（V）
     root_y_offset_ratio: 0.08              # 根本Yを矩形下端から固定する比率（5%）
-    root_lateral_radius_m: 0.20           # 横半径を20cmに拡大（点数確保）
+    root_lateral_radius_m: 0.04           # 横半径を4cmに絞る（背景混入抑制）
+    # 遠距離時の自動補正
+    distance_adaptive.enable: true
+    distance_adaptive.threshold_m: 0.70    # 70cm以上で適用
+    distance_adaptive.skeleton.step_m: 0.030
+    distance_adaptive.skeleton.radius_m: 0.025
+    distance_adaptive.skeleton.points_count: 41
 
     # ===== ノイズ除去パラメータ =====
     
@@ -108,27 +118,34 @@
 
     # ===== アスパラガス品質評価パラメータ =====
     enable_metrics: true                   # メトリクス計算を有効化
-    length_method: "auto"                 # 長さ推定: auto/skeleton/pca
+    # === New schema: group by logic ===
+    length.method: "chord"                # まずは参照直線（弦長）で安定化
+    length.scale: 1.0                      # 校正スケール（自動上書き制限により通常に戻す）
+    depth_unit_auto_override: false        # D405専用の深度スケール自動上書きを禁止
+    length.offset_m: 0.0                   # 校正オフセット
+    length.clip.enable: true               # クリップ適用
+    length.clip.min_m: 0.08                # 最小長さ[m]
+    length.clip.max_m: 0.40                # 最大長さ[m]
+    length.pca.trim_low: 0.05              # PCA長端点の下側分位
+    length.pca.trim_high: 0.95             # PCA長端点の上側分位
     show_pca_reference_line: true          # 直線参照の表示（既定ON）
     root_clip_enable: true                 # 根本より下を切る
     root_clip_margin_m: 0.02               # マージン（2cm）
-    # 長さ校正
-    length_scale: 1.0                      # 長さスケール係数（1.0=無補正）
-    length_offset_m: 0.0                   # 長さオフセット[m]（0.0=無補正）
-    length_clip_enable: true               # 長さの表示レンジ制限を有効化
-    length_min_m: 0.08                     # 最小長さ[m]（8cm未満は無効扱い）
-    length_max_m: 0.40                     # 最大長さ[m]（40cm超は無効扱い）
+    # 旧キーは後方互換として残置（実装は新キー優先で読み込み）
     
     # 収穫適性判定基準
     harvest_min_length: 0.23               # 収穫最小長さ（23cm）
     harvest_max_length: 0.50               # 収穫最大長さ（50cm）
     straightness_threshold: 0.7            # 真っ直ぐ度閾値（70%以上で収穫可能）
-    straightness_kappa_ref: 0.03           # 真直度正規化の基準曲率
+    curvature.method: "hybrid_max"        # 曲率の合成手法
+    curvature.hybrid.weight_skeleton: 0.6
+    curvature.hybrid.weight_pca: 0.4
+    curvature.straightness.kappa_ref: 0.03 # 真直度正規化の基準曲率
     cutting_target_length: 0.23            # 切断対象判定長さ（23cm以上）
 
     # ===== 表示の安全レンジ（この範囲外は非表示） =====
     display_length_min_m: 0.08
-    display_length_max_m: 0.60
+    display_length_max_m: 0.05
     display_diameter_min_m: 0.006
     display_diameter_max_m: 0.020
     display_straightness_min: 0.0
@@ -212,11 +229,11 @@
     # 骨格ポイント設定
     enable_pca_skeleton: true                # PCAベース骨格生成を有効化
     skeleton_enabled: true                   # 骨格ポイント抽出有効
-    skeleton_points_count: 9                 # 骨格点を減らして安定化
-    skeleton_method: "iterative_local"      # 骨格生成: iterative_local
-    skeleton_step_m: 0.022                   # ステップ長[m]（約2.2cm：到達長=約17.6cm）
-    skeleton_radius_m: 0.018                 # 近傍半径[m]（1.8cm）
-    skeleton_window_m: 0.06                  # 縦方向の窓を拡大して曲がりに追従
+    skeleton.method: "iterative_local"      # 骨格生成: iterative_local
+    skeleton.points_count: 9                 # 骨格点（D415はD405より疎め起点）
+    skeleton.step_m: 0.022                   # ステップ長[m]（約2.2cm）
+    skeleton.radius_m: 0.018                 # 近傍半径[m]（1.8cm）
+    skeleton.window_m: 0.06                  # 縦方向の窓
     skeleton_extraction_method: "pca_centerline"  # 抽出手法
     
     # 骨格表示設定
