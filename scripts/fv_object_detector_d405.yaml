@@ -46,10 +46,11 @@ fv_object_detector_d405:
     model:
       type: "yolov10"                               # モデルタイプ：YOLOv10
       model_path: "/models/v2_nano_best_fp16_dynamic.xml"  # モデルファイルパス
+      #model_path: "/home/aspara/seedbox-r1/fluent_vision_ros2/models/openvino/aspara_v2.1b_yolo10n_dynamic_nms.xml"  # モデルファイルパス
       device: "GPU"                                 # 推論デバイス（GPU/CPU/MYRIAD）
       input_width: 640                             # 入力画像幅（ピクセル）
       input_height: 640                            # 入力画像高さ（ピクセル）
-      confidence_threshold: 0.3                    # 信頼度閾値（0.0-1.0）
+      confidence_threshold: 0.1                    # 信頼度閾値（0.0-1.0）
       nms_threshold: 0.45                          # NMS閾値（重複検出除去）
       min_area: 100.0                              # 最小検出面積（ピクセル²）
       
