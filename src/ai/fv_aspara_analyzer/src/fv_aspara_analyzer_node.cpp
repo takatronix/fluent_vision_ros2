@@ -1806,12 +1806,28 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                                 lines.push_back(cv::format("点群数: %d/%d", raw_pts, filt_pts));
                                             }
 
-                                            // テキストに合わせてサイズ調整
+                                            // テキストに合わせてサイズ調整＋配置（選択枠基準のアンカー＆オフセット）
                                             const int pad = 6; const int lh = 18; int panel_text_w = 0; int base = 0;
                                             for (const auto &ln : lines) { cv::Size ts = cv::getTextSize(ln, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &base); panel_text_w = std::max(panel_text_w, ts.width); }
-                                            int text_w = std::min(panel_text_w + pad*2, panel_r.width - 4);
-                                            int text_h = std::min(static_cast<int>(lines.size())*lh + pad*2, panel_r.height - 4);
-                                            cv::Rect info(panel_r.x + 2, panel_r.y + 2, text_w, text_h);
+                                            int text_w = panel_text_w + pad*2;
+                                            int text_h = static_cast<int>(lines.size())*lh + pad*2;
+
+                                            // パラメータ: アンカー(top_left|top_right)とオフセット
+                                            auto params = [this](const char* key, int defv){return this->has_parameter(key)? this->get_parameter(key).as_int() : defv;};
+                                            std::string anchor = this->has_parameter("info_anchor") ? this->get_parameter("info_anchor").as_string() : std::string("top_right");
+                                            int offx = params("info_offset_x", 8);
+                                            int offy = params("info_offset_y", 8);
+
+                                            // 選択枠基準座標
+                                            int anchor_x = (anchor == "top_left") ? roi.x : (roi.x + roi.width);
+                                            int anchor_y = roi.y;
+                                            int px_i = anchor_x + offx;
+                                            int py_i = anchor_y + offy;
+
+                                            // 画像範囲に収める
+                                            px_i = std::clamp(px_i, 0, std::max(0, output_image.cols - text_w - 1));
+                                            py_i = std::clamp(py_i, 0, std::max(0, output_image.rows - text_h - 1));
+                                            cv::Rect info(px_i, py_i, text_w, text_h);
 
                                             // 背景と白枠
                                             {

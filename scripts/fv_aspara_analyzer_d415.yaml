@@ -56,12 +56,16 @@
     info_line_height: 18                   # 行高(px)
     info_show_id: true
     info_show_length: true
-    info_show_diameter: false
+    info_show_diameter: true
     info_show_straightness: true
     info_show_grade: true
     info_show_harvestable: true
     info_show_distance: true
-    info_show_debug_points: false
+    info_show_debug_points: true
+    # 位置指定（選択枠基準）
+    info_anchor: "top_right"       # "top_left" | "top_right"
+    info_offset_x: 8                # 選択枠からのXオフセット(px)
+    info_offset_y: 8                # 選択枠からのYオフセット(px)
 
     # ===== 基本処理パラメータ =====
     
