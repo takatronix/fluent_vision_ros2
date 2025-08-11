@@ -1112,8 +1112,12 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             }
         }
 
-        // 検出が1つしかない場合は常にその中心へ追従
-        if (snapshot_list.size() == 1) {
+        // 検出が1つしかない場合の自動追従（設定でONのとき）
+        bool auto_select_single = true;
+        if (this->has_parameter("auto_select_single")) {
+            auto_select_single = this->get_parameter("auto_select_single").as_bool();
+        }
+        if (auto_select_single && snapshot_list.size() == 1) {
             const auto& only_aspara = snapshot_list[0];
             cursor_position_.x = only_aspara.bounding_box_2d.x + only_aspara.bounding_box_2d.width / 2;
             cursor_position_.y = only_aspara.bounding_box_2d.y + only_aspara.bounding_box_2d.height / 2;
@@ -1189,12 +1193,17 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
             // 既存 - スムージング（より滑らかに）
             auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
             cv::Rect& smooth = smooth_bbox_map[aspara_info.id];
-            // スムージング係数を調整（滑らかなアニメーション）
-            float smooth_factor = std::min(1.0f, animation_speed * 1.5f);  // 滑らかで自然な動き
-            smooth.x = lerp(smooth.x, aspara_info.bounding_box_2d.x, smooth_factor);
-            smooth.y = lerp(smooth.y, aspara_info.bounding_box_2d.y, smooth_factor);
-            smooth.width = lerp(smooth.width, aspara_info.bounding_box_2d.width, smooth_factor);
-            smooth.height = lerp(smooth.height, aspara_info.bounding_box_2d.height, smooth_factor);
+            // 選択中は遅延なく追従（ID処理の影響で枠が動かない問題を回避）
+            if (aspara_info.id == snapshot_selected_id) {
+                smooth = aspara_info.bounding_box_2d;
+            } else {
+                // 非選択は滑らかに追従
+                float smooth_factor = std::min(1.0f, animation_speed * 1.5f);
+                smooth.x = static_cast<int>(lerp(static_cast<float>(smooth.x), static_cast<float>(aspara_info.bounding_box_2d.x), smooth_factor));
+                smooth.y = static_cast<int>(lerp(static_cast<float>(smooth.y), static_cast<float>(aspara_info.bounding_box_2d.y), smooth_factor));
+                smooth.width = static_cast<int>(lerp(static_cast<float>(smooth.width), static_cast<float>(aspara_info.bounding_box_2d.width), smooth_factor));
+                smooth.height = static_cast<int>(lerp(static_cast<float>(smooth.height), static_cast<float>(aspara_info.bounding_box_2d.height), smooth_factor));
+            }
             aspara_info.smooth_bbox = smooth;
             
             float& alpha = animation_alpha_map[aspara_info.id];
@@ -1389,29 +1398,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 }
             }
             
-            // ラベル描画（上部・簡易）
-            {
-                double length_cm = aspara_info.length * 100.0;
-                double straight_pct = aspara_info.straightness * 100.0;
-                double total_ms = aspara_info.processing_times.total_ms;
-                std::string label;
-                if (aspara_info.length_valid) {
-                    label = cv::format("ID:%d  len:%.1fcm  str:%.0f%%  time:%.1fms", aspara_info.id, length_cm, straight_pct, total_ms);
-                } else {
-                    label = cv::format("ID:%d  len:--  str:%.0f%%  time:%.1fms", aspara_info.id, straight_pct, total_ms);
-                }
-                int baseline = 0;
-                cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
-                cv::Point text_pos(aspara_info.smooth_bbox.x, aspara_info.smooth_bbox.y - 5);
-                // 背景ボックス
-                cv::rectangle(output_image, 
-                    cv::Rect(aspara_info.smooth_bbox.x, text_pos.y - text_size.height - 3, 
-                             aspara_info.smooth_bbox.width, text_size.height + 6),
-                    grade_color, -1);
-                // テキスト（黒）
-                fluent::text::draw(output_image, label, cv::Point(text_pos.x + 3, text_pos.y), 
-                    cv::Scalar(0, 0, 0), 0.5, 1);
-            }
+            // 上部の緑バック黒字ラベルは非表示にする（ユーザー指示）
 
             // 矩形内詳細情報（選択中のみ）
             if (is_selected) {
@@ -1465,30 +1452,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 }
                 if (spikes > 0) lines.push_back(cv::format("穂: %d個", spikes));
 
-                // パネル描画（矩形内左上に半透明背景）
-                const int pad = 6;
-                const int lh = 18; // 行高
-                int panel_w = 0;
-                for (const auto &ln : lines) {
-                    int base = 0; cv::Size ts = cv::getTextSize(ln, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &base);
-                    panel_w = std::max(panel_w, ts.width);
-                }
-                panel_w += pad * 2;
-                int panel_h = static_cast<int>(lines.size()) * lh + pad * 2;
-                cv::Rect bbox = aspara_info.smooth_bbox & cv::Rect(0, 0, output_image.cols, output_image.rows);
-                cv::Rect panel(bbox.x + 2, bbox.y + 2, std::min(panel_w, std::max(10, bbox.width - 4)), std::min(panel_h, std::max(10, bbox.height - 4)));
-                // 半透明黒背景
-                cv::Mat roi_img = output_image(panel);
-                cv::Mat overlay_panel; roi_img.copyTo(overlay_panel);
-                cv::rectangle(overlay_panel, cv::Rect(0,0,panel.width,panel.height), cv::Scalar(0,0,0), -1);
-                cv::addWeighted(overlay_panel, 0.45, roi_img, 0.55, 0.0, roi_img);
-                // テキスト描画（白）
-                int tx = panel.x + pad;
-                int ty = panel.y + pad + 12;
-                for (const auto &ln : lines) {
-                    fluent::text::draw(output_image, ln, cv::Point(tx, ty), cv::Scalar(255,255,255), 0.5, 1);
-                    ty += lh;
-                }
+                // 情報パネルは右プレビュー描画の後に最前面で重ね描きするため、この段階では描画しない
             }
         }
 
@@ -1807,6 +1771,59 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                                         if (it_sel != snapshot_list.end() && !it_sel->filtered_pointcloud.data.empty()) {
                                             drawCloudToPanel(it_sel->filtered_pointcloud, roi, panel_r, filt_drawn);
                                         }
+
+                                        // 情報ウィンドウは点群を描いた“後”に重ねて描画（見えなくならないよう最前面）
+                                        try {
+                                            auto paramb = [this](const char* key, bool defv){return this->has_parameter(key)? this->get_parameter(key).as_bool() : defv;};
+                                            bool show_id = paramb("info_show_id", true);
+                                            bool show_length = paramb("info_show_length", true);
+                                            bool show_diameter = paramb("info_show_diameter", true);
+                                            bool show_straightness = paramb("info_show_straightness", true);
+                                            bool show_grade = paramb("info_show_grade", true);
+                                            bool show_harvest = paramb("info_show_harvestable", true);
+                                            bool show_distance = paramb("info_show_distance", true);
+                                            bool show_debug = paramb("info_show_debug_points", true);
+
+                                            std::vector<std::string> lines;
+                                            if (show_id) lines.push_back(cv::format("ID: %d", it_sel->id));
+                                            if (show_length && it_sel->length > 0) lines.push_back(cv::format("長さ: %.1fcm", it_sel->length * 100.0));
+                                            if (show_diameter && it_sel->diameter > 0) lines.push_back(cv::format("太さ: %.0fmm", it_sel->diameter * 1000.0));
+                                            if (show_straightness) lines.push_back(cv::format("曲がり度: %.0f", it_sel->straightness * 100.0));
+                                            if (show_grade) {
+                                                const char* gl = (it_sel->grade==AsparaguGrade::A_GRADE?"A": it_sel->grade==AsparaguGrade::B_GRADE?"B": it_sel->grade==AsparaguGrade::C_GRADE?"C":"NG");
+                                                lines.push_back(std::string("グレード: ") + gl);
+                                            }
+                                            if (show_harvest) lines.push_back(std::string("収穫可否: ") + (it_sel->is_harvestable?"YES":"NO"));
+                                            if (show_distance) {
+                                                double dm = 0.0; const auto &rp = it_sel->root_position_3d;
+                                                if (std::isfinite(rp.x) && std::isfinite(rp.y) && std::isfinite(rp.z)) dm = std::sqrt(rp.x*rp.x + rp.y*rp.y + rp.z*rp.z);
+                                                if (dm > 0.0) lines.push_back(cv::format("距離: %.2fm", dm));
+                                            }
+                                            if (show_debug) {
+                                                int raw_pts = static_cast<int>(it_sel->asparagus_pointcloud.width * it_sel->asparagus_pointcloud.height);
+                                                int filt_pts = static_cast<int>(it_sel->filtered_pointcloud.width * it_sel->filtered_pointcloud.height);
+                                                lines.push_back("[debug]");
+                                                lines.push_back(cv::format("点群数: %d/%d", raw_pts, filt_pts));
+                                            }
+
+                                            // テキストに合わせてサイズ調整
+                                            const int pad = 6; const int lh = 18; int panel_text_w = 0; int base = 0;
+                                            for (const auto &ln : lines) { cv::Size ts = cv::getTextSize(ln, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &base); panel_text_w = std::max(panel_text_w, ts.width); }
+                                            int text_w = std::min(panel_text_w + pad*2, panel_r.width - 4);
+                                            int text_h = std::min(static_cast<int>(lines.size())*lh + pad*2, panel_r.height - 4);
+                                            cv::Rect info(panel_r.x + 2, panel_r.y + 2, text_w, text_h);
+
+                                            // 背景と白枠
+                                            {
+                                                cv::Mat roi_r = output_image(info); cv::Mat ov_r; roi_r.copyTo(ov_r);
+                                                cv::rectangle(ov_r, cv::Rect(0,0,info.width,info.height), cv::Scalar(0,0,0), -1);
+                                                cv::addWeighted(ov_r, 0.45, roi_r, 0.55, 0.0, roi_r);
+                                            }
+                                            cv::rectangle(output_image, info, cv::Scalar(255,255,255), 1);
+
+                                            int tx = info.x + pad; int ty = info.y + pad + 12;
+                                            for (const auto &ln : lines) { fluent::text::draw(output_image, ln, cv::Point(tx, ty), cv::Scalar(255,255,255), 0.5, 1); ty += lh; }
+                                        } catch (...) {}
 
                                     }
                                 }
