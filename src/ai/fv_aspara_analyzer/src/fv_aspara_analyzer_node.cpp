@@ -1388,12 +1388,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                     int v = static_cast<int>(std::round(fy * (rp.y / rp.z) + cy));
                     if (u >= 0 && u < output_image.cols && v >= 0 && v < output_image.rows) {
                         cv::circle(output_image, cv::Point(u, v), 6, cv::Scalar(0, 0, 255), -1);
-                        // 根本座標注記とZ±窓の表示
-                        double pm_cm = aspara_filter_distance_ * 100.0;
-                        std::string rp_txt = cv::format("X:%.3f Y:%.3f Z:%.3f m  +/-%.0fcm", rp.x, rp.y, rp.z, pm_cm);
-                        int text_x = std::min(output_image.cols - 10, u + 10);
-                        int text_y = std::max(12, v - 10);
-                        fluent::text::draw(output_image, rp_txt, cv::Point(text_x, text_y), cv::Scalar(0, 0, 255), 0.5, 1);
+                        // 根本座標テキスト表示は無し（赤丸のみ）
                     }
                 }
             }
@@ -1960,12 +1955,7 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
                 }
             }
         }
-        if (has_distance) {
-            std::string cursor_info = cv::format("(%.2f, %.2f, %.2f) %.1fcm", x_m, y_m, z_m, distance_m * 100.0);
-        fluent::text::draw(output_image, cursor_info, 
-                          cv::Point(smooth_cursor_position_.x + 25, smooth_cursor_position_.y - 25),
-                               cursor_color, 0.5, 1);
-        }
+        // カーソルの座標・距離テキストは表示しない
     }
 
     // 骨格オーバーレイ（全アスパラ表示。選択は太線で強調）
