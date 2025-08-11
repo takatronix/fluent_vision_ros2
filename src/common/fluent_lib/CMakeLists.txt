@@ -71,6 +71,13 @@ install(DIRECTORY include/
   DESTINATION include/
 )
 
+# Expose include directory to downstream packages
+target_include_directories(${PROJECT_NAME}
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
 # Install library
 install(TARGETS ${PROJECT_NAME}
   EXPORT export_${PROJECT_NAME}
@@ -81,6 +88,7 @@ install(TARGETS ${PROJECT_NAME}
 
 # Export targets
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_include_directories(include)
 ament_export_dependencies(
   rclcpp
   std_msgs

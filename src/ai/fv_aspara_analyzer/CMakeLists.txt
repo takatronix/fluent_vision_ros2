@@ -43,8 +43,8 @@ find_package(fluent_lib REQUIRED)
 # ===== インクルードディレクトリ設定 =====
 include_directories(include)                 # ヘッダーファイルディレクトリ
 include_directories(${OpenCV_INCLUDE_DIRS})  # OpenCVインクルードディレクトリ
-include_directories(/home/aspara/seedbox-r1/fluent_vision_ros2/src/common/fluent_lib/include)  # fluent_lib
-include_directories(/home/aspara/seedbox-r1/fluent_vision_ros2/src/common/fluent_lib/legacy/fluent_cloud/include)  # fluent_cloud legacy include
+# Use exported include dirs from fluent_lib; avoid hardcoded absolute paths
+include_directories(${fluent_lib_INCLUDE_DIRS})
 
 # ===== 依存関係リスト =====
 set(dependencies
