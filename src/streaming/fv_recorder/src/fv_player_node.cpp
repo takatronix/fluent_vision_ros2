@@ -2,6 +2,8 @@
 #include <filesystem>
 #include <chrono>
 #include <thread>
+#include <iomanip>
+#include <sstream>
 
 FVPlayerNode::FVPlayerNode() : Node("fv_player_node"), running_(false)
 {
@@ -15,9 +17,12 @@ FVPlayerNode::FVPlayerNode() : Node("fv_player_node"), running_(false)
 void FVPlayerNode::loadParameters()
 {
     // パラメータの読み込み
-    config_.recording_directory = this->declare_parameter("recording_directory", "/tmp/recordings");
-    config_.playback_speed = this->declare_parameter("playback_speed", 1.0);
-    config_.output_topics = this->declare_parameter("output_topics", std::vector<std::string>{});
+    config_.recording_directory = this->declare_parameter("recording.output_directory", "/home/takatronix/recordings");
+    config_.playback_speed = this->declare_parameter("playback.playback_speed", 1.0);
+    config_.output_topics = this->declare_parameter("playback.output_topics", std::vector<std::string>{});
+    // overlays (global defaults can be overridden per-node)
+    config_.overlay_play_indicator = this->declare_parameter("preview.overlay_play_indicator", true);
+    config_.overlay_topic = this->declare_parameter("preview.output_topic", std::string("/fv_player/preview"));
     
     RCLCPP_INFO(this->get_logger(), "📁 Recording directory: %s", config_.recording_directory.c_str());
     RCLCPP_INFO(this->get_logger(), "⏩ Playback speed: %f", config_.playback_speed);
@@ -37,6 +42,10 @@ void FVPlayerNode::initializeServices()
 void FVPlayerNode::initializePublishers()
 {
     status_publisher_ = this->create_publisher<fv_recorder::msg::RecordingStatus>("status", 10);
+    if (config_.overlay_play_indicator) {
+        preview_publisher_ = this->create_publisher<sensor_msgs::msg::Image>(config_.overlay_topic, rclcpp::QoS(2).best_effort());
+        RCLCPP_INFO(this->get_logger(), "🖼️ Player preview on: %s", config_.overlay_topic.c_str());
+    }
 }
 
 void FVPlayerNode::startPlayback(const std::shared_ptr<fv_recorder::srv::StartPlayback::Request> request,
@@ -78,6 +87,8 @@ void FVPlayerNode::startPlayback(const std::shared_ptr<fv_recorder::srv::StartPl
 void FVPlayerNode::stopPlayback(const std::shared_ptr<fv_recorder::srv::StopPlayback::Request> request,
                                std::shared_ptr<fv_recorder::srv::StopPlayback::Response> response)
 {
+    (void)request; // 未使用パラメータ警告を抑制
+    
     if (!running_) {
         response->success = false;
         response->message = "No playback is running";
@@ -98,18 +109,19 @@ void FVPlayerNode::stopPlayback(const std::shared_ptr<fv_recorder::srv::StopPlay
 
 void FVPlayerNode::publishMessage(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name)
 {
-    // 基本的なメッセージタイプのみ対応
     try {
-        // Imageメッセージとしてパブリッシュを試行
-        auto publisher = this->create_publisher<sensor_msgs::msg::Image>(topic_name, 10);
-        
-        // シリアライゼーションを使用してメッセージを復元
-        rclcpp::Serialization<sensor_msgs::msg::Image> serialization;
-        sensor_msgs::msg::Image msg;
-        serialization.deserialize_message(&serialized_msg, &msg);
-        
-        publisher->publish(msg);
-        
+        // 型情報を問い合わせて適切なgeneric publisherを作成
+        auto names_and_types = this->get_topic_names_and_types();
+        std::string type_name;
+        auto it = names_and_types.find(topic_name);
+        if (it != names_and_types.end() && !it->second.empty()) {
+            type_name = it->second.front();
+        } else {
+            // フォールバック（よくある型）
+            type_name = "sensor_msgs/msg/Image";
+        }
+        auto gen_pub = this->create_generic_publisher(topic_name, type_name, rclcpp::QoS(10));
+        gen_pub->publish(serialized_msg);
     } catch (const std::exception& e) {
         RCLCPP_WARN(this->get_logger(), "⚠️ Failed to publish message to %s: %s", topic_name.c_str(), e.what());
     }
@@ -122,6 +134,7 @@ void FVPlayerNode::runPlaybackLoop(const std::vector<std::string>& recording_fil
             if (!running_) break;
             
             RCLCPP_INFO(this->get_logger(), "📂 Playing file: %s", file.c_str());
+            publishPlayOverlay();
             
             // ROSBag2ファイルを読み込み
             rosbag2_storage::StorageOptions storage_options;
@@ -144,20 +157,24 @@ void FVPlayerNode::runPlaybackLoop(const std::vector<std::string>& recording_fil
                 
                 std::string output_topic = mapTopicName(serialized_message->topic_name);
                 
-                // SerializedBagMessageをrclcpp::SerializedMessageに変換
-                rclcpp::SerializedMessage rclcpp_msg;
-                rclcpp_msg.reserve(serialized_message->serialized_data->buffer_length);
-                std::memcpy(rclcpp_msg.get_rcl_serialized_message().buffer, 
-                           serialized_message->serialized_data->buffer, 
-                           serialized_message->serialized_data->buffer_length);
-                rclcpp_msg.get_rcl_serialized_message().buffer_length = serialized_message->serialized_data->buffer_length;
+                // SerializedBagMessageをrclcpp::SerializedMessageに安全にコピー
+                rclcpp::SerializedMessage rclcpp_msg(serialized_message->serialized_data->buffer_length);
+                auto& rcl_buf = rclcpp_msg.get_rcl_serialized_message();
+                std::memcpy(rcl_buf.buffer, serialized_message->serialized_data->buffer, serialized_message->serialized_data->buffer_length);
+                rcl_buf.buffer_length = serialized_message->serialized_data->buffer_length;
                 
                 // メッセージをパブリッシュ
                 publishMessage(rclcpp_msg, output_topic);
                 
-                // 再生速度に応じて待機
-                sleepForDuration(
-                    static_cast<int64_t>(serialized_message->time_stamp * 1e9 / config_.playback_speed));
+                // 再生速度に応じて待機（Bagのタイムスタンプはナノ秒、差分を使う）
+                static uint64_t prev_ts = 0;
+                uint64_t ts = serialized_message->time_stamp; // nanoseconds
+                if (prev_ts != 0 && ts > prev_ts) {
+                    uint64_t delta = ts - prev_ts;
+                    delta = static_cast<uint64_t>(static_cast<double>(delta) / std::max(0.0001, config_.playback_speed));
+                    sleepForDuration(static_cast<int64_t>(delta));
+                }
+                prev_ts = ts;
             }
         }
     } catch (const std::exception& e) {
@@ -231,6 +248,28 @@ void FVPlayerNode::sleepForDuration(int64_t nanoseconds)
     std::this_thread::sleep_for(duration);
 }
 
+void FVPlayerNode::publishPlayOverlay()
+{
+    if (!preview_publisher_) return;
+    
+    // Create a small banner image with "PLAY" and timestamp
+    cv::Mat banner(60, 240, CV_8UC3, cv::Scalar(40, 40, 40));
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char timebuf[64];
+    std::strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    
+    cv::putText(banner, "PLAY", {12, 24}, cv::FONT_HERSHEY_SIMPLEX, 0.8, {0,255,0}, 2, cv::LINE_AA);
+    cv::putText(banner, timebuf, {12, 50}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {255,255,255}, 1, cv::LINE_AA);
+    
+    cv_bridge::CvImage out;
+    out.header.stamp = this->now();
+    out.encoding = sensor_msgs::image_encodings::BGR8;
+    out.image = banner;
+    
+    preview_publisher_->publish(*out.toImageMsg());
+}
+
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
@@ -246,4 +285,4 @@ int main(int argc, char** argv)
     rclcpp::shutdown();
     
     return 0;
-} 
+}

@@ -4,6 +4,78 @@
 
 FV Recorderは、ROS2トピックの録画・再生を行うシステムです。複数のカメラトピック（depth、color等）を同時に記録し、後でシミュレーションとして再生できます。
 
+## クイックスタート（自動録画）
+
+1) ビルドとセットアップ
+
+```bash
+colcon build --packages-select fv_recorder
+source install/setup.bash
+```
+
+2) 設定ファイル（例）で自動録画を有効化（単一カメラ）
+
+`src/streaming/fv_recorder/config/recorder_config.yaml`
+
+```yaml
+fv_recorder:
+  ros__parameters:
+    recording:
+      input_topics:
+        - "/test_camera/image_raw"
+      output_directory: "/home/takatronix/recordings"
+      segment_duration: 300
+      retention_days: 7
+      date_format: "YYYYMMDD"
+      auto_recording: true
+      default_format: "mp4"
+    preview:
+      enabled: true
+      output_topic: "/fv_recorder/preview"
+```
+
+3) 設定ファイルを指定して起動
+
+```bash
+ros2 run fv_recorder fv_recorder_node --ros-args --params-file src/streaming/fv_recorder/config/recorder_config.yaml
+```
+
+起動直後に自動で録画が開始され、例として次のようなファイルが作成されます:
+
+```
+/home/takatronix/recordings/20250812_102804_segment_0.mp4
+```
+
+録画の開始/停止（トピック制御）
+
+```bash
+ros2 topic pub /fv_recorder/recording_control std_msgs/msg/Bool "data: true"  --once  # 開始
+ros2 topic pub /fv_recorder/recording_control std_msgs/msg/Bool "data: false" --once  # 停止
+```
+
+### 動画へ時刻を焼き込む（オプション）
+
+保存する動画に撮影時刻をオーバーレイして記録できます。
+
+`config/recorder_config.yaml`
+
+```yaml
+fv_recorder:
+  ros__parameters:
+    recording:
+      video_time_overlay: true
+      video_time_overlay_format: "%Y-%m-%d %H:%M:%S"  # 例: 2025-08-12 10:28:04
+```
+
+実行時に直接指定する場合:
+
+```bash
+ros2 run fv_recorder fv_recorder_node --ros-args \
+  -p recording.video_time_overlay:=true \
+  -p recording.video_time_overlay_format:="%Y-%m-%d %H:%M:%S" \
+  --params-file src/streaming/fv_recorder/config/recorder_config.yaml
+```
+
 ## 機能
 
 ### 録画機能
@@ -294,8 +366,8 @@ colcon build --packages-select fv_recorder
 # ソース
 source install/setup.bash
 
-# 起動
-ros2 launch fv_recorder fv_recorder.launch.py
+# 起動（paramsファイル指定での単体起動）
+ros2 run fv_recorder fv_recorder_node --ros-args --params-file src/streaming/fv_recorder/config/recorder_config.yaml
 ```
 
 ### 2. 録画制御
@@ -303,8 +375,8 @@ ros2 launch fv_recorder fv_recorder.launch.py
 #### サービスによる制御
 
 ```bash
-# 基本録画開始
-ros2 service call /fv_recorder/start_recording fv_recorder/srv/StartRecording "{recording_directory: '/home/user/recordings', date_format: '20241201', segment_duration: 300, retention_days: 7}"
+# 基本録画開始（設定ファイルのデフォルトを使用）
+ros2 service call /fv_recorder/start_recording fv_recorder/srv/StartRecording "{}"
 
 # カスタムトピックで録画開始
 ros2 service call /fv_recorder/start_recording fv_recorder/srv/StartRecording "{
@@ -316,7 +388,7 @@ ros2 service call /fv_recorder/start_recording fv_recorder/srv/StartRecording "{
 }"
 
 # 録画停止
-ros2 service call /fv_recorder/stop_recording fv_recorder/srv/StopRecording "{recording_id: '20241201_143022'}"
+ros2 service call /fv_recorder/stop_recording fv_recorder/srv/StopRecording "{}"
 ```
 
 #### トピックによる制御

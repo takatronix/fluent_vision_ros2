@@ -1,7 +1,5 @@
-# 再生停止リクエスト
-string playback_id           # 再生ID
-
+# 再生停止サービス
+string playback_id           # 再生ID（空の場合は現在の再生を停止）
 ---
-# 再生停止レスポンス
 bool success                 # 成功フラグ
 string message              # メッセージ 

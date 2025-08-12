@@ -12,10 +12,16 @@ def generate_launch_description():
     # パッケージディレクトリを取得
     pkg_share = FindPackageShare('fv_recorder')
     
-    # 設定ファイルのパス
-    config_file = PathJoinSubstitution([
+    # 設定ファイル（上書き可能）
+    default_config_file = PathJoinSubstitution([
         pkg_share, 'config', 'recorder_config.yaml'
     ])
+    config_file_arg = DeclareLaunchArgument(
+        'config_file',
+        default_value=default_config_file,
+        description='設定YAMLファイルのパス'
+    )
+    config_file = LaunchConfiguration('config_file')
     
     # Launch引数の定義
     recording_directory_arg = DeclareLaunchArgument(
@@ -46,7 +52,7 @@ def generate_launch_description():
     recorder_node = Node(
         package='fv_recorder',
         executable='fv_recorder_node',
-        name='fv_recorder_node',
+        name='fv_recorder',
         output='screen',
         parameters=[
             config_file,
@@ -65,7 +71,7 @@ def generate_launch_description():
     player_node = Node(
         package='fv_recorder',
         executable='fv_player_node',
-        name='fv_player_node',
+        name='fv_player',
         output='screen',
         parameters=[
             config_file,
@@ -79,6 +85,7 @@ def generate_launch_description():
     )
     
     return LaunchDescription([
+        config_file_arg,
         recording_directory_arg,
         segment_duration_arg,
         retention_days_arg,

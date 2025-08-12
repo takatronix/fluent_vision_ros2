@@ -1,8 +1,6 @@
-# 録画停止リクエスト
-string recording_id          # 録画ID
-
+# 録画停止サービス
+string recording_id          # 録画ID（空の場合は現在の録画を停止）
 ---
-# 録画停止レスポンス
 bool success                 # 成功フラグ
 string message              # メッセージ
 string final_file_path      # 最終ファイルパス 
