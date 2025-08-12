@@ -2373,7 +2373,6 @@ void FvAsparaAnalyzerNode::publishCurrentImage()
         std::swap(canvas_pub_, canvas_draw_);
     }
     fi::Image &pub_canvas = canvas_pub_;
-    cv::Mat &pub_image = static_cast<cv::Mat&>(pub_canvas);
     // 画像をパブリッシュ（同一pubキャンバスから非圧縮/圧縮を出力）
     fu::Stopwatch pub_sw;
     try {

@@ -87,11 +87,11 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}  # インストール先：lib/fv_aspara_analyzer/
 )
 
-# ディレクトリのインストール
-install(DIRECTORY
-  launch                    # launchディレクトリ
-  DESTINATION share/${PROJECT_NAME}/  # インストール先：share/fv_aspara_analyzer/
-)
+# ディレクトリのインストール（launchディレクトリが存在しない場合はコメントアウト）
+# install(DIRECTORY
+#   launch                    # launchディレクトリ
+#   DESTINATION share/${PROJECT_NAME}/  # インストール先：share/fv_aspara_analyzer/
+# )
 
 # ===== テスト設定 =====
 if(BUILD_TESTING)
