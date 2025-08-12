@@ -9,6 +9,14 @@ bool ROSBag2Writer::open(const std::string& filepath) {
     try {
         writer_ = std::make_unique<rosbag2_cpp::Writer>();
         writer_->open(filepath);
+        // Create topics if type information is provided
+        for (const auto& [topic_name, type_name] : topics_with_types_) {
+            rosbag2_storage::TopicMetadata metadata;
+            metadata.name = topic_name;
+            metadata.type = type_name;
+            metadata.serialization_format = "cdr";
+            writer_->create_topic(metadata);
+        }
         return true;
     } catch (const std::exception& e) {
         return false;
@@ -129,3 +137,163 @@ void JSONWriter::close() {
         }
     }
 } 
+
+// YAMLWriter実装
+bool YAMLWriter::open(const std::string& filepath) {
+    filepath_ = filepath;
+    file_.open(filepath_, std::ios::out | std::ios::trunc);
+    if (!file_.is_open()) {
+        return false;
+    }
+    file_ << "metadata:\n";
+    file_ << "  format: yaml\n";
+    file_ << "  version: 1.0\n";
+    file_ << "messages:\n";
+    return true;
+}
+
+bool YAMLWriter::write(const sensor_msgs::msg::Image::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) {
+    if (!file_.is_open()) return false;
+    file_ << "  - timestamp: " << timestamp.nanoseconds() << "\n";
+    file_ << "    topic: '" << topic_name << "'\n";
+    file_ << "    type: sensor_msgs/msg/Image\n";
+    file_ << "    data:\n";
+    file_ << "      width: " << msg->width << "\n";
+    file_ << "      height: " << msg->height << "\n";
+    file_ << "      encoding: '" << msg->encoding << "'\n";
+    file_ << "      step: " << msg->step << "\n";
+    file_ << "      data_size: " << msg->data.size() << "\n";
+    return true;
+}
+
+bool YAMLWriter::write(const std_msgs::msg::String::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) {
+    if (!file_.is_open()) return false;
+    file_ << "  - timestamp: " << timestamp.nanoseconds() << "\n";
+    file_ << "    topic: '" << topic_name << "'\n";
+    file_ << "    type: std_msgs/msg/String\n";
+    file_ << "    data: '" << msg->data << "'\n";
+    return true;
+}
+
+bool YAMLWriter::write(const std_msgs::msg::Bool::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) {
+    if (!file_.is_open()) return false;
+    file_ << "  - timestamp: " << timestamp.nanoseconds() << "\n";
+    file_ << "    topic: '" << topic_name << "'\n";
+    file_ << "    type: std_msgs/msg/Bool\n";
+    file_ << "    data: " << (msg->data ? "true" : "false") << "\n";
+    return true;
+}
+
+bool YAMLWriter::writeGeneric(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name, const std::string& message_type, const rclcpp::Time& timestamp) {
+    if (!file_.is_open()) return false;
+    file_ << "  - timestamp: " << timestamp.nanoseconds() << "\n";
+    file_ << "    topic: '" << topic_name << "'\n";
+    file_ << "    type: '" << message_type << "'\n";
+    file_ << "    data:\n";
+    file_ << "      serialized_size: " << serialized_msg.size() << "\n";
+    return true;
+}
+
+void YAMLWriter::close() {
+    if (file_.is_open()) {
+        file_.close();
+    }
+}
+
+// CSVWriter実装
+bool CSVWriter::open(const std::string& filepath) {
+    filepath_ = filepath;
+    file_.open(filepath_, std::ios::out | std::ios::trunc);
+    if (!file_.is_open()) {
+        return false;
+    }
+    file_ << "timestamp,topic,type,data\n";
+    return true;
+}
+
+bool CSVWriter::write(const sensor_msgs::msg::Image::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) {
+    if (!file_.is_open()) return false;
+    file_ << timestamp.nanoseconds() << "," << topic_name << ",sensor_msgs/msg/Image,"
+          << msg->width << "x" << msg->height << "x" << msg->encoding << "\n";
+    return true;
+}
+
+bool CSVWriter::write(const std_msgs::msg::String::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) {
+    if (!file_.is_open()) return false;
+    // Escape quotes in CSV
+    std::string data = msg->data;
+    for (size_t pos = 0; (pos = data.find('"', pos)) != std::string::npos; pos += 2) {
+        data.replace(pos, 1, "\"\"");
+    }
+    file_ << timestamp.nanoseconds() << "," << topic_name << ",std_msgs/msg/String,\"" << data << "\"\n";
+    return true;
+}
+
+bool CSVWriter::write(const std_msgs::msg::Bool::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) {
+    if (!file_.is_open()) return false;
+    file_ << timestamp.nanoseconds() << "," << topic_name << ",std_msgs/msg/Bool," << (msg->data ? "true" : "false") << "\n";
+    return true;
+}
+
+bool CSVWriter::writeGeneric(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name, const std::string& message_type, const rclcpp::Time& timestamp) {
+    if (!file_.is_open()) return false;
+    file_ << timestamp.nanoseconds() << "," << topic_name << "," << message_type << ",size=" << serialized_msg.size() << "\n";
+    return true;
+}
+
+void CSVWriter::close() {
+    if (file_.is_open()) {
+        file_.close();
+    }
+}
+
+// VideoWriter実装（画像トピックのみ対応）
+bool VideoWriter::open(const std::string& filepath) {
+    filepath_ = filepath;
+    // 実際のサイズとFPSは最初のフレームで決定
+    initialized_ = false;
+    return true;
+}
+
+bool VideoWriter::write(const sensor_msgs::msg::Image::SharedPtr& msg, const std::string& /*topic_name*/, const rclcpp::Time& /*timestamp*/) {
+    try {
+        cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+        const cv::Mat& img = cv_ptr->image;
+        if (!initialized_) {
+            double fps = 30.0; // 仮のFPS。厳密なFPS制御はノード側で調整する
+            int fourcc = (format_ == "mp4") ? cv::VideoWriter::fourcc('a','v','c','1') : cv::VideoWriter::fourcc('M','J','P','G');
+            if (!video_writer_.open(filepath_, fourcc, fps, img.size(), true)) {
+                return false;
+            }
+            initialized_ = true;
+        }
+        if (video_writer_.isOpened()) {
+            video_writer_.write(img);
+            return true;
+        }
+    } catch (...) {
+        return false;
+    }
+    return false;
+}
+
+bool VideoWriter::write(const std_msgs::msg::String::SharedPtr& /*msg*/, const std::string& /*topic_name*/, const rclcpp::Time& /*timestamp*/) {
+    // 動画では非対応
+    return true;
+}
+
+bool VideoWriter::write(const std_msgs::msg::Bool::SharedPtr& /*msg*/, const std::string& /*topic_name*/, const rclcpp::Time& /*timestamp*/) {
+    // 動画では非対応
+    return true;
+}
+
+bool VideoWriter::writeGeneric(const rclcpp::SerializedMessage& /*serialized_msg*/, const std::string& /*topic_name*/, const std::string& /*message_type*/, const rclcpp::Time& /*timestamp*/) {
+    // 動画では非対応
+    return true;
+}
+
+void VideoWriter::close() {
+    if (video_writer_.isOpened()) {
+        video_writer_.release();
+    }
+}

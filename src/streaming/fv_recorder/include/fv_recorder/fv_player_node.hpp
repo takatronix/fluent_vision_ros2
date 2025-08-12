@@ -20,11 +20,16 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <opencv2/opencv.hpp>
+#include <cv_bridge/cv_bridge.h>
 
 struct PlayerConfig {
     std::string recording_directory;
     double playback_speed;
     std::vector<std::string> output_topics;
+    // overlays
+    bool overlay_play_indicator {true};
+    std::string overlay_topic {"/fv_player/preview"};
 };
 
 class FVPlayerNode : public rclcpp::Node
@@ -43,6 +48,7 @@ private:
     
     // Publishers
     rclcpp::Publisher<fv_recorder::msg::RecordingStatus>::SharedPtr status_publisher_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr preview_publisher_;
     
     // Services
     rclcpp::Service<fv_recorder::srv::StartPlayback>::SharedPtr start_playback_service_;
@@ -60,6 +66,7 @@ private:
     
     void runPlaybackLoop(const std::vector<std::string>& recording_files);
     void publishMessage(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name);
+    void publishPlayOverlay();
     
     std::vector<std::string> findRecordingFiles(const std::string& directory, const std::string& date_format);
     std::string mapTopicName(const std::string& input_topic);

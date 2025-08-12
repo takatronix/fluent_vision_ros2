@@ -12,8 +12,14 @@ def generate_launch_description():
     # Get package directory
     pkg_dir = get_package_share_directory('fv_recorder')
     launch_dir = os.path.dirname(os.path.abspath(__file__))
+    default_config_file = os.path.join(pkg_dir, 'config', 'recorder_config.yaml')
     
     # Launch arguments
+    config_file_arg = DeclareLaunchArgument(
+        'config_file',
+        default_value=default_config_file,
+        description='設定YAMLファイルのパス'
+    )
     recording_directory_arg = DeclareLaunchArgument(
         'recording_directory',
         default_value='/recordings',
@@ -45,7 +51,7 @@ def generate_launch_description():
         name='fv_recorder_node',
         output='screen',
         parameters=[
-            os.path.join(launch_dir, 'fv_recorder_config.yaml'),
+            LaunchConfiguration('config_file'),
             {
                 'recording.output_directory': LaunchConfiguration('recording_directory'),
                 'recording.segment_duration': LaunchConfiguration('segment_duration'),
@@ -64,7 +70,7 @@ def generate_launch_description():
         name='fv_player_node',
         output='screen',
         parameters=[
-            os.path.join(launch_dir, 'fv_recorder_config.yaml'),
+            LaunchConfiguration('config_file'),
             {
                 'playback.recording_directory': LaunchConfiguration('recording_directory'),
             }
@@ -78,6 +84,7 @@ def generate_launch_description():
     log_info = LogInfo(msg="🚀 Starting FV Recorder for D415 and D405...")
     
     return LaunchDescription([
+        config_file_arg,
         recording_directory_arg,
         segment_duration_arg,
         retention_days_arg,

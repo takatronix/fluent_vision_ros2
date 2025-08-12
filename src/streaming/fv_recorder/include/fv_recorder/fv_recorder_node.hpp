@@ -39,6 +39,7 @@
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <unordered_map>
 
 // フォーマット対応クラス
 class FormatWriter {
@@ -62,7 +63,7 @@ public:
 class ROSBag2Writer : public FormatWriter {
 private:
     std::unique_ptr<rosbag2_cpp::Writer> writer_;
-    std::vector<std::string> topics_;
+    std::vector<std::pair<std::string, std::string>> topics_with_types_;
 
 public:
     bool open(const std::string& filepath) override;
@@ -72,7 +73,7 @@ public:
     bool writeGeneric(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name, const std::string& message_type, const rclcpp::Time& timestamp) override;
     void close() override;
     std::string getFileExtension() const override { return ".db3"; }
-    void setTopics(const std::vector<std::string>& topics) { topics_ = topics; }
+    void setTopicsWithTypes(const std::vector<std::pair<std::string, std::string>>& topics_with_types) { topics_with_types_ = topics_with_types; }
 };
 
 // JSONWriter
@@ -102,6 +103,7 @@ public:
     bool write(const sensor_msgs::msg::Image::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
     bool write(const std_msgs::msg::String::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
     bool write(const std_msgs::msg::Bool::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
+    bool writeGeneric(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name, const std::string& message_type, const rclcpp::Time& timestamp) override;
     void close() override;
     std::string getFileExtension() const override { return ".yaml"; }
 };
@@ -117,6 +119,7 @@ public:
     bool write(const sensor_msgs::msg::Image::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
     bool write(const std_msgs::msg::String::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
     bool write(const std_msgs::msg::Bool::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
+    bool writeGeneric(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name, const std::string& message_type, const rclcpp::Time& timestamp) override;
     void close() override;
     std::string getFileExtension() const override { return ".csv"; }
 };
@@ -127,6 +130,7 @@ private:
     cv::VideoWriter video_writer_;
     std::string filepath_;
     std::string format_;
+    bool initialized_ {false};
 
 public:
     VideoWriter(const std::string& format) : format_(format) {}
@@ -134,6 +138,7 @@ public:
     bool write(const sensor_msgs::msg::Image::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
     bool write(const std_msgs::msg::String::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
     bool write(const std_msgs::msg::Bool::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
+    bool writeGeneric(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name, const std::string& message_type, const rclcpp::Time& timestamp) override;
     void close() override;
     std::string getFileExtension() const override { return format_ == "mp4" ? ".mp4" : ".avi"; }
 };
@@ -182,6 +187,7 @@ private:
 
     // Publishers
     rclcpp::Publisher<fv_recorder::msg::RecordingStatus>::SharedPtr status_publisher_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr preview_image_publisher_;
 
     // Services
     rclcpp::Service<fv_recorder::srv::StartRecording>::SharedPtr start_recording_service_;
@@ -229,6 +235,14 @@ private:
                                const std::vector<std::string>& custom_topics = {}, const std::string& format = "");
     void stopRecordingInternal();
     std::string getMessageType(const std::string& topic_name);
+    void discoverAndCacheTopicTypes();
+
+    // Overlay/preview settings
+    bool preview_enabled_ {true};
+    bool time_overlay_enabled_ {false};
+    std::string time_overlay_format_ {"%Y-%m-%d %H:%M:%S"};
+    std::string preview_output_topic_ {"/fv_recorder/preview"};
+    cv::Mat drawTimeOverlay(const cv::Mat& src);
 };
 
 #endif // FV_RECORDER_NODE_HPP 

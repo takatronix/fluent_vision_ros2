@@ -1,0 +1,37 @@
+## Fluent Vision Recorder default parameters
+
+fv_recorder:
+  ros__parameters:
+    recording:
+      input_topics:
+        - "/fv/d415/color/image_raw"
+        - "/fv/d415/depth/image_rect_raw"
+        - "/fv/d405/color/image_raw"
+        - "/fv/d405/depth/image_rect_raw"
+      output_directory: "/home/takatronix/recordings"
+      segment_duration: 300
+      retention_days: 7
+      date_format: "YYYYMMDD"
+      auto_recording: false
+      default_format: "rosbag"
+
+    playback:
+      output_topics: []
+      playback_speed: 1.0
+      loop_playback: false
+
+    control:
+      enable_topic_control: true
+      enable_service_control: true
+      control_topics:
+        recording_control: "/fv_recorder/recording_control"
+        recording_command: "/fv_recorder/recording_command"
+
+    # preview/overlay (global defaults; can be overridden per node via the same keys)
+    preview:
+      enabled: true
+      time_overlay: true
+      time_format: "%Y-%m-%d %H:%M:%S"
+      output_topic: "/fv_recorder/preview"
+
+

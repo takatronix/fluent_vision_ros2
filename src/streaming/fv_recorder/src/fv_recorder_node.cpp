@@ -85,6 +85,12 @@ void FVRecorderNode::loadParameters()
     config_.date_format = this->declare_parameter("recording.date_format", "YYYYMMDD");
     config_.auto_recording = this->declare_parameter("recording.auto_recording", false);
     config_.default_format = this->declare_parameter("recording.default_format", "rosbag");
+
+    // プレビュー/オーバーレイ設定（グローバル→ノード個別で上書き）
+    preview_enabled_ = this->declare_parameter("preview.enabled", true);
+    time_overlay_enabled_ = this->declare_parameter("preview.time_overlay", false);
+    time_overlay_format_ = this->declare_parameter("preview.time_format", std::string("%Y-%m-%d %H:%M:%S"));
+    preview_output_topic_ = this->declare_parameter("preview.output_topic", std::string("/fv_recorder/preview"));
     
     RCLCPP_INFO(this->get_logger(), "📁 Output directory: %s", config_.output_directory.c_str());
     RCLCPP_INFO(this->get_logger(), "⏱️ Segment duration: %d seconds", config_.segment_duration);
@@ -119,6 +125,12 @@ void FVRecorderNode::initializePublishers()
     // 状態パブリッシャー
     status_publisher_ = this->create_publisher<fv_recorder::msg::RecordingStatus>(
         "status", 10);
+
+    if (preview_enabled_) {
+        preview_image_publisher_ = this->create_publisher<sensor_msgs::msg::Image>(
+            preview_output_topic_, rclcpp::QoS(2).best_effort());
+        RCLCPP_INFO(this->get_logger(), "🖼️ Preview publisher on: %s", preview_output_topic_.c_str());
+    }
     
     RCLCPP_INFO(this->get_logger(), "✅ Publishers initialized");
 }
@@ -127,11 +139,11 @@ void FVRecorderNode::initializeSubscriptions()
 {
     RCLCPP_INFO(this->get_logger(), "📥 Initializing subscriptions...");
     
-    // 各トピックのサブスクリプションを作成
+    // 各トピックのサブスクリプションを作成（型付き + フォールバック汎用）
     for (const auto& topic : config_.input_topics) {
         try {
             auto subscription = this->create_subscription<sensor_msgs::msg::Image>(
-                topic, 10,
+                topic, rclcpp::SensorDataQoS(),
                 [this, topic](const sensor_msgs::msg::Image::SharedPtr msg) {
                     this->imageCallback(msg, topic);
                 });
@@ -142,6 +154,20 @@ void FVRecorderNode::initializeSubscriptions()
             RCLCPP_INFO(this->get_logger(), "📹 Subscribed to: %s", topic.c_str());
         } catch (const std::exception& e) {
             RCLCPP_ERROR(this->get_logger(), "❌ Failed to create subscription for %s: %s", topic.c_str(), e.what());
+            // フォールバックとして汎用サブスクリプションを試す
+            try {
+                rclcpp::SubscriptionOptions options;
+                auto generic_sub = this->create_generic_subscription(
+                    topic, "", rclcpp::QoS(rclcpp::SensorDataQoS()),
+                    [this, topic](std::shared_ptr<rclcpp::SerializedMessage> serialized_msg) {
+                        this->genericMessageCallback(serialized_msg, topic);
+                    }, options);
+                generic_subscriptions_[topic] = generic_sub;
+                topic_to_filename_map_[topic] = sanitizeTopicName(topic);
+                RCLCPP_INFO(this->get_logger(), "🧩 Fallback generic subscription created for: %s", topic.c_str());
+            } catch (const std::exception& eg) {
+                RCLCPP_ERROR(this->get_logger(), "❌ Failed generic subscription for %s: %s", topic.c_str(), eg.what());
+            }
         }
     }
     
@@ -208,6 +234,12 @@ std::unique_ptr<FormatWriter> FVRecorderNode::createFormatWriter(const std::stri
         return std::make_unique<ROSBag2Writer>();
     } else if (format == "json") {
         return std::make_unique<JSONWriter>();
+    } else if (format == "yaml") {
+        return std::make_unique<YAMLWriter>();
+    } else if (format == "csv") {
+        return std::make_unique<CSVWriter>();
+    } else if (format == "mp4" || format == "avi") {
+        return std::make_unique<VideoWriter>(format);
     } else {
         RCLCPP_WARN(this->get_logger(), "⚠️ Unknown format: %s, using rosbag", format.c_str());
         return std::make_unique<ROSBag2Writer>();
@@ -220,6 +252,14 @@ std::string FVRecorderNode::getFileExtension(const std::string& format)
         return ".db3";
     } else if (format == "json") {
         return ".json";
+    } else if (format == "yaml") {
+        return ".yaml";
+    } else if (format == "csv") {
+        return ".csv";
+    } else if (format == "mp4") {
+        return ".mp4";
+    } else if (format == "avi") {
+        return ".avi";
     } else {
         return ".db3"; // デフォルト
     }
@@ -314,6 +354,16 @@ void FVRecorderNode::startRecording(
     // 出力フォーマットを取得
     std::string output_format = request->output_format.empty() ? config_.default_format : request->output_format;
     RCLCPP_INFO(this->get_logger(), "📄 Using output format: %s", output_format.c_str());
+
+    // サービスからセグメント時間/保持日数のオーバーライド（0以下は無視）
+    if (request->segment_duration > 0) {
+        config_.segment_duration = request->segment_duration;
+        RCLCPP_INFO(this->get_logger(), "⏱️ Overridden segment_duration: %d", config_.segment_duration);
+    }
+    if (request->retention_days >= 0) {
+        config_.retention_days = request->retention_days;
+        RCLCPP_INFO(this->get_logger(), "🗓️ Overridden retention_days: %d", config_.retention_days);
+    }
     
     startRecordingInternal(request->recording_directory, request->date_format, custom_topics, output_format);
     
@@ -377,6 +427,21 @@ void FVRecorderNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr msg,
     if (current_session_->writer) {
         current_session_->writer->write(msg, topic_name, this->now());
     }
+
+    // プレビュー配信（時刻オーバーレイ対応）
+    if (preview_enabled_ && preview_image_publisher_ && preview_image_publisher_->get_subscription_count() > 0) {
+        try {
+            cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
+            cv::Mat preview = time_overlay_enabled_ ? drawTimeOverlay(cv_ptr->image) : cv_ptr->image;
+            cv_bridge::CvImage out;
+            out.header = msg->header;
+            out.encoding = sensor_msgs::image_encodings::BGR8;
+            out.image = preview;
+            preview_image_publisher_->publish(*out.toImageMsg());
+        } catch (const std::exception& e) {
+            RCLCPP_WARN(this->get_logger(), "⚠️ Preview publish failed: %s", e.what());
+        }
+    }
 }
 
 void FVRecorderNode::genericMessageCallback(const std::shared_ptr<rclcpp::SerializedMessage> msg, 
@@ -416,7 +481,7 @@ void FVRecorderNode::genericMessageCallback(const std::shared_ptr<rclcpp::Serial
 
 std::string FVRecorderNode::getMessageType(const std::string& topic_name)
 {
-    // トピック名からメッセージタイプを推測
+    // 既知の型キャッシュを優先
     auto it = topic_message_types_.find(topic_name);
     if (it != topic_message_types_.end()) {
         return it->second;
@@ -452,6 +517,24 @@ std::string FVRecorderNode::getMessageType(const std::string& topic_name)
     }
 }
 
+void FVRecorderNode::discoverAndCacheTopicTypes()
+{
+    try {
+        // クライアントAPIでトピック一覧と型を取得
+        auto topic_names_and_types = this->get_topic_names_and_types();
+        for (const auto& entry : topic_names_and_types) {
+            const auto& name = entry.first;
+            const auto& types = entry.second;
+            if (!types.empty()) {
+                // 最初の型を使用
+                topic_message_types_[name] = types.front();
+            }
+        }
+    } catch (const std::exception& e) {
+        RCLCPP_WARN(this->get_logger(), "⚠️ Failed to discover topic types: %s", e.what());
+    }
+}
+
 void FVRecorderNode::createNewSegment(const std::vector<std::string>& topics_to_record, const std::string& format)
 {
     if (!current_session_) {
@@ -470,9 +553,16 @@ void FVRecorderNode::createNewSegment(const std::vector<std::string>& topics_to_
     // 新しいwriter作成
     current_session_->writer = createFormatWriter(format);
     
-    // ROSBag2Writerの場合は特別な設定が必要
+    // ROSBag2Writerの場合は特別な設定が必要（トピックの型を付与してcreate_topic）
     if (auto* rosbag_writer = dynamic_cast<ROSBag2Writer*>(current_session_->writer.get())) {
-        rosbag_writer->setTopics(topics_to_record);
+        // 最新の型キャッシュを更新
+        discoverAndCacheTopicTypes();
+        std::vector<std::pair<std::string, std::string>> topics_with_types;
+        topics_with_types.reserve(topics_to_record.size());
+        for (const auto& t : topics_to_record) {
+            topics_with_types.emplace_back(t, getMessageType(t));
+        }
+        rosbag_writer->setTopicsWithTypes(topics_with_types);
     }
     
     if (!current_session_->writer->open(current_session_->current_file_path)) {
@@ -605,6 +695,31 @@ bool FVRecorderNode::createDirectoryIfNotExists(const std::string& path)
         RCLCPP_ERROR(this->get_logger(), "❌ Failed to create directory %s: %s", path.c_str(), e.what());
         return false;
     }
+}
+
+cv::Mat FVRecorderNode::drawTimeOverlay(const cv::Mat& src)
+{
+    cv::Mat img = src.clone();
+    try {
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::localtime(&t);
+        char buf[128];
+        std::strftime(buf, sizeof(buf), time_overlay_format_.c_str(), &tm);
+        std::string text(buf);
+        int font = cv::FONT_HERSHEY_SIMPLEX;
+        double scale = 0.6;
+        int thickness = 2;
+        int baseline = 0;
+        cv::Size text_size = cv::getTextSize(text, font, scale, thickness, &baseline);
+        cv::Point org(12, 12 + text_size.height);
+        // shadow
+        cv::putText(img, text, org + cv::Point(2, 2), font, scale, cv::Scalar(0,0,0), thickness + 2, cv::LINE_AA);
+        // main
+        cv::putText(img, text, org, font, scale, cv::Scalar(255,255,255), thickness, cv::LINE_AA);
+    } catch (...) {
+    }
+    return img;
 }
 
 int main(int argc, char** argv)
