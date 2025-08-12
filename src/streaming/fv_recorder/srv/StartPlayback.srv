@@ -1,11 +1,9 @@
-# 再生開始リクエスト
-string recording_directory    # 録画ディレクトリ
-string date_format           # 日付形式 (YYYYMMDD)
-float64 playback_speed       # 再生速度 (1.0=実時間)
+# 再生開始サービス
+string recording_directory    # 録画ファイルディレクトリ
+string date_format           # 日付フォーマット（フィルタリング用）
+float64 playback_speed       # 再生速度（1.0 = 実時間）
 bool loop_playback           # ループ再生フラグ
-
 ---
-# 再生開始レスポンス
 bool success                 # 成功フラグ
 string message              # メッセージ
 string playback_id          # 再生ID 

@@ -48,7 +48,7 @@ def generate_launch_description():
     recorder_node = Node(
         package='fv_recorder',
         executable='fv_recorder_node',
-        name='fv_recorder_node',
+        name='fv_recorder',
         output='screen',
         parameters=[
             LaunchConfiguration('config_file'),
@@ -67,7 +67,7 @@ def generate_launch_description():
     player_node = Node(
         package='fv_recorder',
         executable='fv_player_node',
-        name='fv_player_node',
+        name='fv_player',
         output='screen',
         parameters=[
             LaunchConfiguration('config_file'),

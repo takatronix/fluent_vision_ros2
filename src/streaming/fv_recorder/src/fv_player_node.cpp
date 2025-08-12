@@ -2,6 +2,8 @@
 #include <filesystem>
 #include <chrono>
 #include <thread>
+#include <iomanip>
+#include <sstream>
 
 FVPlayerNode::FVPlayerNode() : Node("fv_player_node"), running_(false)
 {
@@ -15,9 +17,9 @@ FVPlayerNode::FVPlayerNode() : Node("fv_player_node"), running_(false)
 void FVPlayerNode::loadParameters()
 {
     // パラメータの読み込み
-    config_.recording_directory = this->declare_parameter("recording_directory", "/tmp/recordings");
-    config_.playback_speed = this->declare_parameter("playback_speed", 1.0);
-    config_.output_topics = this->declare_parameter("output_topics", std::vector<std::string>{});
+    config_.recording_directory = this->declare_parameter("recording.output_directory", "/home/takatronix/recordings");
+    config_.playback_speed = this->declare_parameter("playback.playback_speed", 1.0);
+    config_.output_topics = this->declare_parameter("playback.output_topics", std::vector<std::string>{});
     // overlays (global defaults can be overridden per-node)
     config_.overlay_play_indicator = this->declare_parameter("preview.overlay_play_indicator", true);
     config_.overlay_topic = this->declare_parameter("preview.output_topic", std::string("/fv_player/preview"));
@@ -85,6 +87,8 @@ void FVPlayerNode::startPlayback(const std::shared_ptr<fv_recorder::srv::StartPl
 void FVPlayerNode::stopPlayback(const std::shared_ptr<fv_recorder::srv::StopPlayback::Request> request,
                                std::shared_ptr<fv_recorder::srv::StopPlayback::Response> response)
 {
+    (void)request; // 未使用パラメータ警告を抑制
+    
     if (!running_) {
         response->success = false;
         response->message = "No playback is running";
@@ -244,6 +248,28 @@ void FVPlayerNode::sleepForDuration(int64_t nanoseconds)
     std::this_thread::sleep_for(duration);
 }
 
+void FVPlayerNode::publishPlayOverlay()
+{
+    if (!preview_publisher_) return;
+    
+    // Create a small banner image with "PLAY" and timestamp
+    cv::Mat banner(60, 240, CV_8UC3, cv::Scalar(40, 40, 40));
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    char timebuf[64];
+    std::strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    
+    cv::putText(banner, "PLAY", {12, 24}, cv::FONT_HERSHEY_SIMPLEX, 0.8, {0,255,0}, 2, cv::LINE_AA);
+    cv::putText(banner, timebuf, {12, 50}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {255,255,255}, 1, cv::LINE_AA);
+    
+    cv_bridge::CvImage out;
+    out.header.stamp = this->now();
+    out.encoding = sensor_msgs::image_encodings::BGR8;
+    out.image = banner;
+    
+    preview_publisher_->publish(*out.toImageMsg());
+}
+
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
@@ -259,22 +285,4 @@ int main(int argc, char** argv)
     rclcpp::shutdown();
     
     return 0;
-} 
-
-void FVPlayerNode::publishPlayOverlay()
-{
-    if (!preview_publisher_) return;
-    // Create a small banner image with "PLAY" and timestamp
-    cv::Mat banner(60, 240, CV_8UC3, cv::Scalar(40, 40, 40));
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    char timebuf[64];
-    std::strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
-    cv::putText(banner, "PLAY", {12, 24}, cv::FONT_HERSHEY_SIMPLEX, 0.8, {0,255,0}, 2, cv::LINE_AA);
-    cv::putText(banner, timebuf, {12, 50}, cv::FONT_HERSHEY_SIMPLEX, 0.5, {255,255,255}, 1, cv::LINE_AA);
-    cv_bridge::CvImage out;
-    out.header.stamp = this->now();
-    out.encoding = sensor_msgs::image_encodings::BGR8;
-    out.image = banner;
-    preview_publisher_->publish(*out.toImageMsg());
 }

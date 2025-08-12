@@ -4,16 +4,15 @@ fv_recorder:
   ros__parameters:
     recording:
       input_topics:
-        - "/fv/d415/color/image_raw"
-        - "/fv/d415/depth/image_rect_raw"
-        - "/fv/d405/color/image_raw"
-        - "/fv/d405/depth/image_rect_raw"
+        - "/test_camera/image_raw"
       output_directory: "/home/takatronix/recordings"
       segment_duration: 300
       retention_days: 7
       date_format: "YYYYMMDD"
-      auto_recording: false
-      default_format: "rosbag"
+      auto_recording: true
+      default_format: "mp4"
+      video_time_overlay: false
+      video_time_overlay_format: "%Y-%m-%d %H:%M:%S"
 
     playback:
       output_topics: []

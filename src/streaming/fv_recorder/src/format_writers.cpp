@@ -49,7 +49,9 @@ bool ROSBag2Writer::write(const std_msgs::msg::Bool::SharedPtr& msg, const std::
 
 bool ROSBag2Writer::writeGeneric(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name, const std::string& message_type, const rclcpp::Time& timestamp) {
     if (writer_) {
-        writer_->write(serialized_msg, topic_name, message_type, timestamp);
+        // 非推奨のwriteメソッドの代わりに、新しい形式を使用
+        auto shared_msg = std::make_shared<rclcpp::SerializedMessage>(serialized_msg);
+        writer_->write(shared_msg, topic_name, message_type, timestamp);
         return true;
     }
     return false;
@@ -255,10 +257,13 @@ bool VideoWriter::open(const std::string& filepath) {
     return true;
 }
 
-bool VideoWriter::write(const sensor_msgs::msg::Image::SharedPtr& msg, const std::string& /*topic_name*/, const rclcpp::Time& /*timestamp*/) {
+bool VideoWriter::write(const sensor_msgs::msg::Image::SharedPtr& msg, const std::string& /*topic_name*/, const rclcpp::Time& timestamp) {
     try {
         cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, sensor_msgs::image_encodings::BGR8);
-        const cv::Mat& img = cv_ptr->image;
+        cv::Mat img = cv_ptr->image;
+        if (overlay_time_) {
+            img = drawTimeOverlay(img, overlay_time_format_, timestamp);
+        }
         if (!initialized_) {
             double fps = 30.0; // 仮のFPS。厳密なFPS制御はノード側で調整する
             int fourcc = (format_ == "mp4") ? cv::VideoWriter::fourcc('a','v','c','1') : cv::VideoWriter::fourcc('M','J','P','G');
@@ -296,4 +301,27 @@ void VideoWriter::close() {
     if (video_writer_.isOpened()) {
         video_writer_.release();
     }
+}
+
+cv::Mat VideoWriter::drawTimeOverlay(const cv::Mat& src, const std::string& time_format, const rclcpp::Time& timestamp) {
+    cv::Mat img = src.clone();
+    try {
+        // use ROS time
+        const int64_t sec = timestamp.seconds();
+        std::time_t t = static_cast<std::time_t>(sec);
+        std::tm tm = *std::localtime(&t);
+        char buf[128];
+        std::strftime(buf, sizeof(buf), time_format.c_str(), &tm);
+        std::string text(buf);
+        int font = cv::FONT_HERSHEY_SIMPLEX;
+        double scale = 0.6;
+        int thickness = 2;
+        int baseline = 0;
+        cv::Size text_size = cv::getTextSize(text, font, scale, thickness, &baseline);
+        cv::Point org(12, 12 + text_size.height);
+        cv::putText(img, text, org + cv::Point(2, 2), font, scale, cv::Scalar(0,0,0), thickness + 2, cv::LINE_AA);
+        cv::putText(img, text, org, font, scale, cv::Scalar(255,255,255), thickness, cv::LINE_AA);
+    } catch (...) {
+    }
+    return img;
 }

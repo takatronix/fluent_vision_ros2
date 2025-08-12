@@ -131,9 +131,13 @@ private:
     std::string filepath_;
     std::string format_;
     bool initialized_ {false};
+    bool overlay_time_ {false};
+    std::string overlay_time_format_ {"%Y-%m-%d %H:%M:%S"};
 
 public:
     VideoWriter(const std::string& format) : format_(format) {}
+    VideoWriter(const std::string& format, bool overlay_time, const std::string& overlay_format)
+        : format_(format), overlay_time_(overlay_time), overlay_time_format_(overlay_format) {}
     bool open(const std::string& filepath) override;
     bool write(const sensor_msgs::msg::Image::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
     bool write(const std_msgs::msg::String::SharedPtr& msg, const std::string& topic_name, const rclcpp::Time& timestamp) override;
@@ -141,6 +145,7 @@ public:
     bool writeGeneric(const rclcpp::SerializedMessage& serialized_msg, const std::string& topic_name, const std::string& message_type, const rclcpp::Time& timestamp) override;
     void close() override;
     std::string getFileExtension() const override { return format_ == "mp4" ? ".mp4" : ".avi"; }
+    static cv::Mat drawTimeOverlay(const cv::Mat& src, const std::string& time_format, const rclcpp::Time& timestamp);
 };
 
 class FVRecorderNode : public rclcpp::Node
@@ -169,7 +174,7 @@ private:
         std::chrono::steady_clock::time_point start_time;
         std::chrono::steady_clock::time_point segment_start_time;
         std::unique_ptr<FormatWriter> writer;
-        std::string current_file_path;
+        std::filesystem::path current_file_path;
         int segment_count;
         bool is_active;
         std::string format;
@@ -203,6 +208,7 @@ private:
     void initializePublishers();
     void initializeSubscriptions();
     void initializeControlSubscriptions();
+    void maybeStartAutoRecording();
     
     // 録画関連
     void startRecording(const std::shared_ptr<fv_recorder::srv::StartRecording::Request> request,
@@ -243,6 +249,10 @@ private:
     std::string time_overlay_format_ {"%Y-%m-%d %H:%M:%S"};
     std::string preview_output_topic_ {"/fv_recorder/preview"};
     cv::Mat drawTimeOverlay(const cv::Mat& src);
+
+    // Video overlay settings
+    bool video_time_overlay_enabled_ {false};
+    std::string video_time_overlay_format_ {"%Y-%m-%d %H:%M:%S"};
 };
 
 #endif // FV_RECORDER_NODE_HPP 
