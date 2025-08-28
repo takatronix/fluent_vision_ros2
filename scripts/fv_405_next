@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 固定ドメイン（環境方針）
+export ROS_DOMAIN_ID=1
+ros2 service call "/fv/d405/aspara_analysis/next_asparagus" std_srvs/srv/Trigger {}
+
+

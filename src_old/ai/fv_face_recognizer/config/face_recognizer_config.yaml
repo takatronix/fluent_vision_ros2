@@ -1,0 +1,37 @@
+fv_face_recognizer_node:
+  ros__parameters:
+    # Input/Output topics
+    input_topic: "/image_raw"
+    output_topic: "/fv_face_recognizer/annotated_image"
+    
+    # Model paths
+    cascade_path: "models/haarcascade_frontalface_alt2.xml"
+    model_path: "models/face_recognizer_model.yml"
+    
+    # Detection parameters
+    confidence_threshold: 0.7
+    min_face_size: 30
+    
+    # Feature flags
+    enable_recognition: true
+    enable_landmarks: false
+    
+    # Performance settings
+    max_faces: 10
+    processing_fps: 30.0
+    
+    # Visualization settings
+    draw_bounding_boxes: true
+    draw_labels: true
+    draw_confidence: true
+    draw_face_id: true
+    
+    # Recognition settings
+    recognition_method: "LBPH"  # LBPH, EigenFaces, FisherFaces
+    face_size: 100
+    histogram_equalization: true
+    
+    # Training settings
+    min_training_samples: 5
+    max_training_samples: 50
+    training_quality_threshold: 0.8 

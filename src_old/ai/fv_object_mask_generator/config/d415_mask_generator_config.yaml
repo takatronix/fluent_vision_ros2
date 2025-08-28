@@ -1,0 +1,25 @@
+/**:
+  ros__parameters:
+    # Input topics
+    input_image_topic: "/fv/d415/color/image_raw"
+    
+    # Output topics  
+    output_segmentation_mask_topic: "/fv/d415/segmentation_mask/image"
+    output_colored_mask_topic: "/fv/d415/segmentation_mask/colored"
+    
+    # Processing parameters
+    processing_frequency: 10.0  # Hz
+    enable_visualization: true
+    
+    # UNet Model parameters
+    model:
+      type: "unet"
+      model_path: "/models/unet_asparagus_ch16_256_v1.0_ep20.xml"
+      device: "GPU"
+      input_width: 256
+      input_height: 256
+      confidence_threshold: 0.5
+    
+    # Class configuration
+    class_names: ["Background", "Asparagus"]
+    class_colors: [0, 0, 0, 0, 255, 0]  # BGR: Background=Black, Asparagus=Green

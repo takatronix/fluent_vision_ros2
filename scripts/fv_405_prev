@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ROS_DOMAIN_ID=1
+
+svc="/fv/d405/aspara_analysis/prev_asparagus"
+echo "call: ${svc} (ROS_DOMAIN_ID=${ROS_DOMAIN_ID})"
+ros2 service call "${svc}" std_srvs/srv/Trigger {}
+
+

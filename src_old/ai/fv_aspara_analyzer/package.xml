@@ -1,0 +1,59 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypesign="xml"?>
+<!-- ============================================================================= -->
+<!-- Fluent Vision - アスパラガス解析ノード package.xml -->
+<!-- ============================================================================= -->
+<!-- 
+概要：
+  - アスパラガス3D点群解析ノードのパッケージ定義
+  - ROS2 Humble対応の依存関係管理
+  - ビルド設定とメタデータの定義
+
+作者：Takashi Otsuka
+作成日：2024年
+バージョン：1.0
+-->
+<package format="3">
+  <!-- ===== パッケージ基本情報 ===== -->
+  <name>fv_aspara_analyzer</name>
+  <version>1.0.0</version>
+  <description>アスパラガス3D点群解析と品質評価システム</description>
+  <maintainer email="aspara@example.com">Takashi Otsuka</maintainer>
+  <license>MIT</license>
+
+  <!-- ===== ビルドツール依存関係 ===== -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- ===== コアROS2依存関係 ===== -->
+  <depend>rclcpp</depend>  <!-- ROS2 C++クライアントライブラリ -->
+  <depend>std_msgs</depend>  <!-- 標準メッセージ型 -->
+  <depend>sensor_msgs</depend>  <!-- センサーメッセージ型 -->
+  <depend>geometry_msgs</depend>  <!-- 幾何学メッセージ型 -->
+  <depend>cv_bridge</depend>  <!-- OpenCV-ROS2橋渡し -->
+  <depend>image_transport</depend>  <!-- 画像転送ライブラリ -->
+  <depend>tf2</depend>  <!-- TF2座標変換ライブラリ -->
+  <depend>tf2_ros</depend>  <!-- TF2 ROS2統合 -->
+  <depend>tf2_geometry_msgs</depend>  <!-- TF2幾何学メッセージ -->
+
+  <!-- ===== 点群処理依存関係 ===== -->
+  <depend>pcl_conversions</depend>  <!-- PCL-ROS2変換 -->
+  <depend>pcl_ros</depend>  <!-- PCL ROS2統合 -->
+
+  <!-- ===== コンピュータビジョン依存関係 ===== -->
+  <depend>opencv2</depend>  <!-- OpenCVコンピュータビジョン -->
+
+  <!-- ===== AI/検出メッセージ依存関係 ===== -->
+  <depend>vision_msgs</depend>  <!-- コンピュータビジョンメッセージ -->
+  
+  <!-- ===== Fluent統合ライブラリ ===== -->
+  <depend>fluent_lib</depend>  <!-- Fluent統合ライブラリ -->
+
+  <!-- ===== テスト依存関係 ===== -->
+  <test_depend>ament_lint_auto</test_depend>  <!-- 自動リントツール -->
+  <test_depend>ament_lint_common</test_depend>  <!-- 共通リントツール -->
+
+  <!-- ===== エクスポート設定 ===== -->
+  <export>
+    <build_type>ament_cmake</build_type>    <!-- CMakeビルドシステム -->
+  </export>
+</package>

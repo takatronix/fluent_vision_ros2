@@ -1,5 +1,23 @@
 #pragma once
 
+// Unified public header for fluent_lib.
+// Include this single header from application code.
+
+// Core text rendering (Japanese-capable)
+#include "fluent_text.hpp"
+
+// ---- Utils ----
+#include "fluent_lib/utils/units.hpp"
+#include "fluent_lib/utils/format.hpp"
+
+// ---- UI (if available in the tree) ----
+#include "fluent_lib/ui/overlay_engine.hpp"
+#include "fluent_lib/ui/ui_cursor_controller.hpp"
+#include "fluent_lib/ui/window_base.hpp"
+#include "fluent_lib/ui/info_window.hpp"
+
+#pragma once
+
 // FluentLib unified public header
 // Purpose:
 // - Single include for reusable building blocks in ROS2/C++ vision apps
@@ -35,6 +53,11 @@
 #include "fluent_lib/ui/anim.hpp"
 #include "fluent_lib/ui/renderer.hpp"
 #include "fluent_lib/ui/panel.hpp"
+#include "fluent_lib/ui/hud_base.hpp"
+#include "fluent_lib/ui/hud_widgets.hpp"
+#include "fluent_lib/ui/hud.hpp"
+#include "fluent_lib/ui/offscreen_canvas.hpp"
+#include "fluent_lib/ui/overlay_engine.hpp"
 // Node
 #include "fluent_lib/ros/fluent_node.hpp"
 // Image

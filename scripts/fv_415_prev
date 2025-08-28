@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+export ROS_DOMAIN_ID=1
+ros2 service call "/fv/d415/aspara_analysis/prev_asparagus" std_srvs/srv/Trigger {}
+
+

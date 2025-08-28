@@ -1,0 +1,13 @@
+# Request
+# 空のリクエスト（統計情報を取得するだけ）
+
+---
+# Response
+float64 inference_time_ms      # 推論時間（ミリ秒）
+float64 total_processing_time_ms # 総処理時間（ミリ秒）
+string device_used            # 使用デバイス（CPU/GPU）
+int32 total_detections          # 総検出数
+int32 filtered_detections       # フィルタ後検出数
+float64 fps                    # 処理FPS
+float64 timestamp              # 統計作成時刻
+bool detection_enabled        # 検出が有効かどうか 

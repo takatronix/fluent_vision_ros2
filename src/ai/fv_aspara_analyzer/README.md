@@ -26,10 +26,10 @@ fv_aspara_analyzerは、YOLOによる2D検出結果とRealSenseの点群デー�
 
 ## 入力データ
 
-### 必須トピック
-- **検出結果**: `/fv/d415/object_detection/detections` (vision_msgs/Detection2DArray)
-- **点群データ**: `/fv/d415/points2` (sensor_msgs/PointCloud2)  
-- **カメラ情報**: `/fv/d415/camera_info` (sensor_msgs/CameraInfo)
+### 必須トピック（茎検出ノード出力に統一）
+- **茎検出結果**: `/fv/<camera>/stem_detector/detections` (`fv_stem_detector/StemDetectionArray`)
+- **点群データ**: `/fv/<camera>/points2` (sensor_msgs/PointCloud2)  
+- **カメラ情報**: `/fv/<camera>/color/camera_info` (sensor_msgs/CameraInfo)
 
 ### オプション
 - **セグメンテーションマスク**: `/fv/d415/segmentation_mask/image` (sensor_msgs/Image)
@@ -74,19 +74,23 @@ straightness_threshold: 0.7   # 真っ直ぐ度しきい値
 
 ### ビルド
 ```bash
-cd /ros2_ws
-colcon build --packages-select fv_aspara_analyzer
-source install/setup.bash
+/ros2_ws/build.sh fv_aspara_analyzer | cat
 ```
 
 ### 起動（D415カメラ）
 ```bash
-ros2 launch fv_aspara_analyzer fv_aspara_analyzer_d415_launch.py
+ros2 run fv_aspara_analyzer fv_aspara_analyzer_node --ros-args \
+  -p camera_topic:=/fv/d415/color/image_raw \
+  -p detections_topic:=/fv/d415/stem_detector/detections \
+  -p camera_info_topic:=/fv/d415/color/camera_info
 ```
 
 ### 起動（D405カメラ）
 ```bash
-ros2 launch fv_aspara_analyzer fv_aspara_analyzer_d405_launch.py
+ros2 run fv_aspara_analyzer fv_aspara_analyzer_node --ros-args \
+  -p camera_topic:=/fv/d405/color/image_raw \
+  -p detections_topic:=/fv/d405/stem_detector/detections \
+  -p camera_info_topic:=/fv/d405/color/camera_info
 ```
 
 ### デバッグモード

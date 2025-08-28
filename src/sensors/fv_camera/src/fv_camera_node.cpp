@@ -370,10 +370,13 @@ void FVUSBCameraNode::publishFrame(const cv::Mat& frame)
     
     // Publish color image
     if (stream_config_.color_enabled && color_pub_) {
-        auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", frame).toImageMsg();
-        msg->header.stamp = stamp;
-        msg->header.frame_id = tf_config_.optical_frame;
-        color_pub_->publish(*msg);
+        // 購読が無ければmsg生成をスキップ
+        if (color_pub_->get_subscription_count() > 0) {
+            auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", frame).toImageMsg();
+            msg->header.stamp = stamp;
+            msg->header.frame_id = tf_config_.optical_frame;
+            color_pub_->publish(*msg);
+        }
     }
     
     // Publish compressed image (if initialized)

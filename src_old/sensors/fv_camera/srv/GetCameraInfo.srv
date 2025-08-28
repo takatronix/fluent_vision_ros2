@@ -1,0 +1,13 @@
+# Request
+string camera_name
+
+---
+# Response
+bool success
+string message
+int32 width
+int32 height
+int32 fps
+string format
+string device_name
+int32 device_index 

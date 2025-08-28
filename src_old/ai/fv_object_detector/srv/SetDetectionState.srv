@@ -1,0 +1,7 @@
+# Request
+bool enable_detection    # true: 検出開始, false: 検出停止
+
+---
+# Response
+bool success            # 操作が成功したかどうか
+string message          # 結果メッセージ 

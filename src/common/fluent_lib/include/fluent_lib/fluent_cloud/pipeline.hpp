@@ -7,7 +7,12 @@
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+// for compute3DCentroid / computeCovarianceMatrixNormalized
+#include <pcl/common/centroid.h>
+#include <pcl/common/common.h>
 #include <Eigen/Core>
+// for SelfAdjointEigenSolver
+#include <Eigen/Eigenvalues>
 #include <vector>
 #include <algorithm>
 #include <cmath>

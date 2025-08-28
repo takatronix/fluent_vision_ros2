@@ -201,20 +201,24 @@ void RTMPBridgeNode::onFrameReceived(const uint8_t* data, int width, int height,
         return;
     }
 
+    // Ensure image transport is ready to check subscribers
+    if (!image_transport_) {
+        image_transport_ = std::make_shared<image_transport::ImageTransport>(shared_from_this());
+        image_transport_publisher_ = image_transport_->advertise(output_topic_name_, buffer_size_);
+        RCLCPP_INFO(this->get_logger(), "Image topics initialized:");
+        RCLCPP_INFO(this->get_logger(), "  Raw: %s", output_topic_name_.c_str());
+        RCLCPP_INFO(this->get_logger(), "  Compressed: %s/compressed", output_topic_name_.c_str());
+    }
+
+    // 購読者がいない場合は処理スキップ
+    if (image_transport_publisher_.getNumSubscribers() == 0) {
+        return;
+    }
+
     // Process frame
     auto image_msg = std::make_shared<sensor_msgs::msg::Image>();
     
     if (video_processor_->processFrame(data, width, height, timestamp, *image_msg)) {
-        // Initialize image transport on first use
-        if (!image_transport_) {
-            image_transport_ = std::make_shared<image_transport::ImageTransport>(shared_from_this());
-            image_transport_publisher_ = image_transport_->advertise(output_topic_name_, buffer_size_);
-            
-            RCLCPP_INFO(this->get_logger(), "Image topics initialized:");
-            RCLCPP_INFO(this->get_logger(), "  Raw: %s", output_topic_name_.c_str());
-            RCLCPP_INFO(this->get_logger(), "  Compressed: %s/compressed", output_topic_name_.c_str());
-        }
-        
         // Publish image (raw + compressed automatically)
         image_transport_publisher_.publish(*image_msg);
         frames_published_++;

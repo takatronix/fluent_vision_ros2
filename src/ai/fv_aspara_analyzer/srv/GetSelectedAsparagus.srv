@@ -1,0 +1,30 @@
+# リクエストは空（選択中のアスパラガス情報を取得）
+---
+# 結果
+bool success
+string message
+int32 id
+
+# カメラ/系識別
+string camera_id          # 例: "d405", "d415" など
+
+# 概要メトリクス
+float32 distance_m        # 距離[m]（approach基準）
+float32 length_m          # 長さ[m]（不明時はNaN）
+float32 confidence_2d     # YOLOスコア（0..1, 不明時NaN）
+float32 confidence_3d     # PCAスコア（0..1, 不明時NaN）
+
+# アプローチ 2D/3D
+int32 approach_px_x
+int32 approach_px_y
+geometry_msgs/Point approach_camera
+
+# 根本 2D/3D
+int32 root_px_x
+int32 root_px_y
+geometry_msgs/Point root_camera
+
+# 先端 2D/3D
+int32 tip_px_x
+int32 tip_px_y
+geometry_msgs/Point tip_camera

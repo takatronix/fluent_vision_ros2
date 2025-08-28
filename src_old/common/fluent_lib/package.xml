@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fluent_lib</name>
+  <version>2.0.0</version>
+  <description>Fluent統合ライブラリ - 美しいチェーン可能API for OpenCV, PCL, ROS2</description>
+  
+  <maintainer email="fluent@vision.team">Fluent Vision Team</maintainer>
+  <license>Apache-2.0</license>
+  
+  <url type="website">https://github.com/takatronix/fluent_vision_ros2</url>
+  <url type="bugtracker">https://github.com/takatronix/fluent_vision_ros2/issues</url>
+  <url type="repository">https://github.com/takatronix/fluent_vision_ros2</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Core dependencies -->
+  <depend>libopencv-dev</depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>cv_bridge</depend>
+  
+  <!-- Point cloud dependencies -->
+  <depend>pcl_conversions</depend>
+  <depend>pcl_ros</depend>
+  
+  <!-- Transform dependencies -->
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <!-- Test dependencies -->
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,14 @@
+# Request
+# ROI for point cloud generation (optional)
+int32 roi_x      # ROI top-left x coordinate (default: 0)
+int32 roi_y      # ROI top-left y coordinate (default: 0)
+int32 roi_width  # ROI width (default: full image width)
+int32 roi_height # ROI height (default: full image height)
+bool use_roi     # Whether to use ROI (default: false)
+
+---
+
+# Response
+sensor_msgs/PointCloud2 pointcloud  # Generated point cloud
+bool success                        # Whether the operation was successful
+string message                      # Error/status message

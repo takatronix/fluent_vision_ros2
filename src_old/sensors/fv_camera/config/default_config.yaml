@@ -1,0 +1,54 @@
+# FV Camera - Default Configuration
+# Simple and clean configuration for standard cameras
+
+fv_camera:
+  ros__parameters:
+    # Camera selection
+    camera_selection:
+      selection_method: "index"     # "auto", "index"
+      device_name: ""               # Device name (not used for USB cameras)
+      device_index: 4               # Device index
+    
+    # Power management
+    power_management:
+      startup_delay: 0.5            # Delay before starting streams (seconds)
+    
+    # Camera settings
+    camera:
+      width: 640
+      height: 480
+      fps: 30
+      brightness: -1                # -1 means auto
+      contrast: -1
+      saturation: -1
+      hue: -1
+      gain: -1
+      exposure: -1
+    
+    # Stream settings
+    streams:
+      color_enabled: true
+      compressed_enabled: true
+    
+    # Camera info and compression
+    camera_info:
+      enable_camera_info: true
+      enable_compressed_topics: false
+      compressed_quality: 85
+    
+    # Services
+    services:
+      get_camera_info_enabled: true
+      set_camera_settings_enabled: true
+    
+    # TF settings
+    tf:
+      enabled: true
+      base_frame: "base_link"
+      camera_frame: "camera_link"
+      optical_frame: "camera_optical_frame"
+    
+    # Topics
+    topics:
+      color: "image_raw"
+      color_compressed: "image_raw/compressed" 

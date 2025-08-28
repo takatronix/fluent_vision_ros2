@@ -1,0 +1,44 @@
+# DJI O4 Air Unit Pro Camera Calibration Parameters
+# Based on high-end DJI O4 systems with enhanced optics
+# Higher precision parameters for professional applications
+
+%YAML:1.0
+
+image_width: 640   # Downsampled to VGA for SLAM
+image_height: 480
+camera_name: "dji_o4_air_unit_pro"
+
+# Camera matrix (intrinsic parameters)
+# Scaled from 1440x1080 to 640x480 (scale factor: 4/9) - Pro version
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [542.2, 0.0, 320.0,
+         0.0, 542.2, 240.0,
+         0.0, 0.0, 1.0]
+
+# Distortion model
+distortion_model: "plumb_bob"
+
+# Distortion coefficients [k1, k2, t1, t2, k3]
+# Lower distortion for Pro version (better optics)
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.08, 0.03, 0.0, 0.0, 0.0]
+
+# Rectification matrix (identity for monocular camera)
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
+
+# Projection matrix
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [542.2, 0.0, 320.0, 0.0,
+         0.0, 542.2, 240.0, 0.0,
+         0.0, 0.0, 1.0, 0.0] 

@@ -29,8 +29,30 @@ struct AsparaInfo {
     AsparagusPart body_part;                   ///< 本体情報（緑色表示）
     std::vector<AsparagusPart> spike_parts;    ///< 穂情報リスト（黄色表示）
     // ...
+    // ロボット接近ポイント（紫丸表示）
+    struct ApproachPoint {
+        cv::Point2f pixel;                        // 画像座標（px）
+        geometry_msgs::msg::Point world;          // 3D座標（m）
+        bool pixel_valid;
+        bool world_valid;
+    } approach;
 };
 ```
+
+### アプローチポイント表示（紫丸）
+
+- **目的**: YOLO矩形の安定点（X=中心, Y=中心→底辺の0.75）へロボットを近づけるための目印
+- **描画**: 紫色の丸（塗りつぶし）、右側に世界座標 x,y,z[m] を表示（既定ON）
+- **設定**:
+  ```yaml
+  approach:
+    overlay:
+      enable: true
+      color_bgr: [255, 0, 255]
+      radius: 6
+      thickness: -1
+      debug_xyz: true
+  ```
 
 ## 表示レイアウト
 
@@ -40,12 +62,12 @@ struct AsparaInfo {
 ┌─────────────────┐
 │ ID: #1 [選択中]   │ ← 基本情報
 │ 信頼: 85%        │
-│ 距離: 1.2m       │ ← カメラからの距離
+│ 距離: 120.0cm    │ ← カメラからの距離（表示はcm）
 │ 点群: 1,234点    │ ← ポイントクラウド点数
 │ 分析: 12.3ms     │ ← 分析処理時間（必須表示）
 │ ─────────────── │ ← 区切り線
 │ 長さ: 28.5cm     │ ← 分析結果
-│ 太さ: 15mm       │
+│ 太さ: 1.5cm      │
 │ 真直: 85%        │ ← straightness
 │ グレード: A級     │
 │ 穂: 2個          │ ← 穂情報（検出時のみ）
@@ -58,7 +80,7 @@ struct AsparaInfo {
 ┌─────────────┐
 │ ID: #2       │
 │ 信頼: 72%    │
-│ 距離: 1.8m   │
+│ 距離: 180.0cm │
 └─────────────┘
 ```
 
@@ -90,7 +112,7 @@ struct AsparaInfo {
 
 ### レベル1: 基本情報（常時表示）
 - **ID**: アスパラガス識別番号
-- **信頼度**: 検出信頼度（%）
+- **信頼度**: 検出信頼度（%）※YOLO由来は茎検出ノードの `StemDetectionArray` からは直接来ないため、当面は未設定（0%）
 - **距離**: カメラからの距離（m）
 
 ### レベル2: 処理情報（選択中のみ）

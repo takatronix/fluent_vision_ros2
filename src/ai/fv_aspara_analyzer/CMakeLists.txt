@@ -34,10 +34,11 @@ find_package(tf2_geometry_msgs REQUIRED)     # TF2幾何学メッセージ
 find_package(pcl_conversions REQUIRED)       # PCL-ROS2変換
 find_package(pcl_ros REQUIRED)               # PCL ROS2統合
 find_package(OpenCV REQUIRED)                # OpenCVコンピュータビジョン
-find_package(vision_msgs REQUIRED)           # コンピュータビジョンメッセージ
+find_package(fv_stem_detector REQUIRED)      # stem_detector メッセージ
 find_package(std_srvs REQUIRED)              # 標準サービスメッセージ
 find_package(visualization_msgs REQUIRED)    # 可視化マーカー
 find_package(fluent_lib REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 ## fv_realsense のサービス依存は廃止（画像トピックからのローカル変換に統一）
 
 # ===== インクルードディレクトリ設定 =====
@@ -59,25 +60,33 @@ set(dependencies
   tf2_geometry_msgs         # TF2幾何学メッセージ
   pcl_conversions           # PCL-ROS2変換
   pcl_ros                   # PCL ROS2統合
-  vision_msgs               # コンピュータビジョンメッセージ
+  fv_stem_detector          # stem_detector メッセージ
   std_srvs                  # 標準サービスメッセージ
   visualization_msgs        # 可視化マーカー
   fluent_lib                # Fluent統合ライブラリ
+  rosidl_default_runtime
+)
+# ===== サービス定義（ROSIDL） =====
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/GetSelectedAsparagus.srv"
+  DEPENDENCIES geometry_msgs std_msgs builtin_interfaces
 )
 
+
 # ===== 実行ファイル作成 =====
+# v2最小ノードのみをビルド（legacyは除外）
 add_executable(fv_aspara_analyzer_node
-  src/fv_aspara_analyzer_node.cpp      # メインソースファイル（統合管理）
-  src/aspara_selection.cpp             # アスパラ選択管理クラス
-  src/aspara_analyzer_thread.cpp       # アスパラ解析専用スレッド
-  src/aspara_pointcloud_processor.cpp  # 点群処理専用クラス
-  src/aspara_analysis_logic.cpp        # 分析ロジック（曲がり対応の骨格など）
+  src/fv_aspara_analyzer_node.cpp
 )
 
 
 # ===== 依存関係とライブラリリンク =====
 ament_target_dependencies(fv_aspara_analyzer_node ${dependencies})  # ROS2依存関係
 target_link_libraries(fv_aspara_analyzer_node ${OpenCV_LIBRARIES})  # ライブラリリンク
+
+# 生成インターフェースとのビルド順序依存
+add_dependencies(fv_aspara_analyzer_node ${PROJECT_NAME}__rosidl_generator_cpp)
+rosidl_target_interfaces(fv_aspara_analyzer_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
 
 # ===== インストール設定 =====
@@ -100,4 +109,5 @@ if(BUILD_TESTING)
 endif()
 
 # ===== パッケージ設定 =====
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()  # ROS2パッケージ設定の完了

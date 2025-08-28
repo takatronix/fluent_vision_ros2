@@ -1,0 +1,15 @@
+# Request
+int32 width
+int32 height
+int32 fps
+int32 brightness
+int32 contrast
+int32 saturation
+int32 hue
+int32 gain
+int32 exposure
+
+---
+# Response
+bool success
+string message 

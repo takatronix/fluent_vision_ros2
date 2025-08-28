@@ -1,0 +1,30 @@
+# Object Detection Service Configuration
+object_detection_service:
+  ros__parameters:
+    # Input/Output topics
+    input_image_topic: "/camera/color/image_raw"
+    output_image_topic: "/object_detection/annotated_image"
+    output_detections_topic: "/object_detection/detections"
+    
+    # Processing parameters
+    processing_frequency: 10.0  # Hz
+    enable_tracking: true
+    enable_visualization: true
+    show_stats_on_image: true
+    publish_annotated_image: true
+    
+    # Model configuration
+    model:
+      type: "yolov10"
+      model_path: "/home/takatronix/FluentVision/models/v2_nano_best_fp16_dynamic.xml"
+      device: ""
+      input_width: 640
+      input_height: 640
+      confidence_threshold: 0.5
+      nms_threshold: 0.45
+      min_area: 100.0
+      
+    # Class names (Asparagus detection)
+    class_names:
+      - "アスパラ"
+      - "穂" 

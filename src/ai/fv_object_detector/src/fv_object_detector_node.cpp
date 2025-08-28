@@ -20,6 +20,8 @@
 #include "fv_object_detector/yolov10_model.hpp"
 #include "fv_object_detector/object_tracker.hpp"
 #include "fv_object_detector/detection_data.hpp"
+// Fluent text rendering (Japanese-capable)
+#include "fluent_text.hpp"
 // #include "fv_object_detector/srv/set_detection_state.hpp"
 // #include "fv_object_detector/srv/get_detection_stats.hpp"
 
@@ -28,6 +30,7 @@
 #include <string>
 #include <vector>
 #include <rclcpp/qos.hpp>
+#include <functional>
 
 /**
  * @class FVObjectDetectorNode
@@ -138,6 +141,7 @@ public:
                 std::chrono::duration<double>(1.0 / processing_frequency_),
                 std::bind(&FVObjectDetectorNode::processTimer, this));
         }
+        // 下流（fv_stem_detector）でフィルタする方針。YOLO側の動的しきい値反映は無効化。
         
         RCLCPP_INFO(this->get_logger(), "FV Object Detector Node started successfully");
     }
@@ -237,6 +241,13 @@ private:
         if (!image_received_ || !detection_enabled_) {
             return;
         }
+
+        // 出力購読がゼロなら推論含む全処理をスキップ（負荷軽減）
+        bool need_detections = detections_pub_ && (detections_pub_->get_subscription_count() > 0);
+        bool need_image = (enable_visualization_ && publish_annotated_image_ && image_pub_ && (image_pub_->get_subscription_count() > 0));
+        if (!need_detections && !need_image) {
+            return;
+        }
         
         // 最新画像の取得（スレッドセーフ）
         sensor_msgs::msg::Image::SharedPtr image_msg;
@@ -286,12 +297,14 @@ private:
         }
         
         // ===== 検出結果をパブリッシュ =====
-        publishDetections(detections, image_msg->header);
+        if (need_detections) {
+            publishDetections(detections, image_msg->header);
+        }
         
-        // ===== アノテーション画像をパブリッシュ =====
-        if (enable_visualization_ && publish_annotated_image_) {
-            cv::Mat annotated_image = drawDetections(image, detections);
-            publishAnnotatedImage(annotated_image, image_msg->header);
+        // ===== アノテーション画像をパブリッシュ（購読者がいるときだけ描画/送信） =====
+        if (need_image) {
+                cv::Mat annotated_image = drawDetections(image, detections);
+                publishAnnotatedImage(annotated_image, image_msg->header);
         }
     }
     
@@ -324,25 +337,25 @@ private:
             cv::Scalar color = getColorForClass(det.class_id);
             cv::rectangle(result, bbox, color, 2);
             
-            // ラベルテキストを構築
-            std::string label = det.class_name + " " + std::to_string(static_cast<int>(det.confidence * 100)) + "%";
+            // ラベルテキストを構築（IDがある場合はユーザー仕様で表示: 「アスパラ#<ID> <Conf>%」 小数なし）
+            std::string label;
             if (det.object_id >= 0) {
-                label += " ID:" + std::to_string(det.object_id);
+                int conf_pct = static_cast<int>(det.confidence * 100.0f + 0.5f);
+                if (conf_pct < 0) {
+                    conf_pct = 0;
+                }
+                if (conf_pct > 100) {
+                    conf_pct = 100;
+                }
+                label = std::string("アスパラ#") + std::to_string(det.object_id) + " " + std::to_string(conf_pct) + "%";
+            } else {
+                label = det.class_name + " " + std::to_string(static_cast<int>(det.confidence * 100)) + "%";
             }
-            
-            // テキストサイズを計算
-            int baseline = 0;
-            cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
-            cv::Point text_pos(bbox.x, bbox.y - 5);
-            
-            // ラベル背景を描画
-            cv::rectangle(result, 
-                         cv::Point(text_pos.x, text_pos.y - text_size.height - baseline),
-                         cv::Point(text_pos.x + text_size.width, text_pos.y + baseline),
-                         color, -1);
-            
-            // ラベルテキストを描画
-            cv::putText(result, label, text_pos, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+
+            // 影付き日本語対応のfluentテキストで描画（背景矩形は使わず可読性は影で確保）
+            int tx = bbox.x;
+            int ty = bbox.y - 6; if (ty < 0) ty = 0;
+            fluent::text::drawShadow(result, label, cv::Point(tx, ty), cv::Scalar(255,255,255), cv::Scalar(0,0,0), 0.6, 2, 0);
         }
         
         return result;
@@ -463,8 +476,8 @@ private:
         stats_text += " | Detections: " + std::to_string(stats_.filtered_detections);
         stats_text += " | Status: " + std::string(detection_enabled_ ? "ON" : "OFF");
         
-        // 統計情報を画像上部に描画（緑色）
-        cv::putText(image, stats_text, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+        // 統計情報を画像上部に描画（fluent影付きテキスト）
+        fluent::text::drawShadow(image, stats_text, cv::Point(10, 30), cv::Scalar(0, 255, 0), cv::Scalar(0,0,0), 0.6, 2, 0);
     }
     
     /**

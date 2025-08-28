@@ -43,14 +43,14 @@ graph TD
     C[fv_aspara_analyzer_other] --> E
     
     subgraph "D415カメラ系"
-        A1[YOLO検出結果_d415] --> A
+        A1[茎検出結果_d415 (StemDetectionArray)] --> A
         A2[カラー画像_d415] --> A
         A3[深度画像_d415] --> A
         A4[カメラ情報_d415] --> A
     end
     
     subgraph "D405カメラ系"
-        B1[YOLO検出結果_d405] --> B
+        B1[茎検出結果_d405 (StemDetectionArray)] --> B
         B2[カラー画像_d405] --> B
         B3[深度画像_d405] --> B
         B4[カメラ情報_d405] --> B
@@ -59,9 +59,15 @@ graph TD
 
 ### 起動方法
 ```bash
-# 複数ノードインスタンスを同時起動
-ros2 run fv_aspara_analyzer fv_aspara_analyzer_node --ros-args --params-file d415.yaml &
-ros2 run fv_aspara_analyzer fv_aspara_analyzer_node --ros-args --params-file d405.yaml &
+# 複数ノードインスタンスを同時起動（茎検出ノード出力に接続）
+ros2 run fv_aspara_analyzer fv_aspara_analyzer_node --ros-args \
+  -p camera_topic:=/fv/d415/color/image_raw \
+  -p detections_topic:=/fv/d415/stem_detector/detections \
+  -p camera_info_topic:=/fv/d415/color/camera_info &
+ros2 run fv_aspara_analyzer fv_aspara_analyzer_node --ros-args \
+  -p camera_topic:=/fv/d405/color/image_raw \
+  -p detections_topic:=/fv/d405/stem_detector/detections \
+  -p camera_info_topic:=/fv/d405/color/camera_info &
 ```
 
 ### 処理フロー
@@ -279,9 +285,10 @@ void FvAsparaAnalyzerNode::imageCallback(...) {
 ## ID管理とトラッキング
 
 ### AsparaSelection統合
-- **IoU閾値**: 70%で同一オブジェクト判定
+- **再アタッチ閾値**: `aspara_selection.reacquire_iou=0.3` または `reacquire_center_ratio=0.5`（対角長×比）
+- **Sticky領域**: 前回BBoxを `sticky_region_expand=1.2` 倍に拡張して優先再アタッチ
 - **スムーズアニメーション**: fluent_lib使用
-- **最適候補選定**: 距離優先（矩形サイズ）、信頼度次点
+- **最適候補選定**: 面積優先（`aspara_selection.sort="area"`）、次点で信頼度
 
 ### 追跡アルゴリズム
 ```cpp
@@ -409,23 +416,52 @@ try {
 
 ## 設定パラメータ
 
-### 重要パラメータ
+### 重要パラメータ（YAML キーを現行に統一）
 ```yaml
-# ポイントクラウド処理制御
-enable_pointcloud_processing: true     # 有効/無効切り替え
+# 入出力
+camera_topic: "/fv/d415/color/image_raw"
+detections_topic: "/fv/d415/stem_detector/detections"   # fv_stem_detector の統合出力
+output_annotated_image_topic: "/fv/d415/aspara_analysis/result"
 
-# ID管理・追跡
-object_tracking_overlap_threshold: 0.7  # IoU閾値（70%）
-object_tracking_timeout_ms: 5000       # 追跡タイムアウト
+# オーバーレイ描画
+overlay.smooth_gain: 0.25
+overlay.fade_in_gain: 0.3
+overlay.fade_out_gain: 0.2
+overlay.selected.alpha: 0.8
+overlay.unselected.alpha: 0.4
+overlay.selected.thickness: 2
+overlay.unselected.thickness: 1
 
-# 表示設定
-selected_asparagus_opacity: 0.8        # 選択中透明度
-selected_asparagus_thickness: 2        # 選択中線の太さ
-unselected_asparagus_opacity: 0.4      # 非選択透明度
-unselected_asparagus_thickness: 1      # 非選択線の太さ
+# 選択制御（ID管理）
+aspara_selection.manual_enabled: false
+aspara_selection.auto_enabled: false
+aspara_selection.keep_and_reacquire_enabled: true
+aspara_selection.sticky_ms: 800
+aspara_selection.reacquire_iou: 0.3
+aspara_selection.reacquire_center_ratio: 0.5
+aspara_selection.sticky_bbox_expand_ratio: 1.2
+aspara_selection.stale_max_age_sec: 0.5
+aspara_selection.sort: "area"
 
-# 穂関連付け
-spike_overlap_threshold: 0.3           # 穂の重複判定（30%）
+# アプローチポイント（ロボット接近用）
+approach:
+  enable: true
+  y_mode: center_to_bottom_ratio   # center | center_to_bottom_ratio | root_scanline
+  y_ratio: 0.75                    # 中心(0.0)→底辺(1.0)
+  x_offset_px: 0
+  y_offset_px: 0
+  depth:
+    window_px: 5
+    min_valid: 5
+    strategy: median               # median | mean
+    search_expand_px: 8
+    max_range_m: 2.0
+  overlay:
+    enable: true
+    color_bgr: [255, 0, 255]
+    radius: 6
+    thickness: 2
+    debug_xyz: true                # 丸右にx,y,z表示
 ```
 
 ---

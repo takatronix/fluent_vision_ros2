@@ -41,6 +41,7 @@ find_package(rosidl_default_generators REQUIRED)      # ROS2インターフェ�
 # ===== サービスメッセージ生成 =====
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetDistance.srv"      # 距離取得サービス
+  "srv/GetPointDistance.srv" # 表示モード付き距離取得サービス
   "srv/GetCameraInfo.srv"    # カメラ情報取得サービス
   "srv/SetMode.srv"          # モード設定サービス
   "srv/GeneratePointCloud.srv"  # 点群生成サービス

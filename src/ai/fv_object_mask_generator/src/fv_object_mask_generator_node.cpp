@@ -232,16 +232,18 @@ void FVObjectMaskGeneratorNode::processImage()
   double inference_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
   
   if (!segmentation_mask.empty()) {
-    // ===== 生セグメンテーションマスクのパブリッシュ =====
-    cv_bridge::CvImage mask_msg;
-    mask_msg.header.stamp = this->now();
-    mask_msg.header.frame_id = "camera_frame";
-    mask_msg.encoding = sensor_msgs::image_encodings::MONO8;
-    mask_msg.image = segmentation_mask;
-    segmentation_mask_pub_->publish(*mask_msg.toImageMsg());
+    // ===== 生セグメンテーションマスクのパブリッシュ（購読者がいる場合のみ） =====
+    if (segmentation_mask_pub_ && segmentation_mask_pub_->get_subscription_count() > 0) {
+      cv_bridge::CvImage mask_msg;
+      mask_msg.header.stamp = this->now();
+      mask_msg.header.frame_id = "camera_frame";
+      mask_msg.encoding = sensor_msgs::image_encodings::MONO8;
+      mask_msg.image = segmentation_mask;
+      segmentation_mask_pub_->publish(*mask_msg.toImageMsg());
+    }
     
-    // ===== カラー可視化画像の生成とパブリッシュ =====
-    if (enable_visualization_) {
+    // ===== カラー可視化画像の生成とパブリッシュ（購読者がいる場合のみ） =====
+    if (enable_visualization_ && colored_mask_pub_ && colored_mask_pub_->get_subscription_count() > 0) {
       cv::Mat colored_mask = drawSegmentationResult(latest_image_, segmentation_mask, inference_time_ms);
       if (!colored_mask.empty()) {
         cv_bridge::CvImage colored_msg;

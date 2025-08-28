@@ -22,6 +22,7 @@
 
 // Include service headers
 #include "fv_realsense/srv/get_distance.hpp"
+#include "fv_realsense/srv/get_point_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
 #include "fv_realsense/srv/set_mode.hpp"
 // GeneratePointCloud service removed; use topic-based pipeline only
@@ -126,6 +127,7 @@ private:
     bool organized_pointcloud_enabled_ = false; // organized cloud publish flag
     int organized_pointcloud_decimation_ = 1;    // 1=full, >1 decimated with NaN fill
     bool organized_pointcloud_rgb_ = true;      // include RGB in organized cloud
+    bool cache_latest_frames_enabled_ = false;   // heavy frame cloning cache toggle
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr color_pub_;
@@ -141,8 +143,10 @@ private:
 
     // Services
     rclcpp::Service<fv_realsense::srv::GetDistance>::SharedPtr get_distance_service_;
+    rclcpp::Service<fv_realsense::srv::GetPointDistance>::SharedPtr get_point_distance_service_;
     rclcpp::Service<fv_realsense::srv::GetCameraInfo>::SharedPtr get_camera_info_service_;
     rclcpp::Service<fv_realsense::srv::SetMode>::SharedPtr set_mode_service_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reload_config_service_;
     // GeneratePointCloud service removed
 
     // Subscribers
@@ -201,6 +205,9 @@ private:
     void handleGetDistance(
         const std::shared_ptr<fv_realsense::srv::GetDistance::Request> request,
         std::shared_ptr<fv_realsense::srv::GetDistance::Response> response);
+    void handleGetPointDistance(
+        const std::shared_ptr<fv_realsense::srv::GetPointDistance::Request> request,
+        std::shared_ptr<fv_realsense::srv::GetPointDistance::Response> response);
     
     void handleGetCameraInfo(
         const std::shared_ptr<fv_realsense::srv::GetCameraInfo::Request> request,
@@ -209,6 +216,9 @@ private:
     void handleSetMode(
         const std::shared_ptr<fv_realsense::srv::SetMode::Request> request,
         std::shared_ptr<fv_realsense::srv::SetMode::Response> response);
+    void handleReloadConfig(
+        const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response);
     
     // GeneratePointCloud handler removed
 
@@ -218,8 +228,8 @@ private:
     
     // Display methods
     void clickEventCallback(const geometry_msgs::msg::Point::SharedPtr msg);
-    void drawMarker(cv::Mat& frame) const;
-    void drawHUD(cv::Mat& frame) const;
+    void drawMarker(cv::Mat& frame);
+    void drawHUD(cv::Mat& frame);
     void initializeSubscribers();
 };
 

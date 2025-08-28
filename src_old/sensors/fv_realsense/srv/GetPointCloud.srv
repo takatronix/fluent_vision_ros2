@@ -1,0 +1,14 @@
+# Request
+int32 x_min               # ROI minimum X
+int32 y_min               # ROI minimum Y
+int32 x_max               # ROI maximum X
+int32 y_max               # ROI maximum Y
+int32 skip                # Pixel skip factor (1 = all pixels, 2 = every other pixel, etc.)
+float32 voxel_size        # Voxel filter size in meters (0 = no filtering)
+
+---
+# Response
+bool success              # Success status
+sensor_msgs/PointCloud2 cloud  # Point cloud for the ROI
+string message            # Status message
+int32 point_count         # Number of points in the cloud

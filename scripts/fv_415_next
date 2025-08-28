@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export ROS_DOMAIN_ID=1
+source /opt/ros/humble/setup.bash >/dev/null 2>&1
+
+ros2 service call "/fv/d415/aspara_analysis/next_asparagus" std_srvs/srv/Trigger {}
+
+

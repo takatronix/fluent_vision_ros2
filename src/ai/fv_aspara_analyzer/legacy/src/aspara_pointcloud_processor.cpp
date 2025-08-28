@@ -1,0 +1,645 @@
+#include "fv_aspara_analyzer/aspara_pointcloud_processor.hpp"
+
+#include "fv_aspara_analyzer/fv_aspara_analyzer_node.hpp"
+#include "fv_aspara_analyzer/approach_point.hpp"
+#include "fluent_lib/fluent.hpp"
+#include <cmath>
+#include <algorithm>
+
+namespace fv_aspara_analyzer {
+
+AsparaPointcloudProcessor::AsparaPointcloudProcessor(FvAsparaAnalyzerNode* node_ptr)
+    : node_(node_ptr)
+{
+    // パブリッシャー初期化（shared_from_this()を使わず、直接パラメータを読む）
+    auto get_str = [&](const char* name, const char* defv){
+        try { if (node_->has_parameter(name)) {
+            auto v = node_->get_parameter(name).get_value<std::string>();
+            if (!v.empty()) return v; }
+        } catch (...) {}
+        return std::string(defv);
+    };
+    std::string filtered_topic  = get_str("output_filtered_pointcloud_topic", "output_filtered_pointcloud");
+    std::string annotated_topic = get_str("output_annotated_image_topic",   "output_annotated_image");
+    std::string marker_topic    = get_str("output_marker_topic",            "aspara_markers");
+
+    filtered_pointcloud_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+        filtered_topic,
+        rclcpp::QoS(1).reliability(rclcpp::ReliabilityPolicy::BestEffort));
+    annotated_image_pub_     = node_->create_publisher<sensor_msgs::msg::Image>(annotated_topic, 10);
+    markers_pub_             = node_->create_publisher<visualization_msgs::msg::MarkerArray>(marker_topic, 10);
+    // 表示寿命をパラメータ化
+    try { if (node_->has_parameter("marker_lifetime_sec"))
+        marker_lifetime_sec_ = node_->get_parameter("marker_lifetime_sec").get_value<double>();
+    } catch (...) { marker_lifetime_sec_ = 0.3; }
+    
+    // TFブロードキャスターは廃止（Markerへ移行）
+    
+    // パラメータはFvAsparaAnalyzerNodeのメンバから直接参照
+    pointcloud_distance_min_ = node_->pointcloud_distance_min_;
+    pointcloud_distance_max_ = node_->pointcloud_distance_max_;
+    noise_reduction_neighbors_ = node_->noise_reduction_neighbors_;
+    noise_reduction_std_dev_ = node_->noise_reduction_std_dev_;
+    voxel_leaf_size_ = node_->voxel_leaf_size_;
+    
+    RCLCPP_INFO(node_->get_logger(), "AsparaPointcloudProcessor initialized: distance=%.2f-%.2f, voxel=%.4f", 
+                pointcloud_distance_min_, pointcloud_distance_max_, voxel_leaf_size_);
+}
+
+// 深度+カラー→ROI点群へ変換
+pcl::PointCloud<pcl::PointXYZRGB>::Ptr AsparaPointcloudProcessor::extractPointCloudFromDepth(
+    const cv::Rect& bbox,
+    const sensor_msgs::msg::Image::SharedPtr& depth_image,
+    const sensor_msgs::msg::Image::SharedPtr& color_image,
+    const sensor_msgs::msg::CameraInfo::SharedPtr& camera_info)
+{
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    
+    if (!depth_image || !camera_info || !color_image) {
+        return cloud;
+    }
+    
+    // FluentCloud IOで深度→点群（ROI）を一括生成（自動変換・色付き）
+    const float depth_unit = static_cast<float>(node_->depth_unit_m_16u_);
+    
+    // カメラパラメータの取得と有効性チェック
+    double fx = camera_info->k[0];
+    double fy = camera_info->k[4];
+    // cx,cy はここでは未使用
+    
+    // 0除算の回避（DepthToCloudではfx,fyは使用しないが早期検証）
+    if (fx <= 0.0 || fy <= 0.0) { RCLCPP_ERROR(node_->get_logger(), "Invalid camera parameters: fx=%.3f, fy=%.3f", fx, fy); return cloud; }
+    
+    // バウンディングボックスの有効性確認
+    if (bbox.width <= 0 || bbox.height <= 0) {
+        RCLCPP_WARN(node_->get_logger(), "Invalid bounding box size: %dx%d", bbox.width, bbox.height);
+        return cloud;
+    }
+    
+    // ROIスライスしてDepthToCloudで生成（自動32F/BGR8変換・サイズ補正内蔵）
+    cv::Rect bbox_depth = bbox & cv::Rect(0, 0, static_cast<int>(depth_image->width), static_cast<int>(depth_image->height));
+    if (bbox_depth.area() <= 0) return cloud;
+    cloud = fluent_cloud::io::DepthToCloud::convertAsparagusROI(*depth_image, *color_image, bbox_depth, *camera_info, depth_unit);
+    
+    // メタデータ
+    if (cloud) { cloud->width = cloud->points.size(); cloud->height = 1; cloud->is_dense = false; }
+    
+    RCLCPP_DEBUG(node_->get_logger(), "Extracted %zu points from depth image bbox", cloud->points.size());
+    
+    return cloud;
+}
+
+pcl::PointCloud<pcl::PointXYZRGB>::Ptr AsparaPointcloudProcessor::applyNoiseReduction(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& input_cloud)
+{
+    // 点群サイズチェック
+    if (input_cloud->points.size() < 10) {
+        RCLCPP_WARN(node_->get_logger(), "Too few points for noise reduction");
+        return input_cloud;
+    }
+
+    // ステップ1: ボクセルグリッドフィルタ（ダウンサンプリング）
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr voxel_filtered(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::VoxelGrid<pcl::PointXYZRGB> voxel_filter;
+    voxel_filter.setInputCloud(input_cloud);
+    voxel_filter.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
+    voxel_filter.filter(*voxel_filtered);
+
+    if (voxel_filtered->points.size() < 10) {
+        RCLCPP_WARN(node_->get_logger(), "Too few points after voxel filtering");
+        return voxel_filtered;
+    }
+
+    // ステップ2: 統計的外れ値除去
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr denoised_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::StatisticalOutlierRemoval<pcl::PointXYZRGB> statistical_filter;
+    statistical_filter.setInputCloud(voxel_filtered);
+    statistical_filter.setMeanK(noise_reduction_neighbors_);
+    statistical_filter.setStddevMulThresh(noise_reduction_std_dev_);
+    statistical_filter.filter(*denoised_cloud);
+
+    RCLCPP_DEBUG(node_->get_logger(), 
+                 "Noise reduction: %zu -> %zu -> %zu points",
+                 input_cloud->points.size(),
+                 voxel_filtered->points.size(),
+                 denoised_cloud->points.size());
+
+    return denoised_cloud;
+}
+
+geometry_msgs::msg::Point AsparaPointcloudProcessor::estimateRootPosition(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& aspara_cloud)
+{
+    geometry_msgs::msg::Point root_position;
+    
+    if (aspara_cloud->points.empty()) {
+        return root_position;
+    }
+
+    // Z座標の最小値を根元位置として使用
+    float min_z = std::numeric_limits<float>::max();
+    pcl::PointXYZRGB root_point;
+    
+    for (const auto& point : aspara_cloud->points) {
+        if (point.z < min_z) {
+            min_z = point.z;
+            root_point = point;
+        }
+    }
+
+    root_position.x = root_point.x;
+    root_position.y = root_point.y;
+    root_position.z = root_point.z;
+
+    return root_position;
+}
+
+float AsparaPointcloudProcessor::calculateStraightness(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& aspara_cloud)
+{
+    if (aspara_cloud->points.size() < 3) {
+        return 0.0f;
+    }
+
+    // PCAによる真っ直ぐ度計算
+    pcl::PCA<pcl::PointXYZRGB> pca;
+    pca.setInputCloud(aspara_cloud);
+    
+    Eigen::Vector3f eigenvalues = pca.getEigenValues();
+    
+    // 真っ直ぐ度 = 最大固有値 / 全固有値の和
+    if (eigenvalues[1] == 0.0f) {
+        return 1.0f;  // 完全な直線
+    }
+    
+    float straightness = eigenvalues[0] / (eigenvalues[0] + eigenvalues[1] + eigenvalues[2]);
+    return std::min(1.0f, straightness);
+}
+
+float AsparaPointcloudProcessor::calculateLength(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& aspara_cloud)
+{
+    if (aspara_cloud->points.size() < 2) {
+        return 0.0f;
+    }
+
+    // Z軸方向の最大・最小値を取得
+    float min_val = std::numeric_limits<float>::max();
+    float max_val = std::numeric_limits<float>::lowest();
+
+    for (const auto& point : aspara_cloud->points) {
+        float z = point.z;  // Z軸を主軸として仮定
+        if (z < min_val) min_val = z;
+        if (z > max_val) max_val = z;
+    }
+
+    return std::abs(max_val - min_val);
+}
+
+pcl::PointCloud<pcl::PointXYZ>::Ptr AsparaPointcloudProcessor::generatePCALine(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& aspara_cloud)
+{
+    pcl::PointCloud<pcl::PointXYZ>::Ptr pca_line(new pcl::PointCloud<pcl::PointXYZ>);
+    
+    if (aspara_cloud->points.size() < 3) {
+        return pca_line;
+    }
+
+    // PCA計算
+    pcl::PCA<pcl::PointXYZRGB> pca;
+    pca.setInputCloud(aspara_cloud);
+    
+    // 主成分軸とデータの範囲を取得
+    Eigen::Vector4f centroid = pca.getMean();
+    Eigen::Vector3f principal_axis = pca.getEigenVectors().col(0); // 第1主成分
+    
+    // データの投影範囲を計算
+    float min_proj = std::numeric_limits<float>::max();
+    float max_proj = std::numeric_limits<float>::lowest();
+    
+    for (const auto& point : aspara_cloud->points) {
+        Eigen::Vector3f p(point.x, point.y, point.z);
+        Eigen::Vector3f centered = p - centroid.head<3>();
+        float projection = centered.dot(principal_axis);
+        
+        if (projection < min_proj) min_proj = projection;
+        if (projection > max_proj) max_proj = projection;
+    }
+    
+    // PCAライン上に等間隔でポイントを生成
+    int num_points = 50; // ライン解像度
+    for (int i = 0; i < num_points; ++i) {
+        float t = min_proj + (max_proj - min_proj) * i / (num_points - 1);
+        Eigen::Vector3f line_point = centroid.head<3>() + t * principal_axis;
+        
+        pcl::PointXYZ point;
+        point.x = line_point.x();
+        point.y = line_point.y();
+        point.z = line_point.z();
+        
+        pca_line->points.push_back(point);
+    }
+    
+    // 点群のメタデータを設定
+    pca_line->width = pca_line->points.size();
+    pca_line->height = 1;
+    pca_line->is_dense = false;
+    
+    return pca_line;
+}
+
+cv::Point2f AsparaPointcloudProcessor::project3DTo2D(
+    const pcl::PointXYZRGB& point,
+    const sensor_msgs::msg::CameraInfo& camera_info)
+{
+    // ガード
+    if (point.z <= 0.0f || !std::isfinite(point.z)) {
+        RCLCPP_DEBUG(node_->get_logger(), 
+            "[PROJECT] Invalid Z: z=%.3f", point.z);
+        return cv::Point2f(-1.f, -1.f);
+    }
+
+    // 内部パラメータ
+    double fx = camera_info.k[0];
+    double fy = camera_info.k[4];
+    double cx = camera_info.k[2];
+    double cy = camera_info.k[5];
+    
+    // カメラ内部パラメータの解像度チェック
+    // camera_infoの解像度と実際の画像解像度が異なる場合はスケーリング
+    // ※点群がregistered_pointsの場合、camera_infoの解像度と一致する必要がある
+    RCLCPP_DEBUG(node_->get_logger(),
+        "[PROJECT] Camera params: fx=%.2f fy=%.2f cx=%.2f cy=%.2f (raw)",
+        fx, fy, cx, cy);
+
+    // 正規化座標 (OpenCVと同じ定義)
+    double x = static_cast<double>(point.x) / static_cast<double>(point.z);
+    double y = static_cast<double>(point.y) / static_cast<double>(point.z);
+
+    // 歪み（plumb_bob想定）
+    double u = 0.0, v = 0.0;
+    if (!camera_info.d.empty() && camera_info.distortion_model == "plumb_bob") {
+        const double k1 = camera_info.d.size() > 0 ? camera_info.d[0] : 0.0;
+        const double k2 = camera_info.d.size() > 1 ? camera_info.d[1] : 0.0;
+        const double p1 = camera_info.d.size() > 2 ? camera_info.d[2] : 0.0;
+        const double p2 = camera_info.d.size() > 3 ? camera_info.d[3] : 0.0;
+        const double k3 = camera_info.d.size() > 4 ? camera_info.d[4] : 0.0;
+
+        const double r2 = x*x + y*y;
+        const double r4 = r2*r2;
+        const double r6 = r4*r2;
+        const double radial = 1.0 + k1*r2 + k2*r4 + k3*r6;
+        const double x_tangential = 2.0*p1*x*y + p2*(r2 + 2.0*x*x);
+        const double y_tangential = p1*(r2 + 2.0*y*y) + 2.0*p2*x*y;
+        const double x_distorted = x*radial + x_tangential;
+        const double y_distorted = y*radial + y_tangential;
+        u = fx * x_distorted + cx;
+        v = fy * y_distorted + cy;
+    } else {
+        // 歪みなし
+        u = fx * x + cx;
+        v = fy * y + cy;
+    }
+
+    // 追加デバッグ: 非有限値ガード
+    if (!std::isfinite(u) || !std::isfinite(v)) {
+        return cv::Point2f(-1.f, -1.f);
+    }
+    return cv::Point2f(static_cast<float>(u), static_cast<float>(v));
+}
+
+void AsparaPointcloudProcessor::publishFilteredPointCloud(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
+    const std::string& frame_id,
+    int /*aspara_id*/)
+{
+    if (!cloud || cloud->points.empty()) {
+        RCLCPP_WARN(node_->get_logger(), "Cannot publish empty or null point cloud");
+        return;
+    }
+    
+    sensor_msgs::msg::PointCloud2 output_msg;
+    pcl::toROSMsg(*cloud, output_msg);
+    output_msg.header.stamp = node_->now();
+    output_msg.header.frame_id = frame_id;
+    
+    filtered_pointcloud_pub_->publish(output_msg);
+}
+
+// Overload with explicit timestamp (used by analyzer thread)
+void AsparaPointcloudProcessor::publishFilteredPointCloud(
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& cloud,
+    const std::string& frame_id,
+    int /*aspara_id*/,
+    const rclcpp::Time& stamp)
+{
+    if (!cloud || cloud->points.empty()) {
+        RCLCPP_WARN(node_->get_logger(), "Cannot publish empty or null point cloud");
+        return;
+    }
+    sensor_msgs::msg::PointCloud2 output_msg;
+    pcl::toROSMsg(*cloud, output_msg);
+    output_msg.header.stamp = stamp;
+    output_msg.header.frame_id = frame_id;
+    filtered_pointcloud_pub_->publish(output_msg);
+}
+
+// publishRootTF は廃止
+
+void AsparaPointcloudProcessor::publishAsparaMarker(
+    const geometry_msgs::msg::Point& root_position,
+    const std::string& frame_id,
+    int aspara_id,
+    float length_m,
+    bool is_harvestable,
+    const rclcpp::Time& stamp)
+{
+    if (!markers_pub_) return;
+    visualization_msgs::msg::MarkerArray array_msg;
+    visualization_msgs::msg::Marker cyl;
+    cyl.header.stamp = stamp;
+    cyl.header.frame_id = frame_id;
+    // camera名をprefix化（fv/d415/... → d415）
+    std::string camera_prefix = frame_id;
+    auto p = camera_prefix.find("/d415/");
+    if (p != std::string::npos) camera_prefix = "d415";
+    p = frame_id.find("/d405/");
+    if (p != std::string::npos) camera_prefix = "d405";
+
+    cyl.ns = camera_prefix + "_aspara";
+    cyl.id = aspara_id;
+    cyl.type = visualization_msgs::msg::Marker::CYLINDER;
+    cyl.action = visualization_msgs::msg::Marker::ADD;
+    cyl.pose.position = root_position; // 根元に立てる
+    cyl.pose.orientation.w = 1.0;      // Z軸向き（簡易）
+    cyl.scale.x = 0.02;                // 直径 2cm（調整可）
+    cyl.scale.y = 0.02;
+    cyl.scale.z = std::max(0.01f, length_m); // 高さを長さに合わせる
+    if (is_harvestable) {
+        cyl.color.r = 0.0; cyl.color.g = 1.0; cyl.color.b = 0.0; cyl.color.a = 0.9;
+    } else {
+        cyl.color.r = 1.0; cyl.color.g = 0.0; cyl.color.b = 0.0; cyl.color.a = 0.9;
+    }
+    cyl.lifetime = rclcpp::Duration::from_seconds(marker_lifetime_sec_);
+    array_msg.markers.push_back(cyl);
+    // 距離ラベル
+    visualization_msgs::msg::Marker txt;
+    txt.header = cyl.header;
+    txt.ns = cyl.ns + "_dist";
+    txt.id = aspara_id; // ペア
+    txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    txt.action = visualization_msgs::msg::Marker::ADD;
+    txt.pose = cyl.pose;
+    txt.pose.position.z += cyl.scale.z + 0.03; // 少し上
+    txt.scale.z = 0.06; // 6cm文字
+    txt.color.r = 1.0; txt.color.g = 1.0; txt.color.b = 1.0; txt.color.a = 0.95;
+    // 距離[m]（原点からのユークリッド距離）
+    double dist = std::sqrt(
+        cyl.pose.position.x * cyl.pose.position.x +
+        cyl.pose.position.y * cyl.pose.position.y +
+        cyl.pose.position.z * cyl.pose.position.z);
+    txt.text = (camera_prefix + ": " + std::to_string(static_cast<float>(dist))).substr(0, 16) + " m";
+    txt.lifetime = cyl.lifetime;
+    array_msg.markers.push_back(txt);
+    markers_pub_->publish(array_msg);
+}
+
+// Overload: specify axis direction (unit vector) for cylinder orientation
+void AsparaPointcloudProcessor::publishAsparaMarker(
+    const geometry_msgs::msg::Point& root_position,
+    const std::string& frame_id,
+    int aspara_id,
+    float length_m,
+    bool is_harvestable,
+    const rclcpp::Time& stamp,
+    const geometry_msgs::msg::Vector3& axis_dir)
+{
+    if (!markers_pub_) return;
+
+    // Normalize axis_dir (fallback to Z if invalid)
+    double ax = axis_dir.x, ay = axis_dir.y, az = axis_dir.z;
+    double norm = std::sqrt(ax*ax + ay*ay + az*az);
+    if (norm < 1e-6) { ax = 0; ay = 0; az = 1; norm = 1; }
+    ax /= norm; ay /= norm; az /= norm;
+
+    // Compute quaternion rotating Z(0,0,1) to axis (ax,ay,az)
+    // Reference: shortest-arc quaternion between two vectors
+    double zx = 0.0, zy = 0.0, zz = 1.0;
+    double cx = zy*az - zz*ay;
+    double cy = zz*ax - zx*az;
+    double cz = zx*ay - zy*ax;
+    double dot = zx*ax + zy*ay + zz*az; // = az
+    geometry_msgs::msg::Quaternion q;
+    if (dot < -0.999999) {
+        // Opposite direction: rotate 180 deg around X axis
+        q.x = 1.0; q.y = 0.0; q.z = 0.0; q.w = 0.0;
+    } else {
+        double s = std::sqrt((1.0 + dot) * 2.0);
+        double invs = 1.0 / s;
+        q.x = cx * invs;
+        q.y = cy * invs;
+        q.z = cz * invs;
+        q.w = s * 0.5;
+    }
+
+    // Position at the center of the cylinder along axis: root + axis * (length/2)
+    geometry_msgs::msg::Point center;
+    center.x = root_position.x + static_cast<double>(length_m) * 0.5 * ax;
+    center.y = root_position.y + static_cast<double>(length_m) * 0.5 * ay;
+    center.z = root_position.z + static_cast<double>(length_m) * 0.5 * az;
+
+    visualization_msgs::msg::MarkerArray array_msg;
+    visualization_msgs::msg::Marker cyl;
+    cyl.header.stamp = stamp;
+    cyl.header.frame_id = frame_id;
+
+    std::string camera_prefix = frame_id;
+    auto p = camera_prefix.find("/d415/");
+    if (p != std::string::npos) camera_prefix = "d415";
+    p = frame_id.find("/d405/");
+    if (p != std::string::npos) camera_prefix = "d405";
+
+    cyl.ns = camera_prefix + "_aspara";
+    cyl.id = aspara_id;
+    cyl.type = visualization_msgs::msg::Marker::CYLINDER;
+    cyl.action = visualization_msgs::msg::Marker::ADD;
+    cyl.pose.position = center;
+    cyl.pose.orientation = q;
+    cyl.scale.x = 0.02;
+    cyl.scale.y = 0.02;
+    cyl.scale.z = std::max(0.01f, length_m);
+    if (is_harvestable) {
+        cyl.color.r = 0.0; cyl.color.g = 1.0; cyl.color.b = 0.0; cyl.color.a = 0.9;
+    } else {
+        cyl.color.r = 1.0; cyl.color.g = 0.0; cyl.color.b = 0.0; cyl.color.a = 0.9;
+    }
+    cyl.lifetime = rclcpp::Duration::from_seconds(marker_lifetime_sec_);
+    array_msg.markers.push_back(cyl);
+
+    // Text label above tip
+    visualization_msgs::msg::Marker txt;
+    txt.header = cyl.header;
+    txt.ns = cyl.ns + "_dist";
+    txt.id = aspara_id;
+    txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    txt.action = visualization_msgs::msg::Marker::ADD;
+    txt.pose.position.x = center.x + ax * (static_cast<double>(length_m) * 0.5 + 0.03);
+    txt.pose.position.y = center.y + ay * (static_cast<double>(length_m) * 0.5 + 0.03);
+    txt.pose.position.z = center.z + az * (static_cast<double>(length_m) * 0.5 + 0.03);
+    txt.scale.z = 0.06;
+    txt.color.r = 1.0; txt.color.g = 1.0; txt.color.b = 1.0; txt.color.a = 0.95;
+    double dist = std::sqrt(center.x*center.x + center.y*center.y + center.z*center.z);
+    txt.text = (camera_prefix + ": " + std::to_string(static_cast<float>(dist))).substr(0, 16) + " m";
+    txt.lifetime = cyl.lifetime;
+    array_msg.markers.push_back(txt);
+
+    markers_pub_->publish(array_msg);
+}
+
+void AsparaPointcloudProcessor::publishAnnotatedImage(
+    const cv::Mat& image,
+    const AsparaInfo& aspara_info,
+    const pcl::PointCloud<pcl::PointXYZRGB>::Ptr& filtered_cloud,
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& pca_line_cloud,
+    float length,
+    float straightness,
+    bool is_harvestable)
+{
+    RCLCPP_DEBUG(node_->get_logger(), "Publishing annotated image for aspara %d", aspara_info.id);
+    cv::Mat annotated_image = image.clone();
+
+    // バウンディングボックス
+    const cv::Scalar ok = cv::Scalar(0,255,0), ng = cv::Scalar(0,0,255);
+    cv::Scalar bbox_color = is_harvestable ? ok : ng;
+    cv::rectangle(annotated_image, aspara_info.bounding_box_2d, bbox_color, 3);
+
+    // ヒストグラム帯（高さ8px既定）を矩形下に貼り付け
+    try {
+        if (!aspara_info.depth_histogram_strip.empty()) {
+            int strip_h = 8; // avoid param read here to not require shared_from_this during early phase
+            strip_h = std::max(2, std::min(32, strip_h));
+            const cv::Rect &bbox = aspara_info.bounding_box_2d;
+            if (bbox.width > 1 && bbox.height > 1) {
+                cv::Mat strip_resized;
+                cv::resize(aspara_info.depth_histogram_strip, strip_resized, cv::Size(bbox.width, strip_h), 0, 0, cv::INTER_NEAREST);
+                if (strip_resized.type() != CV_8UC1) {
+                    cv::Mat tmp; strip_resized.convertTo(tmp, CV_8UC1); strip_resized = tmp;
+                }
+                cv::Mat strip_bgr; cv::cvtColor(strip_resized, strip_bgr, cv::COLOR_GRAY2BGR);
+                int sx = std::clamp(bbox.x, 0, std::max(0, annotated_image.cols - 1));
+                int sy = std::clamp(bbox.y + bbox.height + 4, 0, std::max(0, annotated_image.rows - 1));
+                int sw = std::min(strip_bgr.cols, annotated_image.cols - sx);
+                int sh = std::min(strip_bgr.rows, annotated_image.rows - sy);
+                if (sw > 0 && sh > 0) {
+                    strip_bgr(cv::Rect(0, 0, sw, sh)).copyTo(annotated_image(cv::Rect(sx, sy, sw, sh)));
+                }
+            }
+        }
+    } catch (...) {}
+
+    // UI行（デフォルト）
+    std::vector<std::string> lines{
+        "ID:${id} conf:${conf}",
+        "L:${length_cm}cm  S:${straightness}  ${grade_label}"
+    };
+    // アンカー/パディング（デフォルト）
+    std::string anchor = "below_bbox";
+    int padding = 8;
+
+    // 置換用の変数
+    auto to_string_f = [](double v, int prec){ char buf[64]; std::snprintf(buf, sizeof(buf), "%.*f", prec, v); return std::string(buf); };
+    std::map<std::string,std::string> vars = {
+        {"id", std::to_string(aspara_info.id)},
+        {"conf", to_string_f(aspara_info.confidence, 2)},
+        {"length_cm", to_string_f(length*100.0, 1)},
+        {"straightness", to_string_f(straightness, 1)},
+        {"grade_label", is_harvestable ? std::string("OK") : std::string("NG")}
+    };
+    auto subst = [&](std::string s){
+        for (auto &kv : vars) {
+            std::string key = std::string("${") + kv.first + "}";
+            size_t pos = 0;
+            while ((pos = s.find(key, pos)) != std::string::npos) {
+                s.replace(pos, key.size(), kv.second);
+                pos += kv.second.size();
+            }
+        }
+        return s;
+    };
+
+    // 開始位置の計算
+    int x = aspara_info.bounding_box_2d.x;
+    int y = aspara_info.bounding_box_2d.y + aspara_info.bounding_box_2d.height + padding + 20;
+    if (anchor == "top_left") { x = padding; y = padding + 24; }
+    else if (anchor == "top_right") { x = std::max(0, annotated_image.cols - 300); y = padding + 24; }
+
+    // 描画
+    int lh = 22;
+    for (size_t i=0; i<lines.size(); ++i) {
+        std::string text = subst(lines[i]);
+        cv::putText(annotated_image, text, cv::Point(x, y + static_cast<int>(i)*lh),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, bbox_color, 2);
+    }
+
+    // アプローチポイントの描画（紫丸 + デバッグxyz）
+    try {
+        bool overlay_enable = true;
+        cv::Scalar color_bgr(255, 0, 255);
+        int radius = 6;
+        int thickness = 2; // 既定は輪（塗りつぶし禁止）
+        bool debug_xyz = true; // 既定ON
+        cv::Scalar debug_color(255, 0, 255);
+        double debug_font = 0.5;
+        int debug_thickness = 1;
+
+        // 表示用は常に表示中の枠（smooth_bbox）基準で再計算して厳密に中心一致
+        // 強制センター（設定に依存しない）
+        ApproachParams ap{}; ap.y_mode = ApproachYMode::CENTER; ap.y_ratio = 0.0f; ap.x_offset_px = 0; ap.y_offset_px = 0;
+        if (node_) {
+            try { overlay_enable = node_->declare_parameter<bool>("approach.overlay.enable", true); } catch (...) {}
+            try {
+                // radius / thickness / debug_xyz は未宣言でも既定値を確実に使う
+                radius = node_->declare_parameter<int>("approach.overlay.radius", 6);
+                thickness = node_->declare_parameter<int>("approach.overlay.thickness", 2);
+                debug_xyz = node_->declare_parameter<bool>("approach.overlay.debug_xyz", true);
+            } catch (...) {}
+            // パラメータは無視して常にセンター
+        }
+
+        if (overlay_enable) {
+            // 2Dは厳密に検出矩形（bounding_box_2d）の幾何学中心
+            const cv::Rect& b = aspara_info.bounding_box_2d;
+            cv::Point2f px(static_cast<float>(b.x) + static_cast<float>(b.width) * 0.5f,
+                           static_cast<float>(b.y) + static_cast<float>(b.height) * 0.5f);
+
+            // world座標は解析スレッドで計算済みの値をそのまま使う（再計算しない）
+            const geometry_msgs::msg::Point* world_ptr = aspara_info.approach.world_valid ? &aspara_info.approach.world : nullptr;
+            bool world_ok = aspara_info.approach.world_valid;
+            OverlayParams op{overlay_enable, color_bgr, radius, thickness, debug_xyz, debug_color, debug_font, debug_thickness};
+            RCLCPP_WARN(node_->get_logger(), "[APPROACH_DRAW] bbox=(%d,%d,%d,%d) center=(%.1f,%.1f) world_ok=%d",
+                        aspara_info.bounding_box_2d.x, aspara_info.bounding_box_2d.y,
+                        aspara_info.bounding_box_2d.width, aspara_info.bounding_box_2d.height,
+                        px.x, px.y, static_cast<int>(world_ok));
+            drawApproachPoint(annotated_image, px,
+                              world_ptr,
+                              world_ok,
+                              op);
+        }
+    } catch (...) {}
+
+    // 出力
+    try {
+        // 最新のカラー画像ヘッダーを引き継いで、stamp/frame_id のぶれを防ぐ
+        std_msgs::msg::Header hdr;
+        if (node_ && node_->latest_color_image_) {
+            hdr = node_->latest_color_image_->header;
+        }
+        sensor_msgs::msg::Image::SharedPtr msg = cv_bridge::CvImage(
+            hdr, sensor_msgs::image_encodings::BGR8, annotated_image).toImageMsg();
+        annotated_image_pub_->publish(*msg);
+    } catch (cv_bridge::Exception& e) {
+        RCLCPP_ERROR(node_->get_logger(), "CV bridge exception in publishAnnotatedImage: %s", e.what());
+    }
+}
+
+} // namespace fv_aspara_analyzer

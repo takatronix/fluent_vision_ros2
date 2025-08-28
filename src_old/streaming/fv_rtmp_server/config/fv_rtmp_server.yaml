@@ -1,0 +1,21 @@
+fv_rtmp_server_node:
+  ros__parameters:
+    # Server configuration
+    server:
+      port: 1935                        # RTMP server port
+      endpoint: "/live/s"               # RTMP endpoint path
+    
+    # Output configuration
+    output:
+      topic_name: "/fv_rtmp_server/camera/image_raw"   # ROS2 output topic
+      frame_id: "camera_link"           # TF frame ID
+      target_width: 640                # Output image width
+      target_height: 480                # Output image height  
+      publish_rate: 30.0                # Publishing rate in Hz
+      compressed: false                 # Publish compressed images
+    
+    # Processing configuration
+    processing:
+      enable_low_latency: true          # Enable low latency optimizations
+      buffer_size: 1                    # Queue size for best effort QoS
+      quality_mode: "fast"              # Scaling quality: fast|balanced|quality 

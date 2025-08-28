@@ -1,0 +1,17 @@
+# Request
+string camera_name        # Camera name (optional, defaults to current camera)
+
+---
+# Response
+bool success              # Success status
+string camera_name        # Camera name
+string serial_number      # Camera serial number
+string device_name        # Device name
+int32 color_width         # Color image width
+int32 color_height        # Color image height
+int32 color_fps           # Color frame rate
+int32 depth_width         # Depth image width
+int32 depth_height        # Depth image height
+int32 depth_fps           # Depth frame rate
+float64 depth_scale       # Depth scale factor
+string message            # Status message 

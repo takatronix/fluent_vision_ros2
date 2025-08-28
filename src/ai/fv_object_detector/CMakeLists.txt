@@ -33,6 +33,7 @@ find_package(geometry_msgs REQUIRED)         # 幾何学メッセージ型
 find_package(visualization_msgs REQUIRED)    # 可視化メッセージ型
 find_package(vision_msgs REQUIRED)           # コンピュータビジョンメッセージ
 find_package(std_srvs REQUIRED)              # 標準サービス型
+find_package(fluent_lib REQUIRED)            # Fluent共通ライブラリ（日本語テキスト描画等）
 
 # ===== サービスメッセージ生成（一時的に無効化） =====
 # rosidl_generate_interfaces(${PROJECT_NAME}
@@ -53,6 +54,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)          # 標準準拠を必須とする
 
 # ===== インクルードディレクトリ設定 =====
 include_directories(include)                 # ヘッダーファイルディレクトリ
+include_directories(${fluent_lib_INCLUDE_DIRS})
 
 # ===== 実行ファイル作成 =====
 add_executable(fv_object_detector_node
@@ -72,6 +74,7 @@ ament_target_dependencies(fv_object_detector_node
   geometry_msgs             # 幾何学メッセージ型
   visualization_msgs        # 可視化メッセージ型
   vision_msgs               # コンピュータビジョンメッセージ
+  fluent_lib                # Fluent共通ライブラリ
 )
 
 # ===== 外部ライブラリリンク =====
@@ -80,6 +83,7 @@ target_link_libraries(fv_object_detector_node
   openvino::runtime                         # OpenVINO推論エンジン
   nlohmann_json::nlohmann_json              # JSON処理ライブラリ
   yaml-cpp                                  # YAML処理ライブラリ
+  fluent_lib::fluent_lib                    # Fluent共通ライブラリ
 )
 
 # ===== インストール設定 =====
