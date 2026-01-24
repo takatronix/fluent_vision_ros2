@@ -58,7 +58,7 @@ private:
   void handleStop(const std_msgs::msg::Empty::SharedPtr msg);
   void handlePause(const std_msgs::msg::Empty::SharedPtr msg);
   void handleResume(const std_msgs::msg::Empty::SharedPtr msg);
-  bool validateFrame(const fv_audio::msg::AudioFrame & msg) const;
+  bool validateFrame(const fv_audio::msg::AudioFrame & msg);
   void handlePlayFile(
     const std::shared_ptr<fv_audio_output::srv::PlayFile::Request> request,
     std::shared_ptr<fv_audio_output::srv::PlayFile::Response> response);
