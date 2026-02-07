@@ -7,6 +7,8 @@
 
 #include <chrono>
 #include <thread>
+#include <algorithm>
+#include <cctype>
 
 FVUSBCameraNode::FVUSBCameraNode()
     : Node("fv_camera"), running_(false)
@@ -88,6 +90,8 @@ void FVUSBCameraNode::loadParameters()
         this->declare_parameter("camera.height", 480);
     camera_config_.fps = 
         this->declare_parameter("camera.fps", 30);
+    camera_config_.pixel_format =
+        this->declare_parameter("camera.pixel_format", "MJPG");
     camera_config_.brightness = 
         this->declare_parameter("camera.brightness", -1);
     camera_config_.contrast = 
@@ -155,6 +159,18 @@ bool FVUSBCameraNode::initializeCamera()
     if (!selectCamera()) {
         RCLCPP_ERROR(this->get_logger(), "❌ Failed to select camera");
         return false;
+    }
+
+    // Prefer MJPG for high-FPS UVC streaming on high resolutions.
+    if (!camera_config_.pixel_format.empty()) {
+        std::string fmt = camera_config_.pixel_format;
+        std::transform(fmt.begin(), fmt.end(), fmt.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        if (fmt == "MJPG") {
+            camera_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+        } else if (fmt == "YUYV") {
+            camera_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', 'V'));
+        }
     }
     
     // Set camera properties
@@ -319,6 +335,7 @@ void FVUSBCameraNode::processingLoop()
     int frame_count = 0;
     
     while (running_) {
+        auto loop_start = std::chrono::steady_clock::now();
         if (!camera_.isOpened()) {
             RCLCPP_ERROR(this->get_logger(), "❌ Camera not opened, retrying...");
             // Attempt to reconnect automatically if capture backend dropped.
@@ -368,8 +385,14 @@ void FVUSBCameraNode::processingLoop()
             last_time = current_time;
         }
         
-        // Sleep to maintain frame rate
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000 / camera_config_.fps));
+        // Keep a soft upper bound without reducing throughput when capture blocks.
+        if (camera_config_.fps > 0) {
+            auto target = std::chrono::milliseconds(1000 / std::max(1, camera_config_.fps));
+            auto elapsed_loop = std::chrono::steady_clock::now() - loop_start;
+            if (elapsed_loop < target) {
+                std::this_thread::sleep_for(target - elapsed_loop);
+            }
+        }
     }
     
     RCLCPP_INFO(this->get_logger(), "🛑 Processing loop stopped");
@@ -688,4 +711,4 @@ int main(int argc, char** argv)
     
     rclcpp::shutdown();
     return 0;
-} 
+}

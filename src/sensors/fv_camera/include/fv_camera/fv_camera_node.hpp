@@ -46,6 +46,7 @@ private:
         int width = 640;
         int height = 480;
         int fps = 30;
+        std::string pixel_format = "MJPG";
         int brightness = -1;  // -1 means auto
         int contrast = -1;
         int saturation = -1;
