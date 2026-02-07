@@ -197,12 +197,19 @@ bool FVUSBCameraNode::initializeCamera()
 bool FVUSBCameraNode::selectCamera()
 {
     RCLCPP_INFO(this->get_logger(), "🔍 Selecting camera...");
+
+    auto open_with_fallback = [this](int index) -> bool {
+        // Prefer V4L2 backend to avoid unstable GStreamer pipelines in containers.
+        if (camera_.open(index, cv::CAP_V4L2)) {
+            return true;
+        }
+        return camera_.open(index);
+    };
     
     if (camera_selection_config_.selection_method == "auto") {
         // Try to open camera 0
         RCLCPP_INFO(this->get_logger(), "🔄 Auto-selecting camera 0...");
-        camera_.open(0);
-        if (camera_.isOpened()) {
+        if (open_with_fallback(0) && camera_.isOpened()) {
             RCLCPP_INFO(this->get_logger(), "✅ Auto-selected camera 0");
             return true;
         }
@@ -210,8 +217,7 @@ bool FVUSBCameraNode::selectCamera()
         // Try other cameras
         for (int i = 1; i < 10; i++) {
             RCLCPP_INFO(this->get_logger(), "🔄 Trying camera %d...", i);
-            camera_.open(i);
-            if (camera_.isOpened()) {
+            if (open_with_fallback(i) && camera_.isOpened()) {
                 RCLCPP_INFO(this->get_logger(), "✅ Auto-selected camera %d", i);
                 return true;
             }
@@ -222,8 +228,7 @@ bool FVUSBCameraNode::selectCamera()
         
     } else if (camera_selection_config_.selection_method == "index") {
         RCLCPP_INFO(this->get_logger(), "🔄 Opening camera index %d...", camera_selection_config_.device_index);
-        camera_.open(camera_selection_config_.device_index);
-        if (camera_.isOpened()) {
+        if (open_with_fallback(camera_selection_config_.device_index) && camera_.isOpened()) {
             RCLCPP_INFO(this->get_logger(), "✅ Camera index %d opened successfully", camera_selection_config_.device_index);
             return true;
         } else {
@@ -257,7 +262,9 @@ void FVUSBCameraNode::initializePublishers()
     
     // Compressed image publisher (will be initialized later)
     if (camera_info_config_.enable_compressed_topics && stream_config_.compressed_enabled) {
-        RCLCPP_INFO(this->get_logger(), "📤 Compressed publisher: %s (will be initialized later)", topic_config_.color_compressed.c_str());
+        color_compressed_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
+            topic_config_.color_compressed, 10);
+        RCLCPP_INFO(this->get_logger(), "📤 Compressed publisher: %s", topic_config_.color_compressed.c_str());
     }
     
     RCLCPP_INFO(this->get_logger(), "✅ Publishers initialized successfully");
@@ -313,7 +320,11 @@ void FVUSBCameraNode::processingLoop()
     
     while (running_) {
         if (!camera_.isOpened()) {
-            RCLCPP_ERROR(this->get_logger(), "❌ Camera not opened");
+            RCLCPP_ERROR(this->get_logger(), "❌ Camera not opened, retrying...");
+            // Attempt to reconnect automatically if capture backend dropped.
+            if (!selectCamera()) {
+                RCLCPP_ERROR(this->get_logger(), "❌ Camera reconnect failed");
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             continue;
         }
@@ -376,13 +387,26 @@ void FVUSBCameraNode::publishFrame(const cv::Mat& frame)
         color_pub_->publish(*msg);
     }
     
-    // Publish compressed image (if initialized)
-    if (camera_info_config_.enable_compressed_topics && stream_config_.compressed_enabled && image_transport_) {
-        if (color_compressed_pub_.getNumSubscribers() > 0) {
-            auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", frame).toImageMsg();
-            msg->header.stamp = stamp;
-            msg->header.frame_id = tf_config_.optical_frame;
-            color_compressed_pub_.publish(msg);
+    // Publish compressed image as sensor_msgs/CompressedImage
+    if (camera_info_config_.enable_compressed_topics && stream_config_.compressed_enabled && color_compressed_pub_) {
+        if (color_compressed_pub_->get_subscription_count() > 0) {
+            std::vector<uchar> jpeg_data;
+            std::vector<int> params = {
+                cv::IMWRITE_JPEG_QUALITY,
+                std::max(1, std::min(100, camera_info_config_.compressed_quality))
+            };
+            if (cv::imencode(".jpg", frame, jpeg_data, params)) {
+                sensor_msgs::msg::CompressedImage cmsg;
+                cmsg.header.stamp = stamp;
+                cmsg.header.frame_id = tf_config_.optical_frame;
+                cmsg.format = "jpeg";
+                cmsg.data = std::move(jpeg_data);
+                color_compressed_pub_->publish(cmsg);
+            } else {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(), *this->get_clock(), 5000,
+                    "⚠️ Failed to encode JPEG for compressed topic");
+            }
         }
     }
     

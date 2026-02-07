@@ -4,15 +4,13 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <fluent_lib/cv_bridge_compat.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
-#include <image_transport/image_transport.hpp>
-#include <image_transport/publisher.hpp>
-
 #include <memory>
 #include <string>
 #include <mutex>
@@ -107,10 +105,7 @@ private:
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr color_pub_;
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_pub_;
-
-    // Image transport for compressed topics
-    std::unique_ptr<image_transport::ImageTransport> image_transport_;
-    image_transport::Publisher color_compressed_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr color_compressed_pub_;
 
     // Services
     rclcpp::Service<fv_camera::srv::GetCameraInfo>::SharedPtr get_camera_info_service_;
