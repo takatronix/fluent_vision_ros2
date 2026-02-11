@@ -251,6 +251,24 @@ bool FVUSBCameraNode::selectCamera()
             RCLCPP_ERROR(this->get_logger(), "❌ Failed to open camera index %d", camera_selection_config_.device_index);
             return false;
         }
+    } else if (camera_selection_config_.selection_method == "path") {
+        const std::string& dev_path = camera_selection_config_.device_name;
+        if (dev_path.empty()) {
+            RCLCPP_ERROR(this->get_logger(), "❌ selection_method=path but device_name is empty");
+            return false;
+        }
+        RCLCPP_INFO(this->get_logger(), "🔄 Opening camera path %s...", dev_path.c_str());
+        if (camera_.open(dev_path, cv::CAP_V4L2) && camera_.isOpened()) {
+            RCLCPP_INFO(this->get_logger(), "✅ Camera path %s opened successfully", dev_path.c_str());
+            return true;
+        }
+        // Fallback without backend hint
+        if (camera_.open(dev_path) && camera_.isOpened()) {
+            RCLCPP_INFO(this->get_logger(), "✅ Camera path %s opened successfully (fallback)", dev_path.c_str());
+            return true;
+        }
+        RCLCPP_ERROR(this->get_logger(), "❌ Failed to open camera path %s", dev_path.c_str());
+        return false;
     }
     
     RCLCPP_ERROR(this->get_logger(), "❌ Unknown camera selection method: %s", 

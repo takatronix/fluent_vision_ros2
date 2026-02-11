@@ -5,6 +5,7 @@
  * Publishes:
  *   - Surface normals as 32FC3 image
  *   - RGBD (color + depth fused) as 32FC4 image
+ *   - (optional) Normals preview as CompressedImage (JPEG BGR8)
  *
  * This replaces the Python depth_normals_node with native C++ for
  * better throughput on Jetson / ARM platforms.
@@ -13,13 +14,16 @@
 #include <cmath>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 template <typename T>
 static T get_param(rclcpp::Node& node, const std::string& name, const T& def) {
@@ -40,6 +44,8 @@ public:
         publish_rgbd_  = get_param(*this, "publish_rgbd",      true);
         publish_normals_ = get_param(*this, "publish_normals", true);
         frame_id_      = get_param(*this, "frame_id",          std::string(""));
+        normals_preview_topic_ = get_param(*this, "normals_preview_topic", std::string(""));
+        normals_preview_quality_ = std::max(1, std::min(100, get_param(*this, "normals_preview_quality", 75)));
 
         auto qos = rclcpp::SensorDataQoS();
         sub_info_ = create_subscription<sensor_msgs::msg::CameraInfo>(
@@ -53,11 +59,15 @@ public:
             pub_rgbd_ = create_publisher<sensor_msgs::msg::Image>(rgbd_topic_, 10);
         if (publish_normals_)
             pub_normals_ = create_publisher<sensor_msgs::msg::Image>(normals_topic_, 10);
+        if (!normals_preview_topic_.empty())
+            pub_normals_preview_ = create_publisher<sensor_msgs::msg::CompressedImage>(normals_preview_topic_, 10);
 
         RCLCPP_INFO(get_logger(),
-            "FvDepthNormalsNode: color=%s depth=%s info=%s rgbd=%s normals=%s stride=%d",
+            "FvDepthNormalsNode: color=%s depth=%s info=%s rgbd=%s normals=%s preview=%s stride=%d",
             color_topic_.c_str(), depth_topic_.c_str(), info_topic_.c_str(),
-            rgbd_topic_.c_str(), normals_topic_.c_str(), stride_);
+            rgbd_topic_.c_str(), normals_topic_.c_str(),
+            normals_preview_topic_.empty() ? "(none)" : normals_preview_topic_.c_str(),
+            stride_);
     }
 
 private:
@@ -130,14 +140,33 @@ private:
         }
 
         // --- Surface normals ---
-        if (publish_normals_ && pub_normals_) {
+        if ((publish_normals_ && pub_normals_) || pub_normals_preview_) {
             cv::Mat normals = compute_normals(depth_m,
                 static_cast<float>(fx), static_cast<float>(fy),
                 static_cast<float>(cx), static_cast<float>(cy), stride_);
 
-            auto out = cv_bridge::CvImage(msg->header, "32FC3", normals).toImageMsg();
-            if (!frame_id_.empty()) out->header.frame_id = frame_id_;
-            pub_normals_->publish(*out);
+            if (publish_normals_ && pub_normals_) {
+                auto out = cv_bridge::CvImage(msg->header, "32FC3", normals).toImageMsg();
+                if (!frame_id_.empty()) out->header.frame_id = frame_id_;
+                pub_normals_->publish(*out);
+            }
+
+            // --- Normals preview (CompressedImage JPEG) ---
+            if (pub_normals_preview_) {
+                // normals range [-1, 1] → BGR8 [0, 255]
+                cv::Mat vis;
+                normals.convertTo(vis, CV_8UC3, 127.5, 127.5);
+                std::vector<uchar> buf;
+                std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, normals_preview_quality_};
+                cv::imencode(".jpg", vis, buf, params);
+
+                auto comp = sensor_msgs::msg::CompressedImage();
+                comp.header = msg->header;
+                if (!frame_id_.empty()) comp.header.frame_id = frame_id_;
+                comp.format = "jpeg";
+                comp.data = std::move(buf);
+                pub_normals_preview_->publish(comp);
+            }
         }
     }
 
@@ -185,6 +214,8 @@ private:
     // Parameters
     std::string color_topic_, depth_topic_, info_topic_;
     std::string rgbd_topic_, normals_topic_, frame_id_;
+    std::string normals_preview_topic_;
+    int normals_preview_quality_;
     double depth_scale_;
     int stride_;
     bool publish_rgbd_, publish_normals_;
@@ -201,6 +232,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_depth_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_rgbd_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_normals_;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_normals_preview_;
 };
 
 int main(int argc, char** argv) {

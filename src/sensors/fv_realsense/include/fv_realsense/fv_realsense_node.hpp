@@ -120,10 +120,7 @@ private:
     TopicConfig topic_config_;
 
     // RealSense members
-    rs2::context ctx_;
-    rs2::pipeline pipe_;          // used only for legacy fallback/restart
-    rs2::config cfg_;             // stream config (shared)
-    rs2::pipeline_profile profile_; // legacy pipeline profile
+    std::unique_ptr<rs2::context> ctx_;
     rs2::device device_;
 
     // Sensor-based streaming (preferred: decouple color/depth without wait_for_frames)

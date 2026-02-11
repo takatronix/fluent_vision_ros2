@@ -354,7 +354,7 @@ bool FVDepthCameraNode::initializeRealSense()
     try {
         // Initialize context with error handling
         RCLCPP_INFO(this->get_logger(), "📋 Creating RealSense context...");
-        ctx_ = rs2::context();
+        ctx_ = std::make_unique<rs2::context>();
         
         // Device selection based on configuration
         RCLCPP_INFO(this->get_logger(), "🔍 Device selection...");
@@ -1865,7 +1865,11 @@ std::vector<rs2::device> FVDepthCameraNode::getAvailableDevices()
     
     try {
         RCLCPP_INFO(this->get_logger(), "🔍 Querying RealSense devices...");
-        auto device_list = ctx_.query_devices();
+        if (!ctx_) {
+            RCLCPP_ERROR(this->get_logger(), "❌ RealSense context is not initialized");
+            return devices;
+        }
+        auto device_list = ctx_->query_devices();
         size_t device_count = device_list.size();
         
         RCLCPP_INFO(this->get_logger(), "🔍 Found %zu RealSense device(s)", device_count);
