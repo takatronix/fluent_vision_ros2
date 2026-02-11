@@ -39,7 +39,7 @@ public:
         min_depth_      = get_param(*this, "min_depth",         0.05);
         height_min_     = get_param(*this, "height_min",        -1.0);
         height_max_     = get_param(*this, "height_max",        1.0);
-        gravity_axis_   = get_param(*this, "gravity_axis",      std::string("y"));
+        gravity_axis_   = get_param(*this, "gravity_axis",      std::string("+y"));
         frame_id_       = get_param(*this, "frame_id",          std::string(""));
 
         auto qos = rclcpp::SensorDataQoS();
@@ -144,9 +144,9 @@ private:
 
         // Gravity direction
         cv::Vec3f gravity;
-        if (gravity_axis_ == "y")        gravity = {0.0f, 1.0f, 0.0f};
+        if (gravity_axis_ == "y" || gravity_axis_ == "+y")        gravity = {0.0f, 1.0f, 0.0f};
         else if (gravity_axis_ == "-y")  gravity = {0.0f, -1.0f, 0.0f};
-        else if (gravity_axis_ == "z")   gravity = {0.0f, 0.0f, 1.0f};
+        else if (gravity_axis_ == "z" || gravity_axis_ == "+z")   gravity = {0.0f, 0.0f, 1.0f};
         else if (gravity_axis_ == "-z")  gravity = {0.0f, 0.0f, -1.0f};
         else                             gravity = {0.0f, 1.0f, 0.0f};
 
