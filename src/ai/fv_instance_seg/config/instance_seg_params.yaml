@@ -4,9 +4,12 @@
     qos:
       reliability: "best_effort"
       queue_size: 10
-    backend: "openvino"
-    model_path: "src/fluent_vision_ros2/models/openvino/yolov8s-seg-aspara.xml"
-    device: "CPU"
+    # backend: auto|tensorrt|openvino
+    backend: "auto"
+    # For TensorRT backend, provide .engine/.plan path.
+    # For OpenVINO backend, provide .xml path.
+    model_path: "/ros2_ws/models/tensorrt/yolo11n-seg.engine"
+    device: "GPU"
     conf_thres: 0.25
     iou_thres: 0.5
     publish_detections: true
@@ -14,4 +17,3 @@
     nms_class_agnostic: true
     max_detections: 100
     debug_shapes: false
-

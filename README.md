@@ -12,6 +12,7 @@ FluentVision ROS2は、Intel RealSense深度カメラとAI技術を組み合わ�
 - **fv_object_detector**: YOLOv10を使用した汎用物体検出システム
 - **fv_object_mask_generator**: UNet使用のセマンティックセグメンテーション
 - **fv_aspara_analyzer**: アスパラガス品質分析システム
+- **fv_lingbot_depth**: LingBot-Depth連携による深度補完・補正ノード
 - **fv_face_recognizer**: リアルタイム顔認識システム（開発中）
 
 ### 📷 センサー (`src/sensors/`)
@@ -128,6 +129,7 @@ cd launch
 - **セグメンテーション**: `/fv/segmentation/result`
 - **アスパラガス検出**: `/fv/aspara_detection/result`
 - **品質分析**: `/fv/aspara_analysis/result`
+- **深度補正 (LingBot)**: `/fv/d405/depth_refined/image_rect_raw`, `/fv/d405/depth_refined/points`
 
 ### サービス
 - **モード設定**: `/fv_realsense/set_mode` - 表示モード切り替え（0: 表示なし, 1: カーソルのみ, 2: カーソル+座標+距離）
@@ -141,6 +143,11 @@ cd launch
 各カメラ用の設定ファイルが`launch/`ディレクトリに用意されています：
 - `fv_realsense_d415.yaml` / `fv_realsense_d405.yaml`
 - `fv_aspara_analyzer_d415.yaml` / `fv_aspara_analyzer_d405.yaml`
+
+### LingBot-Depth統合設定
+- ノード仕様書: `docs/lingbot_depth_integration_spec.md`
+- ノード設定例: `src/system/fluent_vision_system/config/fv_lingbot_depth_d405.yaml`
+- fluent_vision_systemへの統合サンプル: `src/system/fluent_vision_system/config/fluent_vision_system.lingbot_depth.sample.yaml`
 
 ### パフォーマンス調整
 - 解像度: 320x240（Raspberry Pi対応）〜 1280x720

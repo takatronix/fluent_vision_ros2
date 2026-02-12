@@ -2,7 +2,7 @@
 <package format="3">
   <name>fv_instance_seg</name>
   <version>0.1.0</version>
-  <description>Fluent Vision instance segmentation node (OpenVINO, YOLO-seg).</description>
+  <description>Fluent Vision instance segmentation node (YOLO-seg: TensorRT/OpenVINO).</description>
   <maintainer email="devnull@example.com">fluent-vision</maintainer>
   <license>Apache-2.0</license>
 
@@ -12,6 +12,7 @@
   <depend>sensor_msgs</depend>
   <depend>vision_msgs</depend>
   <depend>cv_bridge</depend>
+  <depend>fv_msgs</depend>
   <depend>OpenCV</depend>
   <depend>fluent_lib</depend>
 

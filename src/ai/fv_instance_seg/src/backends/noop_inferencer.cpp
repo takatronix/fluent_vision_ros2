@@ -1,5 +1,12 @@
 #include "fv_instance_seg/backends/inferencer.hpp"
+
+#ifdef FV_INSTANCE_SEG_HAVE_OPENVINO
 #include "fv_instance_seg/backends/ov_yolo_seg.hpp"
+#endif
+
+#ifdef FV_INSTANCE_SEG_HAVE_TENSORRT
+#include "fv_instance_seg/backends/trt_yolo_seg.hpp"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -33,8 +40,30 @@ std::unique_ptr<Inferencer> CreateInferencer(const std::string& backend) {
     return static_cast<char>(std::tolower(c));
   });
 
-  if (key.empty() || key == "openvino" || key == "ov") {
+  if (key == "auto") {
+#ifdef FV_INSTANCE_SEG_HAVE_TENSORRT
+    return std::make_unique<TrtYoloSegInferencer>();
+#elif defined(FV_INSTANCE_SEG_HAVE_OPENVINO)
     return std::make_unique<OvYoloSegInferencer>();
+#else
+    return std::make_unique<NoopInferencer>();
+#endif
+  }
+
+  if (key == "tensorrt" || key == "trt") {
+#ifdef FV_INSTANCE_SEG_HAVE_TENSORRT
+    return std::make_unique<TrtYoloSegInferencer>();
+#else
+    return std::make_unique<NoopInferencer>();
+#endif
+  }
+
+  if (key.empty() || key == "openvino" || key == "ov") {
+#ifdef FV_INSTANCE_SEG_HAVE_OPENVINO
+    return std::make_unique<OvYoloSegInferencer>();
+#else
+    return std::make_unique<NoopInferencer>();
+#endif
   }
 
   return std::make_unique<NoopInferencer>();

@@ -1,0 +1,29 @@
+fv_lingbot_depth:
+  ros__parameters:
+    color_topic: "/fv/d405/color/image_raw"
+    depth_topic: "/fv/d405/depth/image_rect_raw"
+    camera_info_topic: "/fv/d405/depth/camera_info"
+
+    refined_depth_topic: "depth_refined/image_rect_raw"
+    mask_topic: "depth_refined/mask"
+    pointcloud_topic: "depth_refined/points"
+    frame_id_override: ""
+
+    model_id: "robbyant/lingbot-depth-pretrain-vitl-14"
+    local_model_path: ""
+    device: "auto"
+    use_fp16: true
+    apply_mask: true
+    resolution_level: 9
+    fallback_passthrough: true
+
+    depth_scale_16uc1: 0.001
+    min_depth_m: 0.05
+    max_depth_m: 3.0
+    point_stride: 2
+
+    sync_queue_size: 10
+    sync_slop_sec: 0.03
+    qos_reliability: "best_effort"
+    log_every_n_frames: 30
+

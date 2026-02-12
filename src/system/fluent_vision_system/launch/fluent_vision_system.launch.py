@@ -25,6 +25,19 @@ def _flatten_params(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
     return out
 
 
+def _load_params_file_as_flat(params_file: str) -> Dict[str, Any]:
+    flat_params: Dict[str, Any] = {}
+    with open(params_file, 'r') as pf:
+        raw = yaml.safe_load(pf) or {}
+    if isinstance(raw, dict) and raw:
+        root_key = next(iter(raw.keys()))
+        if isinstance(raw[root_key], dict):
+            ros_params = raw[root_key].get('ros__parameters', {})
+            if isinstance(ros_params, dict):
+                flat_params = _flatten_params(ros_params)
+    return flat_params
+
+
 def load_camera_serials(config_path: str) -> Dict[str, str]:
     # Prefer /config/camera_serials.yaml, else sibling to main config
     candidates = [
@@ -234,16 +247,26 @@ def launch_setup(context, *args, **kwargs):
 
         group_nodes = [n for n in group.get('nodes', []) if n.get('enable', True)]
         for n in group_nodes:
-            params_file = n.get('params_file', '')
-            if not params_file or not os.path.isfile(params_file):
-                actions.append(LogInfo(msg=f"[fluent_vision_system] Skip node '{n.get('id','?')}' due to missing params_file: {params_file}"))
+            params_file = str(n.get('params_file', '') or '').strip()
+            inline_params = n.get('parameters', {})
+            if inline_params is None:
+                inline_params = {}
+            if not isinstance(inline_params, dict):
+                actions.append(LogInfo(msg=f"[fluent_vision_system] Skip node '{n.get('id','?')}' due to invalid parameters type (dict required)"))
+                continue
+            use_params_file = bool(params_file and os.path.isfile(params_file))
+            if params_file and not use_params_file:
+                actions.append(LogInfo(msg=f"[fluent_vision_system] params_file not found for '{n.get('id','?')}': {params_file} (fallback to inline parameters)"))
+            if (not use_params_file) and (not inline_params):
+                actions.append(LogInfo(msg=f"[fluent_vision_system] Skip node '{n.get('id','?')}' due to missing params_file and empty inline parameters"))
                 continue
             # Avoid using '/' as namespace default; empty string means root namespace
             ns = n.get('namespace', '')
             if ns == '/':
                 ns = ''
             # Log what we are about to launch
-            actions.append(LogInfo(msg=f"[fluent_vision_system] Launching {n.get('package')}:{n.get('exec')} name={n.get('node_name', n.get('id'))} ns='{ns}' params='{params_file}'"))
+            params_src = params_file if use_params_file else '(inline)'
+            actions.append(LogInfo(msg=f"[fluent_vision_system] Launching {n.get('package')}:{n.get('exec')} name={n.get('node_name', n.get('id'))} ns='{ns}' params='{params_src}'"))
 
             # Optional runtime parameter overrides (flat dict for this node)
             overrides = {}
@@ -280,15 +303,13 @@ def launch_setup(context, *args, **kwargs):
             # 共通: YAMLパラメータをロードしてフラット化し、overridesをマージして渡す
             # これにより --params-file の二重指定を完全に避ける
             flat_params: Dict[str, Any] = {}
-            try:
-                with open(params_file, 'r') as pf:
-                    raw = yaml.safe_load(pf) or {}
-                if isinstance(raw, dict) and raw:
-                    root_key = next(iter(raw.keys()))
-                    ros_params = raw[root_key].get('ros__parameters', {}) if isinstance(raw[root_key], dict) else {}
-                    flat_params = _flatten_params(ros_params)
-            except Exception as e:
-                actions.append(LogInfo(msg=f"[fluent_vision_system] Failed to read params file {params_file}: {e}"))
+            if use_params_file:
+                try:
+                    flat_params = _load_params_file_as_flat(params_file)
+                except Exception as e:
+                    actions.append(LogInfo(msg=f"[fluent_vision_system] Failed to read params file {params_file}: {e}"))
+            if inline_params:
+                flat_params.update(_flatten_params(inline_params))
 
             # overridesはフラットキー前提
             for ok, ov in (overrides or {}).items():
