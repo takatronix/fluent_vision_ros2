@@ -279,21 +279,29 @@ bool FVUSBCameraNode::selectCamera()
 void FVUSBCameraNode::initializePublishers()
 {
     RCLCPP_INFO(this->get_logger(), "📤 Initializing publishers...");
-    
+
+    // Make relative topics private (~/...) so they include the node_name
+    auto make_private = [](const std::string& topic) -> std::string {
+        if (topic.empty() || topic[0] == '/' || topic[0] == '~') return topic;
+        return "~/" + topic;
+    };
+    topic_config_.color = make_private(topic_config_.color);
+    topic_config_.color_compressed = make_private(topic_config_.color_compressed);
+
     // Color image publisher
     if (stream_config_.color_enabled) {
         color_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
             topic_config_.color, 10);
         RCLCPP_INFO(this->get_logger(), "📤 Color publisher: %s", topic_config_.color.c_str());
     }
-    
+
     // Camera info publisher
     if (camera_info_config_.enable_camera_info) {
         camera_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            "camera_info", 10);
-        RCLCPP_INFO(this->get_logger(), "📤 Camera info publisher: camera_info");
+            "~/camera_info", 10);
+        RCLCPP_INFO(this->get_logger(), "📤 Camera info publisher: ~/camera_info");
     }
-    
+
     // Compressed image publisher (will be initialized later)
     if (camera_info_config_.enable_compressed_topics && stream_config_.compressed_enabled) {
         color_compressed_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(

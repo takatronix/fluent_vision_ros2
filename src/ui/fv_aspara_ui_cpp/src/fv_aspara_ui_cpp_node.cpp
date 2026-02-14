@@ -30,11 +30,11 @@ public:
   explicit AsparaUiCppNode(const rclcpp::NodeOptions &options)
     : rclcpp::Node("fv_aspara_ui_cpp", options)
   {
-    declare_parameter<std::string>("image_topic", "/fv/selected/d405/color/image_raw");
-    declare_parameter<std::string>("detections_topic", "/fv/d405/detection_fusion/rois");
-    declare_parameter<std::string>("metrics_topic", "/fv/d405/stalk/metrics");
-    declare_parameter<std::string>("camera_info_topic", "/fv/d405/color/camera_info");
-    declare_parameter<std::string>("annotated_topic", "/fv/d405/ui/annotated_image");
+    declare_parameter<std::string>("image_topic", "~/color/image_raw");
+    declare_parameter<std::string>("detections_topic", "~/detections");
+    declare_parameter<std::string>("metrics_topic", "~/metrics");
+    declare_parameter<std::string>("camera_info_topic", "~/camera_info");
+    declare_parameter<std::string>("annotated_topic", "~/annotated_image");
     // Image QoS reliability: best_effort | reliable | system_default
     declare_parameter<std::string>("image_qos_reliability", "best_effort");
     // Optional mask overlay

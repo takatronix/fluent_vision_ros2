@@ -1,0 +1,28 @@
+# node_manifest.yaml — fv_object_mask_generator
+# UNet Semantic Segmentation Mask Generator (OpenVINO)
+
+nodes:
+  - key: fv_object_mask_generator
+    package: fv_object_mask_generator
+    exec: fv_object_mask_generator_node
+    category: ai
+    label: "Object Mask Generator"
+
+    inputs:
+      - param: input_image_topic
+        type: image
+
+    outputs:
+      - param: output_segmentation_mask_topic
+        type: image
+        label: seg_mask
+      - param: output_colored_mask_topic
+        type: image
+        label: colored_mask
+
+    default_parameters:
+      input_image_topic: ""
+      output_segmentation_mask_topic: ""
+      output_colored_mask_topic: ""
+      model:
+        device: "auto"

@@ -1,0 +1,2033 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FluentVision Pipeline Editor</title>
+<style>
+/* ================================================================
+   FluentVision Pipeline Editor — Styles
+   ================================================================ */
+:root {
+  --bg: #1a1a2e;
+  --bg2: #16213e;
+  --bg3: #0f3460;
+  --text: #e0e0e0;
+  --text2: #aaa;
+  --accent: #00d9ff;
+  --border: #333;
+  --danger: #ff5252;
+  --success: #00e676;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'Segoe UI', -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+  height: 100vh;
+}
+
+/* --- Toolbar --- */
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  height: 42px;
+  z-index: 100;
+}
+
+#toolbar select, #toolbar input, #toolbar button {
+  font-size: 13px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  outline: none;
+}
+
+#toolbar button {
+  cursor: pointer;
+  transition: background 0.15s;
+}
+#toolbar button:hover { background: var(--bg3); }
+#toolbar button.primary {
+  background: var(--bg3);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+#toolbar button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+#toolbar .sep {
+  width: 1px;
+  height: 24px;
+  background: var(--border);
+  margin: 0 4px;
+}
+
+#toolbar .label {
+  font-size: 12px;
+  color: var(--text2);
+}
+
+#pipelineDir {
+  max-width: 200px;
+  font-size: 11px;
+  color: var(--text2);
+}
+
+/* --- Canvas --- */
+#canvasWrap {
+  position: relative;
+  width: 100%;
+  height: calc(100vh - 42px - 28px); /* toolbar + log header */
+}
+
+#mainCanvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: default;
+}
+
+/* --- Palette overlay --- */
+#paletteOverlay {
+  display: none;
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 200;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 40px;
+}
+#paletteOverlay.open { display: flex; }
+
+#palette {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 600px;
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 16px;
+}
+
+#palette h3 { font-size: 14px; margin-bottom: 10px; color: var(--accent); }
+#paletteSearch {
+  width: 100%;
+  padding: 8px;
+  margin-bottom: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.palette-category { margin-bottom: 16px; }
+.palette-category h4 {
+  font-size: 12px;
+  color: var(--text2);
+  text-transform: uppercase;
+  margin-bottom: 6px;
+  letter-spacing: 1px;
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+.palette-item:hover { background: var(--bg3); }
+
+.palette-item .badge {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: bold;
+  min-width: 32px;
+  text-align: center;
+}
+
+.palette-item .info {
+  flex: 1;
+}
+.palette-item .info .name { font-size: 13px; }
+.palette-item .info .ports {
+  font-size: 11px;
+  color: var(--text2);
+}
+
+/* --- Edit panel --- */
+#editPanel {
+  display: none;
+  position: absolute;
+  top: 60px;
+  right: 16px;
+  width: 340px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  z-index: 150;
+}
+#editPanel.open { display: block; }
+
+#editPanel h3 {
+  font-size: 14px;
+  margin-bottom: 12px;
+  color: var(--accent);
+}
+
+#editPanel label {
+  display: block;
+  font-size: 12px;
+  color: var(--text2);
+  margin-bottom: 3px;
+  margin-top: 8px;
+}
+
+#editPanel input, #editPanel textarea, #editPanel select {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  font-family: monospace;
+}
+
+#editPanel textarea { height: 160px; resize: vertical; }
+
+#editPanel .btn-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+#editPanel .btn-row button {
+  flex: 1;
+  padding: 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+#editPanel .btn-row button.primary {
+  background: var(--bg3);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+#editPanel .btn-row button.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* --- Log panel --- */
+#logPanel {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 180px;
+  background: rgba(10,10,20,0.95);
+  border-top: 1px solid var(--border);
+  z-index: 160;
+  display: flex;
+  flex-direction: column;
+  transition: transform 0.2s ease;
+}
+#logPanel.collapsed {
+  transform: translateY(calc(100% - 28px));
+}
+
+#logHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  height: 28px;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+#logHeader span {
+  font-size: 12px;
+  color: var(--text2);
+}
+
+#logHeader .log-title {
+  color: var(--text);
+  font-weight: bold;
+}
+
+#logHeader button {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text2);
+  cursor: pointer;
+  margin-left: 4px;
+}
+#logHeader button:first-of-type {
+  margin-left: auto;
+}
+
+#logBody {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.log-entry {
+  padding: 1px 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-entry .log-time {
+  color: #666;
+  margin-right: 6px;
+}
+
+.log-entry.log-info { color: #8cb4d8; }
+.log-entry.log-success { color: #00e676; }
+.log-entry.log-warn { color: #ffa726; }
+.log-entry.log-error { color: #ff5252; }
+.log-entry.log-ws { color: #bb86fc; }
+
+.log-badge {
+  display: inline-block;
+  padding: 0 4px;
+  border-radius: 2px;
+  font-size: 10px;
+  font-weight: bold;
+  margin-right: 4px;
+}
+.log-badge.launch { background: #0a3320; color: #00e676; }
+.log-badge.stop { background: #3d0a0a; color: #ff5252; }
+.log-badge.status { background: #1a1a3e; color: #4fc3f7; }
+.log-badge.ws { background: #2a1a3e; color: #bb86fc; }
+.log-badge.error { background: #3d0a0a; color: #ff5252; }
+.log-badge.save { background: #2a2a0a; color: #ffa726; }
+
+/* --- Toast --- */
+#toast {
+  display: none;
+  position: fixed;
+  bottom: 200px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 10px 20px;
+  background: var(--bg3);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  z-index: 1000;
+}
+</style>
+</head>
+<body>
+
+<!-- Toolbar -->
+<div id="toolbar">
+  <span class="label">Pipeline:</span>
+  <select id="pipelineSelect"><option value="">-- none --</option></select>
+  <button id="btnNew">New</button>
+  <button id="btnSave" class="primary">Save</button>
+  <button id="btnSaveAs">Save As</button>
+  <button id="btnDelete" class="danger">Delete</button>
+  <div class="sep"></div>
+  <button id="btnAddNode" class="primary">+ Add Node</button>
+  <div class="sep"></div>
+  <button id="btnLaunchAll" class="primary">Launch All</button>
+  <button id="btnStopAll" class="danger">Stop All</button>
+  <div class="sep"></div>
+  <span id="pipelineDir" title="Pipeline directory"></span>
+</div>
+
+<!-- Canvas -->
+<div id="canvasWrap">
+  <canvas id="mainCanvas"></canvas>
+</div>
+
+<!-- Palette overlay -->
+<div id="paletteOverlay">
+  <div id="palette">
+    <h3>Add Node</h3>
+    <input type="text" id="paletteSearch" placeholder="Search nodes...">
+    <div id="paletteContent"></div>
+  </div>
+</div>
+
+<!-- Edit panel -->
+<div id="editPanel">
+  <h3 id="editTitle">Edit Node</h3>
+  <label>Node Name</label>
+  <input id="editNodeName" type="text">
+  <label>Namespace</label>
+  <input id="editNamespace" type="text">
+  <label>Parameters (JSON)</label>
+  <textarea id="editParams"></textarea>
+  <div class="btn-row">
+    <button class="primary" id="btnEditApply">Apply</button>
+    <button id="btnEditLaunch">Start</button>
+    <button id="btnEditStop">Stop</button>
+    <button class="danger" id="btnEditDelete">Delete</button>
+    <button id="btnEditClose">Close</button>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<!-- Log panel -->
+<div id="logPanel" class="collapsed">
+  <div id="logHeader" onclick="toggleLogPanel()">
+    <span class="log-title">Log</span>
+    <span id="logCount">0</span>
+    <button onclick="event.stopPropagation(); copyLog()">Copy</button>
+    <button onclick="event.stopPropagation(); clearLog()">Clear</button>
+  </div>
+  <div id="logBody"></div>
+</div>
+
+<script>
+/* ================================================================
+   FluentVision Pipeline Editor — Frontend
+   ================================================================ */
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const HEADER_H = 30;
+const PORT_H = 22;
+const FOOTER_H = 20;
+const PAD = 8;
+const NODE_MIN_W = 160;
+const NODE_MAX_W = 500;
+const NODE_DEFAULT_W = 210;
+const PORT_R = 6;
+const PORT_HIT_R = 14;
+const EDGE_HIT_DIST = 8;
+const RESIZE_HANDLE = 14;
+
+const COLORS = {
+  sensor:    { bg: 'rgba(0,50,70,0.85)', border: '#00d9ff', text: '#00d9ff', badge: 'CAM', badgeBg: '#004466' },
+  ai:        { bg: 'rgba(50,20,70,0.85)', border: '#bb86fc', text: '#bb86fc', badge: 'AI',  badgeBg: '#3d1466' },
+  streaming: { bg: 'rgba(20,50,35,0.85)', border: '#00e676', text: '#00e676', badge: 'OUT', badgeBg: '#0a3320' },
+  audio:     { bg: 'rgba(50,35,10,0.85)', border: '#ffa726', text: '#ffa726', badge: 'SND', badgeBg: '#3d2a0a' },
+  ui:        { bg: 'rgba(50,20,40,0.85)', border: '#f06292', text: '#f06292', badge: 'UI',  badgeBg: '#3d0a28' },
+  utils:     { bg: 'rgba(40,40,40,0.85)', border: '#90a4ae', text: '#90a4ae', badge: 'UTL', badgeBg: '#2a2a2a' },
+  filter:    { bg: 'rgba(20,45,50,0.85)', border: '#26c6da', text: '#26c6da', badge: 'FLT', badgeBg: '#0a3038' },
+};
+
+const PORT_COLORS = {
+  image: '#4fc3f7',
+  depth: '#ab47bc',
+  camera_info: '#78909c',
+  pointcloud: '#66bb6a',
+  detections: '#ffa726',
+  audio: '#ef5350',
+  any: '#bdbdbd',
+};
+
+const STATUS_COLORS = {
+  external: '#29b6f6',
+  stopped: '#555',
+  running: '#00e676',
+  error: '#ff5252',
+};
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let ws = null;
+let templates = {};
+let portCompat = {};
+let nodes = [];       // Graph nodes for rendering
+let edges = [];       // Connection edges
+let nodeMap = {};     // id -> node
+
+// Pipeline data
+let pipelineNodes = [];  // Serializable pipeline node data
+let currentPipeline = '';
+let pipelineList = [];
+let builtinList = [];
+let pipelineDir = '~/.fluent_vision/pipelines';
+let dirty = false;
+
+// Interaction state
+let panX = 0, panY = 0, zoom = 1;
+let dragging = null;     // {node, offX, offY}
+let panning = false;
+let panStart = {x:0, y:0, px:0, py:0};
+let wiring = null;       // {sourceNode, sourcePort, sourceIdx, mx, my}
+let resizing = null;     // {node, startW, startX}
+let hoverNode = null;
+let hoverPort = null;
+let selectedNode = null;
+let nodeStatuses = {};
+
+// Animation
+let animating = false;
+let dpr = 1;
+
+// Preview images
+let previewImages = {};    // topic -> Image
+let nodePreviewTopic = {}; // nodeId -> topic (which topic is subscribed for this node)
+const PREVIEW_H = 120;     // Height reserved for preview image in node
+
+// Log state
+let logCollapsed = true;
+let logCount = 0;
+const LOG_MAX = 500;
+
+// ---------------------------------------------------------------------------
+// Log panel
+// ---------------------------------------------------------------------------
+function logTime() {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}.${String(d.getMilliseconds()).padStart(3,'0')}`;
+}
+
+function addLog(level, badge, message) {
+  const body = document.getElementById('logBody');
+  if (!body) return;
+
+  const entry = document.createElement('div');
+  entry.className = `log-entry log-${level}`;
+
+  let badgeHtml = '';
+  if (badge) {
+    badgeHtml = `<span class="log-badge ${badge}">${badge.toUpperCase()}</span>`;
+  }
+
+  entry.innerHTML = `<span class="log-time">${logTime()}</span>${badgeHtml}${escapeHtml(message)}`;
+  body.appendChild(entry);
+
+  // Trim old entries
+  while (body.children.length > LOG_MAX) {
+    body.removeChild(body.firstChild);
+  }
+
+  // Auto-expand on important logs
+  if (logCollapsed && (level === 'error' || badge === 'launch' || badge === 'stop')) {
+    logCollapsed = false;
+    document.getElementById('logPanel').classList.remove('collapsed');
+  }
+
+  // Auto-scroll
+  body.scrollTop = body.scrollHeight;
+
+  // Update count
+  logCount++;
+  const countEl = document.getElementById('logCount');
+  if (countEl) countEl.textContent = logCount;
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function copyLog() {
+  const body = document.getElementById('logBody');
+  if (!body) return;
+  const lines = [];
+  for (const entry of body.children) {
+    lines.push(entry.textContent);
+  }
+  const text = lines.join('\n');
+  // Fallback for non-HTTPS contexts
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+  toast('Log copied');
+}
+
+function clearLog() {
+  const body = document.getElementById('logBody');
+  if (body) body.innerHTML = '';
+  logCount = 0;
+  const countEl = document.getElementById('logCount');
+  if (countEl) countEl.textContent = '0';
+}
+
+function toggleLogPanel() {
+  const panel = document.getElementById('logPanel');
+  logCollapsed = !logCollapsed;
+  panel.classList.toggle('collapsed', logCollapsed);
+}
+
+// ---------------------------------------------------------------------------
+// Canvas setup
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('mainCanvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const wrap = document.getElementById('canvasWrap');
+  dpr = window.devicePixelRatio || 1;
+  canvas.width = wrap.clientWidth * dpr;
+  canvas.height = wrap.clientHeight * dpr;
+  canvas.style.width = wrap.clientWidth + 'px';
+  canvas.style.height = wrap.clientHeight + 'px';
+  render();
+}
+window.addEventListener('resize', resizeCanvas);
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${proto}://${location.host}/ws`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    console.log('[WS] Connected');
+    addLog('success', 'ws', 'WebSocket connected');
+    wsSend({ type: 'get_templates' });
+    wsSend({ type: 'list_pipelines' });
+  };
+
+  ws.onmessage = (evt) => {
+    if (typeof evt.data === 'string') {
+      const msg = JSON.parse(evt.data);
+      handleWSMessage(msg);
+    } else if (evt.data instanceof Blob) {
+      handleBinaryPreview(evt.data);
+    }
+  };
+
+  ws.onclose = () => {
+    console.log('[WS] Disconnected, reconnecting in 2s...');
+    addLog('warn', 'ws', 'WebSocket disconnected, reconnecting in 2s...');
+    setTimeout(connectWS, 2000);
+  };
+
+  ws.onerror = (e) => {
+    console.error('[WS] Error:', e);
+    addLog('error', 'ws', 'WebSocket error');
+  };
+}
+
+function wsSend(msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+function handleWSMessage(msg) {
+  switch (msg.type) {
+    case 'templates':
+      templates = msg.templates || {};
+      portCompat = msg.port_compat || {};
+      for (const k of Object.keys(templates)) {
+        delete templates[k]._manifest_path;
+      }
+      addLog('info', 'ws', `Loaded ${Object.keys(templates).length} node templates`);
+      if (pipelineNodes.length > 0) buildGraph();
+      break;
+
+    case 'pipeline_list':
+      pipelineDir = msg.dir || pipelineDir;
+      pipelineList = msg.pipelines || [];
+      builtinList = msg.builtin || [];
+      updatePipelineSelect();
+      document.getElementById('pipelineDir').textContent = pipelineDir;
+      addLog('info', 'ws', `Pipelines: ${pipelineList.length} user, ${builtinList.length} builtin`);
+      break;
+
+    case 'pipeline_data':
+      addLog('info', 'ws', `Pipeline loaded: "${msg.name}" (${(msg.pipeline.nodes||[]).length} nodes)`);
+      loadPipelineData(msg.name, msg.pipeline, msg.builtin);
+      break;
+
+    case 'save_result':
+      if (msg.success) {
+        addLog('success', 'save', `Saved: ${msg.name}`);
+        toast(`Saved: ${msg.name}`);
+        dirty = false;
+        wsSend({ type: 'list_pipelines' });
+      } else {
+        addLog('error', 'save', `Save failed: ${msg.message || ''}`);
+        toast('Save failed: ' + (msg.message || ''), true);
+      }
+      break;
+
+    case 'delete_result':
+      if (msg.success) {
+        addLog('info', 'save', `Deleted: ${msg.name}`);
+        toast(`Deleted: ${msg.name}`);
+        wsSend({ type: 'list_pipelines' });
+        clearCanvas();
+      }
+      break;
+
+    case 'launch_result':
+      if (msg.success) {
+        nodeStatuses[msg.node_id] = 'running';
+        addLog('success', 'launch', `${msg.node_id} → running (PID: ${msg.pid || '?'})`);
+        subscribeNodePreview(msg.node_id);
+      } else {
+        nodeStatuses[msg.node_id] = 'error';
+        addLog('error', 'launch', `${msg.node_id} → FAILED: ${msg.message || 'unknown error'}`);
+      }
+      render();
+      break;
+
+    case 'stop_result':
+      if (msg.success) {
+        nodeStatuses[msg.node_id] = 'stopped';
+        addLog('info', 'stop', `${msg.node_id} → stopped`);
+        unsubscribeNodePreview(msg.node_id);
+      }
+      render();
+      break;
+
+    case 'node_status':
+      nodeStatuses[msg.node_id] = msg.status;
+      if (msg.status === 'error') {
+        const detail = msg.message || '';
+        addLog('error', 'status', `${msg.node_id} → crashed${detail ? ': ' + detail : ''}`);
+        unsubscribeNodePreview(msg.node_id);
+      } else if (msg.status === 'stopped') {
+        addLog('info', 'status', `${msg.node_id} → stopped`);
+        unsubscribeNodePreview(msg.node_id);
+      }
+      render();
+      break;
+
+    case 'launch_pipeline_result':
+      addLog('success', 'launch', `Pipeline launched: ${(msg.launched||[]).length} nodes [${(msg.launched||[]).join(', ')}]`);
+      toast(`Launched ${(msg.launched||[]).length} nodes`);
+      break;
+
+    case 'stop_pipeline_result':
+      addLog('info', 'stop', `Pipeline stopped: ${(msg.stopped||[]).length} nodes`);
+      toast(`Stopped ${(msg.stopped||[]).length} nodes`);
+      // Unsubscribe all previews
+      for (const nodeId of Object.keys(nodePreviewTopic)) {
+        unsubscribeNodePreview(nodeId);
+      }
+      break;
+
+    case 'statuses':
+      nodeStatuses = msg.statuses || {};
+      // Re-subscribe previews for running nodes (only if not already subscribed)
+      for (const [nid, st] of Object.entries(nodeStatuses)) {
+        if (st === 'running' && !nodePreviewTopic[nid]) subscribeNodePreview(nid);
+      }
+      render();
+      break;
+
+    case 'error':
+      addLog('error', 'error', msg.message || 'Unknown error');
+      toast(msg.message || 'Error', true);
+      break;
+  }
+}
+
+function subscribeNodePreview(nodeId) {
+  const gn = nodeMap[nodeId];
+  if (!gn) return;
+
+  // Find first image/depth output to use as preview
+  for (const out of gn.outputs) {
+    if (out.type === 'image' || out.type === 'depth') {
+      const topic = resolveOutputTopic(gn, out);
+      if (topic) {
+        nodePreviewTopic[nodeId] = topic;
+        wsSend({ type: 'subscribe_preview', topic: topic });
+        return;
+      }
+    }
+  }
+}
+
+function unsubscribeNodePreview(nodeId) {
+  const topic = nodePreviewTopic[nodeId];
+  if (topic) {
+    wsSend({ type: 'unsubscribe_preview', topic: topic });
+    delete nodePreviewTopic[nodeId];
+    if (previewImages[topic]) {
+      URL.revokeObjectURL(previewImages[topic].src);
+      delete previewImages[topic];
+    }
+  }
+}
+
+function handleBinaryPreview(blob) {
+  // Binary format: topic\0jpeg_data
+  blob.arrayBuffer().then(buf => {
+    const bytes = new Uint8Array(buf);
+    const nullIdx = bytes.indexOf(0);
+    if (nullIdx < 0) return;
+    const topic = new TextDecoder().decode(bytes.slice(0, nullIdx));
+    const jpegBlob = new Blob([bytes.slice(nullIdx + 1)], {type:'image/jpeg'});
+    const url = URL.createObjectURL(jpegBlob);
+    const img = new Image();
+    img.onload = () => {
+      if (previewImages[topic]) {
+        URL.revokeObjectURL(previewImages[topic].src);
+      }
+      previewImages[topic] = img;
+      render();
+    };
+    img.src = url;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline management
+// ---------------------------------------------------------------------------
+function updatePipelineSelect() {
+  const sel = document.getElementById('pipelineSelect');
+  sel.innerHTML = '<option value="">-- none --</option>';
+
+  if (builtinList.length > 0) {
+    const grp = document.createElement('optgroup');
+    grp.label = 'Built-in';
+    for (const name of builtinList) {
+      const opt = document.createElement('option');
+      opt.value = 'builtin:' + name;
+      opt.textContent = name;
+      grp.appendChild(opt);
+    }
+    sel.appendChild(grp);
+  }
+
+  if (pipelineList.length > 0) {
+    const grp = document.createElement('optgroup');
+    grp.label = 'My Pipelines';
+    for (const name of pipelineList) {
+      const opt = document.createElement('option');
+      opt.value = 'user:' + name;
+      opt.textContent = name;
+      grp.appendChild(opt);
+    }
+    sel.appendChild(grp);
+  }
+
+  // Restore selection
+  if (currentPipeline) {
+    for (const opt of sel.options) {
+      if (opt.value.endsWith(':' + currentPipeline)) {
+        opt.selected = true;
+        break;
+      }
+    }
+  }
+}
+
+function loadPipelineData(name, data, isBuiltin) {
+  currentPipeline = name;
+  pipelineNodes = data.nodes || [];
+  dirty = false;
+
+  // Restore layout positions
+  const layout = data.layout || {};
+  for (const pn of pipelineNodes) {
+    if (layout[pn.id]) {
+      pn._x = layout[pn.id].x;
+      pn._y = layout[pn.id].y;
+      pn._width = layout[pn.id].width;
+    }
+  }
+
+  buildGraph();
+  autoFitView();
+  toast(`Loaded: ${name}${isBuiltin ? ' (builtin)' : ''}`);
+}
+
+function buildPipelineData() {
+  // Build saveable pipeline data from current state
+  const layout = {};
+  for (const n of nodes) {
+    layout[n.id] = { x: Math.round(n.x), y: Math.round(n.y), width: Math.round(n.width) };
+  }
+
+  // Sync parameters from node state
+  for (const pn of pipelineNodes) {
+    const gn = nodeMap[pn.id];
+    if (gn) {
+      pn.parameters = gn.parameters;
+      pn.node_name = gn.node_name;
+      pn.namespace = gn.namespace;
+    }
+  }
+
+  return {
+    name: currentPipeline || 'Untitled',
+    system: {
+      camera_start_delay: 2.0,
+      default_start_delay: 0.5,
+    },
+    nodes: pipelineNodes.filter(pn => !pn._isTopicSource),
+    layout: layout,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Graph building
+// ---------------------------------------------------------------------------
+function buildGraph() {
+  nodes = [];
+  edges = [];
+  nodeMap = {};
+
+  let x = 100, y = 100;
+
+  for (const pn of pipelineNodes) {
+    const tmpl = templates[pn._template] || null;
+    const isTopicSource = pn._isTopicSource || false;
+
+    const inputs = isTopicSource ? (pn._inputs || []) :
+                   (tmpl ? tmpl.inputs : inferPorts(pn, 'input'));
+    const outputs = isTopicSource ? (pn._outputs || []) :
+                    (tmpl ? tmpl.outputs : inferPorts(pn, 'output'));
+
+    const category = tmpl ? tmpl.category :
+                     (isTopicSource ? 'sensor' : 'ai');
+    const label = tmpl ? tmpl.label : (pn.node_name || pn.id);
+
+    const portRows = Math.max(inputs.length, outputs.length);
+    const nodeW = pn._width || NODE_DEFAULT_W;
+    const hasPreview = !!nodePreviewTopic[pn.id];
+    const nodeH = HEADER_H + portRows * PORT_H + (hasPreview ? PREVIEW_H : 0) + FOOTER_H + PAD;
+
+    const gn = {
+      id: pn.id,
+      label: label,
+      category: category,
+      inputs: inputs,
+      outputs: outputs,
+      node_name: pn.node_name || '',
+      namespace: pn.namespace || '',
+      parameters: pn.parameters || {},
+      package: pn.package || '',
+      exec: pn.exec || '',
+      _template: pn._template || '',
+      _isTopicSource: isTopicSource,
+      _externalSource: pn._externalSource || false,
+      x: pn._x || x,
+      y: pn._y || y,
+      width: nodeW,
+      height: nodeH,
+      status: nodeStatuses[pn.id] || (isTopicSource ? 'external' : 'stopped'),
+    };
+
+    nodes.push(gn);
+    nodeMap[gn.id] = gn;
+
+    // Advance default position
+    if (!pn._x) {
+      x += nodeW + 60;
+      if (x > 1000) { x = 100; y += 250; }
+    }
+  }
+
+  buildEdges();
+  render();
+}
+
+function inferPorts(pn, side) {
+  // Fallback: infer ports from parameter names
+  const ports = [];
+  const params = pn.parameters || {};
+  for (const key of Object.keys(params)) {
+    const lk = key.toLowerCase();
+    if (side === 'input' && (lk.includes('input') || lk.startsWith('color_topic') ||
+        lk.startsWith('depth_topic') || lk.startsWith('camera_info_topic'))) {
+      ports.push({ param: key, type: guessPortType(key) });
+    }
+    if (side === 'output' && (lk.includes('output') || lk.includes('overlay') ||
+        lk.includes('mask') || lk.includes('filtered'))) {
+      ports.push({ param: key, type: guessPortType(key) });
+    }
+  }
+  return ports;
+}
+
+function guessPortType(paramName) {
+  const lk = paramName.toLowerCase();
+  if (lk.includes('depth')) return 'depth';
+  if (lk.includes('camera_info')) return 'camera_info';
+  if (lk.includes('pointcloud') || lk.includes('points')) return 'pointcloud';
+  if (lk.includes('detection')) return 'detections';
+  if (lk.includes('audio')) return 'audio';
+  return 'image';
+}
+
+function buildEdges() {
+  edges = [];
+
+  // Build topic -> {nodeId, portIdx} map from outputs
+  const outputTopicMap = {};
+  for (const gn of nodes) {
+    for (let i = 0; i < gn.outputs.length; i++) {
+      const topic = resolveOutputTopic(gn, gn.outputs[i]);
+      if (topic) outputTopicMap[topic] = { nodeId: gn.id, portIdx: i };
+    }
+  }
+
+  // Match inputs to outputs
+  for (const gn of nodes) {
+    for (let i = 0; i < gn.inputs.length; i++) {
+      const port = gn.inputs[i];
+      const paramValue = getNestedParam(gn.parameters, port.param);
+      if (!paramValue) continue;
+
+      const src = outputTopicMap[paramValue];
+      if (src && src.nodeId !== gn.id) {
+        edges.push({
+          sourceNodeId: src.nodeId,
+          sourcePortIdx: src.portIdx,
+          targetNodeId: gn.id,
+          targetPortIdx: i,
+        });
+      }
+    }
+  }
+}
+
+function resolveOutputTopic(node, port) {
+  // 1. Check node parameters
+  let paramValue = getNestedParam(node.parameters, port.param);
+
+  // 2. Fallback to template default_parameters
+  if (!paramValue && node._template && templates[node._template]) {
+    const defParams = templates[node._template].default_parameters || {};
+    paramValue = getNestedParam(defParams, port.param);
+  }
+
+  // Absolute path — return as-is
+  if (paramValue && paramValue.startsWith('/')) return paramValue;
+
+  // Relative path — construct namespace/node_name/value
+  if (paramValue) {
+    const ns = node.namespace || '';
+    const nn = node.node_name || node.id;
+    // Handle ROS2 ~/ prefix (resolves to namespace/node_name/)
+    if (paramValue.startsWith('~/')) {
+      const suffix = paramValue.slice(2);
+      return `${ns}/${nn}/${suffix}`.replace(/\/+/g, '/');
+    }
+    return `${ns}/${nn}/${paramValue}`.replace(/\/+/g, '/');
+  }
+
+  // Last resort — use param path as topic path
+  const ns = node.namespace || '';
+  const nn = node.node_name || node.id;
+  const paramPath = port.param.replace(/\./g, '/');
+  return `${ns}/${nn}/${paramPath}`.replace(/\/+/g, '/');
+}
+
+function getNestedParam(params, path) {
+  const parts = path.split('.');
+  let obj = params;
+  for (const p of parts) {
+    if (obj == null || typeof obj !== 'object') return '';
+    obj = obj[p];
+  }
+  return obj != null ? String(obj) : '';
+}
+
+function setNestedParam(params, path, value) {
+  const parts = path.split('.');
+  let obj = params;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (!(parts[i] in obj) || typeof obj[parts[i]] !== 'object') {
+      obj[parts[i]] = {};
+    }
+    obj = obj[parts[i]];
+  }
+  obj[parts[parts.length - 1]] = value;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+function render() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+
+  // Recalculate node heights (preview may have appeared/disappeared)
+  for (const n of nodes) {
+    const portRows = Math.max(n.inputs.length, n.outputs.length);
+    const hasPreview = !!nodePreviewTopic[n.id];
+    n.height = HEADER_H + portRows * PORT_H + (hasPreview ? PREVIEW_H : 0) + FOOTER_H + PAD;
+  }
+
+  ctx.save();
+  ctx.translate(panX, panY);
+  ctx.scale(zoom, zoom);
+
+  // Grid
+  drawGrid();
+
+  // Edges
+  drawEdges();
+
+  // Nodes
+  for (const n of nodes) drawNode(n);
+
+  // Ports
+  for (const n of nodes) drawPorts(n);
+
+  // Wiring preview
+  if (wiring) drawWiringPreview();
+
+  ctx.restore();
+}
+
+function drawGrid() {
+  const step = 40;
+  const w = canvas.width / dpr / zoom + Math.abs(panX / zoom);
+  const h = canvas.height / dpr / zoom + Math.abs(panY / zoom);
+  const offX = -panX / zoom;
+  const offY = -panY / zoom;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+  ctx.lineWidth = 1;
+
+  for (let x = Math.floor(offX / step) * step; x < offX + w; x += step) {
+    ctx.beginPath(); ctx.moveTo(x, offY); ctx.lineTo(x, offY + h); ctx.stroke();
+  }
+  for (let y = Math.floor(offY / step) * step; y < offY + h; y += step) {
+    ctx.beginPath(); ctx.moveTo(offX, y); ctx.lineTo(offX + w, y); ctx.stroke();
+  }
+}
+
+function drawNode(n) {
+  const c = COLORS[n.category] || COLORS.ai;
+  const isHover = hoverNode === n;
+  const isSelected = selectedNode === n;
+
+  // Live status from nodeStatuses (not cached n.status)
+  const liveStatus = nodeStatuses[n.id] || n.status || 'stopped';
+  n.status = liveStatus;  // sync back
+
+  // Shadow
+  ctx.shadowColor = 'rgba(0,0,0,0.4)';
+  ctx.shadowBlur = isHover ? 16 : 8;
+  ctx.shadowOffsetY = 2;
+
+  // Background
+  ctx.fillStyle = c.bg;
+  ctx.beginPath();
+  roundRect(ctx, n.x, n.y, n.width, n.height, 6);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // Border — highlight red on error, green on running
+  let borderColor = isSelected ? '#fff' : (isHover ? c.border : 'rgba(255,255,255,0.15)');
+  if (liveStatus === 'error') borderColor = '#ff5252';
+  else if (liveStatus === 'running') borderColor = '#00e676';
+  ctx.strokeStyle = borderColor;
+  ctx.lineWidth = (isSelected || liveStatus === 'error' || liveStatus === 'running') ? 2 : 1;
+  ctx.stroke();
+
+  // Header line
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(n.x, n.y + HEADER_H);
+  ctx.lineTo(n.x + n.width, n.y + HEADER_H);
+  ctx.stroke();
+
+  // Status dot
+  const statusColor = STATUS_COLORS[liveStatus] || STATUS_COLORS.stopped;
+  ctx.fillStyle = statusColor;
+  ctx.beginPath();
+  ctx.arc(n.x + 12, n.y + HEADER_H / 2, 4, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Label
+  ctx.fillStyle = c.text;
+  ctx.font = 'bold 12px "Segoe UI", sans-serif';
+  ctx.textBaseline = 'middle';
+  const maxLabelW = n.width - 70;
+  let label = n.label;
+  if (ctx.measureText(label).width > maxLabelW) {
+    while (label.length > 3 && ctx.measureText(label + '...').width > maxLabelW) {
+      label = label.slice(0, -1);
+    }
+    label += '...';
+  }
+  ctx.fillText(label, n.x + 22, n.y + HEADER_H / 2);
+
+  // Badge
+  ctx.fillStyle = c.badgeBg;
+  const badgeW = 32;
+  const badgeX = n.x + n.width - badgeW - 6;
+  const badgeY = n.y + 6;
+  ctx.beginPath();
+  roundRect(ctx, badgeX, badgeY, badgeW, 16, 3);
+  ctx.fill();
+  ctx.fillStyle = c.text;
+  ctx.font = 'bold 9px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(c.badge, badgeX + badgeW / 2, badgeY + 9);
+  ctx.textAlign = 'left';
+
+  // Port labels
+  ctx.font = '11px "Segoe UI", sans-serif';
+  ctx.textBaseline = 'middle';
+
+  for (let i = 0; i < n.inputs.length; i++) {
+    const py = n.y + HEADER_H + i * PORT_H + PORT_H / 2;
+    ctx.fillStyle = '#aaa';
+    ctx.fillText(portLabel(n.inputs[i]), n.x + 14, py);
+  }
+
+  for (let i = 0; i < n.outputs.length; i++) {
+    const py = n.y + HEADER_H + i * PORT_H + PORT_H / 2;
+    const lbl = portLabel(n.outputs[i]);
+    ctx.fillStyle = '#aaa';
+    ctx.textAlign = 'right';
+    ctx.fillText(lbl, n.x + n.width - 14, py);
+    ctx.textAlign = 'left';
+  }
+
+  // Preview image
+  const previewTopic = nodePreviewTopic[n.id];
+  const previewImg = previewTopic ? previewImages[previewTopic] : null;
+  if (previewImg) {
+    const portRows = Math.max(n.inputs.length, n.outputs.length);
+    const previewY = n.y + HEADER_H + portRows * PORT_H + 4;
+    const previewW = n.width - 8;
+    const previewH = PREVIEW_H - 8;
+    const imgAspect = previewImg.width / previewImg.height;
+    const boxAspect = previewW / previewH;
+    let dw, dh, dx, dy;
+    if (imgAspect > boxAspect) {
+      dw = previewW; dh = previewW / imgAspect;
+      dx = n.x + 4; dy = previewY + (previewH - dh) / 2;
+    } else {
+      dh = previewH; dw = previewH * imgAspect;
+      dx = n.x + 4 + (previewW - dw) / 2; dy = previewY;
+    }
+    ctx.save();
+    ctx.beginPath();
+    roundRect(ctx, n.x + 4, previewY, previewW, previewH, 3);
+    ctx.clip();
+    ctx.drawImage(previewImg, dx, dy, dw, dh);
+    ctx.restore();
+  }
+
+  // Node name (footer)
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.font = '10px monospace';
+  const footerY = n.y + n.height - FOOTER_H / 2;
+  ctx.fillText(n.node_name || n.id, n.x + 8, footerY);
+
+  // Resize handle (bottom-right triangle)
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.beginPath();
+  ctx.moveTo(n.x + n.width, n.y + n.height);
+  ctx.lineTo(n.x + n.width - RESIZE_HANDLE, n.y + n.height);
+  ctx.lineTo(n.x + n.width, n.y + n.height - RESIZE_HANDLE);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawPorts(n) {
+  for (let i = 0; i < n.inputs.length; i++) {
+    const py = n.y + HEADER_H + i * PORT_H + PORT_H / 2;
+    const color = PORT_COLORS[n.inputs[i].type] || PORT_COLORS.any;
+    const isHov = hoverPort && hoverPort.node === n && hoverPort.side === 'input' && hoverPort.idx === i;
+    drawPort(n.x, py, color, isHov);
+  }
+
+  for (let i = 0; i < n.outputs.length; i++) {
+    const py = n.y + HEADER_H + i * PORT_H + PORT_H / 2;
+    const color = PORT_COLORS[n.outputs[i].type] || PORT_COLORS.any;
+    const isHov = hoverPort && hoverPort.node === n && hoverPort.side === 'output' && hoverPort.idx === i;
+    drawPort(n.x + n.width, py, color, isHov);
+  }
+}
+
+function drawPort(x, y, color, isHover) {
+  const r = isHover ? PORT_R + 2 : PORT_R - 1;
+
+  // Glow
+  if (isHover) {
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 10;
+  }
+
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+
+  // White outline
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.shadowBlur = 0;
+}
+
+function drawEdges() {
+  for (const e of edges) {
+    const srcNode = nodeMap[e.sourceNodeId];
+    const tgtNode = nodeMap[e.targetNodeId];
+    if (!srcNode || !tgtNode) continue;
+
+    const sx = srcNode.x + srcNode.width;
+    const sy = srcNode.y + HEADER_H + e.sourcePortIdx * PORT_H + PORT_H / 2;
+    const tx = tgtNode.x;
+    const ty = tgtNode.y + HEADER_H + e.targetPortIdx * PORT_H + PORT_H / 2;
+
+    const srcPort = srcNode.outputs[e.sourcePortIdx];
+    const color = srcPort ? (PORT_COLORS[srcPort.type] || PORT_COLORS.any) : '#888';
+
+    drawBezier(sx, sy, tx, ty, color, 2);
+  }
+}
+
+function drawBezier(sx, sy, tx, ty, color, lineW) {
+  const dist = Math.abs(tx - sx);
+  const cpOff = Math.max(60, dist * 0.4);
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineW;
+  ctx.globalAlpha = 0.7;
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.bezierCurveTo(sx + cpOff, sy, tx - cpOff, ty, tx, ty);
+  ctx.stroke();
+  ctx.globalAlpha = 1.0;
+}
+
+function drawWiringPreview() {
+  const srcNode = wiring.sourceNode;
+  const sx = srcNode.x + srcNode.width;
+  const sy = srcNode.y + HEADER_H + wiring.sourceIdx * PORT_H + PORT_H / 2;
+
+  // Check hover target for color
+  let color = '#888';
+  const srcPort = srcNode.outputs[wiring.sourceIdx];
+  if (srcPort) color = PORT_COLORS[srcPort.type] || '#888';
+
+  if (hoverPort && hoverPort.side === 'input') {
+    // Check compatibility
+    const tgtType = hoverPort.node.inputs[hoverPort.idx].type;
+    const srcType = srcPort ? srcPort.type : 'any';
+    const compat = portCompat[tgtType] || [tgtType];
+    if (!compat.includes(srcType) && tgtType !== 'any' && srcType !== 'any') {
+      color = '#ff5252';  // Incompatible
+    }
+  }
+
+  drawBezier(sx, sy, wiring.mx, wiring.my, color, 2.5);
+}
+
+function portLabel(port) {
+  if (port.label) return port.label;
+  let name = port.param;
+  // "topics.color" -> "color"
+  if (name.includes('.')) name = name.split('.').pop();
+  // Remove _topic suffix
+  name = name.replace(/_topic$/, '');
+  return name;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+}
+
+// ---------------------------------------------------------------------------
+// Mouse & Touch interaction
+// ---------------------------------------------------------------------------
+function screenToWorld(sx, sy) {
+  return {
+    x: (sx - panX) / zoom,
+    y: (sy - panY) / zoom,
+  };
+}
+
+canvas.addEventListener('mousedown', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const w = screenToWorld(sx, sy);
+
+  // Check resize handle
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    const rx = n.x + n.width;
+    const ry = n.y + n.height;
+    if (w.x >= rx - RESIZE_HANDLE && w.x <= rx &&
+        w.y >= ry - RESIZE_HANDLE && w.y <= ry) {
+      resizing = { node: n, startW: n.width, startX: sx };
+      return;
+    }
+  }
+
+  // Check port (start wiring from output)
+  const ph = portHitTest(w.x, w.y);
+  if (ph && ph.side === 'output') {
+    wiring = {
+      sourceNode: ph.node,
+      sourcePort: ph.node.outputs[ph.idx],
+      sourceIdx: ph.idx,
+      mx: w.x,
+      my: w.y,
+    };
+    return;
+  }
+
+  // Check edge click (delete edge)
+  const eh = edgeHitTest(w.x, w.y);
+  if (eh !== null) {
+    removeEdge(eh);
+    return;
+  }
+
+  // Check node click
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (w.x >= n.x && w.x <= n.x + n.width &&
+        w.y >= n.y && w.y <= n.y + n.height) {
+      // Select
+      selectedNode = n;
+      // Start drag
+      dragging = { node: n, offX: w.x - n.x, offY: w.y - n.y };
+      // Move to top
+      nodes.splice(i, 1);
+      nodes.push(n);
+      render();
+      return;
+    }
+  }
+
+  // Deselect
+  selectedNode = null;
+  closeEditPanel();
+
+  // Pan
+  panning = true;
+  panStart = { x: sx, y: sy, px: panX, py: panY };
+  render();
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const w = screenToWorld(sx, sy);
+
+  if (resizing) {
+    const delta = (sx - resizing.startX) / zoom;
+    resizing.node.width = Math.max(NODE_MIN_W,
+      Math.min(NODE_MAX_W, resizing.startW + delta));
+    markDirty();
+    render();
+    return;
+  }
+
+  if (wiring) {
+    wiring.mx = w.x;
+    wiring.my = w.y;
+    // Update hover port
+    hoverPort = portHitTest(w.x, w.y);
+    render();
+    return;
+  }
+
+  if (dragging) {
+    dragging.node.x = w.x - dragging.offX;
+    dragging.node.y = w.y - dragging.offY;
+    markDirty();
+    render();
+    return;
+  }
+
+  if (panning) {
+    panX = panStart.px + (sx - panStart.x);
+    panY = panStart.py + (sy - panStart.y);
+    render();
+    return;
+  }
+
+  // Hover detection
+  let newHoverNode = null;
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (w.x >= n.x && w.x <= n.x + n.width &&
+        w.y >= n.y && w.y <= n.y + n.height) {
+      newHoverNode = n;
+      break;
+    }
+  }
+
+  const newHoverPort = portHitTest(w.x, w.y);
+
+  if (newHoverNode !== hoverNode || newHoverPort !== hoverPort) {
+    hoverNode = newHoverNode;
+    hoverPort = newHoverPort;
+    // Update cursor
+    canvas.style.cursor = hoverPort ? 'crosshair' :
+                          (hoverNode ? 'grab' : 'default');
+    render();
+  }
+});
+
+canvas.addEventListener('mouseup', (e) => {
+  if (wiring && hoverPort && hoverPort.side === 'input') {
+    // Complete wiring
+    const srcNode = wiring.sourceNode;
+    const srcPort = wiring.sourcePort;
+    const tgtNode = hoverPort.node;
+    const tgtPort = tgtNode.inputs[hoverPort.idx];
+
+    // Check compatibility
+    const srcType = srcPort.type || 'any';
+    const tgtType = tgtPort.type || 'any';
+    const compat = portCompat[tgtType] || [tgtType];
+    if (compat.includes(srcType) || tgtType === 'any' || srcType === 'any') {
+      // Set the input parameter to the resolved output topic
+      const topic = resolveOutputTopic(srcNode, srcPort);
+      setNestedParam(tgtNode.parameters, tgtPort.param, topic);
+
+      // Also update pipeline node
+      const pn = pipelineNodes.find(p => p.id === tgtNode.id);
+      if (pn) setNestedParam(pn.parameters, tgtPort.param, topic);
+
+      buildEdges();
+      markDirty();
+    }
+  }
+
+  wiring = null;
+  dragging = null;
+  panning = false;
+  resizing = null;
+  render();
+});
+
+canvas.addEventListener('dblclick', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+  const w = screenToWorld(sx, sy);
+
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (w.x >= n.x && w.x <= n.x + n.width &&
+        w.y >= n.y && w.y <= n.y + n.height) {
+      selectedNode = n;
+      openEditPanel(n);
+      return;
+    }
+  }
+});
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const sx = e.clientX - rect.left;
+  const sy = e.clientY - rect.top;
+
+  const oldZoom = zoom;
+  const delta = -e.deltaY * 0.001;
+  zoom = Math.max(0.2, Math.min(3, zoom + delta));
+
+  // Zoom toward cursor
+  panX = sx - (sx - panX) * (zoom / oldZoom);
+  panY = sy - (sy - panY) * (zoom / oldZoom);
+  render();
+}, { passive: false });
+
+// ---------------------------------------------------------------------------
+// Hit testing
+// ---------------------------------------------------------------------------
+function portHitTest(wx, wy) {
+  for (let ni = nodes.length - 1; ni >= 0; ni--) {
+    const n = nodes[ni];
+
+    // Output ports
+    for (let i = 0; i < n.outputs.length; i++) {
+      const px = n.x + n.width;
+      const py = n.y + HEADER_H + i * PORT_H + PORT_H / 2;
+      if (Math.hypot(wx - px, wy - py) < PORT_HIT_R) {
+        return { node: n, side: 'output', idx: i };
+      }
+    }
+
+    // Input ports
+    for (let i = 0; i < n.inputs.length; i++) {
+      const px = n.x;
+      const py = n.y + HEADER_H + i * PORT_H + PORT_H / 2;
+      if (Math.hypot(wx - px, wy - py) < PORT_HIT_R) {
+        return { node: n, side: 'input', idx: i };
+      }
+    }
+  }
+  return null;
+}
+
+function edgeHitTest(wx, wy) {
+  for (let i = edges.length - 1; i >= 0; i--) {
+    const e = edges[i];
+    const srcNode = nodeMap[e.sourceNodeId];
+    const tgtNode = nodeMap[e.targetNodeId];
+    if (!srcNode || !tgtNode) continue;
+
+    const sx = srcNode.x + srcNode.width;
+    const sy = srcNode.y + HEADER_H + e.sourcePortIdx * PORT_H + PORT_H / 2;
+    const tx = tgtNode.x;
+    const ty = tgtNode.y + HEADER_H + e.targetPortIdx * PORT_H + PORT_H / 2;
+
+    // Sample bezier
+    const dist = Math.abs(tx - sx);
+    const cpOff = Math.max(60, dist * 0.4);
+    for (let t = 0; t <= 1; t += 0.05) {
+      const tt = 1 - t;
+      const bx = tt*tt*tt*sx + 3*tt*tt*t*(sx+cpOff) + 3*tt*t*t*(tx-cpOff) + t*t*t*tx;
+      const by = tt*tt*tt*sy + 3*tt*tt*t*sy + 3*tt*t*t*ty + t*t*t*ty;
+      if (Math.hypot(wx - bx, wy - by) < EDGE_HIT_DIST) {
+        return i;
+      }
+    }
+  }
+  return null;
+}
+
+function removeEdge(edgeIdx) {
+  const e = edges[edgeIdx];
+  const tgtNode = nodeMap[e.targetNodeId];
+  if (tgtNode) {
+    const port = tgtNode.inputs[e.targetPortIdx];
+    if (port) {
+      setNestedParam(tgtNode.parameters, port.param, '');
+      const pn = pipelineNodes.find(p => p.id === tgtNode.id);
+      if (pn) setNestedParam(pn.parameters, port.param, '');
+    }
+  }
+  edges.splice(edgeIdx, 1);
+  markDirty();
+  render();
+}
+
+// ---------------------------------------------------------------------------
+// Node palette
+// ---------------------------------------------------------------------------
+function showPalette() {
+  document.getElementById('paletteOverlay').classList.add('open');
+  document.getElementById('paletteSearch').value = '';
+  renderPalette();
+  document.getElementById('paletteSearch').focus();
+}
+
+function hidePalette() {
+  document.getElementById('paletteOverlay').classList.remove('open');
+}
+
+function renderPalette(filter = '') {
+  const container = document.getElementById('paletteContent');
+  container.innerHTML = '';
+  const lf = filter.toLowerCase();
+
+  // Group templates by category
+  const categories = {};
+  for (const [key, tmpl] of Object.entries(templates)) {
+    const cat = tmpl.category || 'ai';
+    if (!categories[cat]) categories[cat] = [];
+    if (lf && !tmpl.label.toLowerCase().includes(lf) && !key.includes(lf)) continue;
+    categories[cat].push({ key, ...tmpl });
+  }
+
+  const catOrder = ['sensor', 'filter', 'ai', 'streaming', 'audio', 'ui', 'utils'];
+  for (const cat of catOrder) {
+    const items = categories[cat];
+    if (!items || items.length === 0) continue;
+
+    const div = document.createElement('div');
+    div.className = 'palette-category';
+
+    const h4 = document.createElement('h4');
+    h4.textContent = cat.toUpperCase();
+    div.appendChild(h4);
+
+    for (const item of items) {
+      const row = document.createElement('div');
+      row.className = 'palette-item';
+      row.onclick = () => { addNodeFromTemplate(item.key); hidePalette(); };
+
+      const c = COLORS[cat] || COLORS.ai;
+      row.innerHTML = `
+        <span class="badge" style="background:${c.badgeBg};color:${c.text}">${c.badge}</span>
+        <div class="info">
+          <div class="name">${item.label}</div>
+          <div class="ports">in: ${item.inputs.length} / out: ${item.outputs.length}</div>
+        </div>
+      `;
+      div.appendChild(row);
+    }
+
+    container.appendChild(div);
+  }
+}
+
+document.getElementById('paletteSearch').addEventListener('input', (e) => {
+  renderPalette(e.target.value);
+});
+
+document.getElementById('paletteOverlay').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('paletteOverlay')) hidePalette();
+});
+
+function addNodeFromTemplate(templateKey) {
+  const tmpl = templates[templateKey];
+  if (!tmpl) return;
+
+  const uid = templateKey + '_' + Math.random().toString(36).slice(2, 8);
+  const count = pipelineNodes.filter(pn => pn._template === templateKey).length + 1;
+  const nodeName = templateKey.replace('fv_', '') + '_' + count;
+
+  const pn = {
+    id: uid,
+    enable: true,
+    package: tmpl.package,
+    exec: tmpl.exec,
+    node_name: nodeName,
+    namespace: '/fv',
+    parameters: JSON.parse(JSON.stringify(tmpl.default_parameters || {})),
+    _template: templateKey,
+  };
+
+  pipelineNodes.push(pn);
+  buildGraph();
+  markDirty();
+
+  // Select the new node
+  const newNode = nodeMap[uid];
+  if (newNode) {
+    selectedNode = newNode;
+    openEditPanel(newNode);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Edit panel
+// ---------------------------------------------------------------------------
+function openEditPanel(node) {
+  const panel = document.getElementById('editPanel');
+  panel.classList.add('open');
+  document.getElementById('editTitle').textContent =
+    (node._isTopicSource ? '[External] ' : '') + node.label;
+  document.getElementById('editNodeName').value = node.node_name;
+  document.getElementById('editNamespace').value = node.namespace;
+  document.getElementById('editParams').value =
+    JSON.stringify(node.parameters, null, 2);
+
+  // Disable launch/stop for topic sources
+  document.getElementById('btnEditLaunch').disabled = node._externalSource;
+  document.getElementById('btnEditStop').disabled = node._externalSource;
+}
+
+function closeEditPanel() {
+  document.getElementById('editPanel').classList.remove('open');
+}
+
+function applyEdit() {
+  if (!selectedNode) return;
+  const n = selectedNode;
+
+  n.node_name = document.getElementById('editNodeName').value;
+  n.namespace = document.getElementById('editNamespace').value;
+
+  try {
+    n.parameters = JSON.parse(document.getElementById('editParams').value);
+  } catch (e) {
+    toast('Invalid JSON in parameters', true);
+    return;
+  }
+
+  // Sync to pipeline node
+  const pn = pipelineNodes.find(p => p.id === n.id);
+  if (pn) {
+    pn.node_name = n.node_name;
+    pn.namespace = n.namespace;
+    pn.parameters = n.parameters;
+  }
+
+  buildEdges();
+  markDirty();
+  render();
+  toast('Applied');
+}
+
+function deleteSelectedNode() {
+  if (!selectedNode) return;
+  const id = selectedNode.id;
+
+  // Remove from pipeline
+  pipelineNodes = pipelineNodes.filter(pn => pn.id !== id);
+
+  // Remove edges pointing to/from this node
+  edges = edges.filter(e =>
+    e.sourceNodeId !== id && e.targetNodeId !== id);
+
+  // Clear input params that referenced this node's outputs
+  const gn = nodeMap[id];
+  if (gn) {
+    for (const out of gn.outputs) {
+      const topic = resolveOutputTopic(gn, out);
+      for (const n2 of nodes) {
+        if (n2.id === id) continue;
+        for (const inp of n2.inputs) {
+          if (getNestedParam(n2.parameters, inp.param) === topic) {
+            setNestedParam(n2.parameters, inp.param, '');
+            const pn2 = pipelineNodes.find(p => p.id === n2.id);
+            if (pn2) setNestedParam(pn2.parameters, inp.param, '');
+          }
+        }
+      }
+    }
+  }
+
+  selectedNode = null;
+  closeEditPanel();
+  buildGraph();
+  markDirty();
+}
+
+// ---------------------------------------------------------------------------
+// Toolbar actions
+// ---------------------------------------------------------------------------
+document.getElementById('btnAddNode').onclick = showPalette;
+
+document.getElementById('btnNew').onclick = () => {
+  const name = prompt('Pipeline name:');
+  if (!name) return;
+  currentPipeline = name;
+  pipelineNodes = [];
+  buildGraph();
+  dirty = true;
+};
+
+document.getElementById('btnSave').onclick = () => {
+  if (!currentPipeline) {
+    document.getElementById('btnSaveAs').click();
+    return;
+  }
+  const data = buildPipelineData();
+  wsSend({ type: 'save_pipeline', name: currentPipeline, pipeline: data });
+};
+
+document.getElementById('btnSaveAs').onclick = () => {
+  const name = prompt('Save pipeline as:', currentPipeline || '');
+  if (!name) return;
+  currentPipeline = name;
+  const data = buildPipelineData();
+  wsSend({ type: 'save_pipeline', name: name, pipeline: data });
+};
+
+document.getElementById('btnDelete').onclick = () => {
+  if (!currentPipeline) return;
+  if (!confirm(`Delete pipeline "${currentPipeline}"?`)) return;
+  wsSend({ type: 'delete_pipeline', name: currentPipeline });
+};
+
+document.getElementById('pipelineSelect').onchange = (e) => {
+  const val = e.target.value;
+  if (!val) return;
+
+  if (dirty && !confirm('Discard unsaved changes?')) {
+    e.target.value = '';
+    return;
+  }
+
+  // Stop all running nodes first
+  wsSend({ type: 'stop_pipeline' });
+
+  const [prefix, name] = val.split(':');
+  wsSend({
+    type: 'load_pipeline',
+    name: name,
+    builtin: prefix === 'builtin',
+  });
+};
+
+document.getElementById('btnLaunchAll').onclick = () => {
+  const data = buildPipelineData();
+  wsSend({ type: 'launch_pipeline', pipeline: data });
+};
+
+document.getElementById('btnStopAll').onclick = () => {
+  wsSend({ type: 'stop_pipeline' });
+};
+
+// Edit panel buttons
+document.getElementById('btnEditApply').onclick = applyEdit;
+document.getElementById('btnEditClose').onclick = closeEditPanel;
+document.getElementById('btnEditDelete').onclick = deleteSelectedNode;
+
+document.getElementById('btnEditLaunch').onclick = () => {
+  if (!selectedNode) return;
+  wsSend({
+    type: 'launch_node',
+    node_id: selectedNode.id,
+    package: selectedNode.package,
+    exec: selectedNode.exec,
+    node_name: selectedNode.node_name,
+    namespace: selectedNode.namespace,
+    parameters: selectedNode.parameters,
+    _template: selectedNode._template || '',
+  });
+};
+
+document.getElementById('btnEditStop').onclick = () => {
+  if (!selectedNode) return;
+  wsSend({ type: 'stop_node', node_id: selectedNode.id });
+};
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+function markDirty() {
+  dirty = true;
+}
+
+function clearCanvas() {
+  pipelineNodes = [];
+  currentPipeline = '';
+  dirty = false;
+  buildGraph();
+}
+
+function autoFitView() {
+  if (nodes.length === 0) {
+    panX = 0; panY = 0; zoom = 1;
+    return;
+  }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x);
+    minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x + n.width);
+    maxY = Math.max(maxY, n.y + n.height);
+  }
+
+  const pad = 60;
+  const cw = canvas.width / dpr;
+  const ch = canvas.height / dpr;
+  const graphW = maxX - minX + pad * 2;
+  const graphH = maxY - minY + pad * 2;
+
+  zoom = Math.min(1.5, Math.min(cw / graphW, ch / graphH));
+  panX = (cw - graphW * zoom) / 2 - (minX - pad) * zoom;
+  panY = (ch - graphH * zoom) / 2 - (minY - pad) * zoom;
+  render();
+}
+
+function toast(message, isError = false) {
+  const el = document.getElementById('toast');
+  el.textContent = message;
+  el.style.borderColor = isError ? 'var(--danger)' : 'var(--accent)';
+  el.style.display = 'block';
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.style.display = 'none'; }, 3000);
+}
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts
+// ---------------------------------------------------------------------------
+document.addEventListener('keydown', (e) => {
+  // Escape: close palette / edit panel
+  if (e.key === 'Escape') {
+    hidePalette();
+    closeEditPanel();
+    wiring = null;
+    render();
+  }
+
+  // Delete: remove selected node
+  if ((e.key === 'Delete' || e.key === 'Backspace') &&
+      selectedNode &&
+      !document.querySelector('#editPanel.open input:focus, #editPanel.open textarea:focus')) {
+    deleteSelectedNode();
+  }
+
+  // Ctrl+S: save
+  if (e.key === 's' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    document.getElementById('btnSave').click();
+  }
+
+  // A: add node (when not in input)
+  if (e.key === 'a' && !e.ctrlKey && !e.metaKey &&
+      document.activeElement.tagName !== 'INPUT' &&
+      document.activeElement.tagName !== 'TEXTAREA') {
+    showPalette();
+  }
+
+  // F: fit view
+  if (e.key === 'f' && !e.ctrlKey && !e.metaKey &&
+      document.activeElement.tagName !== 'INPUT' &&
+      document.activeElement.tagName !== 'TEXTAREA') {
+    autoFitView();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
+resizeCanvas();
+connectWS();
+
+// Request statuses periodically
+setInterval(() => {
+  wsSend({ type: 'get_statuses' });
+}, 3000);
+</script>
+</body>
+</html>

@@ -40,7 +40,7 @@ FVWebSocketServer::~FVWebSocketServer()
 void FVWebSocketServer::loadParameters()
 {
     // Declare parameters with default values
-    this->declare_parameter("topic_name", "/fv_mjpeg_image");
+    this->declare_parameter("topic_name", "~/image");
     this->declare_parameter("websocket_port", 8765);
     this->declare_parameter("compressed", false);
     this->declare_parameter("frame_rate", 30.0);

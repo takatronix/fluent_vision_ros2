@@ -1,0 +1,98 @@
+# node_manifest.yaml — fv_depth_features
+# Multiple depth processing nodes in one package
+
+nodes:
+  - key: fv_depth_normals
+    package: fv_depth_features
+    exec: fv_depth_normals_node
+    category: ai
+    label: "Depth Normals"
+
+    inputs:
+      - param: color_topic
+        type: image
+      - param: depth_topic
+        type: depth
+      - param: camera_info_topic
+        type: camera_info
+
+    outputs:
+      - param: normals_topic
+        type: image
+        label: normals
+      - param: rgbd_topic
+        type: image
+        label: rgbd
+
+    default_parameters:
+      color_topic: ""
+      depth_topic: ""
+      camera_info_topic: ""
+      normals_topic: ""
+      rgbd_topic: ""
+
+  - key: fv_hha
+    package: fv_depth_features
+    exec: fv_hha_node
+    category: ai
+    label: "HHA Encoding"
+
+    inputs:
+      - param: color_topic
+        type: image
+      - param: depth_topic
+        type: depth
+      - param: camera_info_topic
+        type: camera_info
+
+    outputs:
+      - param: hha_topic
+        type: image
+        label: hha
+
+    default_parameters:
+      color_topic: ""
+      depth_topic: ""
+      camera_info_topic: ""
+      hha_topic: ""
+
+  - key: fv_depth_bilateral
+    package: fv_depth_features
+    exec: fv_depth_bilateral_node
+    category: ai
+    label: "Depth Bilateral Filter"
+
+    inputs:
+      - param: depth_topic
+        type: depth
+
+    outputs:
+      - param: filtered_topic
+        type: depth
+        label: filtered
+
+    default_parameters:
+      depth_topic: ""
+      filtered_topic: ""
+
+  - key: fv_pointcloud
+    package: fv_depth_features
+    exec: fv_pointcloud_node
+    category: ai
+    label: "Depth to PointCloud"
+
+    inputs:
+      - param: depth_topic
+        type: depth
+      - param: camera_info_topic
+        type: camera_info
+
+    outputs:
+      - param: pointcloud_topic
+        type: pointcloud
+        label: pointcloud
+
+    default_parameters:
+      depth_topic: ""
+      camera_info_topic: ""
+      pointcloud_topic: ""

@@ -1,0 +1,26 @@
+# node_manifest.yaml — fv_rtmp_server
+# RTMP Receiver (DJI drone video input) (C++)
+
+nodes:
+  - key: fv_rtmp_server
+    package: fv_rtmp_server
+    exec: fv_rtmp_server_node
+    category: streaming
+    label: "RTMP Server"
+
+    inputs: []
+
+    outputs:
+      - param: output.topic_name
+        type: image
+        label: camera
+
+    default_parameters:
+      server:
+        port: 1935
+        endpoint: "/live/s"
+      output:
+        topic_name: "/fv_rtmp_server/camera/image_raw"
+        target_width: 640
+        target_height: 480
+        publish_rate: 30.0

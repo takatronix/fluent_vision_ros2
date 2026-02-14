@@ -1,0 +1,21 @@
+# node_manifest.yaml — fv_topic_relay
+# Generic Topic Relay / Bridge
+
+nodes:
+  - key: fv_topic_relay
+    package: fv_topic_relay
+    exec: fv_topic_relay_node
+    category: utils
+    label: "Topic Relay"
+
+    inputs:
+      - param: input_topic
+        type: any
+
+    outputs:
+      - param: output_topic
+        type: any
+
+    default_parameters:
+      input_topic: ""
+      output_topic: ""

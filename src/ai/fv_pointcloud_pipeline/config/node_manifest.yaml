@@ -1,0 +1,25 @@
+# node_manifest.yaml — fv_pointcloud_pipeline
+# ROI-based PointCloud Filter Pipeline (C++)
+
+nodes:
+  - key: fv_pointcloud_pipeline
+    package: fv_pointcloud_pipeline
+    exec: fv_pointcloud_pipeline_node
+    category: ai
+    label: "PointCloud Pipeline"
+
+    inputs:
+      - param: pointcloud_topic
+        type: pointcloud
+      - param: detections_topic
+        type: detections
+
+    outputs:
+      - param: filtered_pointcloud_topic
+        type: pointcloud
+        label: filtered_pc
+
+    default_parameters:
+      pointcloud_topic: ""
+      detections_topic: ""
+      filtered_pointcloud_topic: ""

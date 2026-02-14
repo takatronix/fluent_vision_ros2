@@ -59,9 +59,9 @@ FVObjectMaskGeneratorNode::FVObjectMaskGeneratorNode(const rclcpp::NodeOptions &
 void FVObjectMaskGeneratorNode::declareParameters()
 {
   // ===== トピックパラメータ =====
-  this->declare_parameter("input_image_topic", "/camera/color/image_raw");                    // 入力画像トピック
-  this->declare_parameter("output_segmentation_mask_topic", "/segmentation_mask/image");      // セグメンテーションマスク出力トピック
-  this->declare_parameter("output_colored_mask_topic", "/segmentation_mask/colored");         // カラーマスク出力トピック
+  this->declare_parameter("input_image_topic", "~/input/image_raw");                           // 入力画像トピック
+  this->declare_parameter("output_segmentation_mask_topic", "~/segmentation_mask");            // セグメンテーションマスク出力トピック
+  this->declare_parameter("output_colored_mask_topic", "~/colored_mask");                      // カラーマスク出力トピック
   
   // ===== 処理パラメータ =====
   this->declare_parameter("processing_frequency", 10.0);                                      // 処理頻度（Hz）

@@ -1,0 +1,28 @@
+# node_manifest.yaml — fv_instance_seg
+# YOLO Instance Segmentation (TensorRT / OpenVINO)
+
+nodes:
+  - key: fv_instance_seg
+    package: fv_instance_seg
+    exec: fv_instance_seg_node
+    category: ai
+    label: "Instance Segmentation"
+
+    inputs:
+      - param: input_image_topic
+        type: image
+
+    outputs:
+      - param: overlay
+        type: image
+      - param: mask
+        type: image
+      - param: detections
+        type: detections
+
+    default_parameters:
+      input_image_topic: ""
+      backend: "auto"
+      device: "GPU"
+      conf_thres: 0.25
+      iou_thres: 0.5

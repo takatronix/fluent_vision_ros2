@@ -33,7 +33,7 @@ InstanceSegNode::InstanceSegNode(const rclcpp::NodeOptions& options)
   model_path_ = this->declare_parameter<std::string>("model_path", "");
   device_ = this->declare_parameter<std::string>("device", "CPU");
   fallback_device_ = this->declare_parameter<std::string>("fallback_device", "");
-  input_image_topic_ = this->declare_parameter<std::string>("input_image_topic", "/fv/d405/color/image_raw");
+  input_image_topic_ = this->declare_parameter<std::string>("input_image_topic", "~/input/image_raw");
   conf_thres_ = this->declare_parameter<double>("conf_thres", 0.25);
   iou_thres_ = this->declare_parameter<double>("iou_thres", 0.5);
   publish_detections_ = this->declare_parameter<bool>("publish_detections", true);
@@ -81,11 +81,11 @@ InstanceSegNode::InstanceSegNode(const rclcpp::NodeOptions& options)
   int qos_depth = this->declare_parameter<int>("qos.queue_size", 10);
   auto qos = make_qos(qos_rel, qos_depth);
 
-  overlay_pub_ = this->create_publisher<Image>("overlay", qos);
-  mask_pub_ = this->create_publisher<Image>("mask", qos);
-  id_mask_pub_ = this->create_publisher<Image>("mask_id", qos);
+  overlay_pub_ = this->create_publisher<Image>("~/overlay", qos);
+  mask_pub_ = this->create_publisher<Image>("~/mask", qos);
+  id_mask_pub_ = this->create_publisher<Image>("~/mask_id", qos);
   if (publish_detections_) {
-    fv_dets_pub_ = this->create_publisher<DetectionArray>("detections", qos);
+    fv_dets_pub_ = this->create_publisher<DetectionArray>("~/detections", qos);
   }
 
   inferencer_ = CreateInferencer(backend_);

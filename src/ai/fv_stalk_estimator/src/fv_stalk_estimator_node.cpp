@@ -37,13 +37,13 @@ public:
   explicit StalkEstimatorNode(const rclcpp::NodeOptions &options)
   : rclcpp::Node("fv_stalk_estimator_node", options)
   {
-    this->declare_parameter<std::string>("cloud_topic", "/fv/d405/pointcloud/filtered");
-    this->declare_parameter<std::string>("counts_topic", "/fv/d405/pointcloud/filtered_counts");
-    this->declare_parameter<std::string>("detections_topic", "/fv/d405/detection_fusion/rois");
-    this->declare_parameter<std::string>("camera_info_topic", "/fv/d405/color/camera_info");
-    this->declare_parameter<std::string>("output_topic", "/fv/d405/stalk/metrics");
+    this->declare_parameter<std::string>("cloud_topic", "~/cloud");
+    this->declare_parameter<std::string>("counts_topic", "~/counts");
+    this->declare_parameter<std::string>("detections_topic", "~/detections");
+    this->declare_parameter<std::string>("camera_info_topic", "~/camera_info");
+    this->declare_parameter<std::string>("output_topic", "~/metrics");
     this->declare_parameter<bool>("publish_markers", true);
-    this->declare_parameter<std::string>("marker_topic", "/fv/d405/stalk/markers");
+    this->declare_parameter<std::string>("marker_topic", "~/markers");
     this->declare_parameter<double>("marker_scale_m", 0.015);
     this->declare_parameter<double>("pca_trim_low", 0.05);
     this->declare_parameter<double>("pca_trim_high", 0.95);

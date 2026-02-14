@@ -1,0 +1,22 @@
+# node_manifest.yaml — fv_audio
+# Audio Input (ALSA Capture)
+
+nodes:
+  - key: fv_audio
+    package: fv_audio
+    exec: fv_audio_node
+    category: audio
+    label: "Audio Input"
+
+    inputs: []
+
+    outputs:
+      - param: node.input_topic
+        type: audio
+        label: audio_out
+
+    default_parameters:
+      audio:
+        sample_rate: 48000
+        channels: 1
+        chunk_ms: 20

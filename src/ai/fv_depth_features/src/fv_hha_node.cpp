@@ -30,10 +30,10 @@ static T get_param(rclcpp::Node& node, const std::string& name, const T& def) {
 class FvHhaNode : public rclcpp::Node {
 public:
     FvHhaNode() : Node("fv_hha_node") {
-        color_topic_    = get_param(*this, "color_topic",       std::string("/camera/image_raw"));
-        depth_topic_    = get_param(*this, "depth_topic",       std::string("/camera/depth/image_rect_raw"));
-        info_topic_     = get_param(*this, "camera_info_topic", std::string("/camera/depth/camera_info"));
-        hha_topic_      = get_param(*this, "hha_topic",         std::string("/camera/hha"));
+        color_topic_    = get_param(*this, "color_topic",       std::string("~/color/image_raw"));
+        depth_topic_    = get_param(*this, "depth_topic",       std::string("~/depth/image_rect_raw"));
+        info_topic_     = get_param(*this, "camera_info_topic", std::string("~/camera_info"));
+        hha_topic_      = get_param(*this, "hha_topic",         std::string("~/hha_topic"));
         depth_scale_    = get_param(*this, "depth_scale",       0.001);
         max_depth_      = get_param(*this, "max_depth",         3.0);
         min_depth_      = get_param(*this, "min_depth",         0.05);

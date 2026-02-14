@@ -22,7 +22,7 @@ void FVPlayerNode::loadParameters()
     config_.output_topics = this->declare_parameter("playback.output_topics", std::vector<std::string>{});
     // overlays (global defaults can be overridden per-node)
     config_.overlay_play_indicator = this->declare_parameter("preview.overlay_play_indicator", true);
-    config_.overlay_topic = this->declare_parameter("preview.output_topic", std::string("/fv_player/preview"));
+    config_.overlay_topic = this->declare_parameter("preview.output_topic", std::string("~/preview"));
     
     RCLCPP_INFO(this->get_logger(), "📁 Recording directory: %s", config_.recording_directory.c_str());
     RCLCPP_INFO(this->get_logger(), "⏩ Playback speed: %f", config_.playback_speed);

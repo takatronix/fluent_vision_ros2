@@ -1,0 +1,25 @@
+# node_manifest.yaml — fv_audio_vad
+# Voice Activity Detection
+
+nodes:
+  - key: fv_audio_vad
+    package: fv_audio_vad
+    exec: fv_audio_vad_node
+    category: audio
+    label: "Voice Activity"
+
+    inputs:
+      - param: input_topic
+        type: audio
+
+    outputs:
+      - param: output_topic
+        type: audio
+
+    default_parameters:
+      input_topic: ""
+      output_topic: ""
+      vad:
+        threshold: 0.05
+        release_ms: 200
+        min_active_ms: 100

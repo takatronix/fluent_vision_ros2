@@ -1,0 +1,40 @@
+# node_manifest.yaml — fv_recorder
+# Video Recording & Playback (2 nodes in 1 package)
+
+nodes:
+  - key: fv_recorder
+    package: fv_recorder
+    exec: fv_recorder_node
+    category: streaming
+    label: "Recorder"
+
+    inputs:
+      - param: image_topic
+        type: image
+
+    outputs: []
+
+    default_parameters:
+      image_topic: ""
+      recording:
+        output_directory: "/recordings"
+        segment_duration: 300
+        auto_recording: true
+
+  - key: fv_player
+    package: fv_recorder
+    exec: fv_player_node
+    category: streaming
+    label: "Player"
+
+    inputs: []
+
+    outputs:
+      - param: output_topic
+        type: image
+
+    default_parameters:
+      output_topic: ""
+      playback:
+        playback_speed: 1.0
+        loop_playback: false

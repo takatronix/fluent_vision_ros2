@@ -1,0 +1,37 @@
+name: "Face Recognition"
+description: "RealSense → Face Recognizer"
+
+system:
+  camera_start_delay: 2.0
+  default_start_delay: 0.5
+
+nodes:
+  - id: realsense_1
+    enable: true
+    package: fv_realsense
+    exec: fv_realsense_node
+    node_name: realsense_1
+    namespace: /fv
+    parameters:
+      camera_selection:
+        selection_method: "auto"
+      camera:
+        color_width: 640
+        color_height: 480
+        color_fps: 15
+    _template: fv_realsense
+
+  - id: face_recognizer_1
+    enable: true
+    package: fv_face_recognizer
+    exec: fv_face_recognizer_node
+    node_name: face_recognizer_1
+    namespace: /fv
+    parameters:
+      input_topic: /fv/realsense_1/color/image_raw
+      output_topic: ""
+    _template: fv_face_recognizer
+
+layout:
+  realsense_1: { x: 100, y: 200, width: 210 }
+  face_recognizer_1: { x: 420, y: 200, width: 210 }

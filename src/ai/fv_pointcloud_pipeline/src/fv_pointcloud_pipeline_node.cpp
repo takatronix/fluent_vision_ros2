@@ -104,15 +104,15 @@ private:
 
   void declareParameters() {
     this->declare_parameter<std::string>("color_topic", "");
-    this->declare_parameter<std::string>("depth_topic", "/fv/d405/depth/image_rect_raw");
-    this->declare_parameter<std::string>("camera_info_topic", "/fv/d405/depth/camera_info");
-    this->declare_parameter<std::string>("detections_topic", "/fv/d405/detection_fusion/rois");
+    this->declare_parameter<std::string>("depth_topic", "~/depth/image_rect_raw");
+    this->declare_parameter<std::string>("camera_info_topic", "~/camera_info");
+    this->declare_parameter<std::string>("detections_topic", "~/detections");
     // Optional fused ROI mask (from detection_fusion)
     this->declare_parameter<std::string>("mask_topic", "");
     this->declare_parameter<int>("mask_threshold", 128);
-    this->declare_parameter<std::string>("output_topic", "/fv/d405/pointcloud/filtered");
+    this->declare_parameter<std::string>("output_topic", "~/filtered");
     this->declare_parameter<std::string>("counts_topic", "");
-    this->declare_parameter<std::string>("debug_namespace", "/fv/d405/pointcloud/debug");
+    this->declare_parameter<std::string>("debug_namespace", "~/debug");
     this->declare_parameter<std::string>("pipeline_config", "/config/pipelines/fv_pointcloud_default.yaml");
     this->declare_parameter<double>("depth_scale_m", 0.001);
     this->declare_parameter<int>("sample_stride_px", 2);

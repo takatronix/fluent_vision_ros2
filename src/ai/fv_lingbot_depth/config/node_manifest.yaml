@@ -1,0 +1,37 @@
+# node_manifest.yaml — fv_lingbot_depth
+# LingBot-Depth Monocular Depth Refinement
+
+nodes:
+  - key: fv_lingbot_depth
+    package: fv_lingbot_depth
+    exec: fv_lingbot_depth_node
+    category: ai
+    label: "LingBot Depth"
+
+    inputs:
+      - param: color_topic
+        type: image
+      - param: depth_topic
+        type: depth
+      - param: camera_info_topic
+        type: camera_info
+
+    outputs:
+      - param: refined_depth_topic
+        type: depth
+        label: refined_depth
+      - param: mask_topic
+        type: image
+        label: mask
+      - param: pointcloud_topic
+        type: pointcloud
+        label: pointcloud
+
+    default_parameters:
+      color_topic: ""
+      depth_topic: ""
+      camera_info_topic: ""
+      refined_depth_topic: ""
+      mask_topic: ""
+      device: "auto"
+      use_fp16: true

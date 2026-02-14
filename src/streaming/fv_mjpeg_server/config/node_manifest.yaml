@@ -1,0 +1,19 @@
+# node_manifest.yaml — fv_mjpeg_server
+# HTTP MJPEG Streaming Server (C++)
+
+nodes:
+  - key: fv_mjpeg_server
+    package: fv_mjpeg_server
+    exec: fv_mjpeg_server_node
+    category: streaming
+    label: "MJPEG Server"
+
+    inputs:
+      - param: image_topic
+        type: image
+
+    outputs: []
+
+    default_parameters:
+      image_topic: ""
+      port: 8090

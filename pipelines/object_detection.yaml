@@ -1,0 +1,43 @@
+name: "Object Detection"
+description: "RealSense → YOLOv10 Object Detector"
+
+system:
+  camera_start_delay: 2.0
+  default_start_delay: 0.5
+
+nodes:
+  - id: realsense_1
+    enable: true
+    package: fv_realsense
+    exec: fv_realsense_node
+    node_name: realsense_1
+    namespace: /fv
+    parameters:
+      camera_selection:
+        selection_method: "auto"
+      camera:
+        color_width: 640
+        color_height: 480
+        color_fps: 15
+    _template: fv_realsense
+
+  - id: object_detector_1
+    enable: true
+    package: fv_object_detector
+    exec: fv_object_detector_node
+    node_name: object_detector_1
+    namespace: /fv
+    parameters:
+      input_image_topic: /fv/realsense_1/color/image_raw
+      output_image_topic: ""
+      output_detections_topic: ""
+      model:
+        device: "auto"
+        confidence_threshold: 0.5
+      processing_frequency: 10.0
+      enable_tracking: true
+    _template: fv_object_detector
+
+layout:
+  realsense_1: { x: 100, y: 200, width: 210 }
+  object_detector_1: { x: 420, y: 200, width: 220 }

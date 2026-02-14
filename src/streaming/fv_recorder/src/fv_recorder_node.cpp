@@ -96,9 +96,8 @@ void FVRecorderNode::loadParameters()
     RCLCPP_INFO(this->get_logger(), "📋 Loading parameters...");
     
     // 録画設定
-    config_.input_topics = this->declare_parameter("recording.input_topics", 
-        std::vector<std::string>{"/fv/d415/color/image_raw", "/fv/d415/depth/image_rect_raw", 
-                                "/fv/d405/color/image_raw", "/fv/d405/depth/image_rect_raw"});
+    config_.input_topics = this->declare_parameter("recording.input_topics",
+        std::vector<std::string>{"~/color/image_raw", "~/depth/image_rect_raw"});
     config_.output_directory = this->declare_parameter("recording.output_directory", 
         "/home/takatronix/recordings");
     config_.segment_duration = this->declare_parameter("recording.segment_duration", 300);
@@ -111,7 +110,7 @@ void FVRecorderNode::loadParameters()
     preview_enabled_ = this->declare_parameter("preview.enabled", true);
     time_overlay_enabled_ = this->declare_parameter("preview.time_overlay", false);
     time_overlay_format_ = this->declare_parameter("preview.time_format", std::string("%Y-%m-%d %H:%M:%S"));
-    preview_output_topic_ = this->declare_parameter("preview.output_topic", std::string("/fv_recorder/preview"));
+    preview_output_topic_ = this->declare_parameter("preview.output_topic", std::string("~/preview"));
     // Video overlay (on saved video)
     video_time_overlay_enabled_ = this->declare_parameter("recording.video_time_overlay", false);
     video_time_overlay_format_ = this->declare_parameter("recording.video_time_overlay_format", std::string("%Y-%m-%d %H:%M:%S"));

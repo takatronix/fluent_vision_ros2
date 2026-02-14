@@ -66,9 +66,9 @@ public:
         
         // ===== パラメータ宣言 =====
         // 既定はfv_topic_relayの選択ストリームを利用
-        this->declare_parameter("input_image_topic", "/fv/selected/color/image_raw");        // 入力画像トピック
-        this->declare_parameter("output_image_topic", "/object_detection/annotated_image"); // 出力画像トピック
-        this->declare_parameter("output_detections_topic", "/object_detection/detections"); // 検出結果トピック
+        this->declare_parameter("input_image_topic", "~/input/image_raw");                   // 入力画像トピック
+        this->declare_parameter("output_image_topic", "~/output_image_topic");              // 出力画像トピック
+        this->declare_parameter("output_detections_topic", "~/output_detections_topic");    // 検出結果トピック
         this->declare_parameter("processing_frequency", 10.0);                          // 処理頻度（Hz）
         this->declare_parameter("enable_tracking", true);                               // トラッキング有効化
         this->declare_parameter("enable_visualization", true);                          // 可視化有効化

@@ -1,0 +1,25 @@
+# node_manifest.yaml — fv_aspara_ui_cpp
+# Asparagus Detection Result UI Overlay (C++)
+
+nodes:
+  - key: fv_aspara_ui
+    package: fv_aspara_ui_cpp
+    exec: fv_aspara_ui_cpp_node
+    category: ui
+    label: "Aspara UI"
+
+    inputs:
+      - param: image_topic
+        type: image
+      - param: detections_topic
+        type: detections
+
+    outputs:
+      - param: overlay_topic
+        type: image
+        label: overlay
+
+    default_parameters:
+      image_topic: ""
+      detections_topic: ""
+      overlay_topic: ""

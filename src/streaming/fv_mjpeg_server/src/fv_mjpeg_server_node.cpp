@@ -41,7 +41,7 @@ void FVMJPEGServer::loadParameters()
 {
     // Declare parameters with default values
     this->declare_parameter("stream_url", "http://unitcams3.local/stream");
-    this->declare_parameter("topic_name", "/fv_mjpeg_image");
+    this->declare_parameter("topic_name", "~/image");
     this->declare_parameter("compressed", false);
     this->declare_parameter("frame_rate", 30.0);
     

@@ -34,11 +34,11 @@ static T get_param(rclcpp::Node& node, const std::string& name, const T& def) {
 class FvDepthNormalsNode : public rclcpp::Node {
 public:
     FvDepthNormalsNode() : Node("fv_depth_normals_node") {
-        color_topic_   = get_param(*this, "color_topic",       std::string("/camera/image_raw"));
-        depth_topic_   = get_param(*this, "depth_topic",       std::string("/camera/depth/image_rect_raw"));
-        info_topic_    = get_param(*this, "camera_info_topic", std::string("/camera/depth/camera_info"));
-        rgbd_topic_    = get_param(*this, "rgbd_topic",        std::string("/camera/rgbd"));
-        normals_topic_ = get_param(*this, "normals_topic",     std::string("/camera/normals"));
+        color_topic_   = get_param(*this, "color_topic",       std::string("~/color/image_raw"));
+        depth_topic_   = get_param(*this, "depth_topic",       std::string("~/depth/image_rect_raw"));
+        info_topic_    = get_param(*this, "camera_info_topic", std::string("~/camera_info"));
+        rgbd_topic_    = get_param(*this, "rgbd_topic",        std::string("~/rgbd_topic"));
+        normals_topic_ = get_param(*this, "normals_topic",     std::string("~/normals_topic"));
         depth_scale_   = get_param(*this, "depth_scale",       0.001);
         stride_        = std::max(1, get_param(*this, "stride", 2));
         publish_rgbd_  = get_param(*this, "publish_rgbd",      true);

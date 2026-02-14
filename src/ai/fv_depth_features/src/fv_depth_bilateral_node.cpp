@@ -28,8 +28,8 @@ static T get_param(rclcpp::Node& node, const std::string& name, const T& def) {
 class FvDepthBilateralNode : public rclcpp::Node {
 public:
     FvDepthBilateralNode() : Node("fv_depth_bilateral_node") {
-        depth_topic_    = get_param(*this, "depth_topic",    std::string("/camera/depth/image_rect_raw"));
-        filtered_topic_ = get_param(*this, "filtered_topic", std::string("/camera/depth/filtered"));
+        depth_topic_    = get_param(*this, "depth_topic",    std::string("~/depth/image_rect_raw"));
+        filtered_topic_ = get_param(*this, "filtered_topic", std::string("~/filtered_topic"));
         depth_scale_    = get_param(*this, "depth_scale",    0.001);
         // Bilateral params
         bilateral_d_      = get_param(*this, "bilateral_d",      5);

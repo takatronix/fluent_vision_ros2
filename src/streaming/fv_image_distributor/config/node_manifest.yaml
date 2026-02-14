@@ -1,0 +1,18 @@
+# node_manifest.yaml — fv_image_distributor
+# Image Distribution Server
+
+nodes:
+  - key: fv_image_distributor
+    package: fv_image_distributor
+    exec: fv_image_distributor_node
+    category: streaming
+    label: "Image Distributor"
+
+    inputs:
+      - param: input_topic
+        type: image
+
+    outputs: []
+
+    default_parameters:
+      input_topic: ""

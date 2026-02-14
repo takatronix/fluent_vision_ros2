@@ -1,0 +1,18 @@
+# node_manifest.yaml — fv_audio_output
+# Audio Output (ALSA Playback)
+
+nodes:
+  - key: fv_audio_output
+    package: fv_audio_output
+    exec: fv_audio_output_node
+    category: audio
+    label: "Audio Output"
+
+    inputs:
+      - param: input_topic
+        type: audio
+
+    outputs: []
+
+    default_parameters:
+      input_topic: ""

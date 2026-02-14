@@ -1,0 +1,19 @@
+# node_manifest.yaml — fv_websocket_server
+# WebSocket Image Streaming Server (C++)
+
+nodes:
+  - key: fv_websocket_server
+    package: fv_websocket_server
+    exec: fv_websocket_server_node
+    category: streaming
+    label: "WebSocket Server"
+
+    inputs:
+      - param: image_topic
+        type: image
+
+    outputs: []
+
+    default_parameters:
+      image_topic: ""
+      port: 9090

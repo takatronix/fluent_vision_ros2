@@ -1,0 +1,53 @@
+name: "Depth Features"
+description: "RealSense → Depth Bilateral → Depth Normals"
+
+system:
+  camera_start_delay: 2.0
+  default_start_delay: 0.5
+
+nodes:
+  - id: realsense_1
+    enable: true
+    package: fv_realsense
+    exec: fv_realsense_node
+    node_name: realsense_1
+    namespace: /fv
+    parameters:
+      camera_selection:
+        selection_method: "auto"
+      camera:
+        color_width: 640
+        color_height: 480
+        color_fps: 15
+        depth_width: 640
+        depth_height: 480
+        depth_fps: 15
+    _template: fv_realsense
+
+  - id: depth_bilateral_1
+    enable: true
+    package: fv_depth_features
+    exec: fv_depth_bilateral_node
+    node_name: depth_bilateral_1
+    namespace: /fv
+    parameters:
+      depth_topic: /fv/realsense_1/depth/image_rect_raw
+      filtered_topic: ""
+    _template: fv_depth_bilateral
+
+  - id: depth_normals_1
+    enable: true
+    package: fv_depth_features
+    exec: fv_depth_normals_node
+    node_name: depth_normals_1
+    namespace: /fv
+    parameters:
+      color_topic: /fv/realsense_1/color/image_raw
+      depth_topic: /fv/depth_bilateral_1/filtered_topic
+      camera_info_topic: /fv/realsense_1/depth/camera_info
+    _template: fv_depth_normals
+
+layout:
+  realsense_1: { x: 100, y: 200, width: 210 }
+  depth_bilateral_1: { x: 420, y: 280, width: 210 }
+  depth_normals_1: { x: 740, y: 200, width: 210 }

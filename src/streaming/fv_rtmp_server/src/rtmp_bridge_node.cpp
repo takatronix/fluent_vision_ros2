@@ -50,7 +50,7 @@ void RTMPBridgeNode::initializeParameters()
     // Declare parameters with defaults
     this->declare_parameter<int>("server.port", 1935);
     this->declare_parameter<std::string>("server.endpoint", "/live/s");
-    this->declare_parameter<std::string>("output.topic_name", "/fv_rtmp_server/camera/image_raw");
+    this->declare_parameter<std::string>("output.topic_name", "~/camera/image_raw");
     this->declare_parameter<std::string>("output.frame_id", "camera_link");
     this->declare_parameter<int>("output.target_width", 640);
     this->declare_parameter<int>("output.target_height", 480);
@@ -59,7 +59,7 @@ void RTMPBridgeNode::initializeParameters()
     this->declare_parameter<int>("processing.buffer_size", 1);
     this->declare_parameter<std::string>("processing.quality_mode", "fast");
     this->declare_parameter<std::string>("camera.calibration_file", "config/camera_info_o4.yaml");
-    this->declare_parameter<std::string>("camera.info_topic", "/fv_rtmp_server/camera/camera_info");
+    this->declare_parameter<std::string>("camera.info_topic", "~/camera/camera_info");
     this->declare_parameter<bool>("output.compressed", false);
 
     // Get parameter values

@@ -1,0 +1,451 @@
+# node_manifest.yaml — fv_image_filter
+# Chainable image filter nodes: ~/input (image) -> ~/output (image)
+# All parameters are live-updatable via ros2 param set.
+
+nodes:
+  # ════════════════════════════════════════════
+  # Blur
+  # ════════════════════════════════════════════
+  - key: fv_gaussian_blur
+    package: fv_image_filter
+    exec: fv_gaussian_blur_node
+    category: filter
+    label: "Gaussian Blur"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      kernel_size: 5
+      sigma: 1.0
+
+  - key: fv_median_blur
+    package: fv_image_filter
+    exec: fv_median_blur_node
+    category: filter
+    label: "Median Blur"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      kernel_size: 5
+
+  - key: fv_box_blur
+    package: fv_image_filter
+    exec: fv_box_blur_node
+    category: filter
+    label: "Box Blur"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      kernel_size: 5
+      normalize: true
+
+  - key: fv_bilateral_filter
+    package: fv_image_filter
+    exec: fv_bilateral_filter_node
+    category: filter
+    label: "Bilateral Filter"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      diameter: 9
+      sigma_color: 75.0
+      sigma_space: 75.0
+
+  # ════════════════════════════════════════════
+  # Edge Detection
+  # ════════════════════════════════════════════
+  - key: fv_canny_edge
+    package: fv_image_filter
+    exec: fv_canny_edge_node
+    category: filter
+    label: "Canny Edge"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      threshold1: 50.0
+      threshold2: 150.0
+      aperture_size: 3
+      l2_gradient: false
+
+  - key: fv_sobel_edge
+    package: fv_image_filter
+    exec: fv_sobel_edge_node
+    category: filter
+    label: "Sobel Edge"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      dx: 1
+      dy: 0
+      kernel_size: 3
+      scale: 1.0
+      delta: 0.0
+
+  - key: fv_laplacian
+    package: fv_image_filter
+    exec: fv_laplacian_node
+    category: filter
+    label: "Laplacian"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      kernel_size: 3
+      scale: 1.0
+      delta: 0.0
+
+  # ════════════════════════════════════════════
+  # Threshold
+  # ════════════════════════════════════════════
+  - key: fv_threshold
+    package: fv_image_filter
+    exec: fv_threshold_node
+    category: filter
+    label: "Threshold"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      threshold: 128.0
+      max_value: 255.0
+      type: 0
+      otsu: false
+
+  - key: fv_adaptive_threshold
+    package: fv_image_filter
+    exec: fv_adaptive_threshold_node
+    category: filter
+    label: "Adaptive Threshold"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      max_value: 255.0
+      method: 1
+      type: 0
+      block_size: 11
+      C: 2.0
+
+  # ════════════════════════════════════════════
+  # Morphology
+  # ════════════════════════════════════════════
+  - key: fv_morphology
+    package: fv_image_filter
+    exec: fv_morphology_node
+    category: filter
+    label: "Morphology"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      operation: 0
+      shape: 0
+      kernel_size: 5
+      iterations: 1
+
+  # ════════════════════════════════════════════
+  # Color
+  # ════════════════════════════════════════════
+  - key: fv_color_convert
+    package: fv_image_filter
+    exec: fv_color_convert_node
+    category: filter
+    label: "Color Convert"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      conversion: "bgr2gray"
+
+  - key: fv_channel_extract
+    package: fv_image_filter
+    exec: fv_channel_extract_node
+    category: filter
+    label: "Channel Extract"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      channel: 0
+
+  - key: fv_invert
+    package: fv_image_filter
+    exec: fv_invert_node
+    category: filter
+    label: "Invert"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+
+  # ════════════════════════════════════════════
+  # Adjustment
+  # ════════════════════════════════════════════
+  - key: fv_brightness_contrast
+    package: fv_image_filter
+    exec: fv_brightness_contrast_node
+    category: filter
+    label: "Brightness / Contrast"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      brightness: 0.0
+      contrast: 1.0
+
+  - key: fv_gamma
+    package: fv_image_filter
+    exec: fv_gamma_node
+    category: filter
+    label: "Gamma"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      gamma: 1.0
+
+  - key: fv_histogram_eq
+    package: fv_image_filter
+    exec: fv_histogram_eq_node
+    category: filter
+    label: "Histogram Eq"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+
+  - key: fv_clahe
+    package: fv_image_filter
+    exec: fv_clahe_node
+    category: filter
+    label: "CLAHE"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      clip_limit: 2.0
+      tile_size: 8
+
+  # ════════════════════════════════════════════
+  # Transform
+  # ════════════════════════════════════════════
+  - key: fv_resize
+    package: fv_image_filter
+    exec: fv_resize_node
+    category: filter
+    label: "Resize"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      width: 0
+      height: 0
+      scale_factor: 1.0
+      interpolation: 1
+
+  - key: fv_rotate
+    package: fv_image_filter
+    exec: fv_rotate_node
+    category: filter
+    label: "Rotate"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      angle: 0.0
+
+  - key: fv_flip
+    package: fv_image_filter
+    exec: fv_flip_node
+    category: filter
+    label: "Flip"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      flip_code: 1
+
+  - key: fv_crop
+    package: fv_image_filter
+    exec: fv_crop_node
+    category: filter
+    label: "Crop"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      x: 0
+      y: 0
+      width: 0
+      height: 0
+
+  # ════════════════════════════════════════════
+  # Effects
+  # ════════════════════════════════════════════
+  - key: fv_unsharp_mask
+    package: fv_image_filter
+    exec: fv_unsharp_mask_node
+    category: filter
+    label: "Unsharp Mask"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      sigma: 1.0
+      strength: 1.5
+
+  - key: fv_denoise
+    package: fv_image_filter
+    exec: fv_denoise_node
+    category: filter
+    label: "Denoise"
+    inputs:
+      - param: input_topic
+        type: image
+    outputs:
+      - param: output_topic
+        type: image
+        label: output
+    default_parameters:
+      input_topic: "~/input"
+      output_topic: "~/output"
+      h: 10.0
+      template_window_size: 7
+      search_window_size: 21

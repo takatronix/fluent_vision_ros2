@@ -21,9 +21,9 @@ class FvLingbotDepthNode(Node):
         self.bridge = CvBridge()
 
         # I/O
-        self.declare_parameter("color_topic", "/fv/d405/color/image_raw")
-        self.declare_parameter("depth_topic", "/fv/d405/depth/image_rect_raw")
-        self.declare_parameter("camera_info_topic", "/fv/d405/depth/camera_info")
+        self.declare_parameter("color_topic", "~/color/image_raw")
+        self.declare_parameter("depth_topic", "~/depth/image_rect_raw")
+        self.declare_parameter("camera_info_topic", "~/camera_info")
         self.declare_parameter("refined_depth_topic", "depth_refined/image_rect_raw")
         self.declare_parameter("mask_topic", "depth_refined/mask")
         self.declare_parameter("pointcloud_topic", "depth_refined/points")

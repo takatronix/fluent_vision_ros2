@@ -578,7 +578,16 @@ bool FVDepthCameraNode::startSensors() {
                                               camera_config_.color_width, camera_config_.color_height, camera_config_.color_fps);
         }
         if (!color_profile_) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to find suitable color stream profile");
+            RCLCPP_ERROR(this->get_logger(),
+                "❌ No color stream profile found for %dx%d. Available color profiles:",
+                camera_config_.color_width, camera_config_.color_height);
+            for (const auto& sp : profiles) {
+                if (sp.stream_type() != RS2_STREAM_COLOR) continue;
+                if (auto vp = sp.as<rs2::video_stream_profile>()) {
+                    RCLCPP_ERROR(this->get_logger(), "   %dx%d @ %dfps (%s)",
+                        vp.width(), vp.height(), sp.fps(), rs2_format_to_string(sp.format()));
+                }
+            }
             return false;
         }
         auto vp = color_profile_.as<rs2::video_stream_profile>();
@@ -600,7 +609,16 @@ bool FVDepthCameraNode::startSensors() {
         depth_profile_ = pickProfileSmart(profiles, RS2_STREAM_DEPTH, RS2_FORMAT_Z16,
                                           camera_config_.depth_width, camera_config_.depth_height, camera_config_.depth_fps);
         if (!depth_profile_) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to find suitable depth stream profile");
+            RCLCPP_ERROR(this->get_logger(),
+                "❌ No depth stream profile found for %dx%d. Available depth profiles:",
+                camera_config_.depth_width, camera_config_.depth_height);
+            for (const auto& sp : profiles) {
+                if (sp.stream_type() != RS2_STREAM_DEPTH) continue;
+                if (auto vp = sp.as<rs2::video_stream_profile>()) {
+                    RCLCPP_ERROR(this->get_logger(), "   %dx%d @ %dfps (%s)",
+                        vp.width(), vp.height(), sp.fps(), rs2_format_to_string(sp.format()));
+                }
+            }
             return false;
         }
         auto vp = depth_profile_.as<rs2::video_stream_profile>();
@@ -828,10 +846,21 @@ bool FVDepthCameraNode::selectCamera()
 void FVDepthCameraNode::initializePublishers()
 {
     RCLCPP_INFO(this->get_logger(), "📤 Initializing publishers...");
-    
-    // Create image transport for compressed images
-    // Note: ImageTransport will be created after the node is fully initialized
-    
+
+    // Make relative topics private (~/...) so they include the node_name.
+    // e.g. "color/image_raw" → "~/color/image_raw" → /fv/realsense_1/color/image_raw
+    auto make_private = [](const std::string& topic) -> std::string {
+        if (topic.empty() || topic[0] == '/' || topic[0] == '~') return topic;
+        return "~/" + topic;
+    };
+    topic_config_.color = make_private(topic_config_.color);
+    topic_config_.depth = make_private(topic_config_.depth);
+    topic_config_.color_compressed = make_private(topic_config_.color_compressed);
+    topic_config_.depth_colormap = make_private(topic_config_.depth_colormap);
+    topic_config_.pointcloud = make_private(topic_config_.pointcloud);
+    topic_config_.color_camera_info = make_private(topic_config_.color_camera_info);
+    topic_config_.depth_camera_info = make_private(topic_config_.depth_camera_info);
+
     // QoS設定を構築（パラメータから読み込み）
     int qos_queue_size = this->get_parameter("qos.queue_size").as_int();
     std::string qos_reliability = this->get_parameter("qos.reliability").as_string();
@@ -1938,7 +1967,7 @@ int main(int argc, char** argv)
         rclcpp::init(argc, argv);
         
         RCLCPP_INFO(rclcpp::get_logger("fv_realsense"), "🚀 Starting FV RealSense Node...");
-        
+
         // ===== デフォルト名でノードを作成（launchファイルで必要に応じてリマップ） =====
         auto node = std::make_shared<FVDepthCameraNode>("fv_realsense");
         
@@ -1953,8 +1982,16 @@ int main(int argc, char** argv)
         rclcpp::shutdown();
         return 0;
         
+    } catch (const std::bad_alloc& e) {
+        RCLCPP_ERROR(rclcpp::get_logger("fv_realsense"),
+            "❌ Memory allocation failed: %s. "
+            "Check camera resolution parameters — the device may not support the requested resolution. "
+            "Supported resolutions: 424x240, 480x270, 640x360, 640x480, 848x480, 1280x720", e.what());
+        return 1;
     } catch (const std::exception& e) {
-        RCLCPP_ERROR(rclcpp::get_logger("fv_realsense"), "❌ Exception in main: %s", e.what());
+        RCLCPP_ERROR(rclcpp::get_logger("fv_realsense"),
+            "❌ Exception in main: %s. "
+            "If the camera was previously in use, try unplugging and reconnecting the USB cable.", e.what());
         return 1;
     }
 } 

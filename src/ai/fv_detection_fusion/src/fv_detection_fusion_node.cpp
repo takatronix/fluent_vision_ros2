@@ -175,7 +175,7 @@ private:
   }
 
   void declareParameters() {
-    declareIfMissing<std::string>("output_topic", "/fv/d405/detection_fusion/rois");
+    declareIfMissing<std::string>("output_topic", "~/rois");
     declareIfMissing<int>("output_qos_depth", 5);
     declareIfMissing<double>("diagnostic_interval_ms", 100.0);
     declareIfMissing<int>("hold_frames", 5);

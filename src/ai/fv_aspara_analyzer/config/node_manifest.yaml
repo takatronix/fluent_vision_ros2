@@ -1,0 +1,14 @@
+# node_manifest.yaml — fv_aspara_analyzer
+# Asparagus Quality Analysis System
+
+nodes:
+  - key: fv_aspara_analyzer
+    package: fv_aspara_analyzer
+    exec: fv_aspara_analyzer_node
+    category: ai
+    label: "Aspara Analyzer"
+
+    inputs: []
+    outputs: []
+
+    default_parameters: {}

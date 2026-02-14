@@ -1,0 +1,31 @@
+# node_manifest.yaml — fv_camera
+# USB/RPi Camera Driver
+
+nodes:
+  - key: fv_camera
+    package: fv_camera
+    exec: fv_camera_node
+    category: sensor
+    label: "USB Camera"
+
+    inputs: []
+
+    outputs:
+      - param: topics.color
+        type: image
+        label: color
+      - param: topics.color_compressed
+        type: image
+        label: compressed
+
+    default_parameters:
+      camera_selection:
+        selection_method: "index"
+        device_index: 4
+      camera:
+        width: 640
+        height: 480
+        fps: 30
+      topics:
+        color: "image_raw"
+        color_compressed: "image_raw/compressed"

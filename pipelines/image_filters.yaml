@@ -1,0 +1,54 @@
+name: "Image Filters"
+description: "RealSense → Gaussian Blur → Canny Edge"
+
+system:
+  camera_start_delay: 2.0
+  default_start_delay: 0.5
+
+nodes:
+  - id: realsense_1
+    enable: true
+    package: fv_realsense
+    exec: fv_realsense_node
+    node_name: realsense_1
+    namespace: /fv
+    parameters:
+      camera_selection:
+        selection_method: "auto"
+      camera:
+        color_width: 640
+        color_height: 480
+        color_fps: 15
+    _template: fv_realsense
+
+  - id: gaussian_blur_1
+    enable: true
+    package: fv_image_filter
+    exec: fv_gaussian_blur_node
+    node_name: gaussian_blur_1
+    namespace: /fv
+    parameters:
+      input_topic: /fv/realsense_1/color/image_raw
+      output_topic: ""
+      kernel_size: 5
+      sigma: 1.0
+    _template: fv_gaussian_blur
+
+  - id: canny_edge_1
+    enable: true
+    package: fv_image_filter
+    exec: fv_canny_edge_node
+    node_name: canny_edge_1
+    namespace: /fv
+    parameters:
+      input_topic: /fv/gaussian_blur_1/output
+      output_topic: ""
+      threshold1: 50.0
+      threshold2: 150.0
+      aperture_size: 3
+    _template: fv_canny_edge
+
+layout:
+  realsense_1: { x: 100, y: 200, width: 210 }
+  gaussian_blur_1: { x: 420, y: 200, width: 210 }
+  canny_edge_1: { x: 740, y: 200, width: 210 }

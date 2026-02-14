@@ -1,0 +1,31 @@
+# node_manifest.yaml — fv_object_detector
+# YOLOv10 Object Detection (OpenVINO)
+
+nodes:
+  - key: fv_object_detector
+    package: fv_object_detector
+    exec: fv_object_detector_node
+    category: ai
+    label: "Object Detector"
+
+    inputs:
+      - param: input_image_topic
+        type: image
+
+    outputs:
+      - param: output_image_topic
+        type: image
+        label: annotated
+      - param: output_detections_topic
+        type: detections
+        label: detections
+
+    default_parameters:
+      input_image_topic: ""
+      output_image_topic: ""
+      output_detections_topic: ""
+      model:
+        device: "auto"
+        confidence_threshold: 0.5
+      processing_frequency: 10.0
+      enable_tracking: true

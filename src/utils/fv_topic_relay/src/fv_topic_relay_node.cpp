@@ -43,11 +43,8 @@ void FVTopicRelayNode::loadParameters()
     // デフォルト設定（パラメータが空の場合）
     if (relay_configs_.empty()) {
         RCLCPP_WARN(this->get_logger(), "⚠️ No relay mappings found in parameters, using defaults");
-        relay_configs_.push_back({"/fv/d415/depth/colormap", "/vision_ai/d415/depth/colormap"});
-        relay_configs_.push_back({"/fv/d415/object_detection/annotated_image", "/vision_ai/d415/object_detection/annotated_image"});
-        relay_configs_.push_back({"/fv/d415/object_detection/annotated_image_mouse_left", "/vision_ai/d415/object_detection/annotated_image_mouse_left"});
-        // インスタンスセグメンテーションのオーバーレイをUI想定のパスへ中継
-        relay_configs_.push_back({"/fv/d415/instance_seg/overlay", "/vision_ai/d415/segmentation_mask/colored"});
+        // No hardcoded defaults — configure via relay_mappings parameter
+        RCLCPP_INFO(this->get_logger(), "📝 Configure relay_mappings parameter to set up relays");
     }
     
     RCLCPP_INFO(this->get_logger(), "📋 Loaded %zu relay configurations", relay_configs_.size());

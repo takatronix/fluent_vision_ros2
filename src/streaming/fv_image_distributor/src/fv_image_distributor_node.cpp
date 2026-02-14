@@ -41,7 +41,7 @@ FVImageDistributor::~FVImageDistributor()
 void FVImageDistributor::loadParameters()
 {
     // Declare parameters with default values
-    this->declare_parameter("input_topic", "/fv_mjpeg_image");
+    this->declare_parameter("input_topic", "~/image");
     this->declare_parameter("http_port", 8080);
     this->declare_parameter("compressed", false);
     this->declare_parameter("frame_rate", 30.0);

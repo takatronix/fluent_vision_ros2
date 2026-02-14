@@ -1,0 +1,20 @@
+# node_manifest.yaml — fv_tts
+# Text-to-Speech (Open JTalk)
+
+nodes:
+  - key: fv_tts
+    package: fv_tts
+    exec: fv_tts_node
+    category: audio
+    label: "TTS"
+
+    inputs: []
+
+    outputs:
+      - param: output_topic
+        type: audio
+
+    default_parameters:
+      output_topic: "audio/tts/frame"
+      playback_topic: "audio/output/frame"
+      use_playback_topic: true

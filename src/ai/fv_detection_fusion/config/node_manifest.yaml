@@ -1,0 +1,28 @@
+# node_manifest.yaml — fv_detection_fusion
+# Multi-detector Fusion (combines object + instance detections)
+
+nodes:
+  - key: fv_detection_fusion
+    package: fv_detection_fusion
+    exec: fv_detection_fusion_node
+    category: ai
+    label: "Detection Fusion"
+
+    inputs:
+      - param: input_image_topic
+        type: image
+
+    outputs:
+      - param: output_topic
+        type: detections
+        label: detections
+      - param: debug.overlay_topic
+        type: image
+        label: overlay
+
+    default_parameters:
+      input_image_topic: ""
+      output_topic: ""
+      debug:
+        overlay_topic: "overlay"
+        enable_overlay: true

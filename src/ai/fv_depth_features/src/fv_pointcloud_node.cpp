@@ -36,9 +36,9 @@ static T get_param(rclcpp::Node& node, const std::string& name, const T& def) {
 class FvPointcloudNode : public rclcpp::Node {
 public:
     FvPointcloudNode() : Node("fv_pointcloud_node") {
-        depth_topic_      = get_param(*this, "depth_topic",       std::string("/camera/depth/image_rect_raw"));
-        info_topic_       = get_param(*this, "camera_info_topic", std::string("/camera/depth/camera_info"));
-        cloud_topic_      = get_param(*this, "pointcloud_topic",  std::string("/camera/points"));
+        depth_topic_      = get_param(*this, "depth_topic",       std::string("~/depth/image_rect_raw"));
+        info_topic_       = get_param(*this, "camera_info_topic", std::string("~/camera_info"));
+        cloud_topic_      = get_param(*this, "pointcloud_topic",  std::string("~/pointcloud_topic"));
         depth_scale_      = get_param(*this, "depth_scale",       0.001);
         min_depth_        = get_param(*this, "min_depth",         0.05);
         max_depth_        = get_param(*this, "max_depth",         3.0);

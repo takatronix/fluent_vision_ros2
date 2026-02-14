@@ -62,11 +62,11 @@ private:
   };
 
   void declareParams() {
-    this->declare_parameter<std::string>("detections_topic", "/fv/d415/detection_fusion/rois");
-    this->declare_parameter<std::string>("depth_topic", "/fv/d415/depth/image_rect_raw");
-    this->declare_parameter<std::string>("camera_info_topic", "/fv/d415/depth/camera_info");
-    this->declare_parameter<std::string>("points_topic", "/aspara/points_map");
-    this->declare_parameter<std::string>("markers_topic", "/aspara/markers_map");
+    this->declare_parameter<std::string>("detections_topic", "~/detections");
+    this->declare_parameter<std::string>("depth_topic", "~/depth/image_rect_raw");
+    this->declare_parameter<std::string>("camera_info_topic", "~/camera_info");
+    this->declare_parameter<std::string>("points_topic", "~/points_map");
+    this->declare_parameter<std::string>("markers_topic", "~/markers_map");
     this->declare_parameter<std::string>("target_frame", "map");
     this->declare_parameter<double>("min_confidence", 0.3);
     this->declare_parameter<int>("sample_stride_px", 3);

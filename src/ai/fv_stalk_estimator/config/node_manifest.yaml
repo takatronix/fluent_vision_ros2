@@ -1,0 +1,18 @@
+# node_manifest.yaml — fv_stalk_estimator
+# Stalk Length Estimation
+
+nodes:
+  - key: fv_stalk_estimator
+    package: fv_stalk_estimator
+    exec: fv_stalk_estimator_node
+    category: ai
+    label: "Stalk Estimator"
+
+    inputs:
+      - param: pointcloud_topic
+        type: pointcloud
+
+    outputs: []
+
+    default_parameters:
+      pointcloud_topic: ""

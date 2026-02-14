@@ -1,0 +1,55 @@
+# node_manifest.yaml — fv_realsense
+# Intel RealSense Depth Camera (D405, D415)
+# Lazy Publishing: streams.*_enabled parameters are deprecated.
+# Outputs are automatically activated when subscribers exist.
+
+nodes:
+  - key: fv_realsense
+    package: fv_realsense
+    exec: fv_realsense_node
+    category: sensor
+    label: "RealSense"
+
+    inputs: []
+
+    outputs:
+      - param: topics.color
+        type: image
+        label: color
+      - param: topics.depth
+        type: depth
+        label: depth
+      - param: topics.depth_colormap
+        type: image
+        label: depth_jet
+      - param: topics.color_camera_info
+        type: camera_info
+        label: color_info
+      - param: topics.depth_camera_info
+        type: camera_info
+        label: depth_info
+      - param: topics.pointcloud
+        type: pointcloud
+        label: points
+      - param: topics.color_compressed
+        type: image
+        label: compressed
+
+    default_parameters:
+      camera_selection:
+        selection_method: "auto"
+      camera:
+        color_width: 640
+        color_height: 480
+        color_fps: 15
+        depth_width: 640
+        depth_height: 480
+        depth_fps: 15
+      topics:
+        color: "color/image_raw"
+        depth: "depth/image_rect_raw"
+        depth_colormap: "depth/colormap"
+        color_camera_info: "color/camera_info"
+        depth_camera_info: "depth/camera_info"
+        pointcloud: "depth/color/points"
+        color_compressed: "color/image_raw/compressed"
