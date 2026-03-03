@@ -82,6 +82,8 @@ nodes:
     label: "Depth to PointCloud"
 
     inputs:
+      - param: color_topic
+        type: image
       - param: depth_topic
         type: depth
       - param: camera_info_topic
@@ -93,6 +95,8 @@ nodes:
         label: pointcloud
 
     default_parameters:
+      color_topic: ""
       depth_topic: ""
       camera_info_topic: ""
       pointcloud_topic: ""
+      color_timeout_ms: 1000
