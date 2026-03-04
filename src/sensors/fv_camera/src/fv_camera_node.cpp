@@ -288,24 +288,27 @@ void FVUSBCameraNode::initializePublishers()
     topic_config_.color = make_private(topic_config_.color);
     topic_config_.color_compressed = make_private(topic_config_.color_compressed);
 
+    // SensorDataQoS for image topics (BEST_EFFORT — standard for camera data)
+    auto sensor_qos = rclcpp::SensorDataQoS();
+
     // Color image publisher
     if (stream_config_.color_enabled) {
         color_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
-            topic_config_.color, 10);
+            topic_config_.color, sensor_qos);
         RCLCPP_INFO(this->get_logger(), "📤 Color publisher: %s", topic_config_.color.c_str());
     }
 
     // Camera info publisher
     if (camera_info_config_.enable_camera_info) {
         camera_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-            "~/camera_info", 10);
+            "~/camera_info", sensor_qos);
         RCLCPP_INFO(this->get_logger(), "📤 Camera info publisher: ~/camera_info");
     }
 
-    // Compressed image publisher (will be initialized later)
+    // Compressed image publisher
     if (camera_info_config_.enable_compressed_topics && stream_config_.compressed_enabled) {
         color_compressed_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>(
-            topic_config_.color_compressed, 10);
+            topic_config_.color_compressed, sensor_qos);
         RCLCPP_INFO(this->get_logger(), "📤 Compressed publisher: %s", topic_config_.color_compressed.c_str());
     }
     
