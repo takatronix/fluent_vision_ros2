@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
+#include <std_msgs/msg/bool.hpp>
 #if __has_include(<cv_bridge/cv_bridge.h>)
 #include <cv_bridge/cv_bridge.h>
 #elif __has_include(<cv_bridge/cv_bridge.hpp>)
@@ -57,7 +59,7 @@ public:
         max_depth_        = get_param(*this, "max_depth",         3.0);
         stride_           = get_param(*this, "stride",            1);
         frame_id_         = get_param(*this, "frame_id",          std::string(""));
-        color_timeout_ms_ = get_param(*this, "color_timeout_ms",  120);
+        color_timeout_ms_ = get_param(*this, "color_timeout_ms",  1000);
 
         if (stride_ < 1) stride_ = 1;
 
@@ -77,6 +79,15 @@ public:
         // Point cloud is for high-rate visualization/preview: prefer BEST_EFFORT
         // to avoid backpressure and reduce latency on weak links.
         pub_cloud_ = create_publisher<sensor_msgs::msg::PointCloud2>(cloud_topic_, qos);
+
+        // Runtime enable/disable via Bool topic (dashboard toggle)
+        sub_enable_ = create_subscription<std_msgs::msg::Bool>(
+            "~/enable", rclcpp::QoS(1).reliable(),
+            [this](std_msgs::msg::Bool::ConstSharedPtr m) {
+                enabled_.store(m->data);
+                RCLCPP_INFO(get_logger(), "Pointcloud processing %s",
+                            m->data ? "ENABLED" : "DISABLED");
+            });
 
         RCLCPP_INFO(get_logger(),
             "FvPointcloudNode: color=%s depth=%s info=%s out=%s scale=%.4f range=[%.2f,%.2f] stride=%d color_timeout_ms=%d",
@@ -112,6 +123,10 @@ private:
     void on_depth(sensor_msgs::msg::Image::ConstSharedPtr msg) {
         // Skip conversion work when nobody subscribes to point cloud output.
         if (!pub_cloud_ || pub_cloud_->get_subscription_count() == 0) {
+            return;
+        }
+        // Skip when disabled by dashboard toggle
+        if (!enabled_.load()) {
             return;
         }
 
@@ -154,7 +169,7 @@ private:
                 const int64_t depth_stamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
                 const int64_t color_stamp_ns = latest_color_stamp_.nanoseconds();
                 const int64_t dt_ms = std::llabs((depth_stamp_ns - color_stamp_ns) / 1000000);
-                if (dt_ms <= static_cast<int64_t>(color_timeout_ms_)) {
+                if (color_timeout_ms_ < 0 || dt_ms <= static_cast<int64_t>(color_timeout_ms_)) {
                     color_bgr = latest_color_bgr_;
                     has_fresh_color = (color_bgr.type() == CV_8UC3);
                 }
@@ -271,6 +286,10 @@ private:
     cv::Mat latest_color_bgr_;
     rclcpp::Time latest_color_stamp_{0, 0, RCL_ROS_TIME};
     bool has_color_ = false;
+
+    // Enable/disable control
+    std::atomic<bool> enabled_{true};
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
 
     // ROS
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_color_;
