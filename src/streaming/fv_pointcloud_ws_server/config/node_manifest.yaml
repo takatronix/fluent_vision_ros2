@@ -1,0 +1,27 @@
+# node_manifest.yaml — fv_pointcloud_ws_server
+# Binary WebSocket PointCloud Streaming Server (C++)
+
+nodes:
+  - key: fv_pointcloud_ws_server
+    package: fv_pointcloud_ws_server
+    exec: fv_pointcloud_ws_server_node
+    category: streaming
+    label: "PointCloud WS Server"
+
+    inputs:
+      - param: pointcloud_topic
+        type: pointcloud
+
+    outputs: []
+
+    default_parameters:
+      pointcloud_topic: ""
+      server.host: "0.0.0.0"
+      server.port: 9070
+      stream.max_points: 20000
+      stream.sample_step: 2
+      stream.min_range_m: 0.20
+      stream.max_range_m: 2.50
+      stream.codec: "none"
+      stream.compression_min_bytes: 65536
+      lazy.cooldown_sec: 5.0

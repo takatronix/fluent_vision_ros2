@@ -1,0 +1,53 @@
+cmake_minimum_required(VERSION 3.8)
+project(fv_pointcloud_ws_server)
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_auto REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system thread)
+find_library(LZ4_LIBRARY lz4 REQUIRED)
+
+include_directories(include)
+
+add_executable(fv_pointcloud_ws_server_node
+  src/fv_pointcloud_ws_server_node.cpp
+)
+
+ament_target_dependencies(fv_pointcloud_ws_server_node
+  rclcpp
+  sensor_msgs
+  std_msgs
+)
+
+target_link_libraries(fv_pointcloud_ws_server_node
+  ${Boost_LIBRARIES}
+  ${LZ4_LIBRARY}
+)
+
+install(TARGETS
+  fv_pointcloud_ws_server_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY
+  config
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+install(DIRECTORY
+  launch
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+if(BUILD_TESTING)
+  find_package(ament_lint_auto REQUIRED)
+  ament_lint_auto_find_test_dependencies()
+endif()
+
+ament_package()
