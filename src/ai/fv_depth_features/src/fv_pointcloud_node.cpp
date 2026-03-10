@@ -288,7 +288,7 @@ private:
     bool has_color_ = false;
 
     // Enable/disable control
-    std::atomic<bool> enabled_{true};
+    std::atomic<bool> enabled_{false};
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
 
     // ROS

@@ -1,0 +1,55 @@
+name: "Color Detection"
+description: "RealSense D405 → HSV Color Detector with depth distance"
+
+system:
+  camera_start_delay: 2.0
+  default_start_delay: 0.5
+
+nodes:
+  - id: realsense_1
+    enable: true
+    package: fv_realsense
+    exec: fv_realsense_node
+    node_name: realsense_1
+    namespace: /fv
+    parameters:
+      camera_selection:
+        selection_method: "auto"
+      camera:
+        color_width: 640
+        color_height: 480
+        color_fps: 15
+        depth_width: 640
+        depth_height: 480
+        depth_fps: 15
+        enable_depth: true
+    _template: fv_realsense
+
+  - id: color_detector_1
+    enable: true
+    package: fv_color_detector
+    exec: fv_color_detector_node
+    node_name: color_detector_1
+    namespace: /fv
+    parameters:
+      color_topic: /fv/realsense_1/color/image_raw
+      depth_topic: /fv/realsense_1/depth/image_rect_raw
+      overlay_topic: /fv/color_detector_1/overlay
+      detections_topic: /fv/color_detector_1/detections
+      # HSV range -- adjust for your cube color
+      # Example: green cube
+      h_min: 35
+      h_max: 85
+      s_min: 50
+      s_max: 255
+      v_min: 50
+      v_max: 255
+      min_area: 500
+      depth_scale: 0.0001
+      depth_roi_radius: 5
+      process_fps: 15.0
+      morph_size: 5
+
+layout:
+  realsense_1: { x: 100, y: 200, width: 210 }
+  color_detector_1: { x: 420, y: 200, width: 220 }

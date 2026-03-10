@@ -16,10 +16,20 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#if __has_include(<cv_bridge/cv_bridge.h>)
 #include <cv_bridge/cv_bridge.h>
+#elif __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#elif __has_include(<cv_bridge/cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge/cv_bridge.hpp>
+#else
+#error "cv_bridge header not found"
+#endif
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 template <typename T>
 static T get_param(rclcpp::Node& node, const std::string& name, const T& def) {
@@ -41,6 +51,8 @@ public:
         height_max_     = get_param(*this, "height_max",        1.0);
         gravity_axis_   = get_param(*this, "gravity_axis",      std::string("+y"));
         frame_id_       = get_param(*this, "frame_id",          std::string(""));
+        hha_preview_topic_ = get_param(*this, "hha_preview_topic", std::string(""));
+        hha_preview_quality_ = std::max(1, std::min(100, get_param(*this, "hha_preview_quality", 75)));
 
         auto qos = rclcpp::SensorDataQoS();
         sub_info_  = create_subscription<sensor_msgs::msg::CameraInfo>(
@@ -51,11 +63,15 @@ public:
             depth_topic_, qos, [this](sensor_msgs::msg::Image::ConstSharedPtr m){ on_depth(m); });
 
         pub_hha_ = create_publisher<sensor_msgs::msg::Image>(hha_topic_, 10);
+        if (!hha_preview_topic_.empty())
+            pub_hha_preview_ = create_publisher<sensor_msgs::msg::CompressedImage>(hha_preview_topic_, 10);
 
         RCLCPP_INFO(get_logger(),
-            "FvHhaNode: color=%s depth=%s info=%s hha=%s gravity=%s",
+            "FvHhaNode: color=%s depth=%s info=%s hha=%s preview=%s gravity=%s",
             color_topic_.c_str(), depth_topic_.c_str(), info_topic_.c_str(),
-            hha_topic_.c_str(), gravity_axis_.c_str());
+            hha_topic_.c_str(),
+            hha_preview_topic_.empty() ? "(none)" : hha_preview_topic_.c_str(),
+            gravity_axis_.c_str());
     }
 
 private:
@@ -176,12 +192,24 @@ private:
         std::vector<cv::Mat> channels = {ch_b, ch_g, ch_r};
         cv::merge(channels, hha);
 
-        // Publish
+        // Publish raw
         auto out = cv_bridge::CvImage(msg->header, "bgr8", hha).toImageMsg();
         if (!frame_id_.empty()) {
             out->header.frame_id = frame_id_;
         }
         pub_hha_->publish(*out);
+
+        // Publish compressed preview
+        if (pub_hha_preview_) {
+            std::vector<uchar> buf;
+            std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, hha_preview_quality_};
+            cv::imencode(".jpg", hha, buf, params);
+            auto comp = sensor_msgs::msg::CompressedImage();
+            comp.header = out->header;
+            comp.format = "jpeg";
+            comp.data.assign(buf.begin(), buf.end());
+            pub_hha_preview_->publish(comp);
+        }
     }
 
     // ---- Surface normal computation (image-based) ----
@@ -223,6 +251,8 @@ private:
 
     // ---- Members ----
     std::string color_topic_, depth_topic_, info_topic_, hha_topic_;
+    std::string hha_preview_topic_;
+    int hha_preview_quality_;
     std::string gravity_axis_, frame_id_;
     double depth_scale_, max_depth_, min_depth_;
     double height_min_, height_max_;
@@ -235,6 +265,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_color_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_depth_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_hha_;
+    rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_hha_preview_;
 };
 
 
