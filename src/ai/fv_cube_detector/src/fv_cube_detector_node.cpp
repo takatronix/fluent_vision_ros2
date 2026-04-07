@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <sstream>
 #include <iomanip>
 
@@ -40,6 +41,7 @@ const cv::Scalar FvCubeDetectorNode::CLASS_COLORS[NUM_CLASSES] = {
 FvCubeDetectorNode::FvCubeDetectorNode(const rclcpp::NodeOptions& options)
     : rclcpp::Node("cube_detector_node", options) {
   model_path_ = this->declare_parameter<std::string>("model_path", "");
+  auto trt_engine_path = this->declare_parameter<std::string>("trt_engine_path", "");
   input_image_topic_ = this->declare_parameter<std::string>(
       "input_image_topic", "/fv/d415/color/image_raw");
   conf_thres_ = this->declare_parameter<double>("conf_thres", 0.25);
@@ -59,22 +61,63 @@ FvCubeDetectorNode::FvCubeDetectorNode(const rclcpp::NodeOptions& options)
   int qos_depth = this->declare_parameter<int>("qos.queue_size", 10);
   auto qos = make_qos(qos_rel, qos_depth);
 
+  // Auto-detect TRT engine path: replace .onnx with .engine
+  if (trt_engine_path.empty() && !model_path_.empty()) {
+    auto pos = model_path_.rfind(".onnx");
+    if (pos != std::string::npos) {
+      trt_engine_path = model_path_.substr(0, pos) + ".engine";
+      // Check models/tensorrt/ path too
+      auto slash = trt_engine_path.rfind('/');
+      if (slash != std::string::npos) {
+        std::string dir = trt_engine_path.substr(0, slash);
+        // Try replacing /onnx/ with /tensorrt/
+        auto onnx_pos = dir.rfind("/onnx");
+        if (onnx_pos != std::string::npos) {
+          std::string trt_dir = dir.substr(0, onnx_pos) + "/tensorrt";
+          std::string trt_alt = trt_dir + trt_engine_path.substr(slash);
+          std::ifstream test(trt_alt);
+          if (test.good()) trt_engine_path = trt_alt;
+        }
+      }
+    }
+  }
+
   overlay_pub_ = this->create_publisher<Image>("overlay", qos);
   mask_pub_ = this->create_publisher<Image>("mask", qos);
   fv_dets_pub_ = this->create_publisher<DetectionArray>("detections", qos);
 
-  // Load model
-  inferencer_ = std::make_unique<OrtYoloSeg>();
-  if (!model_path_.empty()) {
-    bool loaded = inferencer_->load(model_path_, use_gpu_);
-    if (!loaded) {
-      RCLCPP_ERROR(this->get_logger(), "Failed to load model: %s", model_path_.c_str());
-    } else {
-      RCLCPP_INFO(this->get_logger(), "Model loaded: %s (device=%s)",
-                  model_path_.c_str(), inferencer_->device_name().c_str());
+  // Load model: TensorRT engine → ONNX Runtime (GPU) → ONNX Runtime (CPU)
+#ifdef FV_HAS_TENSORRT
+  if (use_gpu_ && !trt_engine_path.empty()) {
+    std::ifstream test(trt_engine_path);
+    if (test.good()) {
+      test.close();
+      trt_inferencer_ = std::make_unique<TrtYoloSeg>();
+      if (trt_inferencer_->load(trt_engine_path)) {
+        use_trt_ = true;
+        RCLCPP_INFO(this->get_logger(), "Model loaded: %s (device=TensorRT)",
+                    trt_engine_path.c_str());
+      } else {
+        trt_inferencer_.reset();
+        RCLCPP_WARN(this->get_logger(), "TRT engine load failed, falling back to ORT");
+      }
     }
-  } else {
-    RCLCPP_WARN(this->get_logger(), "No model_path specified");
+  }
+#endif
+
+  if (!use_trt_) {
+    inferencer_ = std::make_unique<OrtYoloSeg>();
+    if (!model_path_.empty()) {
+      bool loaded = inferencer_->load(model_path_, use_gpu_);
+      if (!loaded) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to load model: %s", model_path_.c_str());
+      } else {
+        RCLCPP_INFO(this->get_logger(), "Model loaded: %s (device=%s)",
+                    model_path_.c_str(), inferencer_->device_name().c_str());
+      }
+    } else {
+      RCLCPP_WARN(this->get_logger(), "No model_path specified");
+    }
   }
 
   image_sub_ = this->create_subscription<Image>(
@@ -117,9 +160,18 @@ void FvCubeDetectorNode::imageCallback(const Image::SharedPtr msg) {
 
   auto infer_start = std::chrono::steady_clock::now();
   SegResult res;
-  bool ok = inferencer_ && inferencer_->infer(
-      cv_ptr->image, static_cast<float>(conf_thres_),
-      static_cast<float>(iou_thres_), &res);
+  bool ok = false;
+#ifdef FV_HAS_TENSORRT
+  if (use_trt_ && trt_inferencer_) {
+    ok = trt_inferencer_->infer(cv_ptr->image, static_cast<float>(conf_thres_),
+                                 static_cast<float>(iou_thres_), &res);
+  } else
+#endif
+  {
+    ok = inferencer_ && inferencer_->infer(
+        cv_ptr->image, static_cast<float>(conf_thres_),
+        static_cast<float>(iou_thres_), &res);
+  }
   auto infer_end = std::chrono::steady_clock::now();
 
   if (!ok) {
@@ -363,7 +415,13 @@ void FvCubeDetectorNode::drawStats(cv::Mat& image) {
     ++line;
   };
 
-  put("CubeDetector (ONNX Runtime " + (inferencer_ ? inferencer_->device_name() : std::string("N/A")) + ")");
+  std::string dev_name;
+#ifdef FV_HAS_TENSORRT
+  if (use_trt_ && trt_inferencer_) dev_name = trt_inferencer_->device_name();
+  else
+#endif
+  dev_name = inferencer_ ? ("ONNX Runtime " + inferencer_->device_name()) : std::string("N/A");
+  put("CubeDetector (" + dev_name + ")");
   put("FPS: " + std::to_string(static_cast<int>(stats_fps_)));
   put("Inference: " + std::to_string(static_cast<int>(stats_inference_ms_)) + "ms");
   put("Cubes: " + std::to_string(stats_detection_count_));

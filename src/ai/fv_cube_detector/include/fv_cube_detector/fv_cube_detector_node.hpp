@@ -12,6 +12,9 @@
 #include <atomic>
 
 #include "fv_cube_detector/ort_yolo_seg.hpp"
+#ifdef FV_HAS_TENSORRT
+#include "fv_cube_detector/trt_yolo_seg.hpp"
+#endif
 
 namespace fv_cube_detector {
 
@@ -58,6 +61,10 @@ class FvCubeDetectorNode : public rclcpp::Node {
   rclcpp::Publisher<fv_msgs::msg::DetectionArray>::SharedPtr fv_dets_pub_;
 
   std::unique_ptr<OrtYoloSeg> inferencer_;
+#ifdef FV_HAS_TENSORRT
+  std::unique_ptr<TrtYoloSeg> trt_inferencer_;
+#endif
+  bool use_trt_ = false;
 
   std::string model_path_;
   std::string input_image_topic_;

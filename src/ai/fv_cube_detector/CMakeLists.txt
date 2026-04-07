@@ -41,6 +41,25 @@ endif()
 message(STATUS "ONNX Runtime include: ${ONNXRUNTIME_INCLUDE_DIR}")
 message(STATUS "ONNX Runtime lib: ${ONNXRUNTIME_LIB}")
 
+# TensorRT (optional GPU acceleration)
+find_path(TENSORRT_INCLUDE_DIR
+  NAMES NvInfer.h
+  PATHS /usr/include /usr/local/include
+        /usr/include/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu
+        /usr/include/aarch64-linux-gnu
+        /usr/include/x86_64-linux-gnu
+)
+find_library(NVINFER_LIB NAMES nvinfer)
+find_library(CUDART_LIB NAMES cudart PATHS /usr/local/cuda/lib64)
+
+set(FV_HAS_TENSORRT OFF)
+if(TENSORRT_INCLUDE_DIR AND NVINFER_LIB AND CUDART_LIB)
+  set(FV_HAS_TENSORRT ON)
+  message(STATUS "TensorRT found: ${NVINFER_LIB}")
+else()
+  message(STATUS "TensorRT not found. TRT backend disabled (ORT-only).")
+endif()
+
 include_directories(include)
 include_directories(${ONNXRUNTIME_INCLUDE_DIR})
 include_directories(${fluent_lib_INCLUDE_DIRS})
@@ -53,16 +72,33 @@ else()
   list(APPEND FV_OPENCV_LIBS ${OpenCV_LIBS})
 endif()
 
-add_executable(fv_cube_detector_node
+set(FV_CUBE_SOURCES
   src/ort_yolo_seg.cpp
   src/fv_cube_detector_node.cpp
 )
-
-target_link_libraries(fv_cube_detector_node
+set(FV_CUBE_LIBS
   ${ONNXRUNTIME_LIB}
   ${FV_OPENCV_LIBS}
   fluent_lib::fluent_lib
 )
+
+if(FV_HAS_TENSORRT)
+  list(APPEND FV_CUBE_SOURCES src/trt_yolo_seg.cpp)
+  list(APPEND FV_CUBE_LIBS ${NVINFER_LIB} ${CUDART_LIB})
+  include_directories(${TENSORRT_INCLUDE_DIR})
+  if(CUDART_LIB)
+    get_filename_component(_cuda_lib_dir ${CUDART_LIB} DIRECTORY)
+    include_directories(${_cuda_lib_dir}/../include)
+  endif()
+endif()
+
+add_executable(fv_cube_detector_node ${FV_CUBE_SOURCES})
+
+if(FV_HAS_TENSORRT)
+  target_compile_definitions(fv_cube_detector_node PRIVATE FV_HAS_TENSORRT)
+endif()
+
+target_link_libraries(fv_cube_detector_node ${FV_CUBE_LIBS})
 
 ament_target_dependencies(fv_cube_detector_node
   rclcpp sensor_msgs fv_msgs cv_bridge fluent_lib
