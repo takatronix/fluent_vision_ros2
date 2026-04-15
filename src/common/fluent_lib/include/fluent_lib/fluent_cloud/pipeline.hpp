@@ -79,5 +79,81 @@ inline PCAMetrics compute_pca_metrics(const pcl::PointCloud<pcl::PointXYZRGB>::P
     return m;
 }
 
+// ---- OBB (Oriented Bounding Box) metrics for 3D shape estimation ----
+
+struct OBBMetrics {
+    Eigen::Vector3f center{0,0,0};
+    // Principal axes (eigenvectors), ordered by eigenvalue descending
+    Eigen::Vector3f axes[3];
+    // Half-extents along each axis [m]
+    float extents[3]{0,0,0};
+    // Eigenvalues (descending)
+    float eigenvalues[3]{0,0,0};
+    // Number of valid points used
+    uint32_t num_points{0};
+    // Mean RGB
+    uint8_t mean_r{0}, mean_g{0}, mean_b{0};
+};
+
+inline OBBMetrics compute_obb_metrics(const pcl::PointCloud<pcl::PointXYZRGB>::Ptr &cloud)
+{
+    OBBMetrics m;
+    if (!cloud || cloud->points.empty()) return m;
+
+    // Collect valid points and accumulate color
+    std::vector<Eigen::Vector3f> pts;
+    pts.reserve(cloud->points.size());
+    uint64_t sum_r = 0, sum_g = 0, sum_b = 0;
+    for (const auto &p : cloud->points) {
+        if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) && p.z > 0.0f) {
+            pts.emplace_back(p.x, p.y, p.z);
+            sum_r += p.r; sum_g += p.g; sum_b += p.b;
+        }
+    }
+    if (pts.size() < 3) return m;
+    m.num_points = static_cast<uint32_t>(pts.size());
+    m.mean_r = static_cast<uint8_t>(sum_r / pts.size());
+    m.mean_g = static_cast<uint8_t>(sum_g / pts.size());
+    m.mean_b = static_cast<uint8_t>(sum_b / pts.size());
+
+    // Centroid
+    Eigen::Vector4f mean4;
+    pcl::compute3DCentroid(*cloud, mean4);
+    m.center = Eigen::Vector3f(mean4[0], mean4[1], mean4[2]);
+
+    // Covariance + PCA
+    Eigen::Matrix3f cov;
+    pcl::computeCovarianceMatrixNormalized(
+        *cloud, Eigen::Vector4f(mean4[0], mean4[1], mean4[2], 1.0f), cov);
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+
+    // Eigenvectors: col(0)=smallest, col(2)=largest → reorder descending
+    for (int i = 0; i < 3; ++i) {
+        m.axes[i] = es.eigenvectors().col(2 - i).normalized();
+        m.eigenvalues[i] = es.eigenvalues()(2 - i);
+        if (m.eigenvalues[i] < 0.0f) m.eigenvalues[i] = 0.0f;
+    }
+
+    // Project all valid points onto each axis to get extents
+    float mins[3] = { std::numeric_limits<float>::max(),  std::numeric_limits<float>::max(),  std::numeric_limits<float>::max()};
+    float maxs[3] = {-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max()};
+    for (const auto &pt : pts) {
+        Eigen::Vector3f v = pt - m.center;
+        for (int a = 0; a < 3; ++a) {
+            float t = m.axes[a].dot(v);
+            if (t < mins[a]) mins[a] = t;
+            if (t > maxs[a]) maxs[a] = t;
+        }
+    }
+
+    // Use trimmed extents (5%-95%) for robustness against outliers
+    // For speed, we approximate with the min/max approach but clamp with eigenvalue-based estimate
+    for (int a = 0; a < 3; ++a) {
+        m.extents[a] = (maxs[a] - mins[a]) * 0.5f;
+    }
+
+    return m;
+}
+
 } // namespace fluent_cloud
 

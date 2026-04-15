@@ -13,6 +13,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/StalkMetrics.msg"
   "msg/StalkMetricsArray.msg"
   "msg/DetectionCloudIndices.msg"
+  "msg/Object3D.msg"
+  "msg/Object3DArray.msg"
   DEPENDENCIES std_msgs geometry_msgs builtin_interfaces
 )
 

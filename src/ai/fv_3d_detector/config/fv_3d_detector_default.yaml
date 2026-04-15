@@ -1,0 +1,30 @@
+fv_3d_detector_node:
+  ros__parameters:
+    # Mode: "depth" (depth image + intrinsics) or "pointcloud" (organized PointCloud2)
+    mode: "depth"
+
+    # Input topics
+    mask_topic: "/d405_cube/mask"               # Binary mask (MONO8, 0=bg, 255=fg)
+    detections_topic: "/d405_cube/detections"    # DetectionArray from fv_instance_seg
+    depth_topic: "/d405_depth/filtered"          # Depth image (16UC1)
+    color_topic: "/d405_color/image_raw"         # Color image (BGR8/RGB8)
+    camera_info_topic: "/d405_depth/camera_info"
+    cloud_topic: "/d405/points"                  # Only used in pointcloud mode
+
+    # Output
+    output_topic: "~/objects_3d"
+    publish_markers: true
+    marker_topic: "~/markers"
+
+    # Depth settings
+    depth_scale: 0.001    # 16UC1 to meters (1 = 1mm for RealSense)
+    min_depth_m: 0.05
+    max_depth_m: 3.0
+
+    # Minimum points per detection to compute 3D
+    min_points: 10
+
+    # Shape classification thresholds (eigenvalue ratios)
+    shape:
+      cube_threshold: 0.4
+      plate_threshold: 0.25
