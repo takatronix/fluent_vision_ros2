@@ -1,0 +1,56 @@
+name: "Depth Anything V3"
+description: "RealSense → Depth Anything V3 (monocular depth estimation from RGB)"
+
+system:
+  camera_start_delay: 2.0
+  default_start_delay: 0.5
+
+nodes:
+  - id: realsense_1
+    enable: true
+    package: fv_realsense
+    exec: fv_realsense_node
+    node_name: realsense_1
+    namespace: /fv
+    parameters:
+      camera_selection:
+        selection_method: "auto"
+      camera:
+        color_width: 640
+        color_height: 480
+        color_fps: 15
+        depth_width: 640
+        depth_height: 480
+        depth_fps: 15
+    _template: fv_realsense
+
+  - id: depth_anything_1
+    enable: true
+    package: fv_depth_anything
+    exec: fv_depth_anything_node
+    node_name: depth_anything_1
+    namespace: /fv
+    parameters:
+      input_image_topic: /fv/realsense_1/color/image_raw
+      camera_info_topic: /fv/realsense_1/depth/camera_info
+      depth_topic: depth_anything/image
+      depth_colored_topic: depth_anything/image_color
+      pointcloud_topic: depth_anything/points
+      backend: "onnx"
+      model_path: "/ros2_ws/models/depth_anything_v3/onnx-community-small/onnx/model.onnx"
+      model_variant: "small"
+      inference_width: 518
+      inference_height: 518
+      min_depth_m: 0.1
+      max_depth_m: 10.0
+      metric_depth: false
+      publish_colored: true
+      publish_pointcloud: false
+      qos_reliability: "best_effort"
+      processing_frequency: 0.0
+      log_every_n_frames: 30
+    _template: fv_depth_anything
+
+layout:
+  realsense_1: { x: 50, y: 100, width: 180 }
+  depth_anything_1: { x: 300, y: 100, width: 180 }

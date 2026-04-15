@@ -1,0 +1,37 @@
+# node_manifest.yaml — fv_depth_anything
+# Depth Anything V3 Monocular Depth Estimation
+
+nodes:
+  - key: fv_depth_anything
+    package: fv_depth_anything
+    exec: fv_depth_anything_node
+    category: ai
+    label: "Depth Anything V3"
+
+    inputs:
+      - param: input_image_topic
+        type: image
+      - param: camera_info_topic
+        type: camera_info
+
+    outputs:
+      - param: depth_topic
+        type: depth
+        label: depth
+      - param: depth_colored_topic
+        type: image
+        label: depth_colored
+      - param: pointcloud_topic
+        type: pointcloud
+        label: pointcloud
+
+    default_parameters:
+      input_image_topic: ""
+      camera_info_topic: ""
+      depth_topic: ""
+      depth_colored_topic: ""
+      backend: "onnx"
+      model_path: "/ros2_ws/models/depth_anything_v3/onnx-community-small/onnx/model.onnx"
+      metric_depth: false
+      publish_colored: true
+      publish_pointcloud: false

@@ -1,0 +1,28 @@
+fv_depth_anything:
+  ros__parameters:
+    input_image_topic: "/fv/d405/color/image_raw"
+    camera_info_topic: "/fv/d405/depth/camera_info"
+
+    depth_topic: "depth_anything/image"
+    depth_colored_topic: "depth_anything/image_color"
+    pointcloud_topic: "depth_anything/points"
+    frame_id_override: ""
+
+    backend: "onnx"
+    model_path: "/ros2_ws/models/depth_anything_v3/DA3METRIC-LARGE.onnx"
+    model_variant: "large"
+
+    inference_width: 518
+    inference_height: 518
+
+    min_depth_m: 0.1
+    max_depth_m: 10.0
+    metric_depth: true
+    point_stride: 2
+    publish_pointcloud: true
+    publish_colored: true
+    colormap: 20
+
+    qos_reliability: "best_effort"
+    processing_frequency: 10.0  # Limit FPS for large model
+    log_every_n_frames: 30

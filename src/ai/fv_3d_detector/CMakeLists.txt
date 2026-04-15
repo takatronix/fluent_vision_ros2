@@ -15,6 +15,7 @@ find_package(pcl_conversions REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io)
 find_package(OpenCV REQUIRED)
 find_package(fv_msgs REQUIRED)
+find_package(fluent_lib QUIET)
 
 add_executable(fv_3d_detector_node
   src/fv_3d_detector_node.cpp
@@ -31,11 +32,17 @@ ament_target_dependencies(fv_3d_detector_node
 )
 
 # fluent_cloud/pipeline.hpp is header-only (PCL + Eigen only)
+# Use ament install path first, fall back to relative source path
+if(fluent_lib_FOUND)
+  set(FLUENT_LIB_INCLUDE "${fluent_lib_INCLUDE_DIRS}")
+else()
+  set(FLUENT_LIB_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../common/fluent_lib/include")
+endif()
 target_include_directories(fv_3d_detector_node
   PRIVATE
     ${PCL_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/fluent_lib/include
+    ${FLUENT_LIB_INCLUDE}
 )
 
 target_link_libraries(fv_3d_detector_node

@@ -50,3 +50,11 @@ docs/_build/
 .env
 .env.local
 config/secrets.yaml
+
+# Large model files (download via hf or scripts)
+models/depth_anything_v3/*.onnx
+models/depth_anything_v3/*.onnx_data
+models/depth_anything_v3/*.safetensors
+models/depth_anything_v3/DA3-SMALL/
+models/depth_anything_v3/onnx-community-small/
+models/depth_anything_v3/DA3METRIC-LARGE.onnx
