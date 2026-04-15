@@ -193,9 +193,29 @@ private:
             intr      = intr_;
             frame_id  = camera_frame_;
         }
-        if (!det_msg || det_msg->detections.empty()) return;
         if (!depth_msg || !intr.valid()) return;
         if (mask_msg->encoding != "mono8" && mask_msg->encoding != "8UC1") return;
+
+        // No detections: publish passthrough overlay and return
+        if (!det_msg || det_msg->detections.empty()) {
+            if (publish_overlay_ && color_msg && !color_msg->data.empty()
+                && overlay_pub_->get_subscription_count() > 0) {
+                cv::Mat passthrough(color_msg->height, color_msg->width, CV_8UC3,
+                    const_cast<uint8_t*>(color_msg->data.data()));
+                bool color_bgr = (color_msg->encoding == "bgr8" || color_msg->encoding == "8UC3");
+                cv::Mat bgr;
+                if (color_bgr) bgr = passthrough;
+                else cv::cvtColor(passthrough, bgr, cv::COLOR_RGB2BGR);
+                std::vector<uint8_t> jpeg_buf;
+                cv::imencode(".jpg", bgr, jpeg_buf, {cv::IMWRITE_JPEG_QUALITY, 80});
+                sensor_msgs::msg::CompressedImage comp_msg;
+                comp_msg.header = mask_msg->header;
+                comp_msg.format = "jpeg";
+                comp_msg.data = std::move(jpeg_buf);
+                overlay_pub_->publish(comp_msg);
+            }
+            return;
+        }
 
         const uint32_t mask_w = mask_msg->width;
         const uint32_t mask_h = mask_msg->height;

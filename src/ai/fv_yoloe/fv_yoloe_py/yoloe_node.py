@@ -18,6 +18,11 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+try:
+    from fv_msgs.msg import Detection2D, DetectionArray
+    _HAS_FV_MSGS = True
+except ImportError:
+    _HAS_FV_MSGS = False
 
 
 class FvYoloeNode(Node):
@@ -29,6 +34,7 @@ class FvYoloeNode(Node):
         self.declare_parameter("overlay_topic", "yoloe/overlay")
         self.declare_parameter("overlay_compressed_topic", "yoloe/overlay/compressed")
         self.declare_parameter("detections_topic", "yoloe/detections")
+        self.declare_parameter("mask_topic", "yoloe/mask")
 
         # Model
         self.declare_parameter("model_name", "yoloe-11s-seg.pt")
@@ -52,6 +58,7 @@ class FvYoloeNode(Node):
         self.overlay_topic = str(self.get_parameter("overlay_topic").value)
         self.overlay_compressed_topic = str(self.get_parameter("overlay_compressed_topic").value)
         self.detections_topic = str(self.get_parameter("detections_topic").value)
+        self.mask_topic = str(self.get_parameter("mask_topic").value)
 
         self.model_name = str(self.get_parameter("model_name").value)
         self.device_mode = str(self.get_parameter("device").value)
@@ -72,6 +79,13 @@ class FvYoloeNode(Node):
             CompressedImage, self.overlay_compressed_topic, 10
         )
         self.detections_pub = self.create_publisher(String, self.detections_topic, 10)
+        if _HAS_FV_MSGS:
+            self.detections_fv_pub = self.create_publisher(
+                DetectionArray, self.detections_topic, 10
+            )
+        else:
+            self.detections_fv_pub = None
+        self.mask_pub = self.create_publisher(Image, self.mask_topic, 10)
 
         # Load model
         self._model = None
@@ -203,6 +217,20 @@ class FvYoloeNode(Node):
         # Draw overlay
         overlay = result.plot()
 
+        # Add stats overlay text at top
+        proc_ms_now = (time.perf_counter() - start) * 1000.0
+        n_det = len(result.boxes) if result.boxes is not None else 0
+        device_str = getattr(self, '_device', '?')
+        info_text = f"{self.model_name} | {device_str} | {proc_ms_now:.0f}ms | {n_det} det"
+        prompt_text = f"Prompt: {', '.join(self._current_classes)}"
+        w_img = overlay.shape[1]
+        # Background bar at top
+        cv2.rectangle(overlay, (0, 0), (w_img, 44), (0, 0, 0), -1)
+        cv2.putText(overlay, info_text, (8, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 200, 255), 1, cv2.LINE_AA)
+        cv2.putText(overlay, prompt_text, (8, 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 220, 150), 1, cv2.LINE_AA)
+
         header = msg.header
 
         # Publish raw overlay
@@ -217,10 +245,28 @@ class FvYoloeNode(Node):
         comp_msg.data = jpeg_data.tobytes()
         self.overlay_compressed_pub.publish(comp_msg)
 
-        # Publish detections as JSON string
-        if result.boxes is not None and len(result.boxes) > 0:
-            import json
-            dets = []
+        # Publish combined instance mask (for fv_3d_detector input)
+        if result.masks is not None and len(result.masks) > 0:
+            h, w = img_bgr.shape[:2]
+            combined_mask = np.zeros((h, w), dtype=np.uint8)
+            for i, mask_data in enumerate(result.masks.data):
+                m = mask_data.cpu().numpy()
+                if m.shape != (h, w):
+                    m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+                combined_mask[m > 0.5] = i + 1  # instance ID (1-based)
+            mask_msg = self._cv2_to_imgmsg(combined_mask, "mono8", header)
+            self.mask_pub.publish(mask_msg)
+
+        # Stats
+        self._frame_counter += 1
+        proc_ms = (time.perf_counter() - start) * 1000.0
+        self._proc_ms_acc += proc_ms
+        n_det = len(result.boxes) if result.boxes is not None else 0
+
+        # Publish detections + stats as JSON
+        import json
+        dets = []
+        if result.boxes is not None:
             for i, box in enumerate(result.boxes):
                 cls_id = int(box.cls[0])
                 cls_name = result.names.get(cls_id, str(cls_id))
@@ -230,21 +276,49 @@ class FvYoloeNode(Node):
                     "class": cls_name, "conf": round(conf, 3),
                     "bbox": [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)]
                 })
-            det_msg = String()
-            det_msg.data = json.dumps(dets)
-            self.detections_pub.publish(det_msg)
 
-        # Stats
-        self._frame_counter += 1
-        proc_ms = (time.perf_counter() - start) * 1000.0
-        self._proc_ms_acc += proc_ms
+        avg_ms = self._proc_ms_acc / self._frame_counter if self._frame_counter > 0 else proc_ms
+        det_msg = String()
+        det_msg.data = json.dumps({
+            "detections": dets,
+            "stats": {
+                "model": self.model_name,
+                "device": getattr(self, '_device', 'unknown'),
+                "inference_ms": round(proc_ms, 1),
+                "avg_ms": round(avg_ms, 1),
+                "fps": round(1000.0 / avg_ms, 1) if avg_ms > 0 else 0,
+                "frame": self._frame_counter,
+                "classes": self._current_classes,
+                "num_detections": n_det,
+            }
+        })
+        self.detections_pub.publish(det_msg)
+
+        # Publish fv_msgs/DetectionArray for fv_3d_detector compatibility
+        if self.detections_fv_pub is not None and result.boxes is not None:
+            from geometry_msgs.msg import Point32
+            det_arr = DetectionArray()
+            det_arr.header = header
+            for i, box in enumerate(result.boxes):
+                d = Detection2D()
+                d.header = header
+                d.id = i
+                d.class_id = int(box.cls[0])
+                d.label = result.names.get(d.class_id, str(d.class_id))
+                d.conf_fused = float(box.conf[0])
+                d.conf_object = float(box.conf[0])
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                d.bbox_min = Point32(x=float(x1), y=float(y1), z=0.0)
+                d.bbox_max = Point32(x=float(x2), y=float(y2), z=0.0)
+                d.mask_instance_id = i + 1
+                det_arr.detections.append(d)
+            self.detections_fv_pub.publish(det_arr)
+
         if self._frame_counter % self.log_every_n_frames == 0:
-            avg = self._proc_ms_acc / float(self.log_every_n_frames)
-            fps = 1000.0 / avg if avg > 0 else 0
-            n_det = len(result.boxes) if result.boxes is not None else 0
             self._proc_ms_acc = 0.0
+            self._frame_counter = 0
             self.get_logger().info(
-                f"frames={self._frame_counter} avg={avg:.1f}ms ({fps:.1f}fps) "
+                f"avg={avg_ms:.1f}ms ({1000/avg_ms:.1f}fps) "
                 f"detections={n_det} classes={self._current_classes}"
             )
 
