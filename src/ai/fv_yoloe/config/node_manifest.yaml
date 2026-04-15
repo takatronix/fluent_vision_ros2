@@ -1,0 +1,29 @@
+# node_manifest.yaml — fv_yoloe
+# YOLOE Open-Vocabulary Detection & Segmentation
+
+nodes:
+  - key: fv_yoloe
+    package: fv_yoloe
+    exec: fv_yoloe_node
+    category: ai
+    label: "YOLOE"
+
+    inputs:
+      - param: input_image_topic
+        type: image
+
+    outputs:
+      - param: overlay_compressed_topic
+        type: image
+        label: overlay
+      - param: detections_topic
+        type: string
+        label: detections
+
+    default_parameters:
+      input_image_topic: ""
+      overlay_topic: ""
+      overlay_compressed_topic: ""
+      model_name: "yoloe-11s-seg.pt"
+      text_prompt: "cube"
+      device: "auto"

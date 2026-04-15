@@ -1,0 +1,27 @@
+fv_yoloe:
+  ros__parameters:
+    input_image_topic: "/d405_color/image_raw"
+
+    overlay_topic: "yoloe/overlay"
+    overlay_compressed_topic: "yoloe/overlay/compressed"
+    detections_topic: "yoloe/detections"
+
+    # Model (auto-downloads from ultralytics hub)
+    # Options: yoloe-11s-seg.pt (fastest), yoloe-11l-seg.pt (best accuracy)
+    model_name: "yoloe-11s-seg.pt"
+    device: "auto"
+    conf_threshold: 0.25
+    iou_threshold: 0.5
+
+    # Text prompt: comma-separated object names
+    # Change at runtime via topic ~/set_prompt or ros2 topic pub
+    text_prompt: "cube"
+
+    # Topic to receive new prompts (publish std_msgs/String)
+    prompt_topic: "~/set_prompt"
+
+    # Performance
+    processing_frequency: 10.0
+    qos_reliability: "best_effort"
+    log_every_n_frames: 30
+    jpeg_quality: 80
