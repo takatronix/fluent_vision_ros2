@@ -73,10 +73,11 @@ class FvYoloeNode(Node):
         self.log_every_n_frames = max(1, int(self.get_parameter("log_every_n_frames").value))
         self.jpeg_quality = int(self.get_parameter("jpeg_quality").value)
 
-        # Publishers
-        self.overlay_pub = self.create_publisher(Image, self.overlay_topic, 10)
+        # Publishers (use sensor QoS = BEST_EFFORT for streaming topics)
+        qos_pub = self._sensor_qos()
+        self.overlay_pub = self.create_publisher(Image, self.overlay_topic, qos_pub)
         self.overlay_compressed_pub = self.create_publisher(
-            CompressedImage, self.overlay_compressed_topic, 10
+            CompressedImage, self.overlay_compressed_topic, qos_pub
         )
         self.detections_pub = self.create_publisher(String, self.detections_topic, 10)
         if _HAS_FV_MSGS:
@@ -85,7 +86,7 @@ class FvYoloeNode(Node):
             )
         else:
             self.detections_fv_pub = None
-        self.mask_pub = self.create_publisher(Image, self.mask_topic, 10)
+        self.mask_pub = self.create_publisher(Image, self.mask_topic, qos_pub)
 
         # Load model
         self._model = None
