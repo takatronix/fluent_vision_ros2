@@ -247,16 +247,16 @@ class FvYoloeNode(Node):
         self.overlay_compressed_pub.publish(comp_msg)
 
         # Publish combined instance mask (for fv_3d_detector input)
+        h, w = img_bgr.shape[:2]
+        combined_mask = np.zeros((h, w), dtype=np.uint8)
         if result.masks is not None and len(result.masks) > 0:
-            h, w = img_bgr.shape[:2]
-            combined_mask = np.zeros((h, w), dtype=np.uint8)
             for i, mask_data in enumerate(result.masks.data):
                 m = mask_data.cpu().numpy()
                 if m.shape != (h, w):
                     m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
                 combined_mask[m > 0.5] = i + 1  # instance ID (1-based)
-            mask_msg = self._cv2_to_imgmsg(combined_mask, "mono8", header)
-            self.mask_pub.publish(mask_msg)
+        mask_msg = self._cv2_to_imgmsg(combined_mask, "mono8", header)
+        self.mask_pub.publish(mask_msg)
 
         # Stats
         self._frame_counter += 1
