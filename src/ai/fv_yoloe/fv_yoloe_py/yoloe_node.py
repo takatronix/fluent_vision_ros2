@@ -79,7 +79,13 @@ class FvYoloeNode(Node):
         self.overlay_compressed_pub = self.create_publisher(
             CompressedImage, self.overlay_compressed_topic, qos_pub
         )
-        self.detections_pub = self.create_publisher(String, self.detections_topic, 10)
+        # Two publishers, distinct topics so Foxglove/rqt don't see the same
+        # name with two different schemas:
+        #   <detections_topic>       -> fv_msgs/DetectionArray (primary, for ROS nodes)
+        #   <detections_topic>/json  -> std_msgs/String        (JSON debug dump)
+        self.detections_pub = self.create_publisher(
+            String, f'{self.detections_topic}/json', 10
+        )
         if _HAS_FV_MSGS:
             self.detections_fv_pub = self.create_publisher(
                 DetectionArray, self.detections_topic, 10
