@@ -60,6 +60,15 @@ public:
         stride_           = get_param(*this, "stride",            1);
         frame_id_         = get_param(*this, "frame_id",          std::string(""));
         color_timeout_ms_ = get_param(*this, "color_timeout_ms",  1000);
+        // Max publish rate in Hz. 0 = unlimited (publish on every valid depth).
+        // Throttling here keeps downstream consumers (octomap, foxglove_bridge)
+        // from being starved by a 30Hz full-cloud firehose.
+        publish_hz_       = get_param(*this, "publish_hz",        0.0);
+        // Skip pixels whose BGR all exceed this threshold (overexposed/white).
+        // D405 auto-exposure occasionally blows out highlights into (255,255,255);
+        // those pixels poison ColorOcTree voxels white. 0-254 = threshold,
+        // 255 or -1 = disable this filter.
+        overexposed_threshold_ = get_param(*this, "overexposed_threshold", 250);
 
         if (stride_ < 1) stride_ = 1;
 
@@ -129,6 +138,18 @@ private:
         if (!enabled_.load()) {
             return;
         }
+        // Rate limiter: honor publish_hz_ by dropping depth frames that arrive
+        // faster than the configured interval. Keeps octomap / foxglove_bridge
+        // from being saturated by a high-rate cloud.
+        if (publish_hz_ > 0.0) {
+            const auto now = this->get_clock()->now();
+            const double min_interval_s = 1.0 / publish_hz_;
+            if (last_publish_time_.nanoseconds() != 0) {
+                const double since_last = (now - last_publish_time_).seconds();
+                if (since_last < min_interval_s) return;
+            }
+            last_publish_time_ = now;
+        }
 
         double fx, fy, cx, cy;
         {
@@ -178,6 +199,14 @@ private:
         const int color_h = has_fresh_color ? color_bgr.rows : 0;
         const int color_w = has_fresh_color ? color_bgr.cols : 0;
 
+        // When RGB is requested but no color frame is fresh, skip this depth
+        // entirely rather than emitting a grayscale fallback. Otherwise the
+        // fallback points (all near-white in close range) get permanently
+        // burned into downstream accumulators like octomap_server.
+        if (include_rgb && !has_fresh_color) {
+            return;
+        }
+
         // Build point cloud as float array: XYZ (3) or XYZRGB-packed-float (4).
         std::vector<float> points;
         const size_t floats_per_point = include_rgb ? 4u : 3u;
@@ -206,6 +235,18 @@ private:
                         const int rr = std::min(color_h - 1, (r * color_h) / h);
                         const int cc = std::min(color_w - 1, (c * color_w) / w);
                         const cv::Vec3b bgr = color_bgr.at<cv::Vec3b>(rr, cc);
+                        // Skip overexposed pixels that would poison ColorOcTree white.
+                        if (overexposed_threshold_ > 0 && overexposed_threshold_ < 255) {
+                            if (bgr[0] >= overexposed_threshold_ &&
+                                bgr[1] >= overexposed_threshold_ &&
+                                bgr[2] >= overexposed_threshold_) {
+                                // roll back the XYZ we just pushed for this pixel
+                                points.pop_back();  // z
+                                points.pop_back();  // y
+                                points.pop_back();  // x
+                                continue;
+                            }
+                        }
                         packed_rgb =
                             (static_cast<uint32_t>(bgr[2]) << 16) |
                             (static_cast<uint32_t>(bgr[1]) << 8) |
@@ -288,7 +329,18 @@ private:
     bool has_color_ = false;
 
     // Enable/disable control
-    std::atomic<bool> enabled_{false};
+    // Default to ON: point cloud generation is a prerequisite for octomap /
+    // other consumers; having it gated off by default means every restart
+    // needs an explicit dashboard / topic_pub to resume. Dashboard can still
+    // flip it via /depth_camera_pointcloud/enable at any time.
+    std::atomic<bool> enabled_{true};
+
+    // Publish rate limiter (0 = unlimited)
+    double publish_hz_ = 0.0;
+    rclcpp::Time last_publish_time_{0, 0, RCL_ROS_TIME};
+
+    // Per-pixel white/overexposure rejection threshold (applied to BGR channels)
+    int overexposed_threshold_ = 250;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr sub_enable_;
 
     // ROS
