@@ -1,0 +1,57 @@
+# node_manifest.yaml — fv_policy_runner
+nodes:
+  - key: fv_policy_runner
+    package: fv_policy_runner
+    exec: fv_policy_runner_node
+    category: ai
+    label: "Policy Runner"
+    inputs:
+      - param: image_topics
+        type: image
+        label: "Images"
+      - param: state_topic
+        type: any
+        label: "State"
+      - param: trigger_topic
+        type: any
+        label: "Start"
+      - param: stop_topic
+        type: any
+        label: "Stop"
+      - param: policy_select_topic
+        type: any
+        label: "Policy Select"
+      - param: prompt_topic
+        type: any
+        label: "Prompt"
+    outputs:
+      - param: action_topic
+        type: any
+        label: "Action"
+      - param: joint_action_topic
+        type: any
+        label: "Joint Action"
+      - param: status_topic
+        type: any
+        label: "Status"
+      - param: trajectory_topic
+        type: any
+        label: "Trajectory Markers"
+    default_parameters:
+      backend_endpoint: "http://127.0.0.1:8000/infer"
+      observation_format: "aloha"
+      default_policy_id: "pi0"
+      compare_policy_ids: []
+      publish_hz: 10.0
+      profile_path: ""
+      profile_arm_namespace: ""
+      trajectory_topic: "policy/trajectory_markers"
+      trajectory_mode: "action_xyz"
+      trajectory_frame_id: "base_link"
+      trajectory_action_indices: [0, 1, 2]
+      trajectory_scale: 1.0
+      trajectory_line_width: 0.02
+      trajectory_fk_urdf_topic: "/robot_description"
+      trajectory_fk_base_link: "base_link"
+      trajectory_fk_tip_link: "gripper_tip"
+      trajectory_fk_joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"]
