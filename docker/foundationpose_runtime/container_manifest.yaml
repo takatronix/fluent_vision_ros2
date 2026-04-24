@@ -1,0 +1,19 @@
+containers:
+  - key: foundationpose_runtime
+    label: "FoundationPose Runtime"
+    category: ai_runtime
+    image: "foundationpose-runtime:latest"
+    default_parameters:
+      image: "foundationpose-runtime:latest"
+      container_name: "fv-foundationpose-runtime"
+      network_host: true
+      gpu: true
+      env:
+        ISAAC_ROS_WS: "/workspaces/isaac_ros-dev"
+      volumes:
+        - host: "/mnt/nova_ssd/workspaces/isaac_ros-dev"
+          container: "/workspaces/isaac_ros-dev"
+      command:
+        - "bash"
+        - "-lc"
+        - "sleep infinity"

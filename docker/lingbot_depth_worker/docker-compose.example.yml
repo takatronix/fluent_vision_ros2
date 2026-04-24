@@ -1,0 +1,24 @@
+services:
+  lingbot-depth-worker:
+    build:
+      context: ../..
+      dockerfile: docker/lingbot_depth_worker/Dockerfile
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}
+        TORCH_PACKAGES: ${TORCH_PACKAGES:-torch==2.6.0 torchvision}
+        INSTALL_XFORMERS: ${INSTALL_XFORMERS:-0}
+    image: lingbot-depth-worker:latest
+    network_mode: host
+    deploy: {}
+    environment:
+      MODEL_ID: ${MODEL_ID:-robbyant/lingbot-depth-pretrain-vitl-14-v0.5}
+      DEVICE: ${DEVICE:-auto}
+      USE_FP16: ${USE_FP16:-1}
+      APPLY_MASK: ${APPLY_MASK:-1}
+      RESOLUTION_LEVEL: ${RESOLUTION_LEVEL:-9}
+      LISTEN_PORT: ${LISTEN_PORT:-5540}
+      FALLBACK_PASSTHROUGH: ${FALLBACK_PASSTHROUGH:-1}
+    volumes:
+      - ${HF_HOME:-/tmp/lingbot-hf-cache}:/root/.cache/huggingface
+    gpus: all
+    restart: unless-stopped

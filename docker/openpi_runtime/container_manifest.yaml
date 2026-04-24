@@ -1,0 +1,22 @@
+containers:
+  - key: openpi_runtime
+    label: "OpenPI Runtime"
+    category: ai_runtime
+    image: "openpi-runtime:latest"
+    default_parameters:
+      image: "openpi-runtime:latest"
+      container_name: "fv-openpi-runtime"
+      network_host: true
+      gpu: true
+      env:
+        OPENPI_PORT: "8000"
+        OPENPI_SERVER_MODE: "http"
+        OPENPI_POLICY_SPECS: "pi0:pi0_aloha_sim:gs://openpi-assets/checkpoints/pi0_aloha_sim"
+      volumes:
+        - host: "/home/aspa/daihen-physical-ai/data/.cache/openpi"
+          container: "/root/.cache/openpi"
+        - host: "/home/aspa/daihen-physical-ai/data/.cache/huggingface"
+          container: "/root/.cache/huggingface"
+        - host: "/home/aspa/daihen-physical-ai/data/.cache/uv"
+          container: "/root/.cache/uv"
+      command: []

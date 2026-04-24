@@ -1,0 +1,17 @@
+containers:
+  - key: lingbot_depth_worker
+    label: "LingBot Depth Worker"
+    category: ai_runtime
+    image: "lingbot-depth-worker:latest"
+    default_parameters:
+      image: "lingbot-depth-worker:latest"
+      container_name: "fv-lingbot-depth-worker"
+      network_host: true
+      gpu: true
+      env:
+        MODEL_ID: "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
+        LISTEN_PORT: "5540"
+      volumes:
+        - host: "/home/aspa/daihen-physical-ai/data/.cache/huggingface"
+          container: "/root/.cache/huggingface"
+      command: []

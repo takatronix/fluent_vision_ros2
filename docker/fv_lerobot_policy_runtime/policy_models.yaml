@@ -1,0 +1,73 @@
+models:
+  - key: pi05_week19_morikawa_all_30k
+    name: Pi05-Week19-Morikawa-All_30k
+    policy_type: pi05
+    model_id: 4734b5bf-be26-511a-85cb-4e2574baa0d4
+    model_path: /data/models/4734b5bf-be26-511a-85cb-4e2574baa0d4
+    local: true
+    training_steps: 30000
+    image_names:
+      - top_camera
+      - arm_camera
+    state_dim: 7
+    action_dim: 7
+  - key: pi05_week19_morikawa_all_20k
+    name: Pi05-Week19-Morikawa-All_20k
+    policy_type: pi05
+    model_id: 669ce87f-8cfa-5836-8f29-b9c3f6e650cf
+    model_path: /data/models/669ce87f-8cfa-5836-8f29-b9c3f6e650cf
+    local: true
+    training_steps: 20000
+    image_names:
+      - top_camera
+      - arm_camera
+    state_dim: 7
+    action_dim: 7
+  - key: pi05_week19_morikawa_all_10k
+    name: Pi05-Week19-Morikawa-All_10k
+    policy_type: pi05
+    model_id: 1dc2af59-2d87-52f9-99af-fae7c6335bcf
+    model_path: /data/models/1dc2af59-2d87-52f9-99af-fae7c6335bcf
+    local: true
+    training_steps: 10000
+    image_names:
+      - top_camera
+      - arm_camera
+    state_dim: 7
+    action_dim: 7
+  - key: pi05_week19_morikawa_otsuka_green_30k
+    name: Pi05-week19-morikawa-otsuka-green-30k
+    policy_type: pi05
+    model_id: 96e73c66-ed86-47d0-9123-4f314e64a928
+    model_path: /data/models/96e73c66-ed86-47d0-9123-4f314e64a928
+    local: true
+    training_steps: 30000
+    image_names:
+      - top_camera
+      - arm_camera
+    state_dim: 7
+    action_dim: 7
+  - key: pi05_week19_morikawa_otsuka_green_20k
+    name: Pi05-week19-morikawa-otsuka-green-20k
+    policy_type: pi05
+    model_id: 6ea9ef2a-00c1-45ef-bc41-17905e1fabab
+    model_path: /data/models/6ea9ef2a-00c1-45ef-bc41-17905e1fabab
+    local: true
+    training_steps: 20000
+    image_names:
+      - top_camera
+      - arm_camera
+    state_dim: 7
+    action_dim: 7
+  - key: pi05_week19_morikawa_all_40k
+    name: Pi05-Week19-Morikawa-All_40k
+    policy_type: pi05
+    model_id: 0562db94-3d8f-56dc-8e83-a8f833e4ee47
+    model_path: /data/models/0562db94-3d8f-56dc-8e83-a8f833e4ee47
+    local: false
+    training_steps: 40000
+    image_names:
+      - top_camera
+      - arm_camera
+    state_dim: 7
+    action_dim: 7
