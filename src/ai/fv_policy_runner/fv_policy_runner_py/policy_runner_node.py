@@ -243,6 +243,7 @@ class FvPolicyRunnerNode(Node):
         self.declare_parameter("policy_gripper_state_override", False)
         self.declare_parameter("policy_gripper_joint_name", "gripper")
         self.declare_parameter("policy_gripper_state_value", 5.6)
+        self.declare_parameter("policy_gripper_output_scale", 1.0)
         self.declare_parameter("trajectory_fk_urdf_topic", "")
         self.declare_parameter("trajectory_fk_urdf_topic_timeout_sec", 3.0)
         self.declare_parameter("trajectory_fk_urdf_path", "")
@@ -342,6 +343,7 @@ class FvPolicyRunnerNode(Node):
         self.policy_gripper_state_override = bool(self.get_parameter("policy_gripper_state_override").value)
         self.policy_gripper_joint_name = str(self.get_parameter("policy_gripper_joint_name").value).strip()
         self.policy_gripper_state_value = float(self.get_parameter("policy_gripper_state_value").value)
+        self.policy_gripper_output_scale = float(self.get_parameter("policy_gripper_output_scale").value)
         self.trajectory_fk_urdf_topic = str(self.get_parameter("trajectory_fk_urdf_topic").value)
         self.trajectory_fk_urdf_topic_timeout_sec = max(
             0.1,
@@ -622,6 +624,10 @@ class FvPolicyRunnerNode(Node):
         )
 
     def _on_image(self, slot: ImageSlot, msg: Image) -> None:
+        # Skip decode when idle so an inactive runner doesn't burn CPU on
+        # every camera frame. Trigger -> first frame after that gets stored.
+        if not self._running:
+            return
         try:
             image = self.bridge.imgmsg_to_cv2(msg, desired_encoding=self.image_transport_encoding)
             stamp_sec = _stamp_to_sec(msg.header.stamp)
@@ -633,6 +639,9 @@ class FvPolicyRunnerNode(Node):
             slot.stamp_sec = stamp_sec
 
     def _on_compressed_image(self, slot: ImageSlot, msg: CompressedImage) -> None:
+        # Skip JPEG decode when idle (see _on_image).
+        if not self._running:
+            return
         try:
             data = np.frombuffer(bytes(msg.data), dtype=np.uint8)
             image_bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
@@ -654,12 +663,17 @@ class FvPolicyRunnerNode(Node):
             self._state_stamp_sec = _stamp_to_sec(msg.header.stamp)
 
     def _on_trigger(self, msg: Bool) -> None:
-        rising = bool(msg.data) and not self._last_trigger
+        # Treat any True as "start" rather than requiring a False→True
+        # edge. Controllers that send idempotent triggers (dashboard,
+        # MCP) shouldn't need to track the runner's previous state.
         self._last_trigger = bool(msg.data)
-        if rising:
-            with self._lock:
-                self._running = True
-                self._queue.clear()
+        if not msg.data:
+            return
+        with self._lock:
+            was_running = self._running
+            self._running = True
+            self._queue.clear()
+        if not was_running:
             self._publish_status("trigger")
 
     def _on_stop(self, msg: Bool) -> None:
@@ -845,8 +859,16 @@ class FvPolicyRunnerNode(Node):
         self._publish_status("infer_done")
 
     def _publish_action(self, action: np.ndarray) -> None:
-        msg = Float32MultiArray()
         action_values = [float(x) for x in action.tolist()]
+
+        if self.policy_gripper_output_scale != 1.0 and self.action_joint_names:
+            name = self.policy_gripper_joint_name
+            for i, n in enumerate(self.action_joint_names):
+                if n == name and i < len(action_values):
+                    action_values[i] = action_values[i] * self.policy_gripper_output_scale
+                    break
+
+        msg = Float32MultiArray()
         msg.data = action_values
         self._action_pub.publish(msg)
 

@@ -102,8 +102,10 @@ void FVUSBCameraNode::loadParameters()
         this->declare_parameter("camera.hue", -1);
     camera_config_.gain = 
         this->declare_parameter("camera.gain", -1);
-    camera_config_.exposure = 
+    camera_config_.exposure =
         this->declare_parameter("camera.exposure", -1);
+    camera_config_.rotate_180 =
+        this->declare_parameter("camera.rotate_180", false);
     
     // Stream settings
     stream_config_.color_enabled = 
@@ -116,9 +118,21 @@ void FVUSBCameraNode::loadParameters()
         this->declare_parameter("camera_info.enable_camera_info", true);
     camera_info_config_.enable_compressed_topics = 
         this->declare_parameter("camera_info.enable_compressed_topics", true);
-    camera_info_config_.compressed_quality = 
+    camera_info_config_.compressed_quality =
         this->declare_parameter("camera_info.compressed_quality", 85);
-    
+    // Intrinsic overrides — leave <=0 to fall back to image-center / 1000px focal.
+    camera_info_config_.fx =
+        this->declare_parameter("camera_info.fx", -1.0);
+    camera_info_config_.fy =
+        this->declare_parameter("camera_info.fy", -1.0);
+    camera_info_config_.cx =
+        this->declare_parameter("camera_info.cx", -1.0);
+    camera_info_config_.cy =
+        this->declare_parameter("camera_info.cy", -1.0);
+    camera_info_config_.distortion =
+        this->declare_parameter<std::vector<double>>(
+            "camera_info.distortion", std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
+
     // Services
     services_config_.get_camera_info_enabled = 
         this->declare_parameter("services.get_camera_info_enabled", true);
@@ -387,7 +401,12 @@ void FVUSBCameraNode::processingLoop()
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        
+
+        // Apply 180-degree rotation for physically inverted mounts.
+        if (camera_config_.rotate_180) {
+            cv::rotate(frame, frame, cv::ROTATE_180);
+        }
+
         // Update frame
         {
             std::lock_guard<std::mutex> lock(frame_mutex_);
@@ -515,24 +534,29 @@ void FVUSBCameraNode::updateCameraInfo()
     camera_info_msg_.width = camera_.get(cv::CAP_PROP_FRAME_WIDTH);
     camera_info_msg_.height = camera_.get(cv::CAP_PROP_FRAME_HEIGHT);
     
-    // Set default camera matrix (identity)
-    camera_info_msg_.k[0] = 1000.0;  // fx
-    camera_info_msg_.k[4] = 1000.0;  // fy
-    camera_info_msg_.k[2] = camera_info_msg_.width / 2.0;   // cx
-    camera_info_msg_.k[5] = camera_info_msg_.height / 2.0;  // cy
+    // Camera matrix — use parameter overrides when provided, otherwise fall
+    // back to image-center principal point and 1000 px focal length.
+    const double fx = (camera_info_config_.fx > 0.0)
+                        ? camera_info_config_.fx : 1000.0;
+    const double fy = (camera_info_config_.fy > 0.0)
+                        ? camera_info_config_.fy : 1000.0;
+    const double cx = (camera_info_config_.cx > 0.0)
+                        ? camera_info_config_.cx : camera_info_msg_.width / 2.0;
+    const double cy = (camera_info_config_.cy > 0.0)
+                        ? camera_info_config_.cy : camera_info_msg_.height / 2.0;
+    camera_info_msg_.k[0] = fx;
+    camera_info_msg_.k[4] = fy;
+    camera_info_msg_.k[2] = cx;
+    camera_info_msg_.k[5] = cy;
     camera_info_msg_.k[1] = 0.0;
     camera_info_msg_.k[3] = 0.0;
     camera_info_msg_.k[6] = 0.0;
     camera_info_msg_.k[7] = 0.0;
     camera_info_msg_.k[8] = 1.0;
-    
-    // Set distortion coefficients (no distortion)
-    camera_info_msg_.d.resize(5);
-    camera_info_msg_.d[0] = 0.0;  // k1
-    camera_info_msg_.d[1] = 0.0;  // k2
-    camera_info_msg_.d[2] = 0.0;  // p1
-    camera_info_msg_.d[3] = 0.0;  // p2
-    camera_info_msg_.d[4] = 0.0;  // k3
+
+    // Distortion — parameter (defaults to 5 zeros = no distortion).
+    camera_info_msg_.d = camera_info_config_.distortion;
+    camera_info_msg_.distortion_model = "plumb_bob";
     
     // Set projection matrix
     camera_info_msg_.p[0] = camera_info_msg_.k[0];

@@ -15,6 +15,7 @@
 #include <string>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 #include <opencv2/opencv.hpp>
 
 // Include service headers
@@ -53,6 +54,7 @@ private:
         int hue = -1;
         int gain = -1;
         int exposure = -1;
+        bool rotate_180 = false;  // physically inverted mounts (e.g., overhead C920)
     };
 
     struct StreamConfig
@@ -66,6 +68,12 @@ private:
         bool enable_camera_info = true;
         bool enable_compressed_topics = true;
         int compressed_quality = 85;
+        // Optional intrinsic overrides. <= 0 means "use default" (image center / 1000 px focal).
+        double fx = -1.0;
+        double fy = -1.0;
+        double cx = -1.0;
+        double cy = -1.0;
+        std::vector<double> distortion;  // empty = zero distortion
     };
 
     struct ServicesConfig
