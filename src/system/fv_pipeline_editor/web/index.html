@@ -66,6 +66,11 @@ body {
   border-color: var(--danger);
   color: var(--danger);
 }
+#toolbar button.has-running {
+  border-color: var(--success);
+  color: var(--success);
+  box-shadow: 0 0 14px rgba(0, 230, 118, 0.18);
+}
 
 #toolbar .sep {
   width: 1px;
@@ -243,6 +248,272 @@ body {
   color: var(--danger);
 }
 
+/* --- Docker panel --- */
+#dockerPanel {
+  display: none;
+  position: absolute;
+  top: 54px;
+  right: 16px;
+  width: min(880px, calc(100vw - 32px));
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  background:
+    radial-gradient(circle at 20% 0%, rgba(0, 217, 255, 0.13), transparent 30%),
+    linear-gradient(135deg, rgba(22,33,62,0.98), rgba(12,18,35,0.98));
+  border: 1px solid rgba(0, 217, 255, 0.28);
+  border-radius: 14px;
+  padding: 14px;
+  z-index: 145;
+  box-shadow: 0 18px 70px rgba(0,0,0,0.42);
+}
+#dockerPanel.open { display: block; }
+#dockerPanel h3 {
+  font-size: 16px;
+  margin-bottom: 3px;
+  color: var(--accent);
+}
+.docker-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+.docker-subtitle {
+  font-size: 12px;
+  color: var(--text2);
+  line-height: 1.45;
+}
+.docker-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(90px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.docker-metric {
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  padding: 9px 10px;
+  background: rgba(0,0,0,0.19);
+}
+.docker-metric-value {
+  font-size: 18px;
+  color: var(--text);
+}
+.docker-metric-label {
+  font-size: 10px;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  margin-top: 2px;
+}
+.docker-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.docker-actions select {
+  flex: 1.4;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+}
+.docker-actions button {
+  flex: 0.7;
+  padding: 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+.docker-main {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(320px, 0.95fr);
+  gap: 12px;
+}
+.docker-card {
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  background: rgba(0,0,0,0.14);
+  padding: 12px;
+}
+.docker-template-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.docker-template-card {
+  border: 1px solid rgba(0, 217, 255, 0.18);
+  border-radius: 10px;
+  padding: 9px;
+  background: rgba(0, 217, 255, 0.045);
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.15s, background 0.15s;
+}
+.docker-template-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  background: rgba(0, 217, 255, 0.09);
+}
+.docker-template-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  margin-bottom: 5px;
+}
+.docker-template-meta {
+  font-size: 10px;
+  color: var(--text2);
+  line-height: 1.35;
+  word-break: break-all;
+}
+.docker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.docker-section-title {
+  margin: 14px 0 8px;
+  font-size: 11px;
+  color: var(--text2);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.docker-item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(0,0,0,0.15);
+  cursor: pointer;
+}
+.docker-item.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(0, 217, 255, 0.25) inset;
+}
+.docker-item-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+.docker-item-meta {
+  font-size: 11px;
+  color: var(--text2);
+  margin-bottom: 8px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+.docker-item-detail {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  margin-bottom: 8px;
+}
+.docker-chip {
+  border-radius: 999px;
+  padding: 3px 7px;
+  background: rgba(255,255,255,0.06);
+  color: var(--text2);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.docker-item-row {
+  display: flex;
+  gap: 6px;
+}
+.docker-item-row button {
+  flex: 1;
+  padding: 5px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 11px;
+}
+.docker-status-running { color: var(--success); }
+.docker-status-exited,
+.docker-status-stopped,
+.docker-status-error { color: var(--danger); }
+.docker-status-created,
+.docker-status-starting { color: #ffa726; }
+.docker-editor {
+  margin-top: 0;
+  border-top: 0;
+  padding-top: 0;
+}
+.docker-editor label {
+  display: block;
+  font-size: 12px;
+  color: var(--text2);
+  margin-bottom: 4px;
+  margin-top: 8px;
+}
+.docker-editor input,
+.docker-editor select,
+.docker-editor textarea {
+  width: 100%;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  font-family: monospace;
+}
+.docker-editor textarea {
+  min-height: 260px;
+  resize: vertical;
+}
+.docker-editor-buttons {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+.docker-editor-buttons button {
+  flex: 1;
+  padding: 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+.docker-empty {
+  font-size: 12px;
+  color: var(--text2);
+  padding: 8px 0;
+}
+@media (max-width: 760px) {
+  #dockerPanel {
+    right: 8px;
+    width: calc(100vw - 16px);
+  }
+  .docker-header,
+  .docker-main {
+    display: block;
+  }
+  .docker-summary,
+  .docker-template-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .docker-card {
+    margin-bottom: 10px;
+  }
+}
+
 /* --- Log panel --- */
 #logPanel {
   position: absolute;
@@ -371,6 +642,7 @@ body {
   <div class="sep"></div>
   <button id="btnLaunchAll" class="primary">Launch All</button>
   <button id="btnStopAll" class="danger">Stop All</button>
+  <button id="btnDocker">Docker <span id="dockerToolbarCount">0/0</span></button>
   <div class="sep"></div>
   <span id="pipelineDir" title="Pipeline directory"></span>
 </div>
@@ -404,6 +676,47 @@ body {
     <button id="btnEditStop">Stop</button>
     <button class="danger" id="btnEditDelete">Delete</button>
     <button id="btnEditClose">Close</button>
+  </div>
+</div>
+
+<!-- Docker panel -->
+<div id="dockerPanel">
+  <div class="docker-header">
+    <div>
+      <h3>Docker Runtimes</h3>
+      <div class="docker-subtitle">GPU-heavy policy/depth workers live outside the ROS2 process. Save the container spec with the pipeline, then start it before the dependent nodes.</div>
+    </div>
+    <div class="docker-actions">
+      <select id="dockerTemplateSelect"></select>
+      <button id="btnDockerAdd">Add</button>
+      <button id="btnDockerRefresh">Refresh</button>
+      <button id="btnDockerClose">Close</button>
+    </div>
+  </div>
+  <div id="dockerSummary" class="docker-summary"></div>
+  <div class="docker-main">
+    <div class="docker-card">
+      <div class="docker-section-title">Runtime Templates</div>
+      <div id="dockerTemplateGrid" class="docker-template-grid"></div>
+      <div class="docker-section-title">Pipeline Containers</div>
+      <div id="dockerList" class="docker-list"></div>
+    </div>
+    <div class="docker-card docker-editor">
+      <div class="docker-section-title">Container Editor</div>
+      <label>Container ID</label>
+      <input id="dockerEditId" type="text" placeholder="openpi_runtime_1">
+      <label>Template</label>
+      <select id="dockerEditTemplate"></select>
+      <label>Parameters (JSON)</label>
+      <textarea id="dockerEditParams"></textarea>
+      <div class="docker-editor-buttons">
+        <button id="btnDockerApply">Apply</button>
+        <button id="btnDockerStart">Start</button>
+        <button id="btnDockerStop">Stop</button>
+        <button id="btnDockerLogs">Logs</button>
+        <button id="btnDockerRemove">Remove</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -473,6 +786,7 @@ const STATUS_COLORS = {
 // ---------------------------------------------------------------------------
 let ws = null;
 let templates = {};
+let containerTemplates = {};
 let portCompat = {};
 let nodes = [];       // Graph nodes for rendering
 let edges = [];       // Connection edges
@@ -480,7 +794,14 @@ let nodeMap = {};     // id -> node
 
 // Pipeline data
 let pipelineNodes = [];  // Serializable pipeline node data
+let pipelineContainers = []; // Serializable pipeline container data
 let currentPipeline = '';
+let pipelineSystem = {
+  camera_start_delay: 2.0,
+  default_start_delay: 0.5,
+  container_start_delay: 1.0,
+};
+let pipelineExtras = {};
 let pipelineList = [];
 let builtinList = [];
 let pipelineDir = '~/.fluent_vision/pipelines';
@@ -497,6 +818,8 @@ let hoverNode = null;
 let hoverPort = null;
 let selectedNode = null;
 let nodeStatuses = {};
+let containerStatuses = {};
+let selectedContainerId = '';
 
 // Animation
 let animating = false;
@@ -556,6 +879,7 @@ function addLog(level, badge, message) {
 }
 
 function escapeHtml(str) {
+  str = String(str ?? '');
   return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
@@ -623,6 +947,7 @@ function connectWS() {
     addLog('success', 'ws', 'WebSocket connected');
     wsSend({ type: 'get_templates' });
     wsSend({ type: 'list_pipelines' });
+    refreshContainerStatuses();
   };
 
   ws.onmessage = (evt) => {
@@ -656,11 +981,17 @@ function handleWSMessage(msg) {
   switch (msg.type) {
     case 'templates':
       templates = msg.templates || {};
+      containerTemplates = msg.container_templates || {};
       portCompat = msg.port_compat || {};
       for (const k of Object.keys(templates)) {
         delete templates[k]._manifest_path;
       }
+      for (const k of Object.keys(containerTemplates)) {
+        delete containerTemplates[k]._manifest_path;
+      }
       addLog('info', 'ws', `Loaded ${Object.keys(templates).length} node templates`);
+      addLog('info', 'ws', `Loaded ${Object.keys(containerTemplates).length} container templates`);
+      renderDockerPanel();
       if (pipelineNodes.length > 0) buildGraph();
       break;
 
@@ -735,11 +1066,17 @@ function handleWSMessage(msg) {
 
     case 'launch_pipeline_result':
       addLog('success', 'launch', `Pipeline launched: ${(msg.launched||[]).length} nodes [${(msg.launched||[]).join(', ')}]`);
+      if ((msg.launched_containers || []).length) {
+        addLog('success', 'launch', `Containers launched: ${(msg.launched_containers || []).join(', ')}`);
+      }
       toast(`Launched ${(msg.launched||[]).length} nodes`);
       break;
 
     case 'stop_pipeline_result':
       addLog('info', 'stop', `Pipeline stopped: ${(msg.stopped||[]).length} nodes`);
+      if ((msg.stopped_containers||[]).length) {
+        addLog('info', 'stop', `Containers stopped: ${(msg.stopped_containers||[]).join(', ')}`);
+      }
       toast(`Stopped ${(msg.stopped||[]).length} nodes`);
       // Unsubscribe all previews
       for (const nodeId of Object.keys(nodePreviewTopic)) {
@@ -754,6 +1091,53 @@ function handleWSMessage(msg) {
         if (st === 'running' && !nodePreviewTopic[nid]) subscribeNodePreview(nid);
       }
       render();
+      break;
+
+    case 'container_launch_result':
+      if (msg.success) {
+        containerStatuses[msg.container_id] = {
+          status: msg.status || 'running',
+          health: msg.health || '',
+          container_name: msg.container_name || '',
+        };
+        addLog('success', 'launch', `${msg.container_id} → ${msg.status || 'running'}`);
+      } else {
+        addLog('error', 'launch', `${msg.container_id} → FAILED: ${msg.message || 'unknown error'}`);
+      }
+      renderDockerPanel();
+      break;
+
+    case 'container_stop_result':
+      if (msg.success) {
+        containerStatuses[msg.container_id] = {
+          status: 'stopped',
+          health: '',
+        };
+        addLog('info', 'stop', `${msg.container_id} → stopped`);
+      }
+      renderDockerPanel();
+      break;
+
+    case 'container_status':
+      containerStatuses[msg.container_id] = {
+        ...(containerStatuses[msg.container_id] || {}),
+        status: msg.status,
+        health: msg.health || '',
+      };
+      renderDockerPanel();
+      break;
+
+    case 'container_statuses':
+      containerStatuses = msg.statuses || {};
+      renderDockerPanel();
+      break;
+
+    case 'container_logs':
+      if (msg.success) {
+        addLog('info', 'status', `[${msg.container_id}] logs\n${msg.logs || ''}`);
+      } else {
+        addLog('error', 'status', `[${msg.container_id}] log fetch failed: ${msg.message || ''}`);
+      }
       break;
 
     case 'error':
@@ -778,6 +1162,409 @@ function subscribeNodePreview(nodeId) {
       }
     }
   }
+}
+
+function openDockerPanel() {
+  document.getElementById('dockerPanel').classList.add('open');
+  refreshContainerStatuses();
+  renderDockerTemplateOptions();
+  if (!selectedContainerId && pipelineContainers.length > 0) {
+    selectedContainerId = pipelineContainers[0].id;
+  }
+  renderDockerPanel();
+}
+
+function closeDockerPanel() {
+  document.getElementById('dockerPanel').classList.remove('open');
+}
+
+function dockerStatusClass(status) {
+  return `docker-status-${(status || 'unknown').toLowerCase()}`;
+}
+
+function refreshContainerStatuses() {
+  wsSend({
+    type: 'get_container_statuses',
+    containers: pipelineContainers.map(c => ({
+      id: c.id,
+      template: c.template,
+      parameters: cloneJson(c.parameters || {}),
+    })),
+  });
+}
+
+function renderDockerTemplateOptions() {
+  const selects = [
+    document.getElementById('dockerTemplateSelect'),
+    document.getElementById('dockerEditTemplate'),
+  ];
+  const keys = Object.keys(containerTemplates).sort();
+  for (const sel of selects) {
+    if (!sel) continue;
+    const current = sel.value;
+    sel.innerHTML = keys.map((key) => {
+      const tmpl = containerTemplates[key] || {};
+      return `<option value="${escapeHtml(key)}">${escapeHtml(tmpl.label || key)}</option>`;
+    }).join('');
+    if (current && keys.includes(current)) {
+      sel.value = current;
+    } else if (keys.length) {
+      sel.value = keys[0];
+    }
+  }
+}
+
+function cloneJson(obj) {
+  return JSON.parse(JSON.stringify(obj || {}));
+}
+
+function getPipelineContainer(containerId) {
+  return pipelineContainers.find(c => c.id === containerId) || null;
+}
+
+function defaultContainerIdFromTemplate(templateKey) {
+  let idx = 1;
+  let candidate = `${templateKey}_${idx}`;
+  while (getPipelineContainer(candidate)) {
+    idx += 1;
+    candidate = `${templateKey}_${idx}`;
+  }
+  return candidate;
+}
+
+function selectContainer(containerId) {
+  selectedContainerId = containerId || '';
+  const item = getPipelineContainer(selectedContainerId);
+  const idEl = document.getElementById('dockerEditId');
+  const tmplEl = document.getElementById('dockerEditTemplate');
+  const paramsEl = document.getElementById('dockerEditParams');
+  if (!item) {
+    idEl.value = '';
+    if (tmplEl.options.length > 0) tmplEl.selectedIndex = 0;
+    const templateKey = tmplEl.value;
+    const tmpl = containerTemplates[templateKey] || {};
+    paramsEl.value = JSON.stringify(cloneJson(tmpl.default_parameters || {}), null, 2);
+    renderDockerPanel();
+    return;
+  }
+  idEl.value = item.id || '';
+  tmplEl.value = item.template || '';
+  paramsEl.value = JSON.stringify(cloneJson(item.parameters || {}), null, 2);
+  renderDockerPanel();
+}
+
+function addContainerToPipeline() {
+  const templateKey = document.getElementById('dockerTemplateSelect').value;
+  const tmpl = containerTemplates[templateKey];
+  if (!tmpl) return;
+  const containerId = defaultContainerIdFromTemplate(templateKey);
+  pipelineContainers.push({
+    id: containerId,
+    enable: true,
+    template: templateKey,
+    parameters: cloneJson(tmpl.default_parameters || {}),
+  });
+  markDirty();
+  selectContainer(containerId);
+}
+
+function applyContainerEdit() {
+  const idEl = document.getElementById('dockerEditId');
+  const tmplEl = document.getElementById('dockerEditTemplate');
+  const paramsEl = document.getElementById('dockerEditParams');
+  const containerId = (idEl.value || '').trim();
+  const templateKey = (tmplEl.value || '').trim();
+  if (!containerId) {
+    toast('Container ID is required', true);
+    return false;
+  }
+  if (!templateKey || !containerTemplates[templateKey]) {
+    toast('Template is required', true);
+    return false;
+  }
+
+  let params = {};
+  try {
+    params = paramsEl.value.trim() ? JSON.parse(paramsEl.value) : {};
+  } catch (err) {
+    toast('Invalid container JSON: ' + err.message, true);
+    return false;
+  }
+
+  const existingIdx = pipelineContainers.findIndex(c => c.id === selectedContainerId);
+  const duplicateIdx = pipelineContainers.findIndex(c => c.id === containerId);
+  if (duplicateIdx >= 0 && duplicateIdx !== existingIdx) {
+    toast('Container ID already exists in pipeline', true);
+    return false;
+  }
+
+  const nextItem = {
+    id: containerId,
+    enable: true,
+    template: templateKey,
+    parameters: params,
+  };
+
+  if (existingIdx >= 0) {
+    pipelineContainers[existingIdx] = nextItem;
+  } else {
+    pipelineContainers.push(nextItem);
+  }
+  selectedContainerId = containerId;
+  markDirty();
+  renderDockerPanel();
+  return true;
+}
+
+function removeSelectedContainer() {
+  if (!selectedContainerId) return;
+  pipelineContainers = pipelineContainers.filter(c => c.id !== selectedContainerId);
+  delete containerStatuses[selectedContainerId];
+  selectedContainerId = '';
+  markDirty();
+  selectContainer('');
+}
+
+function launchContainer(containerId) {
+  const item = getPipelineContainer(containerId);
+  if (!item) {
+    const tmpl = containerTemplates[containerId];
+    if (!tmpl) return;
+    wsSend({
+      type: 'launch_container',
+      container_id: containerId,
+      template_key: containerId,
+      parameters: cloneJson(tmpl.default_parameters || {}),
+    });
+    return;
+  }
+  wsSend({
+    type: 'launch_container',
+    container_id: item.id,
+    template_key: item.template,
+    parameters: cloneJson(item.parameters || {}),
+  });
+}
+
+function stopContainer(containerId) {
+  const item = getPipelineContainer(containerId);
+  wsSend({
+    type: 'stop_container',
+    container_id: containerId,
+    template_key: item ? item.template : containerId,
+    parameters: item ? cloneJson(item.parameters || {}) : cloneJson((containerTemplates[containerId] || {}).default_parameters || {}),
+  });
+}
+
+function fetchContainerLogs(containerId) {
+  const item = getPipelineContainer(containerId);
+  wsSend({
+    type: 'get_container_logs',
+    container_id: containerId,
+    template_key: item ? item.template : containerId,
+    parameters: item ? cloneJson(item.parameters || {}) : cloneJson((containerTemplates[containerId] || {}).default_parameters || {}),
+  });
+}
+
+function containerStatusMetrics() {
+  let running = 0;
+  let healthy = 0;
+  let error = 0;
+  for (const item of pipelineContainers) {
+    const st = containerStatuses[item.id] || {};
+    const status = (st.status || 'stopped').toLowerCase();
+    const health = (st.health || '').toLowerCase();
+    if (status === 'running') running += 1;
+    if (health === 'healthy') healthy += 1;
+    if (status === 'error' || status === 'exited' || health === 'unhealthy') error += 1;
+  }
+  return {
+    total: pipelineContainers.length,
+    running,
+    healthy,
+    error,
+  };
+}
+
+function updateDockerToolbarBadge() {
+  const metrics = containerStatusMetrics();
+  const count = document.getElementById('dockerToolbarCount');
+  const btn = document.getElementById('btnDocker');
+  if (count) count.textContent = `${metrics.running}/${metrics.total}`;
+  if (btn) btn.classList.toggle('has-running', metrics.running > 0);
+}
+
+function renderDockerSummary() {
+  const el = document.getElementById('dockerSummary');
+  if (!el) return;
+  const metrics = containerStatusMetrics();
+  el.innerHTML = [
+    ['Configured', metrics.total],
+    ['Running', metrics.running],
+    ['Healthy', metrics.healthy],
+    ['Needs Attention', metrics.error],
+  ].map(([label, value]) => `
+    <div class="docker-metric">
+      <div class="docker-metric-value">${escapeHtml(value)}</div>
+      <div class="docker-metric-label">${escapeHtml(label)}</div>
+    </div>
+  `).join('');
+  updateDockerToolbarBadge();
+}
+
+function renderDockerTemplateGrid() {
+  const grid = document.getElementById('dockerTemplateGrid');
+  if (!grid) return;
+  const keys = Object.keys(containerTemplates).sort();
+  if (!keys.length) {
+    grid.innerHTML = '<div class="docker-empty">No runtime templates loaded.</div>';
+    return;
+  }
+  grid.innerHTML = keys.map((key) => {
+    const tmpl = containerTemplates[key] || {};
+    const params = tmpl.default_parameters || {};
+    const gpu = params.gpu ? 'GPU' : 'CPU';
+    const net = params.network_host ? 'host network' : 'mapped ports';
+    const image = params.image || tmpl.image || '';
+    return `
+      <div class="docker-template-card" onclick="addDefaultContainerToPipeline(${JSON.stringify(key)})">
+        <div class="docker-template-title">
+          <strong>${escapeHtml(tmpl.label || key)}</strong>
+          <span>${escapeHtml(gpu)}</span>
+        </div>
+        <div class="docker-template-meta">${escapeHtml(net)}<br>${escapeHtml(image)}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderDockerPanel() {
+  const list = document.getElementById('dockerList');
+  if (!list) return;
+  renderDockerSummary();
+  renderDockerTemplateGrid();
+
+  if (!selectedContainerId && pipelineContainers.length > 0) {
+    selectedContainerId = pipelineContainers[0].id;
+  }
+
+  if (Object.keys(containerTemplates).length === 0) {
+    list.innerHTML = '<div class="docker-empty">No container templates loaded.</div>';
+    return;
+  }
+
+  renderDockerTemplateOptions();
+
+  if (pipelineContainers.length === 0) {
+    list.innerHTML = '<div class="docker-empty">No containers saved in this pipeline yet.</div>';
+  } else {
+    const html = pipelineContainers.map((item) => {
+      const tmpl = containerTemplates[item.template] || {};
+      const st = containerStatuses[item.id] || {};
+      const defaultParams = tmpl.default_parameters || {};
+      const merged = { ...cloneJson(defaultParams), ...cloneJson(item.parameters || {}) };
+      const status = st.status || 'stopped';
+      const health = st.health ? ` / ${st.health}` : '';
+      const image = (merged.image || tmpl.image || '').toString();
+      const containerName = (st.container_name || merged.container_name || item.id).toString();
+      const network = merged.network_host ? 'net=host' : 'ports';
+      const gpu = merged.gpu ? 'gpu=all' : 'gpu=off';
+      const selectedClass = item.id === selectedContainerId ? ' selected' : '';
+      return `
+        <div class="docker-item${selectedClass}" onclick="selectContainer(${JSON.stringify(item.id)})">
+          <div class="docker-item-title">
+            <strong>${escapeHtml(item.id)}</strong>
+            <span class="${dockerStatusClass(status)}">${escapeHtml(status + health)}</span>
+          </div>
+          <div class="docker-item-meta">${escapeHtml(tmpl.label || item.template)}<br>${escapeHtml(containerName)}<br>${escapeHtml(image)}</div>
+          <div class="docker-item-detail">
+            <span class="docker-chip">${escapeHtml(gpu)}</span>
+            <span class="docker-chip">${escapeHtml(network)}</span>
+          </div>
+          <div class="docker-item-row">
+            <button onclick="event.stopPropagation(); launchContainer(${JSON.stringify(item.id)})">Start</button>
+            <button onclick="event.stopPropagation(); stopContainer(${JSON.stringify(item.id)})">Stop</button>
+            <button onclick="event.stopPropagation(); fetchContainerLogs(${JSON.stringify(item.id)})">Logs</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+    list.innerHTML = html;
+  }
+
+  const item = getPipelineContainer(selectedContainerId);
+  const idEl = document.getElementById('dockerEditId');
+  const tmplEl = document.getElementById('dockerEditTemplate');
+  const paramsEl = document.getElementById('dockerEditParams');
+  if (item) {
+    idEl.value = item.id || '';
+    tmplEl.value = item.template || tmplEl.value;
+    paramsEl.value = JSON.stringify(cloneJson(item.parameters || {}), null, 2);
+  } else if (!idEl.value) {
+    paramsEl.value = paramsEl.value || JSON.stringify(cloneJson((containerTemplates[tmplEl.value] || {}).default_parameters || {}), null, 2);
+  }
+}
+
+function updateDockerEditorTemplate() {
+  const tmplEl = document.getElementById('dockerEditTemplate');
+  const paramsEl = document.getElementById('dockerEditParams');
+  const templateKey = tmplEl.value;
+  if (selectedContainerId && getPipelineContainer(selectedContainerId)) return;
+  paramsEl.value = JSON.stringify(cloneJson((containerTemplates[templateKey] || {}).default_parameters || {}), null, 2);
+}
+
+function startSelectedContainer() {
+  if (!applyContainerEdit()) return;
+  launchContainer(selectedContainerId);
+}
+
+function stopSelectedContainer() {
+  if (!selectedContainerId) return;
+  stopContainer(selectedContainerId);
+}
+
+function fetchSelectedContainerLogs() {
+  if (!selectedContainerId) return;
+  fetchContainerLogs(selectedContainerId);
+}
+
+function addDefaultContainerToPipeline(templateKey) {
+  const tmpl = containerTemplates[templateKey] || {};
+  const containerId = defaultContainerIdFromTemplate(templateKey);
+  pipelineContainers.push({
+    id: containerId,
+    enable: true,
+    template: templateKey,
+    parameters: cloneJson(tmpl.default_parameters || {}),
+  });
+  markDirty();
+  selectContainer(containerId);
+}
+
+function renderDockerPanelLegacyTemplates() {
+  const keys = Object.keys(containerTemplates).sort();
+  return keys.map((key) => {
+    const tmpl = containerTemplates[key] || {};
+    const st = containerStatuses[key] || {};
+    const status = st.status || 'stopped';
+    const health = st.health ? ` / ${st.health}` : '';
+    const image = (tmpl.image || (tmpl.default_parameters || {}).image || '').toString();
+    const containerName = (st.container_name || (tmpl.default_parameters || {}).container_name || key).toString();
+    return `
+      <div class="docker-item">
+        <div class="docker-item-title">
+          <strong>${escapeHtml(tmpl.label || key)}</strong>
+          <span class="${dockerStatusClass(status)}">${escapeHtml(status + health)}</span>
+        </div>
+        <div class="docker-item-meta">${escapeHtml(containerName)}<br>${escapeHtml(image)}</div>
+        <div class="docker-item-row">
+          <button onclick="event.stopPropagation(); addDefaultContainerToPipeline('${key}')">Add to Pipeline</button>
+          <button onclick="event.stopPropagation(); launchContainer('${key}')">Quick Start</button>
+          <button onclick="event.stopPropagation(); fetchContainerLogs('${key}')">Logs</button>
+        </div>
+      </div>
+    `;
+  }).join('');
 }
 
 function unsubscribeNodePreview(nodeId) {
@@ -858,6 +1645,15 @@ function updatePipelineSelect() {
 function loadPipelineData(name, data, isBuiltin) {
   currentPipeline = name;
   pipelineNodes = data.nodes || [];
+  pipelineContainers = data.containers || [];
+  pipelineSystem = cloneJson(data.system || pipelineSystem);
+  pipelineExtras = cloneJson(data || {});
+  delete pipelineExtras.name;
+  delete pipelineExtras.system;
+  delete pipelineExtras.containers;
+  delete pipelineExtras.nodes;
+  delete pipelineExtras.layout;
+  selectedContainerId = pipelineContainers.length > 0 ? pipelineContainers[0].id : '';
   dirty = false;
 
   // Restore layout positions
@@ -872,6 +1668,7 @@ function loadPipelineData(name, data, isBuiltin) {
 
   buildGraph();
   autoFitView();
+  renderDockerPanel();
   toast(`Loaded: ${name}${isBuiltin ? ' (builtin)' : ''}`);
 }
 
@@ -893,11 +1690,10 @@ function buildPipelineData() {
   }
 
   return {
+    ...cloneJson(pipelineExtras),
     name: currentPipeline || 'Untitled',
-    system: {
-      camera_start_delay: 2.0,
-      default_start_delay: 0.5,
-    },
+    system: cloneJson(pipelineSystem),
+    containers: pipelineContainers,
     nodes: pipelineNodes.filter(pn => !pn._isTopicSource),
     layout: layout,
   };
@@ -1848,9 +2644,18 @@ document.getElementById('btnAddNode').onclick = showPalette;
 document.getElementById('btnNew').onclick = () => {
   const name = prompt('Pipeline name:');
   if (!name) return;
+  pipelineSystem = {
+    camera_start_delay: 2.0,
+    default_start_delay: 0.5,
+    container_start_delay: 1.0,
+  };
+  pipelineExtras = {};
   currentPipeline = name;
   pipelineNodes = [];
+  pipelineContainers = [];
+  selectedContainerId = '';
   buildGraph();
+  renderDockerPanel();
   dirty = true;
 };
 
@@ -1887,7 +2692,7 @@ document.getElementById('pipelineSelect').onchange = (e) => {
   }
 
   // Stop all running nodes first
-  wsSend({ type: 'stop_pipeline' });
+  wsSend({ type: 'stop_pipeline', pipeline: buildPipelineData() });
 
   const [prefix, name] = val.split(':');
   wsSend({
@@ -1903,8 +2708,18 @@ document.getElementById('btnLaunchAll').onclick = () => {
 };
 
 document.getElementById('btnStopAll').onclick = () => {
-  wsSend({ type: 'stop_pipeline' });
+  wsSend({ type: 'stop_pipeline', pipeline: buildPipelineData() });
 };
+document.getElementById('btnDocker').onclick = openDockerPanel;
+document.getElementById('btnDockerRefresh').onclick = refreshContainerStatuses;
+document.getElementById('btnDockerClose').onclick = closeDockerPanel;
+document.getElementById('btnDockerAdd').onclick = addContainerToPipeline;
+document.getElementById('btnDockerApply').onclick = applyContainerEdit;
+document.getElementById('btnDockerStart').onclick = startSelectedContainer;
+document.getElementById('btnDockerStop').onclick = stopSelectedContainer;
+document.getElementById('btnDockerLogs').onclick = fetchSelectedContainerLogs;
+document.getElementById('btnDockerRemove').onclick = removeSelectedContainer;
+document.getElementById('dockerEditTemplate').onchange = updateDockerEditorTemplate;
 
 // Edit panel buttons
 document.getElementById('btnEditApply').onclick = applyEdit;
@@ -1939,9 +2754,18 @@ function markDirty() {
 
 function clearCanvas() {
   pipelineNodes = [];
+  pipelineContainers = [];
   currentPipeline = '';
+  pipelineSystem = {
+    camera_start_delay: 2.0,
+    default_start_delay: 0.5,
+    container_start_delay: 1.0,
+  };
+  pipelineExtras = {};
+  selectedContainerId = '';
   dirty = false;
   buildGraph();
+  renderDockerPanel();
 }
 
 function autoFitView() {
@@ -1986,6 +2810,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     hidePalette();
     closeEditPanel();
+    closeDockerPanel();
     wiring = null;
     render();
   }

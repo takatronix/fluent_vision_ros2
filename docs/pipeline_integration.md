@@ -154,6 +154,14 @@ modified: "2026-02-14T12:00:00"
 system:
   camera_start_delay: 2.0
   default_start_delay: 0.5
+  container_start_delay: 1.0
+
+containers:
+  - id: <一意のコンテナID>
+    enable: true
+    template: <container_template_key>
+    parameters:
+      <key>: <value>
 
 nodes:
   - id: <一意のノードID>
@@ -177,6 +185,27 @@ layout:
 | `~/.fluent_vision/pipelines/` | デフォルト（ユーザー用） |
 | `fluent_vision_ros2/pipelines/` | ビルトイン（読み取り専用） |
 | 任意のディレクトリ | UIから切り替え可能 |
+
+### 3.3 Container 拡張
+
+重い推論 runtime を Docker に分離する場合、pipeline YAML に `containers:` を持てる。
+
+- `template`: `docker/**/container_manifest.yaml` の `containers[].key`
+- `parameters`: template の `default_parameters` を上書き
+- `system.container_start_delay`: container 起動後に次へ進むまでの待ち時間
+
+典型例:
+
+```yaml
+containers:
+  - id: openpi_runtime_1
+    enable: true
+    template: openpi_runtime
+    parameters:
+      container_name: "fv-openpi-runtime"
+      env:
+        OPENPI_PORT: "8000"
+```
 
 ---
 

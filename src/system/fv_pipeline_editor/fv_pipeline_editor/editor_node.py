@@ -15,6 +15,7 @@ import asyncio
 import glob as globmod
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -102,6 +103,44 @@ def load_node_manifests(search_roots: List[str]) -> Dict[str, Dict]:
                 }
         except Exception as e:
             print(f"[manifest] Error loading {path}: {e}", file=sys.stderr)
+
+    return templates
+
+
+def find_container_manifest_files(search_roots: List[str]) -> List[str]:
+    """Find all container_manifest.yaml files under search roots."""
+    paths = []
+    for root in search_roots:
+        root = os.path.expanduser(root)
+        pattern = os.path.join(root, '**', 'container_manifest.yaml')
+        paths.extend(globmod.glob(pattern, recursive=True))
+    return sorted(set(paths))
+
+
+def load_container_manifests(search_roots: List[str]) -> Dict[str, Dict]:
+    """Load all container_manifest.yaml files and return unified template dict."""
+    templates: Dict[str, Dict] = {}
+    manifest_files = find_container_manifest_files(search_roots)
+
+    for path in manifest_files:
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f)
+            if not data or 'containers' not in data:
+                continue
+            for cont_def in data['containers']:
+                key = cont_def.get('key')
+                if not key:
+                    continue
+                templates[key] = {
+                    'label': cont_def.get('label', key),
+                    'category': cont_def.get('category', 'ai_runtime'),
+                    'image': cont_def.get('image', ''),
+                    'default_parameters': cont_def.get('default_parameters', {}),
+                    '_manifest_path': path,
+                }
+        except Exception as e:
+            print(f"[container_manifest] Error loading {path}: {e}", file=sys.stderr)
 
     return templates
 
@@ -221,11 +260,16 @@ class FVPipelineEditorNode(Node):
         self.declare_parameter('manifest_search_roots', [
             '/ros2_ws/src/fluent_vision_ros2/src',
         ])
+        self.declare_parameter('container_manifest_search_roots', [
+            '/ros2_ws/src/fluent_vision_ros2/docker',
+        ])
 
         self.port = self.get_parameter('port').value
         self.pipeline_dir = self.get_parameter('pipeline_dir').value
         self.builtin_dir = self.get_parameter('builtin_dir').value
         self.manifest_roots = self.get_parameter('manifest_search_roots').value
+        self.container_manifest_roots = self.get_parameter(
+            'container_manifest_search_roots').value
 
         # Auto-detect builtin dir
         if not self.builtin_dir:
@@ -236,8 +280,22 @@ class FVPipelineEditorNode(Node):
                     self.builtin_dir = candidate
                     break
 
+        detected_container_roots = []
+        for root in self.container_manifest_roots:
+            expanded = os.path.expanduser(root)
+            if os.path.isdir(expanded):
+                detected_container_roots.append(expanded)
+        if not detected_container_roots:
+            for root in self.manifest_roots:
+                candidate = os.path.join(os.path.dirname(root), 'docker')
+                if os.path.isdir(candidate):
+                    detected_container_roots.append(candidate)
+        self.container_manifest_roots = sorted(set(detected_container_roots))
+
         # Load manifests
         self.templates = load_node_manifests(self.manifest_roots)
+        self.container_templates = load_container_manifests(
+            self.container_manifest_roots)
         self.get_logger().info(
             f'Loaded {len(self.templates)} node templates from manifests')
         for key in sorted(self.templates.keys()):
@@ -245,10 +303,19 @@ class FVPipelineEditorNode(Node):
             self.get_logger().info(
                 f'  [{t["category"]}] {key}: {t["label"]} '
                 f'(in={len(t["inputs"])}, out={len(t["outputs"])})')
+        self.get_logger().info(
+            f'Loaded {len(self.container_templates)} container templates')
+        for key in sorted(self.container_templates.keys()):
+            t = self.container_templates[key]
+            self.get_logger().info(
+                f'  [container:{t["category"]}] {key}: {t["label"]} '
+                f'image={t["image"]}')
 
         # Process management
         self._processes: Dict[str, subprocess.Popen] = {}
         self._process_lock = threading.Lock()
+        self._containers: Dict[str, Dict[str, str]] = {}
+        self._container_lock = threading.Lock()
 
         # WebSocket clients
         self._ws_clients: Set[web.WebSocketResponse] = set()
@@ -325,7 +392,9 @@ class FVPipelineEditorNode(Node):
         return web.json_response({
             'status': 'ok',
             'templates': len(self.templates),
+            'container_templates': len(self.container_templates),
             'processes': len(self._processes),
+            'containers': len(self._containers),
         })
 
     # -----------------------------------------------------------------------
@@ -372,6 +441,10 @@ class FVPipelineEditorNode(Node):
             'launch_pipeline': self._handle_launch_pipeline,
             'stop_pipeline': self._handle_stop_pipeline,
             'get_statuses': self._handle_get_statuses,
+            'launch_container': self._handle_launch_container,
+            'stop_container': self._handle_stop_container,
+            'get_container_statuses': self._handle_get_container_statuses,
+            'get_container_logs': self._handle_get_container_logs,
             'subscribe_preview': self._handle_subscribe_preview,
             'unsubscribe_preview': self._handle_unsubscribe_preview,
         }
@@ -395,6 +468,7 @@ class FVPipelineEditorNode(Node):
         await ws.send_json({
             'type': 'templates',
             'templates': self.templates,
+            'container_templates': self.container_templates,
             'port_compat': compat,
         })
 
@@ -484,6 +558,317 @@ class FVPipelineEditorNode(Node):
 
         # Return updated list
         await self._handle_list_pipelines(ws, {'dir': self.pipeline_dir})
+
+    # -----------------------------------------------------------------------
+    # Container launch / stop
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _sanitize_container_name(name: str) -> str:
+        cleaned = re.sub(r'[^a-zA-Z0-9_.-]+', '-', name).strip('-')
+        return cleaned or 'fv-container'
+
+    @staticmethod
+    def _expand_value(value: str) -> str:
+        return os.path.expanduser(os.path.expandvars(str(value)))
+
+    def _merge_container_params(self, template_key: str,
+                                parameters: Dict[str, Any]) -> Dict[str, Any]:
+        defaults = self.container_templates.get(template_key, {}).get(
+            'default_parameters', {})
+        merged = json.loads(json.dumps(defaults))
+        if isinstance(parameters, dict):
+            for key, value in parameters.items():
+                merged[key] = value
+        return merged
+
+    def _build_docker_run_cmd(self, container_id: str,
+                              template_key: str,
+                              parameters: Dict[str, Any]) -> tuple[List[str], str]:
+        merged = self._merge_container_params(template_key, parameters)
+        image = str(merged.get('image') or self.container_templates.get(
+            template_key, {}).get('image', '')).strip()
+        if not image:
+            raise ValueError(f'container template "{template_key}" has no image')
+
+        container_name = self._sanitize_container_name(
+            str(merged.get('container_name', container_id or template_key)))
+        cmd = ['docker', 'run', '-d', '--rm', '--name', container_name]
+
+        if bool(merged.get('network_host', True)):
+            cmd += ['--net=host']
+
+        if bool(merged.get('gpu', False)):
+            cmd += ['--gpus', 'all']
+
+        for env_file in merged.get('env_files', []) or []:
+            env_file_path = self._expand_value(env_file)
+            if env_file_path:
+                cmd += ['--env-file', env_file_path]
+
+        for env_key, env_value in (merged.get('env', {}) or {}).items():
+            cmd += ['-e', f'{env_key}={self._expand_value(env_value)}']
+
+        for volume in merged.get('volumes', []) or []:
+            if not isinstance(volume, dict):
+                continue
+            host_path = self._expand_value(volume.get('host', ''))
+            container_path = str(volume.get('container', '')).strip()
+            if not host_path or not container_path:
+                continue
+            spec = f'{host_path}:{container_path}'
+            if volume.get('read_only', False):
+                spec += ':ro'
+            cmd += ['-v', spec]
+
+        for port_map in merged.get('ports', []) or []:
+            if not isinstance(port_map, dict):
+                continue
+            host_port = str(port_map.get('host', '')).strip()
+            container_port = str(port_map.get('container', '')).strip()
+            if host_port and container_port:
+                cmd += ['-p', f'{host_port}:{container_port}']
+
+        cmd.append(image)
+
+        command = merged.get('command', [])
+        if isinstance(command, str) and command.strip():
+            cmd.append(command.strip())
+        elif isinstance(command, list):
+            cmd.extend([str(x) for x in command if str(x).strip()])
+
+        return cmd, container_name
+
+    def _container_name_from_spec(self, container_id: str, template_key: str,
+                                  parameters: Dict[str, Any]) -> str:
+        """Resolve the Docker container name from a manifest-backed spec."""
+        if template_key and template_key in self.container_templates:
+            merged = self._merge_container_params(template_key, parameters)
+            return self._sanitize_container_name(
+                str(merged.get('container_name', container_id or template_key)))
+        return self._sanitize_container_name(container_id)
+
+    def _resolve_container_name(self, container_id: str, msg: Dict) -> str:
+        with self._container_lock:
+            info = self._containers.get(container_id)
+        if info and info.get('name'):
+            return info['name']
+        return self._container_name_from_spec(
+            container_id,
+            msg.get('template_key', ''),
+            msg.get('parameters', {}) or {},
+        )
+
+    def _inspect_container(self, container_name: str) -> Dict[str, str]:
+        result = subprocess.run(
+            [
+                'docker', 'inspect', '--format',
+                '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                container_name,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return {'status': 'missing', 'health': ''}
+        parts = result.stdout.strip().split('|', 1)
+        status = parts[0] if parts else 'unknown'
+        health = parts[1] if len(parts) > 1 else ''
+        return {'status': status, 'health': health}
+
+    async def _broadcast_container_status(self, container_id: str, status: str,
+                                          health: str = '',
+                                          message: str = ''):
+        payload = {
+            'type': 'container_status',
+            'container_id': container_id,
+            'status': status,
+        }
+        if health:
+            payload['health'] = health
+        if message:
+            payload['message'] = message
+        msg = json.dumps(payload)
+        dead_clients = set()
+        for ws in self._ws_clients:
+            try:
+                await ws.send_str(msg)
+            except Exception:
+                dead_clients.add(ws)
+        self._ws_clients -= dead_clients
+
+    async def _handle_launch_container(self, ws, msg: Dict):
+        container_id = msg.get('container_id', '')
+        template_key = msg.get('template_key', '')
+        parameters = msg.get('parameters', {})
+
+        if not template_key:
+            await ws.send_json({
+                'type': 'container_launch_result',
+                'success': False,
+                'container_id': container_id,
+                'message': 'template_key required',
+            })
+            return
+
+        if template_key not in self.container_templates:
+            await ws.send_json({
+                'type': 'container_launch_result',
+                'success': False,
+                'container_id': container_id,
+                'message': f'unknown container template: {template_key}',
+            })
+            return
+
+        logical_id = container_id or template_key
+        self._stop_container(logical_id)
+
+        try:
+            cmd, container_name = self._build_docker_run_cmd(
+                logical_id, template_key, parameters)
+            self.get_logger().info(
+                f'Launching container [{logical_id}]: {" ".join(cmd[:8])}...')
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+
+            with self._container_lock:
+                self._containers[logical_id] = {
+                    'name': container_name,
+                    'template_key': template_key,
+                    'image': self.container_templates[template_key].get(
+                        'image', ''),
+                }
+
+            inspect = self._inspect_container(container_name)
+            await ws.send_json({
+                'type': 'container_launch_result',
+                'success': True,
+                'container_id': logical_id,
+                'container_name': container_name,
+                'status': inspect['status'],
+                'health': inspect['health'],
+            })
+            await self._broadcast_container_status(
+                logical_id, inspect['status'], inspect['health'])
+        except Exception as e:
+            self.get_logger().error(f'Container launch failed [{logical_id}]: {e}')
+            await ws.send_json({
+                'type': 'container_launch_result',
+                'success': False,
+                'container_id': logical_id,
+                'message': str(e),
+            })
+            await self._broadcast_container_status(logical_id, 'error', message=str(e))
+
+    def _stop_container(self, container_id: str) -> bool:
+        with self._container_lock:
+            info = self._containers.get(container_id)
+        if not info:
+            return False
+        container_name = info.get('name', '')
+        try:
+            subprocess.run(
+                ['docker', 'stop', container_name],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        finally:
+            with self._container_lock:
+                self._containers.pop(container_id, None)
+        return True
+
+    async def _handle_stop_container(self, ws, msg: Dict):
+        container_id = msg.get('container_id', '')
+        stopped = self._stop_container(container_id)
+        if not stopped:
+            container_name = self._resolve_container_name(container_id, msg)
+            result = subprocess.run(
+                ['docker', 'stop', container_name],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            stopped = result.returncode == 0
+        await ws.send_json({
+            'type': 'container_stop_result',
+            'success': stopped,
+            'container_id': container_id,
+        })
+        if stopped:
+            await self._broadcast_container_status(container_id, 'stopped')
+
+    async def _handle_get_container_statuses(self, ws, msg: Dict):
+        statuses = {}
+        requested = msg.get('containers', []) or []
+        for cont in requested:
+            if not isinstance(cont, dict):
+                continue
+            container_id = cont.get('id') or cont.get('template', '')
+            if not container_id:
+                continue
+            template_key = cont.get('template', '')
+            parameters = cont.get('parameters', {}) or {}
+            container_name = self._container_name_from_spec(
+                container_id, template_key, parameters)
+            inspect = self._inspect_container(container_name)
+            tmpl = self.container_templates.get(template_key, {})
+            image = str((parameters or {}).get('image') or tmpl.get('image', ''))
+            statuses[container_id] = {
+                'status': inspect['status'],
+                'health': inspect['health'],
+                'template_key': template_key,
+                'container_name': container_name,
+                'image': image,
+            }
+        with self._container_lock:
+            items = dict(self._containers)
+        for container_id, info in items.items():
+            inspect = self._inspect_container(info.get('name', ''))
+            statuses[container_id] = {
+                'status': inspect['status'],
+                'health': inspect['health'],
+                'template_key': info.get('template_key', ''),
+                'container_name': info.get('name', ''),
+                'image': info.get('image', ''),
+            }
+        await ws.send_json({
+            'type': 'container_statuses',
+            'statuses': statuses,
+        })
+
+    async def _handle_get_container_logs(self, ws, msg: Dict):
+        container_id = msg.get('container_id', '')
+        container_name = self._resolve_container_name(container_id, msg)
+        inspect = self._inspect_container(container_name)
+        if inspect['status'] == 'missing':
+            await ws.send_json({
+                'type': 'container_logs',
+                'container_id': container_id,
+                'success': False,
+                'message': f'container not found: {container_name}',
+                'logs': '',
+            })
+            return
+        result = subprocess.run(
+            ['docker', 'logs', '--tail', '200', container_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        logs = (result.stdout or '') + (result.stderr or '')
+        await ws.send_json({
+            'type': 'container_logs',
+            'container_id': container_id,
+            'success': result.returncode == 0,
+            'logs': logs[-8000:],
+        })
 
     # -----------------------------------------------------------------------
     # Node launch / stop
@@ -587,9 +972,24 @@ class FVPipelineEditorNode(Node):
         system_cfg = pipeline.get('system', {})
         camera_delay = float(system_cfg.get('camera_start_delay', 2.0))
         default_delay = float(system_cfg.get('default_start_delay', 0.5))
+        container_delay = float(system_cfg.get('container_start_delay', 1.0))
         nodes = pipeline.get('nodes', [])
+        containers = pipeline.get('containers', [])
 
         launched = []
+        launched_containers = []
+
+        for cont in containers:
+            if not cont.get('enable', True):
+                continue
+            await self._handle_launch_container(ws, {
+                'container_id': cont.get('id', ''),
+                'template_key': cont.get('template', ''),
+                'parameters': cont.get('parameters', {}),
+            })
+            launched_containers.append(cont.get('id', cont.get('template', '')))
+            if container_delay > 0:
+                await asyncio.sleep(container_delay)
 
         # Separate camera (sensor) nodes and others
         sensor_nodes = []
@@ -642,23 +1042,56 @@ class FVPipelineEditorNode(Node):
             'type': 'launch_pipeline_result',
             'success': True,
             'launched': launched,
+            'launched_containers': launched_containers,
         })
 
     async def _handle_stop_pipeline(self, ws, msg: Dict):
         """Stop all managed nodes."""
         stopped = []
+        pipeline = msg.get('pipeline', {}) or {}
+        requested_containers = pipeline.get('containers', []) or []
         with self._process_lock:
             node_ids = list(self._processes.keys())
+        with self._container_lock:
+            container_ids = list(self._containers.keys())
 
         for node_id in node_ids:
             self._kill_process(node_id)
             stopped.append(node_id)
             await self._broadcast_status(node_id, 'stopped')
 
+        stopped_containers = []
+        for container_id in container_ids:
+            self._stop_container(container_id)
+            stopped_containers.append(container_id)
+            await self._broadcast_container_status(container_id, 'stopped')
+
+        for cont in requested_containers:
+            if not isinstance(cont, dict):
+                continue
+            container_id = cont.get('id', '')
+            if not container_id or container_id in stopped_containers:
+                continue
+            container_name = self._container_name_from_spec(
+                container_id,
+                cont.get('template', ''),
+                cont.get('parameters', {}) or {},
+            )
+            result = subprocess.run(
+                ['docker', 'stop', container_name],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if result.returncode == 0:
+                stopped_containers.append(container_id)
+                await self._broadcast_container_status(container_id, 'stopped')
+
         await ws.send_json({
             'type': 'stop_pipeline_result',
             'success': True,
             'stopped': stopped,
+            'stopped_containers': stopped_containers,
         })
 
     async def _handle_get_statuses(self, ws, msg: Dict):
@@ -678,6 +1111,7 @@ class FVPipelineEditorNode(Node):
             'type': 'statuses',
             'statuses': statuses,
         })
+        await self._handle_get_container_statuses(ws, msg)
 
     # -----------------------------------------------------------------------
     # Preview streaming
@@ -865,6 +1299,10 @@ class FVPipelineEditorNode(Node):
             node_ids = list(self._processes.keys())
         for node_id in node_ids:
             self._kill_process(node_id)
+        with self._container_lock:
+            container_ids = list(self._containers.keys())
+        for container_id in container_ids:
+            self._stop_container(container_id)
 
     async def _broadcast_status(self, node_id: str, status: str,
                                message: str = ''):
@@ -934,6 +1372,22 @@ class FVPipelineEditorNode(Node):
                     await self._broadcast_status(
                         node_id, status,
                         stderr_output.strip() if stderr_output else '')
+
+            with self._container_lock:
+                container_items = list(self._containers.items())
+
+            for container_id, info in container_items:
+                inspect = self._inspect_container(info.get('name', ''))
+                status = inspect['status']
+                health = inspect['health']
+                if status == 'missing':
+                    with self._container_lock:
+                        self._containers.pop(container_id, None)
+                    await self._broadcast_container_status(
+                        container_id, 'stopped')
+                else:
+                    await self._broadcast_container_status(
+                        container_id, status, health)
 
 
 # ---------------------------------------------------------------------------
