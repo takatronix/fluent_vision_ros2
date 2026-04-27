@@ -21,6 +21,11 @@ Python runtime:
 - `opencv-python`, `numpy`, `huggingface_hub`
 - `mdm` package from LingBot-Depth repository
 
+Containerized worker mode:
+- Set `backend=http` on the ROS node to keep LingBot dependencies out of the main FluentVision environment.
+- The node will call an external worker at `worker_endpoint` and still publish the same ROS topics.
+- Worker scaffolding lives under `docker/lingbot_depth_worker/`.
+
 Example (inside your Python env):
 
 ```bash
@@ -43,3 +48,12 @@ ros2 launch fv_lingbot_depth fv_lingbot_depth.launch.py \
   config_file:=/path/to/custom.yaml
 ```
 
+HTTP worker example:
+
+```yaml
+fv_lingbot_depth:
+  ros__parameters:
+    backend: "http"
+    worker_endpoint: "http://127.0.0.1:5540/infer"
+    fallback_passthrough: true
+```

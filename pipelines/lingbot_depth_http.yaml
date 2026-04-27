@@ -1,0 +1,55 @@
+name: "LingBot Depth Worker"
+description: "D405 topics -> fv_lingbot_depth -> LingBot worker container"
+
+system:
+  camera_start_delay: 0.5
+  default_start_delay: 0.5
+  container_start_delay: 1.0
+
+containers:
+  - id: lingbot_depth_worker_1
+    enable: true
+    template: lingbot_depth_worker
+    parameters:
+      container_name: "fv-lingbot-depth-worker"
+      env:
+        MODEL_ID: "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
+        LISTEN_PORT: "5540"
+
+nodes:
+  - id: fv_lingbot_depth_d405
+    enable: true
+    package: fv_lingbot_depth
+    exec: fv_lingbot_depth_node
+    node_name: fv_lingbot_depth_d405
+    namespace: /fv/d405
+    parameters:
+      color_topic: /fv/d405/color/image_raw
+      depth_topic: /fv/d405/depth/image_rect_raw
+      camera_info_topic: /fv/d405/depth/camera_info
+      refined_depth_topic: /fv/d405/depth_refined/image_rect_raw
+      mask_topic: /fv/d405/depth_refined/mask
+      pointcloud_topic: /fv/d405/depth_refined/points
+      frame_id_override: ""
+      backend: http
+      worker_endpoint: http://127.0.0.1:5540/infer
+      worker_timeout_sec: 5.0
+      model_id: robbyant/lingbot-depth-pretrain-vitl-14-v0.5
+      local_model_path: ""
+      device: auto
+      use_fp16: true
+      apply_mask: true
+      resolution_level: 9
+      fallback_passthrough: true
+      depth_scale_16uc1: 0.001
+      min_depth_m: 0.05
+      max_depth_m: 3.0
+      point_stride: 2
+      sync_queue_size: 10
+      sync_slop_sec: 0.03
+      qos_reliability: best_effort
+      log_every_n_frames: 30
+    _template: fv_lingbot_depth
+
+layout:
+  fv_lingbot_depth_d405: { x: 320, y: 180, width: 250 }

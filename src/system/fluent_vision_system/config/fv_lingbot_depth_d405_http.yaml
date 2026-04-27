@@ -1,18 +1,18 @@
-fv_lingbot_depth:
+fv_lingbot_depth_d405:
   ros__parameters:
     color_topic: "/fv/d405/color/image_raw"
     depth_topic: "/fv/d405/depth/image_rect_raw"
     camera_info_topic: "/fv/d405/depth/camera_info"
 
-    refined_depth_topic: "depth_refined/image_rect_raw"
-    mask_topic: "depth_refined/mask"
-    pointcloud_topic: "depth_refined/points"
+    refined_depth_topic: "/fv/d405/depth_refined/image_rect_raw"
+    mask_topic: "/fv/d405/depth_refined/mask"
+    pointcloud_topic: "/fv/d405/depth_refined/points"
     frame_id_override: ""
 
-    backend: "direct"
+    backend: "http"
     worker_endpoint: "http://127.0.0.1:5540/infer"
     worker_timeout_sec: 5.0
-    model_id: "robbyant/lingbot-depth-pretrain-vitl-14"
+    model_id: "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
     local_model_path: ""
     device: "auto"
     use_fp16: true

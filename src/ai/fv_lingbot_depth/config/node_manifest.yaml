@@ -33,5 +33,7 @@ nodes:
       camera_info_topic: ""
       refined_depth_topic: ""
       mask_topic: ""
+      backend: "direct"
+      worker_endpoint: "http://127.0.0.1:5540/infer"
       device: "auto"
       use_fp16: true

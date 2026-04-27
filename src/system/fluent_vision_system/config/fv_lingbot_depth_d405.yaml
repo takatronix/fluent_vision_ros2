@@ -9,6 +9,9 @@ fv_lingbot_depth_d405:
     pointcloud_topic: "/fv/d405/depth_refined/points"
     frame_id_override: ""
 
+    backend: "direct"
+    worker_endpoint: "http://127.0.0.1:5540/infer"
+    worker_timeout_sec: 5.0
     model_id: "robbyant/lingbot-depth-pretrain-vitl-14"
     local_model_path: ""
     device: "auto"
@@ -26,4 +29,3 @@ fv_lingbot_depth_d405:
     sync_slop_sec: 0.03
     qos_reliability: "best_effort"
     log_every_n_frames: 30
-

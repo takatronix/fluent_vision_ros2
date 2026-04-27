@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
 import time
 from typing import Optional, Tuple
+import urllib.error
+import urllib.request
 
 import cv2
 import numpy as np
@@ -30,6 +33,9 @@ class FvLingbotDepthNode(Node):
         self.declare_parameter("frame_id_override", "")
 
         # Model/runtime
+        self.declare_parameter("backend", "direct")  # direct|http
+        self.declare_parameter("worker_endpoint", "http://127.0.0.1:5540/infer")
+        self.declare_parameter("worker_timeout_sec", 5.0)
         self.declare_parameter("model_id", "robbyant/lingbot-depth-pretrain-vitl-14")
         self.declare_parameter("local_model_path", "")
         self.declare_parameter("device", "auto")  # auto|cuda|cpu
@@ -60,6 +66,9 @@ class FvLingbotDepthNode(Node):
         self.pointcloud_topic = str(self.get_parameter("pointcloud_topic").value)
         self.frame_id_override = str(self.get_parameter("frame_id_override").value)
 
+        self.backend = str(self.get_parameter("backend").value).strip().lower()
+        self.worker_endpoint = str(self.get_parameter("worker_endpoint").value).strip()
+        self.worker_timeout_sec = float(self.get_parameter("worker_timeout_sec").value)
         self.model_id = str(self.get_parameter("model_id").value)
         self.local_model_path = str(self.get_parameter("local_model_path").value)
         self.device_mode = str(self.get_parameter("device").value)
@@ -83,11 +92,22 @@ class FvLingbotDepthNode(Node):
         self.mask_pub = self.create_publisher(Image, self.mask_topic, 10)
         self.points_pub = self.create_publisher(PointCloud2, self.pointcloud_topic, 10)
 
+        if self.backend not in ("direct", "http"):
+            self.get_logger().warning(
+                f"Unknown backend='{self.backend}', falling back to direct"
+            )
+            self.backend = "direct"
+
         self._model = None
         self._torch = None
         self._device = None
         self._model_error = ""
-        self._try_load_model()
+        if self.backend == "direct":
+            self._try_load_model()
+        else:
+            self.get_logger().info(
+                f"LingBot-Depth worker backend enabled endpoint={self.worker_endpoint}"
+            )
 
         qos = self._sensor_qos_profile()
         self.color_sub = Subscriber(self, Image, self.color_topic, qos_profile=qos)
@@ -108,7 +128,7 @@ class FvLingbotDepthNode(Node):
         self.get_logger().info(
             f"fv_lingbot_depth started color={self.color_topic} depth={self.depth_topic} "
             f"info={self.camera_info_topic} out_depth={self.refined_depth_topic} "
-            f"out_points={self.pointcloud_topic} model={model_source}"
+            f"out_points={self.pointcloud_topic} backend={self.backend} model={model_source}"
         )
 
     def _sensor_qos_profile(self) -> QoSProfile:
@@ -180,7 +200,15 @@ class FvLingbotDepthNode(Node):
         if intr_norm is None:
             return
 
-        if self._model is not None:
+        if self.backend == "http":
+            refined_depth, mask, points = self._run_remote_model(color_bgr, depth_m, intr_norm)
+            if refined_depth is None:
+                if not self.fallback_passthrough:
+                    return
+                refined_depth = depth_m
+                mask = np.isfinite(refined_depth) & (refined_depth > 0.0)
+                points = self._depth_to_points(refined_depth, intr_norm, mask)
+        elif self._model is not None:
             refined_depth, mask, points = self._run_model(color_bgr, depth_m, intr_norm)
             if refined_depth is None:
                 if not self.fallback_passthrough:
@@ -224,6 +252,63 @@ class FvLingbotDepthNode(Node):
             self.get_logger().info(
                 f"processed={self._frame_counter} avg_proc_ms={avg:.1f} model={mode}"
             )
+
+    def _run_remote_model(
+        self, color_bgr: np.ndarray, depth_m: np.ndarray, intr_norm: np.ndarray
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        payload = io.BytesIO()
+        np.savez_compressed(
+            payload,
+            color_bgr=color_bgr.astype(np.uint8, copy=False),
+            depth_m=depth_m.astype(np.float32, copy=False),
+            intrinsics_norm=intr_norm.astype(np.float32, copy=False),
+            use_fp16=np.asarray(self.use_fp16, dtype=np.uint8),
+            apply_mask=np.asarray(self.apply_mask, dtype=np.uint8),
+            resolution_level=np.asarray(self.resolution_level, dtype=np.int32),
+        )
+
+        req = urllib.request.Request(
+            self.worker_endpoint,
+            data=payload.getvalue(),
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.worker_timeout_sec) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+            if detail:
+                self.get_logger().error(
+                    f"worker request failed status={exc.code} detail={detail}"
+                )
+            else:
+                self.get_logger().error(f"worker request failed status={exc.code}")
+            return None, None, None
+        except Exception as exc:
+            self.get_logger().error(f"worker request failed: {exc}")
+            return None, None, None
+
+        try:
+            with np.load(io.BytesIO(body), allow_pickle=False) as result:
+                depth_np = None
+                points_np = None
+                mask_np = None
+
+                if "depth" in result.files:
+                    depth_np = result["depth"].astype(np.float32, copy=False)
+                if "mask" in result.files:
+                    mask_np = result["mask"].astype(bool, copy=False)
+                if "points" in result.files:
+                    points_np = result["points"].astype(np.float32, copy=False)
+
+                if points_np is None and depth_np is not None:
+                    points_np = self._depth_to_points(depth_np, intr_norm, mask_np)
+                return depth_np, mask_np, points_np
+        except Exception as exc:
+            self.get_logger().error(f"invalid worker response: {exc}")
+            return None, None, None
 
     def _depth_to_meters(self, msg: Image) -> np.ndarray:
         depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
