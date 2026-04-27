@@ -73,6 +73,14 @@ public:
         // Size filter (extent in meters, 0 = disabled)
         this->declare_parameter<double>("filter.min_size_m", 0.0);
         this->declare_parameter<double>("filter.max_size_m", 0.0);
+        // Aspect ratio filter (longest_edge / shortest_edge, 0 = disabled)
+        this->declare_parameter<double>("filter.max_aspect", 0.0);
+        // Same-object NMS in 3D — when the segmentation classifier
+        // outputs two boxes for the same physical cube (e.g. "blue"
+        // and "unknown_color") their centroids end up within a few
+        // cm of each other. Greedy-keep the highest-confidence one
+        // per cluster. 0 = disabled.
+        this->declare_parameter<double>("filter.nms_dist_m", 0.0);
         // Distance filter on 3D centroid (0 = disabled)
         this->declare_parameter<double>("filter.min_distance_m", 0.0);
         this->declare_parameter<double>("filter.max_distance_m", 0.0);
@@ -139,6 +147,8 @@ private:
         max_depth_m_       = static_cast<float>(this->get_parameter("max_depth_m").as_double());
         filter_min_size_   = static_cast<float>(this->get_parameter("filter.min_size_m").as_double());
         filter_max_size_   = static_cast<float>(this->get_parameter("filter.max_size_m").as_double());
+        filter_max_aspect_ = static_cast<float>(this->get_parameter("filter.max_aspect").as_double());
+        filter_nms_dist_   = static_cast<float>(this->get_parameter("filter.nms_dist_m").as_double());
         filter_min_dist_   = static_cast<float>(this->get_parameter("filter.min_distance_m").as_double());
         filter_max_dist_   = static_cast<float>(this->get_parameter("filter.max_distance_m").as_double());
         max_fps_           = this->get_parameter("max_fps").as_double();
@@ -165,11 +175,13 @@ private:
         last_det_ = msg;
     }
 
-    bool passFilters(float distance_m, float max_extent) const {
+    bool passFilters(float distance_m, float max_extent, float min_extent) const {
         if (filter_min_dist_ > 0.0f && distance_m < filter_min_dist_) return false;
         if (filter_max_dist_ > 0.0f && distance_m > filter_max_dist_) return false;
         if (filter_min_size_ > 0.0f && max_extent < filter_min_size_) return false;
         if (filter_max_size_ > 0.0f && max_extent > filter_max_size_) return false;
+        if (filter_max_aspect_ > 0.0f && min_extent > 1e-4f &&
+            (max_extent / min_extent) > filter_max_aspect_) return false;
         return true;
     }
 
@@ -260,6 +272,18 @@ private:
             if (!color_bgr) cv::cvtColor(overlay, overlay, cv::COLOR_RGB2BGR);
         }
 
+        // ---- Phase 1: gather candidates ----
+        struct Candidate {
+            int32_t det_id;
+            fv_msgs::msg::Detection2D det;
+            CloudPtr sub;
+            fluent_cloud::OBBMetrics obb;
+            float distance{0.0f};
+            int x_min{0}, y_min{0}, x_max{0}, y_max{0};
+        };
+        std::vector<Candidate> cands;
+        cands.reserve(det_map.size());
+
         for (const auto &[det_id, det] : det_map) {
             int x_min = std::max(0, static_cast<int>(det.bbox_min.x));
             int y_min = std::max(0, static_cast<int>(det.bbox_min.y));
@@ -298,14 +322,134 @@ private:
             if (obb.num_points < static_cast<uint32_t>(min_points_)) continue;
 
             float distance = obb.center.norm();
-            float max_extent = std::max({2.0f * obb.extents[0], 2.0f * obb.extents[1], 2.0f * obb.extents[2]});
+            float ex = 2.0f * obb.extents[0];
+            float ey = 2.0f * obb.extents[1];
+            float ez = 2.0f * obb.extents[2];
+            float max_extent = std::max({ex, ey, ez});
+            float min_extent = std::min({ex, ey, ez});
 
-            // Apply distance/size filters
-            if (!passFilters(distance, max_extent)) continue;
+            if (!passFilters(distance, max_extent, min_extent)) continue;
+
+            Candidate c;
+            c.det_id = det_id;
+            c.det = det;
+            c.sub = sub;
+            c.obb = obb;
+            c.distance = distance;
+            c.x_min = x_min; c.y_min = y_min; c.x_max = x_max; c.y_max = y_max;
+            cands.push_back(std::move(c));
+        }
+
+        // ---- Phase 2: 3D NMS with class-id rescue ----
+        // Two heads can fire for the same physical object in one
+        // frame (cube model: "blue" + "unknown_color"). We cluster
+        // by 3D IoU on the axis-aligned bounding box around each
+        // detection's OBB, keep the highest-confidence detection
+        // per cluster, and *promote* its label/colour from a
+        // suppressed sibling whenever the winner is "unknown" but
+        // the cluster contains a more specific class. That way a
+        // confident-but-vague "unknown_color" hit doesn't erase a
+        // less-confident-but-specific "blue" hit at the same spot.
+        // Build the world-AABB that encloses an OBB by walking the
+        // 8 corners (centre ± half_x*ax0 ± half_y*ax1 ± half_z*ax2)
+        // and taking componentwise min/max. This is a proper IoU
+        // upper bound on the OBB-vs-OBB volume, and for nearly
+        // axis-aligned cubes (our case) it's near-tight. Falls back
+        // gracefully when the boxes are tilted differently — still
+        // monotonic in true OBB overlap, just slightly looser.
+        auto worldAabb = [](const fluent_cloud::OBBMetrics &m,
+                            Eigen::Vector3f &lo, Eigen::Vector3f &hi) {
+            lo.setConstant(std::numeric_limits<float>::max());
+            hi.setConstant(-std::numeric_limits<float>::max());
+            const float hx = m.extents[0], hy = m.extents[1], hz = m.extents[2];
+            for (int sx = -1; sx <= 1; sx += 2) {
+                for (int sy = -1; sy <= 1; sy += 2) {
+                    for (int sz = -1; sz <= 1; sz += 2) {
+                        Eigen::Vector3f corner = m.center
+                            + sx * hx * m.axes[0]
+                            + sy * hy * m.axes[1]
+                            + sz * hz * m.axes[2];
+                        lo = lo.cwiseMin(corner);
+                        hi = hi.cwiseMax(corner);
+                    }
+                }
+            }
+        };
+        auto bboxIoU = [&worldAabb](const Candidate &a, const Candidate &b) -> float {
+            Eigen::Vector3f a_lo, a_hi, b_lo, b_hi;
+            worldAabb(a.obb, a_lo, a_hi);
+            worldAabb(b.obb, b_lo, b_hi);
+            Eigen::Vector3f inter_lo = a_lo.cwiseMax(b_lo);
+            Eigen::Vector3f inter_hi = a_hi.cwiseMin(b_hi);
+            Eigen::Vector3f d = (inter_hi - inter_lo).cwiseMax(Eigen::Vector3f::Zero());
+            float vi = d.x() * d.y() * d.z();
+            Eigen::Vector3f ea = a_hi - a_lo;
+            Eigen::Vector3f eb = b_hi - b_lo;
+            float va = ea.x() * ea.y() * ea.z();
+            float vb = eb.x() * eb.y() * eb.z();
+            float vu = va + vb - vi;
+            return (vu > 1e-9f) ? (vi / vu) : 0.0f;
+        };
+        auto isUnknown = [](const std::string &label) {
+            return label.empty() || label.find("unknown") != std::string::npos;
+        };
+        if (cands.size() > 1) {
+            std::sort(cands.begin(), cands.end(),
+                [](const Candidate &a, const Candidate &b) {
+                    return a.det.conf_fused > b.det.conf_fused;
+                });
+            std::vector<Candidate> kept;
+            kept.reserve(cands.size());
+            const float iou_threshold = 0.15f;     // 15% volume overlap —
+                                                   // same physical cube
+                                                   // can drift across
+                                                   // frames; keep this
+                                                   // permissive
+            // Distance threshold acts as a fallback when both boxes
+            // are tiny and their AABBs barely meet — operator can
+            // tune via filter.nms_dist_m.
+            const float dist_threshold = filter_nms_dist_;
+            for (auto &c : cands) {
+                int merge_idx = -1;
+                for (size_t i = 0; i < kept.size(); ++i) {
+                    bool same_object = bboxIoU(c, kept[i]) >= iou_threshold;
+                    if (!same_object && dist_threshold > 0.0f) {
+                        Eigen::Vector3f d = c.obb.center - kept[i].obb.center;
+                        same_object = d.norm() < dist_threshold;
+                    }
+                    if (same_object) { merge_idx = static_cast<int>(i); break; }
+                }
+                if (merge_idx < 0) {
+                    kept.push_back(std::move(c));
+                    continue;
+                }
+                // Merge: rescue a specific class from this candidate
+                // into a kept "unknown" winner.
+                Candidate &k = kept[merge_idx];
+                if (isUnknown(k.det.label) && !isUnknown(c.det.label)) {
+                    k.det.label    = c.det.label;
+                    k.det.class_id = c.det.class_id;
+                    // Recolour OBB stats too so the marker shows
+                    // the rescued class's mean RGB.
+                    k.obb.mean_r = c.obb.mean_r;
+                    k.obb.mean_g = c.obb.mean_g;
+                    k.obb.mean_b = c.obb.mean_b;
+                }
+            }
+            cands = std::move(kept);
+        }
+
+        // ---- Phase 3: emit objects / cloud / overlay / markers ----
+        for (const auto &c : cands) {
+            const auto &det = c.det;
+            const auto &obb = c.obb;
+            const auto &sub = c.sub;
+            const float distance = c.distance;
+            const int x_min = c.x_min, y_min = c.y_min, x_max = c.x_max, y_max = c.y_max;
 
             fv_msgs::msg::Object3D obj;
             obj.header = out.header;
-            obj.id = det_id;
+            obj.id = c.det_id;
             obj.class_id   = det.class_id;
             obj.label      = det.label;
             obj.confidence = det.conf_fused;
@@ -332,24 +476,18 @@ private:
                 cv::Scalar col = label_color(det.label);
                 cv::rectangle(overlay, cv::Point(x_min, y_min), cv::Point(x_max, y_max), col, 2);
 
-                // Project 3D centroid to 2D pixel
                 int cx_px = static_cast<int>(intr.fx * obb.center.x() / obb.center.z() + intr.cx);
                 int cy_px = static_cast<int>(intr.fy * obb.center.y() / obb.center.z() + intr.cy);
-
-                // Yellow dot at centroid
                 if (cx_px >= 0 && cx_px < static_cast<int>(mask_w) &&
                     cy_px >= 0 && cy_px < static_cast<int>(mask_h)) {
                     cv::circle(overlay, cv::Point(cx_px, cy_px), 5, cv::Scalar(0, 255, 255), cv::FILLED);
                     cv::circle(overlay, cv::Point(cx_px, cy_px), 5, cv::Scalar(0, 0, 0), 1);
                 }
 
-                // Line 1: label + distance mm
                 char line1[80];
                 std::snprintf(line1, sizeof(line1), "%s  %.0fmm",
                     det.label.c_str(),
                     static_cast<double>(distance) * 1000.0);
-
-                // Line 2: xyz in mm
                 char line2[80];
                 std::snprintf(line2, sizeof(line2), "(%.0f, %.0f, %.0f)",
                     static_cast<double>(obb.center.x()) * 1000.0,
@@ -463,6 +601,8 @@ private:
     double depth_scale_{0.001};
     float min_depth_m_{0.05f}, max_depth_m_{3.0f};
     float filter_min_size_{0.0f}, filter_max_size_{0.0f};
+    float filter_max_aspect_{0.0f};
+    float filter_nms_dist_{0.0f};
     float filter_min_dist_{0.0f}, filter_max_dist_{0.0f};
     double max_fps_{10.0};
     int point_stride_{2};
