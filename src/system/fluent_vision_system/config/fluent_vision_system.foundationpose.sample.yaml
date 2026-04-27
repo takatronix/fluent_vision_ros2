@@ -1,0 +1,25 @@
+system:
+  default_start_delay: 0.5
+  camera_start_delay: 3.0
+  inter_group_delay: 1.0
+
+groups:
+  - id: foundationpose_bridge
+    enable: true
+    nodes:
+      - id: fv_foundationpose_bridge
+        enable: true
+        package: fv_foundationpose_bridge
+        exec: fv_foundationpose_bridge_node
+        node_name: fv_foundationpose_bridge
+        namespace: "/fv/foundationpose"
+        parameters:
+          input_topic: "/pose_estimation/output"
+          output_topic: "/fv/foundationpose/objects_3d"
+          publish_tf: true
+          tf_parent_frame: "fv/d405/color_optical_frame"
+          tf_child_frame_prefix: "fp_object"
+          tf_use_label: false
+          confidence_threshold: 0.0
+        respawn: true
+        respawn_delay: 2.0

@@ -1,0 +1,40 @@
+name: fv_lerobot_pi05_morikawa_sample
+description: FV LeRobot pi05 Morikawa-All sample runtime with 20K default and 10K selectable.
+system:
+  container_start_delay: 1.0
+containers:
+  - id: fv_lerobot_pi05_morikawa_runtime
+    template: fv_lerobot_policy_runtime
+    parameters:
+      container_name: fv-lerobot-policy-runtime
+      env:
+        DPEX_DEFAULT_POLICY_ID: pi05_week19_morikawa_all_20k
+        DPEX_POLICY_SPECS: pi05_week19_morikawa_all_20k:pi05:/data/models/669ce87f-8cfa-5836-8f29-b9c3f6e650cf;pi05_week19_morikawa_all_10k:pi05:/data/models/1dc2af59-2d87-52f9-99af-fae7c6335bcf
+        DPEX_CAMERA_ALIASES: top_camera=top_camera,arm_camera=arm_camera,cam_high=top_camera,cam_left_wrist=arm_camera,cam_right_wrist=arm_camera
+nodes:
+  - id: policy_runner
+    template: fv_policy_runner
+    parameters:
+      backend_endpoint: http://127.0.0.1:8010/infer
+      default_policy_id: pi05_week19_morikawa_all_20k
+      profile_path: /vlabor/profiles/active_profile.yaml
+      profile_arm_namespace: follower_arm
+      compare_policy_ids: []
+      trajectory_topic: policy/trajectory_markers
+      trajectory_mode: fk
+      trajectory_frame_id: base_link
+      trajectory_action_indices: [0, 1, 2]
+      trajectory_scale: 1.0
+      trajectory_offset_xyz: [0.0, 0.0, 0.0]
+      trajectory_line_width: 0.02
+      trajectory_fk_urdf_topic: /robot_description
+      trajectory_fk_urdf_path: ""
+      trajectory_fk_base_link: base_link
+      trajectory_fk_tip_link: gripper_tip
+      trajectory_fk_joint_names: [joint1, joint2, joint3, joint4, joint5, joint6, gripper]
+      image_names:
+        - top_camera
+        - arm_camera
+      image_topics:
+        - ~/image/top_camera
+        - ~/image/arm_camera

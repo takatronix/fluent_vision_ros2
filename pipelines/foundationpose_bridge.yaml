@@ -1,0 +1,40 @@
+name: "FoundationPose Bridge"
+description: "FoundationPose runtime container + bridge from Detection3DArray to fv_msgs/Object3DArray"
+
+system:
+  camera_start_delay: 2.0
+  default_start_delay: 0.5
+  container_start_delay: 1.0
+
+containers:
+  - id: foundationpose_runtime_1
+    enable: true
+    template: foundationpose_runtime
+    parameters:
+      container_name: "fv-foundationpose-runtime"
+      env:
+        ISAAC_ROS_WS: "/workspaces/isaac_ros-dev"
+      command:
+        - "bash"
+        - "-lc"
+        - "sleep infinity"
+
+nodes:
+  - id: foundationpose_bridge_1
+    enable: true
+    package: fv_foundationpose_bridge
+    exec: fv_foundationpose_bridge_node
+    node_name: foundationpose_bridge_1
+    namespace: /fv
+    parameters:
+      input_topic: /pose_estimation/output
+      output_topic: /fv/foundationpose/objects_3d
+      publish_tf: true
+      tf_parent_frame: fv/d405/color_optical_frame
+      tf_child_frame_prefix: fp_object
+      tf_use_label: false
+      confidence_threshold: 0.0
+    _template: fv_foundationpose_bridge
+
+layout:
+  foundationpose_bridge_1: { x: 280, y: 140, width: 260 }

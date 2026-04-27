@@ -1,0 +1,59 @@
+name: "OpenPI Policy Runner"
+description: "External topics -> fv_policy_runner -> OpenPI runtime container"
+
+system:
+  camera_start_delay: 0.5
+  default_start_delay: 0.5
+  container_start_delay: 1.0
+
+containers:
+  - id: openpi_runtime_1
+    enable: true
+    template: openpi_runtime
+    parameters:
+      container_name: "fv-openpi-runtime"
+      env:
+        OPENPI_PORT: "8000"
+        OPENPI_SERVER_MODE: "http"
+        OPENPI_POLICY_SPECS: "pi0:pi0_aloha_sim:gs://openpi-assets/checkpoints/pi0_aloha_sim"
+
+nodes:
+  - id: fv_policy_runner_1
+    enable: true
+    package: fv_policy_runner
+    exec: fv_policy_runner_node
+    node_name: fv_policy_runner_1
+    namespace: /fv/policy
+    parameters:
+      image_topics:
+        - /top_camera/image_raw
+        - /left_wrist_camera/image_raw
+        - /right_wrist_camera/image_raw
+      image_names:
+        - cam_high
+        - cam_left_wrist
+        - cam_right_wrist
+      state_topic: /follower/joint_states_single
+      trigger_topic: /policy/start
+      stop_topic: /policy/stop
+      policy_select_topic: /policy/select
+      prompt_topic: /policy/prompt
+      action_topic: /policy/action
+      joint_action_topic: /policy/joint_action
+      status_topic: /policy/status
+      backend_endpoint: http://127.0.0.1:8000/infer
+      backend_timeout_sec: 30.0
+      observation_format: aloha
+      default_policy_id: pi0
+      default_prompt: do something
+      publish_hz: 10.0
+      replenish_threshold_steps: 5
+      observation_max_age_sec: 0.5
+      image_transport_encoding: rgb8
+      image_codec: jpg
+      image_quality: 90
+      auto_start: false
+    _template: fv_policy_runner
+
+layout:
+  fv_policy_runner_1: { x: 320, y: 180, width: 250 }
