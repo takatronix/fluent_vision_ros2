@@ -152,19 +152,6 @@ inline OBBMetrics compute_obb_metrics(const pcl::PointCloud<pcl::PointXYZRGB>::P
         m.extents[a] = (maxs[a] - mins[a]) * 0.5f;
     }
 
-    // Move the centre from the PCA centroid to the actual bbox
-    // centre — when the cloud is asymmetric (one face of the cube
-    // captured at a different density than the opposite), the
-    // centroid drifts toward the dense side and a marker rendered
-    // at the centroid with the full bbox extent ends up "one size
-    // bigger" on the sparse side. Project the per-axis midpoints
-    // back into world space to fix that.
-    Eigen::Vector3f bbox_offset = Eigen::Vector3f::Zero();
-    for (int a = 0; a < 3; ++a) {
-        bbox_offset += m.axes[a] * ((mins[a] + maxs[a]) * 0.5f);
-    }
-    m.center += bbox_offset;
-
     return m;
 }
 
