@@ -1,0 +1,16 @@
+/**:
+  ros__parameters:
+    input_image_topic: "/fv/d415/color/image_raw"
+    qos:
+      reliability: "best_effort"
+      queue_size: 10
+    model_path: "src/fluent_vision_ros2/models/onnx/cube_yolo11n_seg.onnx"
+    use_gpu: true
+    conf_thres: 0.25
+    iou_thres: 0.5
+    publish_overlay: true
+    max_fps: 0.0
+    tracking:
+      match_max_distance_px: 80.0
+      hold_frames: 3
+      drop_frames: 10
