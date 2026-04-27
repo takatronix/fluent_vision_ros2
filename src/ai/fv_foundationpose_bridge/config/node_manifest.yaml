@@ -1,0 +1,25 @@
+nodes:
+  - key: fv_foundationpose_bridge
+    package: fv_foundationpose_bridge
+    exec: fv_foundationpose_bridge_node
+    category: ai
+    label: "FoundationPose Bridge"
+    inputs:
+      - param: input_topic
+        type: any
+        label: "Detection3D"
+    outputs:
+      - param: output_topic
+        type: any
+        label: "Object3D"
+    default_parameters:
+      input_topic: "/pose_estimation/output"
+      output_topic: "~/objects_3d"
+      publish_tf: true
+      tf_parent_frame: ""
+      tf_child_frame_prefix: "fp_object"
+      tf_use_label: false
+      confidence_threshold: 0.0
+      default_label: "object"
+      fallback_class_id: 0
+      prefer_bbox_center: true

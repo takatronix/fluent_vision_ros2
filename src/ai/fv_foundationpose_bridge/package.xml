@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>fv_foundationpose_bridge</name>
+  <version>0.1.0</version>
+  <description>Bridge Detection3D output from Isaac ROS FoundationPose into FluentVision Object3DArray and TF.</description>
+
+  <maintainer email="maintainer@example.com">FV Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <build_depend>rclpy</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>tf2_ros</build_depend>
+  <build_depend>vision_msgs</build_depend>
+  <build_depend>fv_msgs</build_depend>
+  <build_depend>cv_bridge</build_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>vision_msgs</exec_depend>
+  <exec_depend>fv_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

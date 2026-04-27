@@ -1,0 +1,14 @@
+fv_foundationpose_bridge:
+  ros__parameters:
+    input_topic: "/pose_estimation/output"
+    output_topic: "~/objects_3d"
+    publish_tf: true
+    tf_parent_frame: ""
+    tf_child_frame_prefix: "fp_object"
+    tf_use_label: false
+    confidence_threshold: 0.0
+    default_label: "object"
+    fallback_class_id: 0
+    prefer_bbox_center: true
+    qos:
+      reliability: "reliable"
