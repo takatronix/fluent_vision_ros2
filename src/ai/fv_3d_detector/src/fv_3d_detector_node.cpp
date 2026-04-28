@@ -23,6 +23,17 @@
 
 #include "fluent_lib/fluent_cloud/pipeline.hpp"
 
+// tf2 — used to optionally re-publish detections in a downstream
+// frame (typically `base_link`) so consumers don't have to chase the
+// camera pose themselves. Lookup uses the original detection stamp so
+// arm motion between detection and publish doesn't smear positions.
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+
 namespace fv_3d_detector {
 
 using Cloud    = pcl::PointCloud<pcl::PointXYZRGB>;
@@ -88,7 +99,27 @@ public:
         this->declare_parameter<double>("max_fps", 10.0);
         this->declare_parameter<int>("point_stride", 2);
 
+        // Optional output frame. When non-empty (typical: "base_link"),
+        // every centroid + orientation in the published Object3DArray is
+        // transformed from the camera/depth frame into target_frame
+        // using a stamped tf2 lookup. Markers are published in the same
+        // frame so RViz / scene_viewer render them correctly without
+        // each consumer redoing the math. Empty string = legacy
+        // behaviour (publish in source frame).
+        this->declare_parameter<std::string>("target_frame", "");
+        // How long to wait for the source→target tf to be available
+        // when handling each detection batch. The buffer is normally
+        // warm (TFs flow at >>10 Hz); only the first frame after node
+        // start tends to need this.
+        this->declare_parameter<double>("tf_lookup_timeout_sec", 0.2);
+
         readParams();
+
+        // Initialise tf2 buffer + listener even when target_frame is
+        // empty — it costs almost nothing and lets us flip the param
+        // at runtime without restart.
+        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
         auto qos_be = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
 
@@ -153,6 +184,8 @@ private:
         filter_max_dist_   = static_cast<float>(this->get_parameter("filter.max_distance_m").as_double());
         max_fps_           = this->get_parameter("max_fps").as_double();
         point_stride_      = std::max(1, static_cast<int>(this->get_parameter("point_stride").as_int()));
+        target_frame_      = this->get_parameter("target_frame").as_string();
+        tf_lookup_timeout_sec_ = this->get_parameter("tf_lookup_timeout_sec").as_double();
         if (max_fps_ > 0.0) min_interval_ns_ = static_cast<int64_t>(1.0e9 / max_fps_);
     }
 
@@ -566,6 +599,57 @@ private:
                 }
             }
             prev_marker_count_ = marker_id;
+        }
+
+        // Optional: re-express centroids + orientation in target_frame
+        // (typically base_link). Done LAST so all the source-frame
+        // detection / OBB math stays in camera frame where the depth
+        // comes from. Falls back to source frame if the lookup fails
+        // — better to publish slightly stale than not at all.
+        if (!target_frame_.empty() && target_frame_ != out.header.frame_id) {
+            geometry_msgs::msg::TransformStamped tf;
+            bool got_tf = false;
+            try {
+                tf = tf_buffer_->lookupTransform(
+                    target_frame_, out.header.frame_id, out.header.stamp,
+                    rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
+                got_tf = true;
+            } catch (const std::exception &e) {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 5000,
+                    "tf lookup %s -> %s failed: %s — publishing in source frame",
+                    out.header.frame_id.c_str(), target_frame_.c_str(), e.what());
+            }
+            if (got_tf) {
+                for (auto &obj : out.objects) {
+                    geometry_msgs::msg::PoseStamped src_pose, dst_pose;
+                    src_pose.header = out.header;
+                    src_pose.pose.position = obj.centroid;
+                    src_pose.pose.orientation = obj.orientation;
+                    tf2::doTransform(src_pose, dst_pose, tf);
+                    obj.centroid = dst_pose.pose.position;
+                    obj.orientation = dst_pose.pose.orientation;
+                    // Per-object header.frame_id (if set) should match
+                    // the array header so downstream tools don't see
+                    // mixed frames.
+                    obj.header.frame_id = target_frame_;
+                }
+                // Also re-frame markers so RViz / scene_viewer render
+                // them in the new frame without per-consumer fixup.
+                for (auto &m : markers.markers) {
+                    if (m.action == visualization_msgs::msg::Marker::DELETE) continue;
+                    m.header.frame_id = target_frame_;
+                    geometry_msgs::msg::PoseStamped src_pose, dst_pose;
+                    src_pose.header = out.header;
+                    src_pose.pose = m.pose;
+                    tf2::doTransform(src_pose, dst_pose, tf);
+                    m.pose = dst_pose.pose;
+                }
+                out.header.frame_id = target_frame_;
+            }
+        }
+
+        if (publish_markers_) {
             marker_pub_->publish(markers);
         }
 
@@ -609,6 +693,12 @@ private:
     int64_t min_interval_ns_{0};
     int64_t last_process_ns_{0};
     int prev_marker_count_{0};
+
+    // Optional output frame for re-publishing detections.
+    std::string target_frame_;
+    double tf_lookup_timeout_sec_{0.2};
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     std::mutex mutex_;
     Intrinsics intr_;

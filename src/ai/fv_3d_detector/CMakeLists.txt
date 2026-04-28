@@ -16,6 +16,11 @@ find_package(PCL REQUIRED COMPONENTS common io)
 find_package(OpenCV REQUIRED)
 find_package(fv_msgs REQUIRED)
 find_package(fluent_lib QUIET)
+# tf2 for stamped lookup so we can re-publish detection points in
+# whichever frame downstream consumers want (typically base_link).
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
 add_executable(fv_3d_detector_node
   src/fv_3d_detector_node.cpp
@@ -29,6 +34,9 @@ ament_target_dependencies(fv_3d_detector_node
   visualization_msgs
   pcl_conversions
   fv_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 # fluent_cloud/pipeline.hpp is header-only (PCL + Eigen only)
