@@ -428,7 +428,11 @@ class FvPolicyRunnerNode(Node):
 
         # Live profile swap: destroys + rebuilds image/state subs and updates
         # backend URL / model / prompt in one atomic call. Dashboard and MCP
-        # call this after resolving a VLA profile against the registry.
+        # call this after resolving a policy profile against the registry.
+        # (NOTE: srv name `LoadVlaProfile` is the legacy-named contract; the
+        # mux source `vla` was unified into `policy` but the srv message
+        # name is kept for one release of compat. To be renamed alongside
+        # the dashboard `_vla_*` python identifiers in a follow-up PR.)
         self._sensor_qos = sensor_qos
         if HAS_LOAD_VLA_SRV:
             self.create_service(
