@@ -617,10 +617,21 @@ private:
                     rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
                 got_tf = true;
             } catch (const std::exception &e) {
-                RCLCPP_WARN_THROTTLE(
-                    get_logger(), *get_clock(), 5000,
-                    "tf lookup %s -> %s failed: %s — publishing in source frame",
-                    out.header.frame_id.c_str(), target_frame_.c_str(), e.what());
+                try {
+                    tf = tf_buffer_->lookupTransform(
+                        target_frame_, out.header.frame_id, rclcpp::Time(0, 0, RCL_ROS_TIME),
+                        rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
+                    got_tf = true;
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 5000,
+                        "stamped tf lookup %s -> %s failed: %s — using latest transform",
+                        out.header.frame_id.c_str(), target_frame_.c_str(), e.what());
+                } catch (const std::exception &latest_e) {
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 5000,
+                        "tf lookup %s -> %s failed: stamped=%s latest=%s — publishing in source frame",
+                        out.header.frame_id.c_str(), target_frame_.c_str(), e.what(), latest_e.what());
+                }
             }
             if (got_tf) {
                 output_tf = tf;
