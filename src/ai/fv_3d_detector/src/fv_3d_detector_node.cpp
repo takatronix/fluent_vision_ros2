@@ -606,6 +606,8 @@ private:
         // detection / OBB math stays in camera frame where the depth
         // comes from. Falls back to source frame if the lookup fails
         // — better to publish slightly stale than not at all.
+        geometry_msgs::msg::TransformStamped output_tf;
+        bool got_output_tf = false;
         if (!target_frame_.empty() && target_frame_ != out.header.frame_id) {
             geometry_msgs::msg::TransformStamped tf;
             bool got_tf = false;
@@ -621,6 +623,8 @@ private:
                     out.header.frame_id.c_str(), target_frame_.c_str(), e.what());
             }
             if (got_tf) {
+                output_tf = tf;
+                got_output_tf = true;
                 for (auto &obj : out.objects) {
                     geometry_msgs::msg::PoseStamped src_pose, dst_pose;
                     src_pose.header = out.header;
@@ -657,6 +661,11 @@ private:
 
         // Publish aggregated cloud
         if (!agg_cloud->points.empty()) {
+            if (got_output_tf) {
+                for (auto &pt : agg_cloud->points) {
+                    transform_cloud_point(output_tf, pt);
+                }
+            }
             agg_cloud->width = agg_cloud->points.size();
             agg_cloud->height = 1;
             agg_cloud->is_dense = false;
@@ -676,6 +685,31 @@ private:
             comp_msg.data = std::move(jpeg_buf);
             overlay_pub_->publish(comp_msg);
         }
+    }
+
+    static void transform_cloud_point(
+        const geometry_msgs::msg::TransformStamped &tf,
+        pcl::PointXYZRGB &pt)
+    {
+        const auto &q = tf.transform.rotation;
+        const auto &t = tf.transform.translation;
+
+        const double x = pt.x;
+        const double y = pt.y;
+        const double z = pt.z;
+        const double qx = q.x;
+        const double qy = q.y;
+        const double qz = q.z;
+        const double qw = q.w;
+
+        const double ix =  qw * x + qy * z - qz * y;
+        const double iy =  qw * y + qz * x - qx * z;
+        const double iz =  qw * z + qx * y - qy * x;
+        const double iw = -qx * x - qy * y - qz * z;
+
+        pt.x = static_cast<float>(ix * qw + iw * -qx + iy * -qz - iz * -qy + t.x);
+        pt.y = static_cast<float>(iy * qw + iw * -qy + iz * -qx - ix * -qz + t.y);
+        pt.z = static_cast<float>(iz * qw + iw * -qz + ix * -qy - iy * -qx + t.z);
     }
 
     std::string mask_topic_, det_topic_, depth_topic_, color_topic_;

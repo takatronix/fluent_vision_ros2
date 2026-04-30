@@ -1,6 +1,10 @@
 #include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
+#include <tf2/exceptions.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include <boost/asio.hpp>
 #include <boost/beast/core.hpp>
@@ -179,12 +183,15 @@ class FVPointCloudWSServer : public rclcpp::Node
 public:
   FVPointCloudWSServer()
   : Node("fv_pointcloud_ws_server"),
+    tf_buffer_(this->get_clock()),
+    tf_listener_(tf_buffer_),
     ioc_(1),
     running_(false),
     seq_(0),
     last_stats_log_sec_(0.0)
   {
     this->declare_parameter<std::string>("pointcloud_topic", "/fv/d405/depth/points");
+    this->declare_parameter<std::string>("target_frame", "");
     this->declare_parameter<std::string>("server.host", "0.0.0.0");
     this->declare_parameter<int>("server.port", 9070);
     this->declare_parameter<int>("stream.max_points", 20000);
@@ -196,6 +203,7 @@ public:
     this->declare_parameter<double>("lazy.cooldown_sec", 5.0);
 
     pointcloud_topic_ = this->get_parameter("pointcloud_topic").as_string();
+    target_frame_ = this->get_parameter("target_frame").as_string();
     server_host_ = this->get_parameter("server.host").as_string();
     server_port_ = this->get_parameter("server.port").as_int();
     max_points_ = this->get_parameter("stream.max_points").as_int();
@@ -216,6 +224,9 @@ public:
 
     RCLCPP_INFO(this->get_logger(), "Initializing FV PointCloud WS Server");
     RCLCPP_INFO(this->get_logger(), "  pointcloud_topic: %s", pointcloud_topic_.c_str());
+    RCLCPP_INFO(
+      this->get_logger(), "  target_frame: %s",
+      target_frame_.empty() ? "(source frame)" : target_frame_.c_str());
     RCLCPP_INFO(this->get_logger(), "  ws endpoint: ws://%s:%d", server_host_.c_str(), server_port_);
     RCLCPP_INFO(this->get_logger(), "  max_points: %d, sample_step: %d", max_points_, sample_step_);
     RCLCPP_INFO(this->get_logger(), "  range[m]: %.2f - %.2f", min_range_m_, max_range_m_);
@@ -403,6 +414,21 @@ private:
 
   std::vector<uint8_t> build_binary_frame(const sensor_msgs::msg::PointCloud2 & msg)
   {
+    bool do_transform = false;
+    geometry_msgs::msg::TransformStamped transform;
+    if (!target_frame_.empty() && msg.header.frame_id != target_frame_) {
+      try {
+        transform = tf_buffer_.lookupTransform(target_frame_, msg.header.frame_id, tf2::TimePointZero);
+        do_transform = true;
+      } catch (const tf2::TransformException & ex) {
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "TF lookup failed for pointcloud %s -> %s: %s",
+          msg.header.frame_id.c_str(), target_frame_.c_str(), ex.what());
+        return {};
+      }
+    }
+
     FieldRef fx, fy, fz, frgb;
     for (const auto & f : msg.fields) {
       if (f.name == "x") {
@@ -492,9 +518,16 @@ private:
         b = static_cast<uint8_t>(packed & 0xFFu);
       }
 
-      append_f32(payload, x);
-      append_f32(payload, y);
-      append_f32(payload, z);
+      float out_x = x;
+      float out_y = y;
+      float out_z = z;
+      if (do_transform) {
+        transform_point(transform, x, y, z, out_x, out_y, out_z);
+      }
+
+      append_f32(payload, out_x);
+      append_f32(payload, out_y);
+      append_f32(payload, out_z);
       payload.push_back(r);
       payload.push_back(g);
       payload.push_back(b);
@@ -575,6 +608,29 @@ private:
     return frame;
   }
 
+  static void transform_point(
+    const geometry_msgs::msg::TransformStamped & tf,
+    float x, float y, float z,
+    float & out_x, float & out_y, float & out_z)
+  {
+    const auto & q = tf.transform.rotation;
+    const auto & t = tf.transform.translation;
+
+    const double qx = q.x;
+    const double qy = q.y;
+    const double qz = q.z;
+    const double qw = q.w;
+
+    const double ix =  qw * x + qy * z - qz * y;
+    const double iy =  qw * y + qz * x - qx * z;
+    const double iz =  qw * z + qx * y - qy * x;
+    const double iw = -qx * x - qy * y - qz * z;
+
+    out_x = static_cast<float>(ix * qw + iw * -qx + iy * -qz - iz * -qy + t.x);
+    out_y = static_cast<float>(iy * qw + iw * -qy + iz * -qx - ix * -qz + t.y);
+    out_z = static_cast<float>(iz * qw + iw * -qz + ix * -qy - iy * -qx + t.z);
+  }
+
   void broadcast_binary(const std::vector<uint8_t> & frame)
   {
     std::lock_guard<std::mutex> lk(sessions_mutex_);
@@ -623,6 +679,7 @@ private:
   }
 
   std::string pointcloud_topic_;
+  std::string target_frame_;
   std::string server_host_;
   int server_port_;
 
@@ -634,6 +691,9 @@ private:
   CompressionCodec stream_codec_{CompressionCodec::None};
   int compression_min_bytes_;
   double lazy_cooldown_sec_;
+
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
 
   net::io_context ioc_;
   std::unique_ptr<tcp::acceptor> acceptor_;

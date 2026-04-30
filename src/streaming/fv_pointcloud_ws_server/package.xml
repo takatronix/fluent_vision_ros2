@@ -8,8 +8,11 @@
   <license>MIT</license>
 
   <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
   <depend>boost</depend>
   <build_depend>liblz4-dev</build_depend>
   <exec_depend>liblz4-dev</exec_depend>
