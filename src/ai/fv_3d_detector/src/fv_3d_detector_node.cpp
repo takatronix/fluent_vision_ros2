@@ -604,8 +604,9 @@ private:
         // Optional: re-express centroids + orientation in target_frame
         // (typically base_link). Done LAST so all the source-frame
         // detection / OBB math stays in camera frame where the depth
-        // comes from. Falls back to source frame if the lookup fails
-        // — better to publish slightly stale than not at all.
+        // comes from. If the stamped lookup fails, keep the output in
+        // the source frame; applying a stale "latest" TF corrupts object
+        // and marker coordinates when the camera/arm is moving.
         geometry_msgs::msg::TransformStamped output_tf;
         bool got_output_tf = false;
         if (!target_frame_.empty() && target_frame_ != out.header.frame_id) {
@@ -617,21 +618,10 @@ private:
                     rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
                 got_tf = true;
             } catch (const std::exception &e) {
-                try {
-                    tf = tf_buffer_->lookupTransform(
-                        target_frame_, out.header.frame_id, rclcpp::Time(0, 0, RCL_ROS_TIME),
-                        rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
-                    got_tf = true;
-                    RCLCPP_WARN_THROTTLE(
-                        get_logger(), *get_clock(), 5000,
-                        "stamped tf lookup %s -> %s failed: %s — using latest transform",
-                        out.header.frame_id.c_str(), target_frame_.c_str(), e.what());
-                } catch (const std::exception &latest_e) {
-                    RCLCPP_WARN_THROTTLE(
-                        get_logger(), *get_clock(), 5000,
-                        "tf lookup %s -> %s failed: stamped=%s latest=%s — publishing in source frame",
-                        out.header.frame_id.c_str(), target_frame_.c_str(), e.what(), latest_e.what());
-                }
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 5000,
+                    "tf lookup %s -> %s failed: %s; publishing in source frame",
+                    out.header.frame_id.c_str(), target_frame_.c_str(), e.what());
             }
             if (got_tf) {
                 output_tf = tf;
@@ -652,8 +642,8 @@ private:
                 // Also re-frame markers so RViz / scene_viewer render
                 // them in the new frame without per-consumer fixup.
                 for (auto &m : markers.markers) {
-                    if (m.action == visualization_msgs::msg::Marker::DELETE) continue;
                     m.header.frame_id = target_frame_;
+                    if (m.action == visualization_msgs::msg::Marker::DELETE) continue;
                     geometry_msgs::msg::PoseStamped src_pose, dst_pose;
                     src_pose.header = out.header;
                     src_pose.pose = m.pose;

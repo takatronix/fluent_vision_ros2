@@ -418,13 +418,15 @@ private:
     geometry_msgs::msg::TransformStamped transform;
     if (!target_frame_.empty() && msg.header.frame_id != target_frame_) {
       try {
-        transform = tf_buffer_.lookupTransform(target_frame_, msg.header.frame_id, tf2::TimePointZero);
+        transform = tf_buffer_.lookupTransform(
+          target_frame_, msg.header.frame_id, rclcpp::Time(msg.header.stamp));
         do_transform = true;
       } catch (const tf2::TransformException & ex) {
         RCLCPP_WARN_THROTTLE(
           this->get_logger(), *this->get_clock(), 2000,
-          "TF lookup failed for pointcloud %s -> %s: %s",
-          msg.header.frame_id.c_str(), target_frame_.c_str(), ex.what());
+          "TF lookup failed for pointcloud %s -> %s at stamp %d.%09u: %s",
+          msg.header.frame_id.c_str(), target_frame_.c_str(),
+          msg.header.stamp.sec, msg.header.stamp.nanosec, ex.what());
         return {};
       }
     }
