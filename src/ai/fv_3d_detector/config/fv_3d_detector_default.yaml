@@ -24,6 +24,14 @@ fv_3d_detector_node:
     # Minimum points per detection to compute 3D
     min_points: 10
 
+    # Robust depth cleanup before OBB fitting.
+    # mask.erode_px removes segmentation edge bleed; filter.depth_median_abs_m
+    # keeps only points near the per-detection median depth.
+    mask:
+      erode_px: 0
+    filter:
+      depth_median_abs_m: 0.0
+
     # Shape classification thresholds (eigenvalue ratios)
     shape:
       cube_threshold: 0.4

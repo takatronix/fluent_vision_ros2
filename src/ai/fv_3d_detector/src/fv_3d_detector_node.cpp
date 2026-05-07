@@ -98,6 +98,11 @@ public:
         // Performance
         this->declare_parameter<double>("max_fps", 10.0);
         this->declare_parameter<int>("point_stride", 2);
+        // Depth masks often include edge bleed / background pixels. Erode
+        // the mask before lifting pixels to 3D, then reject depth samples
+        // that are too far from the per-detection median depth.
+        this->declare_parameter<int>("mask.erode_px", 0);
+        this->declare_parameter<double>("filter.depth_median_abs_m", 0.0);
 
         // Optional output frame. When non-empty (typical: "base_link"),
         // every centroid + orientation in the published Object3DArray is
@@ -184,6 +189,8 @@ private:
         filter_max_dist_   = static_cast<float>(this->get_parameter("filter.max_distance_m").as_double());
         max_fps_           = this->get_parameter("max_fps").as_double();
         point_stride_      = std::max(1, static_cast<int>(this->get_parameter("point_stride").as_int()));
+        mask_erode_px_     = std::max(0, static_cast<int>(this->get_parameter("mask.erode_px").as_int()));
+        depth_median_abs_  = static_cast<float>(this->get_parameter("filter.depth_median_abs_m").as_double());
         target_frame_      = this->get_parameter("target_frame").as_string();
         tf_lookup_timeout_sec_ = this->get_parameter("tf_lookup_timeout_sec").as_double();
         if (max_fps_ > 0.0) min_interval_ns_ = static_cast<int64_t>(1.0e9 / max_fps_);
@@ -265,6 +272,18 @@ private:
         const uint32_t mask_w = mask_msg->width;
         const uint32_t mask_h = mask_msg->height;
         const uint8_t *mask_data = mask_msg->data.data();
+        uint32_t mask_step = mask_msg->step;
+        cv::Mat eroded_mask;
+        if (mask_erode_px_ > 0) {
+            cv::Mat mask_mat(
+                static_cast<int>(mask_h), static_cast<int>(mask_w), CV_8UC1,
+                const_cast<uint8_t*>(mask_data), mask_msg->step);
+            const int k = 2 * mask_erode_px_ + 1;
+            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(k, k));
+            cv::erode(mask_mat, eroded_mask, kernel);
+            mask_data = eroded_mask.data;
+            mask_step = static_cast<uint32_t>(eroded_mask.step);
+        }
         if (frame_id.empty()) frame_id = depth_msg->header.frame_id;
 
         const uint16_t *depth_ptr = reinterpret_cast<const uint16_t*>(depth_msg->data.data());
@@ -326,10 +345,12 @@ private:
 
             CloudPtr sub(new Cloud);
             sub->points.reserve(static_cast<size_t>((x_max - x_min) * (y_max - y_min) / 4));
+            std::vector<float> depths;
+            depths.reserve(sub->points.capacity());
 
             for (int py = y_min; py <= y_max; py += point_stride_) {
                 for (int px = x_min; px <= x_max; px += point_stride_) {
-                    if (mask_data[py * mask_msg->step + px] == 0) continue;
+                    if (mask_data[py * mask_step + px] == 0) continue;
                     if (static_cast<uint32_t>(px) >= depth_w || static_cast<uint32_t>(py) >= depth_h) continue;
                     uint16_t dv = depth_ptr[py * depth_step + px];
                     if (dv == 0) continue;
@@ -345,11 +366,32 @@ private:
                         else           { pt.r = cp[0]; pt.g = cp[1]; pt.b = cp[2]; }
                     }
                     sub->points.push_back(pt);
+                    depths.push_back(z);
                 }
             }
 
             sub->width = sub->points.size(); sub->height = 1; sub->is_dense = false;
             if (static_cast<int>(sub->points.size()) < min_points_) continue;
+
+            if (depth_median_abs_ > 0.0f && depths.size() == sub->points.size()) {
+                std::vector<float> sorted_depths = depths;
+                const size_t mid = sorted_depths.size() / 2;
+                std::nth_element(sorted_depths.begin(), sorted_depths.begin() + mid, sorted_depths.end());
+                const float median_z = sorted_depths[mid];
+
+                CloudPtr filtered(new Cloud);
+                filtered->points.reserve(sub->points.size());
+                for (const auto &pt : sub->points) {
+                    if (std::fabs(pt.z - median_z) <= depth_median_abs_) {
+                        filtered->points.push_back(pt);
+                    }
+                }
+                filtered->width = filtered->points.size();
+                filtered->height = 1;
+                filtered->is_dense = false;
+                if (static_cast<int>(filtered->points.size()) < min_points_) continue;
+                sub = filtered;
+            }
 
             auto obb = fluent_cloud::compute_obb_metrics(sub);
             if (obb.num_points < static_cast<uint32_t>(min_points_)) continue;
@@ -725,6 +767,8 @@ private:
     float filter_min_dist_{0.0f}, filter_max_dist_{0.0f};
     double max_fps_{10.0};
     int point_stride_{2};
+    int mask_erode_px_{0};
+    float depth_median_abs_{0.0f};
     int64_t min_interval_ns_{0};
     int64_t last_process_ns_{0};
     int prev_marker_count_{0};
