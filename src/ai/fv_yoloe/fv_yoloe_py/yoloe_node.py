@@ -7,6 +7,8 @@ Text prompt で任意の物体をリアルタイム検出。
 from __future__ import annotations
 
 import time
+import json
+import os
 from typing import List, Optional
 
 import cv2
@@ -46,6 +48,8 @@ class FvYoloeNode(Node):
         self.declare_parameter("text_prompt", "cube")
         # Topic to receive prompt updates (publish String to change classes)
         self.declare_parameter("prompt_topic", "~/set_prompt")
+        # Topic to receive visual prompt updates from the dashboard registry.
+        self.declare_parameter("visual_prompt_topic", "~/set_visual_prompt")
 
         # Performance
         self.declare_parameter("processing_frequency", 10.0)
@@ -67,6 +71,7 @@ class FvYoloeNode(Node):
 
         self.text_prompt = str(self.get_parameter("text_prompt").value)
         self.prompt_topic = str(self.get_parameter("prompt_topic").value)
+        self.visual_prompt_topic = str(self.get_parameter("visual_prompt_topic").value)
 
         self.processing_frequency = float(self.get_parameter("processing_frequency").value)
         self.qos_reliability = str(self.get_parameter("qos_reliability").value).strip().lower()
@@ -97,6 +102,8 @@ class FvYoloeNode(Node):
         # Load model
         self._model = None
         self._current_classes: List[str] = []
+        self._class_aliases = {}
+        self._prompt_mode = "text"
         self._load_model()
 
         # Subscriber
@@ -108,6 +115,9 @@ class FvYoloeNode(Node):
         # Prompt update subscriber
         self.prompt_sub = self.create_subscription(
             String, self.prompt_topic, self._on_prompt, 10
+        )
+        self.visual_prompt_sub = self.create_subscription(
+            String, self.visual_prompt_topic, self._on_visual_prompt, 10
         )
 
         # Service to get current prompt
@@ -155,13 +165,17 @@ class FvYoloeNode(Node):
             self.get_logger().error(f"YOLOE model load failed: {e}")
             self._model = None
 
+    @staticmethod
+    def _prompt_names(prompt_str: str) -> List[str]:
+        return [n.strip() for n in str(prompt_str or "").split(",") if n.strip()]
+
     def _set_classes(self, prompt_str: str) -> None:
         if self._model is None:
             return
 
-        names = [n.strip() for n in prompt_str.split(",") if n.strip()]
+        names = self._prompt_names(prompt_str)
         if not names:
-            self.get_logger().warning("Empty prompt, keeping current classes")
+            self._clear_classes()
             return
 
         if names == self._current_classes:
@@ -171,15 +185,192 @@ class FvYoloeNode(Node):
             text_pe = self._model.get_text_pe(names)
             self._model.set_classes(names, text_pe)
             self._current_classes = names
+            self._class_aliases = {}
+            self._prompt_mode = "text"
             self.get_logger().info(f"YOLOE classes set: {names}")
         except Exception as e:
             self.get_logger().error(f"Failed to set classes: {e}")
 
+    def _clear_classes(self) -> None:
+        self._current_classes = []
+        self._class_aliases = {}
+        self._prompt_mode = "none"
+        if self._model is not None:
+            self._model.predictor = None
+        self.get_logger().info("YOLOE classes cleared")
+
     def _on_prompt(self, msg: String) -> None:
         new_prompt = msg.data.strip()
-        if new_prompt:
-            self.get_logger().info(f"Prompt update: '{new_prompt}'")
-            self._set_classes(new_prompt)
+        if new_prompt in ("__clear__", "__none__"):
+            new_prompt = ""
+        self.get_logger().info(f"Prompt update: '{new_prompt}'")
+        self._set_classes(new_prompt)
+
+    def _on_visual_prompt(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data or "{}")
+        except json.JSONDecodeError as e:
+            self.get_logger().warning(f"Invalid visual prompt JSON: {e}")
+            return
+        self._set_visual_prompt(payload)
+
+    def _build_visual_pe(self, predictor, label: str, examples: list):
+        import torch
+
+        visual_pes = []
+        used_examples = []
+        skipped = 0
+        for candidate in examples:
+            if not isinstance(candidate, dict):
+                skipped += 1
+                continue
+            image_path = str(
+                candidate.get("image_path_abs") or candidate.get("image_path") or ""
+            ).strip()
+            if not image_path or not os.path.exists(image_path):
+                skipped += 1
+                continue
+
+            bbox = candidate.get("bbox") or [
+                0, 0, candidate.get("width", 0), candidate.get("height", 0)
+            ]
+            try:
+                bbox = [float(v) for v in bbox[:4]]
+            except Exception:
+                skipped += 1
+                continue
+            if len(bbox) != 4 or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                skipped += 1
+                continue
+
+            try:
+                predictor.set_prompts({"bboxes": [bbox], "cls": [0]})
+                predictor.setup_model(model=self._model.model, verbose=False)
+                visual_pe = predictor.get_vpe(image_path)
+                if visual_pe is None:
+                    skipped += 1
+                    continue
+                visual_pes.append(visual_pe)
+                used_examples.append({
+                    "id": str(candidate.get("id") or ""),
+                    "image": image_path,
+                    "bbox": bbox,
+                })
+            except Exception as e:
+                skipped += 1
+                self.get_logger().warning(
+                    f"Visual prompt example skipped for {label}: {e}"
+                )
+
+        if not visual_pes:
+            return None, [], [], skipped
+
+        if len(visual_pes) == 1:
+            return visual_pes[0], [label], used_examples, skipped
+
+        try:
+            return torch.cat(visual_pes, dim=1), [label] * len(visual_pes), used_examples, skipped
+        except Exception as e:
+            self.get_logger().warning(
+                f"Visual prompt concat failed for {label}, falling back to mean: {e}"
+            )
+            base_dtype = visual_pes[0].dtype
+            visual_pe = torch.stack(
+                [pe.to(dtype=torch.float32) for pe in visual_pes],
+                dim=0,
+            ).mean(dim=0).to(dtype=base_dtype)
+            return visual_pe, [label], used_examples, skipped
+
+    def _set_visual_prompt(self, payload: dict) -> None:
+        if self._model is None:
+            return
+
+        text_names = self._prompt_names(payload.get("text_prompt") or payload.get("text") or "")
+        targets = payload.get("targets")
+        if not isinstance(targets, list):
+            label = str(payload.get("label") or payload.get("prompt") or payload.get("key") or "").strip()
+            examples = payload.get("examples") or []
+            if not label:
+                self.get_logger().warning("Visual prompt ignored: label is empty")
+                return
+            targets = [{"label": label, "key": payload.get("key", ""), "examples": examples}]
+
+        try:
+            import torch
+            from ultralytics.models.yolo.yoloe.predict import (
+                YOLOEVPDetectPredictor,
+                YOLOEVPSegPredictor,
+            )
+
+            class_names = []
+            class_aliases = {}
+            prompt_pes = []
+            used_visual = []
+            skipped = 0
+
+            if text_names:
+                prompt_pes.append(self._model.get_text_pe(text_names))
+                class_names.extend(text_names)
+
+            task = str(getattr(self._model, "task", "") or getattr(self._model.model, "task", ""))
+            predictor_cls = YOLOEVPSegPredictor if task == "segment" else YOLOEVPDetectPredictor
+            predictor = predictor_cls(
+                overrides={
+                    "task": task or self._model.model.task,
+                    "mode": "predict",
+                    "save": False,
+                    "verbose": False,
+                    "batch": 1,
+                    "device": self._device,
+                    "half": False,
+                    "imgsz": self._model.overrides.get("imgsz", 640),
+                },
+                _callbacks=self._model.callbacks,
+            )
+
+            for target in targets:
+                if not isinstance(target, dict):
+                    skipped += 1
+                    continue
+                label = str(target.get("label") or target.get("prompt") or target.get("key") or "").strip()
+                examples = target.get("examples") or []
+                if not label or not isinstance(examples, list) or not examples:
+                    skipped += 1
+                    continue
+                visual_pe, visual_names, used_examples, skipped_count = self._build_visual_pe(
+                    predictor, label, examples
+                )
+                skipped += skipped_count
+                if visual_pe is None:
+                    continue
+                prompt_pes.append(visual_pe)
+                class_names.extend(visual_names)
+                for name in visual_names:
+                    class_aliases[name] = label
+                used_visual.extend({"label": label, **item} for item in used_examples)
+
+            if not prompt_pes or not class_names:
+                self.get_logger().warning("YOLOE prompt ignored: no usable text or visual prompts")
+                return
+
+            pe = prompt_pes[0] if len(prompt_pes) == 1 else torch.cat(prompt_pes, dim=1)
+            self._model.set_classes(class_names, pe)
+            self._model.predictor = None
+            self._current_classes = list(dict.fromkeys(class_aliases.get(name, name) for name in class_names))
+            self._class_aliases = class_aliases
+            self._prompt_mode = "mixed" if text_names and used_visual else ("visual" if used_visual else "text")
+            self.get_logger().info(
+                f"YOLOE prompt set: mode={self._prompt_mode} "
+                f"text={text_names} visual_examples={len(used_visual)} "
+                f"embeddings={len(class_names)} skipped={skipped}"
+            )
+            for item in used_visual:
+                self.get_logger().debug(
+                    f"YOLOE visual example: label={item['label']} id={item['id']} "
+                    f"image={item['image']} bbox={item['bbox']}"
+                )
+        except Exception as e:
+            self.get_logger().error(f"Failed to set YOLOE visual/mixed prompt: {e}")
 
     def _srv_get_prompt(self, request, response):
         response.success = self._model is not None
@@ -187,9 +378,6 @@ class FvYoloeNode(Node):
         return response
 
     def _on_image(self, msg: Image) -> None:
-        if self._model is None or not self._current_classes:
-            return
-
         # Throttle
         if self.processing_frequency > 0:
             now = time.monotonic()
@@ -205,6 +393,10 @@ class FvYoloeNode(Node):
             img_bgr = self._imgmsg_to_bgr(msg)
         except Exception as e:
             self.get_logger().warning(f"Image decode failed: {e}")
+            return
+
+        if self._model is None or not self._current_classes:
+            self._publish_passthrough(msg, img_bgr, start)
             return
 
         # Inference
@@ -229,7 +421,7 @@ class FvYoloeNode(Node):
         n_det = len(result.boxes) if result.boxes is not None else 0
         device_str = getattr(self, '_device', '?')
         info_text = f"{self.model_name} | {device_str} | {proc_ms_now:.0f}ms | {n_det} det"
-        prompt_text = f"Prompt: {', '.join(self._current_classes)}"
+        prompt_text = f"Prompt({self._prompt_mode}): {', '.join(self._current_classes)}"
         w_img = overlay.shape[1]
         # Background bar at top
         cv2.rectangle(overlay, (0, 0), (w_img, 44), (0, 0, 0), -1)
@@ -271,12 +463,12 @@ class FvYoloeNode(Node):
         n_det = len(result.boxes) if result.boxes is not None else 0
 
         # Publish detections + stats as JSON
-        import json
         dets = []
         if result.boxes is not None:
             for i, box in enumerate(result.boxes):
                 cls_id = int(box.cls[0])
                 cls_name = result.names.get(cls_id, str(cls_id))
+                cls_name = self._class_aliases.get(cls_name, cls_name)
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 dets.append({
@@ -296,6 +488,7 @@ class FvYoloeNode(Node):
                 "fps": round(1000.0 / avg_ms, 1) if avg_ms > 0 else 0,
                 "frame": self._frame_counter,
                 "classes": self._current_classes,
+                "prompt_mode": self._prompt_mode,
                 "num_detections": n_det,
             }
         })
@@ -311,7 +504,8 @@ class FvYoloeNode(Node):
                 d.header = header
                 d.id = i
                 d.class_id = int(box.cls[0])
-                d.label = result.names.get(d.class_id, str(d.class_id))
+                raw_label = result.names.get(d.class_id, str(d.class_id))
+                d.label = self._class_aliases.get(raw_label, raw_label)
                 d.conf_fused = float(box.conf[0])
                 d.conf_object = float(box.conf[0])
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
@@ -328,6 +522,46 @@ class FvYoloeNode(Node):
                 f"avg={avg_ms:.1f}ms ({1000/avg_ms:.1f}fps) "
                 f"detections={n_det} classes={self._current_classes}"
             )
+
+    def _publish_passthrough(self, msg: Image, img_bgr: np.ndarray, start: float) -> None:
+        """Publish camera image plus empty detection products when no prompt is active."""
+        header = msg.header
+        overlay_msg = self._cv2_to_imgmsg(img_bgr, "bgr8", header)
+        self.overlay_pub.publish(overlay_msg)
+
+        _, jpeg_data = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        comp_msg = CompressedImage()
+        comp_msg.header = header
+        comp_msg.format = "jpeg"
+        comp_msg.data = jpeg_data.tobytes()
+        self.overlay_compressed_pub.publish(comp_msg)
+
+        h, w = img_bgr.shape[:2]
+        mask_msg = self._cv2_to_imgmsg(np.zeros((h, w), dtype=np.uint8), "mono8", header)
+        self.mask_pub.publish(mask_msg)
+
+        proc_ms = (time.perf_counter() - start) * 1000.0
+        det_msg = String()
+        det_msg.data = json.dumps({
+            "detections": [],
+            "stats": {
+                "model": self.model_name,
+                "device": getattr(self, '_device', 'unknown'),
+                "inference_ms": 0.0,
+                "avg_ms": round(proc_ms, 1),
+                "fps": 0,
+                "frame": self._frame_counter,
+                "classes": self._current_classes,
+                "prompt_mode": "none" if not self._current_classes else self._prompt_mode,
+                "num_detections": 0,
+            }
+        })
+        self.detections_pub.publish(det_msg)
+
+        if self.detections_fv_pub is not None:
+            det_arr = DetectionArray()
+            det_arr.header = header
+            self.detections_fv_pub.publish(det_arr)
 
     # --- Image conversion (no cv_bridge) ---
     def _imgmsg_to_bgr(self, msg: Image) -> np.ndarray:

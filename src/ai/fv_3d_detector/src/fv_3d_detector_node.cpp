@@ -10,6 +10,8 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/segmentation/extract_clusters.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <mutex>
@@ -77,6 +79,7 @@ public:
         this->declare_parameter<std::string>("marker_topic", "~/markers");
         this->declare_parameter<bool>("publish_overlay", true);
         this->declare_parameter<int>("min_points", 10);
+        this->declare_parameter<int>("mask.erode_px", 0);
         this->declare_parameter<double>("depth_scale", 0.001);
         // Distance filter
         this->declare_parameter<double>("min_depth_m", 0.05);
@@ -95,14 +98,16 @@ public:
         // Distance filter on 3D centroid (0 = disabled)
         this->declare_parameter<double>("filter.min_distance_m", 0.0);
         this->declare_parameter<double>("filter.max_distance_m", 0.0);
+        // Robust per-detection depth gate. 0 = disabled. Useful for
+        // open-vocabulary masks that include table/background speckles.
+        this->declare_parameter<double>("filter.depth_median_abs_m", 0.0);
+        this->declare_parameter<int>("filter.sor_mean_k", 0);
+        this->declare_parameter<double>("filter.sor_stddev_mul", 1.0);
+        this->declare_parameter<double>("filter.cluster_tolerance_m", 0.0);
+        this->declare_parameter<int>("filter.cluster_min_points", 0);
         // Performance
         this->declare_parameter<double>("max_fps", 10.0);
         this->declare_parameter<int>("point_stride", 2);
-        // Depth masks often include edge bleed / background pixels. Erode
-        // the mask before lifting pixels to 3D, then reject depth samples
-        // that are too far from the per-detection median depth.
-        this->declare_parameter<int>("mask.erode_px", 0);
-        this->declare_parameter<double>("filter.depth_median_abs_m", 0.0);
 
         // Optional output frame. When non-empty (typical: "base_link"),
         // every centroid + orientation in the published Object3DArray is
@@ -178,6 +183,7 @@ private:
         marker_topic_      = this->get_parameter("marker_topic").as_string();
         publish_overlay_   = this->get_parameter("publish_overlay").as_bool();
         min_points_        = std::max(3, static_cast<int>(this->get_parameter("min_points").as_int()));
+        mask_erode_px_     = std::max(0, static_cast<int>(this->get_parameter("mask.erode_px").as_int()));
         depth_scale_       = this->get_parameter("depth_scale").as_double();
         min_depth_m_       = static_cast<float>(this->get_parameter("min_depth_m").as_double());
         max_depth_m_       = static_cast<float>(this->get_parameter("max_depth_m").as_double());
@@ -187,10 +193,13 @@ private:
         filter_nms_dist_   = static_cast<float>(this->get_parameter("filter.nms_dist_m").as_double());
         filter_min_dist_   = static_cast<float>(this->get_parameter("filter.min_distance_m").as_double());
         filter_max_dist_   = static_cast<float>(this->get_parameter("filter.max_distance_m").as_double());
+        filter_depth_median_abs_ = static_cast<float>(this->get_parameter("filter.depth_median_abs_m").as_double());
+        filter_sor_mean_k_ = std::max(0, static_cast<int>(this->get_parameter("filter.sor_mean_k").as_int()));
+        filter_sor_stddev_mul_ = static_cast<float>(this->get_parameter("filter.sor_stddev_mul").as_double());
+        filter_cluster_tolerance_ = static_cast<float>(this->get_parameter("filter.cluster_tolerance_m").as_double());
+        filter_cluster_min_points_ = std::max(0, static_cast<int>(this->get_parameter("filter.cluster_min_points").as_int()));
         max_fps_           = this->get_parameter("max_fps").as_double();
         point_stride_      = std::max(1, static_cast<int>(this->get_parameter("point_stride").as_int()));
-        mask_erode_px_     = std::max(0, static_cast<int>(this->get_parameter("mask.erode_px").as_int()));
-        depth_median_abs_  = static_cast<float>(this->get_parameter("filter.depth_median_abs_m").as_double());
         target_frame_      = this->get_parameter("target_frame").as_string();
         tf_lookup_timeout_sec_ = this->get_parameter("tf_lookup_timeout_sec").as_double();
         if (max_fps_ > 0.0) min_interval_ns_ = static_cast<int64_t>(1.0e9 / max_fps_);
@@ -272,18 +281,6 @@ private:
         const uint32_t mask_w = mask_msg->width;
         const uint32_t mask_h = mask_msg->height;
         const uint8_t *mask_data = mask_msg->data.data();
-        uint32_t mask_step = mask_msg->step;
-        cv::Mat eroded_mask;
-        if (mask_erode_px_ > 0) {
-            cv::Mat mask_mat(
-                static_cast<int>(mask_h), static_cast<int>(mask_w), CV_8UC1,
-                const_cast<uint8_t*>(mask_data), mask_msg->step);
-            const int k = 2 * mask_erode_px_ + 1;
-            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(k, k));
-            cv::erode(mask_mat, eroded_mask, kernel);
-            mask_data = eroded_mask.data;
-            mask_step = static_cast<uint32_t>(eroded_mask.step);
-        }
         if (frame_id.empty()) frame_id = depth_msg->header.frame_id;
 
         const uint16_t *depth_ptr = reinterpret_cast<const uint16_t*>(depth_msg->data.data());
@@ -342,15 +339,33 @@ private:
             int x_max = std::min(static_cast<int>(mask_w) - 1, static_cast<int>(det.bbox_max.x));
             int y_max = std::min(static_cast<int>(mask_h) - 1, static_cast<int>(det.bbox_max.y));
             if (x_min >= x_max || y_min >= y_max) continue;
+            const uint32_t mask_instance_id = det.mask_instance_id;
 
             CloudPtr sub(new Cloud);
             sub->points.reserve(static_cast<size_t>((x_max - x_min) * (y_max - y_min) / 4));
-            std::vector<float> depths;
-            depths.reserve(sub->points.capacity());
+            auto maskMatches = [&](int px, int py) -> bool {
+                auto pixelMatches = [&](int qx, int qy) -> bool {
+                    if (qx < 0 || qy < 0 || static_cast<uint32_t>(qx) >= mask_w || static_cast<uint32_t>(qy) >= mask_h) {
+                        return false;
+                    }
+                    const uint8_t mv = mask_data[qy * mask_msg->step + qx];
+                    if (mask_instance_id > 0) {
+                        return static_cast<uint32_t>(mv) == mask_instance_id;
+                    }
+                    return mv != 0;
+                };
+                if (!pixelMatches(px, py)) return false;
+                for (int dy = -mask_erode_px_; dy <= mask_erode_px_; ++dy) {
+                    for (int dx = -mask_erode_px_; dx <= mask_erode_px_; ++dx) {
+                        if (!pixelMatches(px + dx, py + dy)) return false;
+                    }
+                }
+                return true;
+            };
 
             for (int py = y_min; py <= y_max; py += point_stride_) {
                 for (int px = x_min; px <= x_max; px += point_stride_) {
-                    if (mask_data[py * mask_step + px] == 0) continue;
+                    if (!maskMatches(px, py)) continue;
                     if (static_cast<uint32_t>(px) >= depth_w || static_cast<uint32_t>(py) >= depth_h) continue;
                     uint16_t dv = depth_ptr[py * depth_step + px];
                     if (dv == 0) continue;
@@ -366,32 +381,15 @@ private:
                         else           { pt.r = cp[0]; pt.g = cp[1]; pt.b = cp[2]; }
                     }
                     sub->points.push_back(pt);
-                    depths.push_back(z);
                 }
             }
 
             sub->width = sub->points.size(); sub->height = 1; sub->is_dense = false;
             if (static_cast<int>(sub->points.size()) < min_points_) continue;
-
-            if (depth_median_abs_ > 0.0f && depths.size() == sub->points.size()) {
-                std::vector<float> sorted_depths = depths;
-                const size_t mid = sorted_depths.size() / 2;
-                std::nth_element(sorted_depths.begin(), sorted_depths.begin() + mid, sorted_depths.end());
-                const float median_z = sorted_depths[mid];
-
-                CloudPtr filtered(new Cloud);
-                filtered->points.reserve(sub->points.size());
-                for (const auto &pt : sub->points) {
-                    if (std::fabs(pt.z - median_z) <= depth_median_abs_) {
-                        filtered->points.push_back(pt);
-                    }
-                }
-                filtered->width = filtered->points.size();
-                filtered->height = 1;
-                filtered->is_dense = false;
-                if (static_cast<int>(filtered->points.size()) < min_points_) continue;
-                sub = filtered;
-            }
+            sub = filterByMedianDepth(sub);
+            sub = filterStatisticalOutliers(sub);
+            sub = keepLargestCluster(sub);
+            if (static_cast<int>(sub->points.size()) < min_points_) continue;
 
             auto obb = fluent_cloud::compute_obb_metrics(sub);
             if (obb.num_points < static_cast<uint32_t>(min_points_)) continue;
@@ -487,6 +485,11 @@ private:
             for (auto &c : cands) {
                 int merge_idx = -1;
                 for (size_t i = 0; i < kept.size(); ++i) {
+                    const uint32_t c_inst = c.det.mask_instance_id;
+                    const uint32_t k_inst = kept[i].det.mask_instance_id;
+                    if (c_inst > 0 && k_inst > 0 && c_inst != k_inst) {
+                        continue;
+                    }
                     bool same_object = bboxIoU(c, kept[i]) >= iou_threshold;
                     if (!same_object && dist_threshold > 0.0f) {
                         Eigen::Vector3f d = c.obb.center - kept[i].obb.center;
@@ -755,20 +758,102 @@ private:
         pt.z = static_cast<float>(iz * qw + iw * -qz + ix * -qy - iy * -qx + t.z);
     }
 
+    CloudPtr filterByMedianDepth(const CloudPtr &in) const
+    {
+        if (!in || filter_depth_median_abs_ <= 0.0f ||
+            static_cast<int>(in->points.size()) < min_points_) {
+            return in;
+        }
+        std::vector<float> zs;
+        zs.reserve(in->points.size());
+        for (const auto &pt : in->points) {
+            if (std::isfinite(pt.z) && pt.z > 0.0f) zs.push_back(pt.z);
+        }
+        if (static_cast<int>(zs.size()) < min_points_) return in;
+        const size_t mid = zs.size() / 2;
+        std::nth_element(zs.begin(), zs.begin() + mid, zs.end());
+        const float median_z = zs[mid];
+
+        CloudPtr out(new Cloud);
+        out->points.reserve(in->points.size());
+        for (const auto &pt : in->points) {
+            if (!std::isfinite(pt.z) || pt.z <= 0.0f) continue;
+            if (std::fabs(pt.z - median_z) > filter_depth_median_abs_) continue;
+            out->points.push_back(pt);
+        }
+        out->width = out->points.size();
+        out->height = 1;
+        out->is_dense = false;
+        return out;
+    }
+
+    CloudPtr filterStatisticalOutliers(const CloudPtr &in) const
+    {
+        if (!in || filter_sor_mean_k_ <= 0 ||
+            static_cast<int>(in->points.size()) <= filter_sor_mean_k_) {
+            return in;
+        }
+        return fluent_cloud::filters::StatisticalOutlierRemoval<pcl::PointXYZRGB>()
+            .setMeanK(filter_sor_mean_k_)
+            .setStddevMulThresh(filter_sor_stddev_mul_)
+            .filter(in);
+    }
+
+    CloudPtr keepLargestCluster(const CloudPtr &in) const
+    {
+        if (!in || filter_cluster_tolerance_ <= 0.0f ||
+            static_cast<int>(in->points.size()) < min_points_) {
+            return in;
+        }
+        auto tree = pcl::search::KdTree<pcl::PointXYZRGB>::Ptr(new pcl::search::KdTree<pcl::PointXYZRGB>);
+        tree->setInputCloud(in);
+
+        std::vector<pcl::PointIndices> clusters;
+        pcl::EuclideanClusterExtraction<pcl::PointXYZRGB> ec;
+        ec.setClusterTolerance(filter_cluster_tolerance_);
+        ec.setMinClusterSize(std::max(min_points_, filter_cluster_min_points_));
+        ec.setMaxClusterSize(static_cast<int>(in->points.size()));
+        ec.setSearchMethod(tree);
+        ec.setInputCloud(in);
+        ec.extract(clusters);
+        if (clusters.empty()) return in;
+
+        auto largest = std::max_element(
+            clusters.begin(), clusters.end(),
+            [](const pcl::PointIndices &a, const pcl::PointIndices &b) {
+                return a.indices.size() < b.indices.size();
+            });
+        CloudPtr out(new Cloud);
+        out->points.reserve(largest->indices.size());
+        for (const int idx : largest->indices) {
+            if (idx >= 0 && static_cast<size_t>(idx) < in->points.size()) {
+                out->points.push_back(in->points[static_cast<size_t>(idx)]);
+            }
+        }
+        out->width = out->points.size();
+        out->height = 1;
+        out->is_dense = false;
+        return out;
+    }
+
     std::string mask_topic_, det_topic_, depth_topic_, color_topic_;
     std::string camera_info_topic_, output_topic_, marker_topic_;
     bool publish_markers_{true}, publish_overlay_{true};
     int min_points_{10};
+    int mask_erode_px_{0};
     double depth_scale_{0.001};
     float min_depth_m_{0.05f}, max_depth_m_{3.0f};
     float filter_min_size_{0.0f}, filter_max_size_{0.0f};
     float filter_max_aspect_{0.0f};
     float filter_nms_dist_{0.0f};
     float filter_min_dist_{0.0f}, filter_max_dist_{0.0f};
+    float filter_depth_median_abs_{0.0f};
+    int filter_sor_mean_k_{0};
+    float filter_sor_stddev_mul_{1.0f};
+    float filter_cluster_tolerance_{0.0f};
+    int filter_cluster_min_points_{0};
     double max_fps_{10.0};
     int point_stride_{2};
-    int mask_erode_px_{0};
-    float depth_median_abs_{0.0f};
     int64_t min_interval_ns_{0};
     int64_t last_process_ns_{0};
     int prev_marker_count_{0};
