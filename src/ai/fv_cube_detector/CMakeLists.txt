@@ -49,8 +49,27 @@ find_path(TENSORRT_INCLUDE_DIR
         /usr/include/aarch64-linux-gnu
         /usr/include/x86_64-linux-gnu
 )
-find_library(NVINFER_LIB NAMES nvinfer)
-find_library(CUDART_LIB NAMES cudart PATHS /usr/local/cuda/lib64)
+# nvinfer ships in the multiarch lib dir on aarch64 (Thor: TRT 10 lives in
+# /lib/aarch64-linux-gnu). Some installs only ship versioned soname, so
+# accept libnvinfer.so.10 as well.
+find_library(NVINFER_LIB
+  NAMES nvinfer libnvinfer.so.10
+  PATHS /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu
+        /lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu
+        /usr/lib/aarch64-linux-gnu
+        /lib/aarch64-linux-gnu
+        /usr/lib/x86_64-linux-gnu
+)
+# cudart on aarch64 sbsa (Thor) lives under targets/sbsa-linux/lib, on
+# Jetson L4T under targets/aarch64-linux/lib, x86_64 under lib64.
+find_library(CUDART_LIB
+  NAMES cudart
+  PATHS /usr/local/cuda/targets/sbsa-linux/lib
+        /usr/local/cuda/targets/aarch64-linux/lib
+        /usr/local/cuda/lib64
+        /usr/local/cuda/lib
+        /usr/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu
+)
 
 set(FV_HAS_TENSORRT OFF)
 if(TENSORRT_INCLUDE_DIR AND NVINFER_LIB AND CUDART_LIB)
