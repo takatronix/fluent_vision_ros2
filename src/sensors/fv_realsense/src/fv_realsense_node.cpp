@@ -840,9 +840,22 @@ void FVDepthCameraNode::onDepthFrame(const rs2::frame& frame) {
 bool FVDepthCameraNode::selectCamera()
 {
     auto devices = getAvailableDevices();
-    
-    RCLCPP_INFO(this->get_logger(), "🔍 selectCamera() - Method: %s, Name: %s", 
-        camera_selection_config_.selection_method.c_str(), 
+
+    // Crash guard: every branch below dereferences `devices` (most
+    // notoriously the auto branch's `devices[0]`, which segfaults on
+    // an empty vector). This used to be reachable only at boot when
+    // ros2 launch already verified a device existed; the watchdog
+    // deep-reset now calls selectCamera() while the USB might still
+    // be unplugged, so we have to fail closed before any indexing.
+    if (devices.empty()) {
+        RCLCPP_WARN(this->get_logger(),
+                    "🔍 selectCamera(): no RealSense devices enumerated; "
+                    "will retry on the next watchdog cycle");
+        return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "🔍 selectCamera() - Method: %s, Name: %s",
+        camera_selection_config_.selection_method.c_str(),
         camera_selection_config_.device_name.c_str());
     
     if (camera_selection_config_.selection_method == "serial" && 
