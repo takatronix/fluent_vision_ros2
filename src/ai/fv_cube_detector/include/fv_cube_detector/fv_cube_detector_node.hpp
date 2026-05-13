@@ -37,6 +37,11 @@ class FvCubeDetectorNode : public rclcpp::Node {
     rclcpp::Time first_seen;
     rclcpp::Time last_seen;
     int age_frames = 0;
+    // Per-frame slot in the published combined mask (1..254). 0 if this
+    // track did not contribute any pixels this frame. Consumers like
+    // fv_3d_detector use this as Detection2D.mask_instance_id to
+    // gather only this track's pixels from /d405_cube/mask.
+    uint8_t publish_slot_id = 0;
   };
 
   void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg);

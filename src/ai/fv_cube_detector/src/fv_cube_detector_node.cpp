@@ -226,6 +226,11 @@ void FvCubeDetectorNode::imageCallback(const Image::SharedPtr msg) {
   }
   reusable_combined_mask_.setTo(0);
 
+  // Per-frame slot id for the mask payload. Detection2D.mask_instance_id
+  // is set to this same slot so fv_3d_detector can recover per-track
+  // pixels from a single MONO8 image. Slot 0 = background, so we wrap
+  // 1..255 (capacity 255 simultaneous tracks per frame).
+  uint8_t next_slot = 0;
   for (auto& track : publish_tracks) {
     if (track.mask.empty()) continue;
     if (track.mask.size() != reusable_combined_mask_.size()) {
@@ -234,7 +239,16 @@ void FvCubeDetectorNode::imageCallback(const Image::SharedPtr msg) {
                  cv::INTER_NEAREST);
       track.mask = resized;
     }
-    reusable_combined_mask_ |= track.mask;
+    if (next_slot == 255) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "more than 255 active tracks in one frame; extra tracks "
+          "will not be reachable from MONO8 mask consumers");
+      track.publish_slot_id = 0;
+      continue;
+    }
+    next_slot += 1;
+    track.publish_slot_id = next_slot;
+    reusable_combined_mask_.setTo(cv::Scalar(next_slot), track.mask);
   }
 
   publishMask(reusable_combined_mask_, msg->header);
@@ -301,7 +315,7 @@ void FvCubeDetectorNode::publishDetections(const std::vector<TrackState>& tracks
     fv_det.bbox_max.y = static_cast<float>(track.bbox.y + track.bbox.height);
     fv_det.bbox_max.z = 0.0f;
 
-    fv_det.mask_instance_id = static_cast<uint32_t>(track.id);
+    fv_det.mask_instance_id = static_cast<uint32_t>(track.publish_slot_id);
     fv_det.mask_semantic_id = 0;
     fv_det.depth_hint_m = 0.0f;
     fv_det.observed_at = header.stamp;
