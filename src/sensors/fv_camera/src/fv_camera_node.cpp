@@ -21,12 +21,26 @@ FVUSBCameraNode::FVUSBCameraNode()
         loadParameters();
         
         // Step 2: Initialize camera
+        //
+        // Policy: boot-time open failure is treated as a hard error
+        // (configuration / cable / hardware fault — the operator must
+        // see this loudly), so we let the constructor return without
+        // setting up the rest. The launcher / supervisor then sees
+        // the node didn't actually start, instead of a zombie that
+        // looks alive but never publishes.
+        //
+        // *Runtime* failures (USB unplug while we were already
+        // streaming) are handled separately inside processingLoop()
+        // via the deep-reopen counter — the node stays alive there
+        // and recovers when the device reappears, because we *had*
+        // a working device, so this is observably a transient drop
+        // rather than a misconfiguration.
         RCLCPP_INFO(this->get_logger(), "📷 Step 2: Initializing camera...");
         if (!initializeCamera()) {
             RCLCPP_ERROR(this->get_logger(), "❌ Failed to initialize camera");
             return;
         }
-        
+
         // Step 3: Initialize publishers
         RCLCPP_INFO(this->get_logger(), "📤 Step 3: Initializing publishers...");
         initializePublishers();
@@ -376,31 +390,80 @@ void FVUSBCameraNode::processingLoop()
     cv::Mat frame;
     auto last_time = std::chrono::steady_clock::now();
     int frame_count = 0;
-    
+    // OpenCV's VideoCapture keeps isOpened()=true after USB unplug —
+    // only read() starts returning false. Without this counter, the
+    // existing selectCamera() reconnect path at the top of the loop
+    // never fires for a USB cable yank, and we spam "Failed to read
+    // frame" at 10 Hz forever. After kReopenAfterFails consecutive
+    // failures (~5s at 100ms sleep) we force release()+selectCamera()
+    // — the same shape as the fv_realsense deep reset.
+    int read_fail_streak = 0;
+    int empty_frame_streak = 0;
+    constexpr int kReopenAfterFails = 50;
+
     while (running_) {
         auto loop_start = std::chrono::steady_clock::now();
         if (!camera_.isOpened()) {
-            RCLCPP_ERROR(this->get_logger(), "❌ Camera not opened, retrying...");
+            RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                  "❌ Camera not opened, retrying...");
             // Attempt to reconnect automatically if capture backend dropped.
             if (!selectCamera()) {
-                RCLCPP_ERROR(this->get_logger(), "❌ Camera reconnect failed");
+                RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                      "❌ Camera reconnect failed");
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             continue;
         }
-        
+
         // Capture frame
         if (!camera_.read(frame)) {
-            RCLCPP_WARN(this->get_logger(), "⚠️ Failed to read frame");
+            read_fail_streak += 1;
+            if (read_fail_streak == 1 || read_fail_streak % 50 == 0) {
+                RCLCPP_WARN(this->get_logger(),
+                            "⚠️ Failed to read frame (streak=%d)",
+                            read_fail_streak);
+            }
+            if (read_fail_streak >= kReopenAfterFails) {
+                RCLCPP_ERROR(this->get_logger(),
+                             "🔁 Deep reopen after %d failed reads "
+                             "(USB likely unplugged; isOpened() lies)",
+                             read_fail_streak);
+                try { camera_.release(); } catch (...) {}
+                read_fail_streak = 0;
+                if (!selectCamera()) {
+                    RCLCPP_WARN(this->get_logger(),
+                                "Deep reopen: selectCamera failed; "
+                                "will retry next cycle");
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        
+        read_fail_streak = 0;
+
         if (frame.empty()) {
-            RCLCPP_WARN(this->get_logger(), "⚠️ Empty frame received");
+            empty_frame_streak += 1;
+            if (empty_frame_streak == 1 || empty_frame_streak % 50 == 0) {
+                RCLCPP_WARN(this->get_logger(),
+                            "⚠️ Empty frame received (streak=%d)",
+                            empty_frame_streak);
+            }
+            if (empty_frame_streak >= kReopenAfterFails) {
+                RCLCPP_ERROR(this->get_logger(),
+                             "🔁 Deep reopen after %d empty frames",
+                             empty_frame_streak);
+                try { camera_.release(); } catch (...) {}
+                empty_frame_streak = 0;
+                if (!selectCamera()) {
+                    RCLCPP_WARN(this->get_logger(),
+                                "Deep reopen: selectCamera failed; "
+                                "will retry next cycle");
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
+        empty_frame_streak = 0;
 
         // Apply 180-degree rotation for physically inverted mounts.
         if (camera_config_.rotate_180) {
