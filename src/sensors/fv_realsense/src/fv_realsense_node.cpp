@@ -689,6 +689,66 @@ bool FVDepthCameraNode::startSensors() {
     return true;
 }
 
+bool FVDepthCameraNode::deepResetAndRestart() {
+    // Step 1: tear down sensors against the (now-likely-invalid) device.
+    // stopSensors() already swallows rs2::error internally so it's safe
+    // to call after USB unplug.
+    stopSensors();
+
+    // Step 2: drop the old rs2::context. rs2::device handles cached
+    // inside it survive USB enumeration but point at the pre-unplug
+    // device path; that's exactly the "No such device" the cheap
+    // stop+start watchdog kept hitting.
+    try {
+        ctx_.reset();
+    } catch (...) {}
+
+    // Step 3: recreate context + re-enumerate. selectCamera() walks
+    // ctx_->query_devices() and reassigns device_ to a fresh handle.
+    // We retry up to ~3s because USB re-enumeration after plug-in is
+    // not instantaneous on Tegra.
+    constexpr int kMaxAttempts = 6;
+    constexpr int kAttemptDelayMs = 500;
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+        try {
+            ctx_ = std::make_unique<rs2::context>();
+            if (selectCamera()) {
+                if (startSensors()) {
+                    RCLCPP_INFO(this->get_logger(),
+                                "✅ Deep reset succeeded on attempt %d/%d",
+                                attempt, kMaxAttempts);
+                    return true;
+                }
+                RCLCPP_WARN(this->get_logger(),
+                            "Deep reset attempt %d/%d: startSensors failed",
+                            attempt, kMaxAttempts);
+            } else {
+                RCLCPP_WARN(this->get_logger(),
+                            "Deep reset attempt %d/%d: no device enumerated",
+                            attempt, kMaxAttempts);
+            }
+        } catch (const rs2::error &e) {
+            RCLCPP_WARN(this->get_logger(),
+                        "Deep reset attempt %d/%d: %s",
+                        attempt, kMaxAttempts, e.what());
+        } catch (const std::exception &e) {
+            RCLCPP_WARN(this->get_logger(),
+                        "Deep reset attempt %d/%d: %s",
+                        attempt, kMaxAttempts, e.what());
+        }
+        if (attempt < kMaxAttempts) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kAttemptDelayMs));
+        }
+    }
+    RCLCPP_ERROR(this->get_logger(),
+                 "❌ Deep reset exhausted %d attempts; sensor stays down "
+                 "until next watchdog cycle (operator may need to "
+                 "verify USB cable / power).",
+                 kMaxAttempts);
+    return false;
+}
+
 void FVDepthCameraNode::stopSensors() {
     if (!sensors_started_) {
         return;
@@ -1055,9 +1115,12 @@ void FVDepthCameraNode::processingLoop()
                                 warned = true;
                             }
                             if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
-                                RCLCPP_ERROR(this->get_logger(), "🔁 Restarting sensors after %ldms color stall (mode=1)", (long)stall_ms);
-                                stopSensors();
-                                startSensors();
+                                RCLCPP_ERROR(this->get_logger(), "🔁 Deep reset after %ldms color stall (mode=1)", (long)stall_ms);
+                                deepResetAndRestart();
+                                last_color_recv_ns_.store(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch()).count(),
+                                    std::memory_order_relaxed);
                                 warned = false;
                             }
                         }
@@ -1135,9 +1198,12 @@ void FVDepthCameraNode::processingLoop()
                                 warned = true;
                             }
                             if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
-                                RCLCPP_ERROR(this->get_logger(), "🔁 Restarting sensors after %ldms color stall (mode=2)", (long)stall_ms);
-                                stopSensors();
-                                startSensors();
+                                RCLCPP_ERROR(this->get_logger(), "🔁 Deep reset after %ldms color stall (mode=2)", (long)stall_ms);
+                                deepResetAndRestart();
+                                last_color_recv_ns_.store(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch()).count(),
+                                    std::memory_order_relaxed);
                                 warned = false;
                             }
                         }
