@@ -695,6 +695,31 @@ bool FVDepthCameraNode::deepResetAndRestart() {
     // to call after USB unplug.
     stopSensors();
 
+    // Step 1b: explicitly drop EVERY cached rs2 handle that still
+    // references the about-to-be-destroyed context. Anything left
+    // referencing the old context (sensor, device, stream_profile,
+    // frame, queued frame items) will be freed against an arena that
+    // no longer exists once ctx_.reset() runs, producing
+    // "free(): corrupted unsorted chunks" on the *next* deep reset
+    // (the first one looks fine because the dangling pointers
+    // haven't been touched yet).
+    try { color_sensor_ = rs2::sensor(); } catch (...) {}
+    try { depth_sensor_ = rs2::sensor(); } catch (...) {}
+    try { device_ = rs2::device(); } catch (...) {}
+    try { color_profile_ = rs2::stream_profile(); } catch (...) {}
+    try { depth_profile_ = rs2::stream_profile(); } catch (...) {}
+    {
+        std::lock_guard<std::mutex> lk(latest_frame_mutex_);
+        try { latest_color_frame_ = rs2::frame(); } catch (...) {}
+        try { latest_depth_frame_ = rs2::frame(); } catch (...) {}
+    }
+    {
+        std::lock_guard<std::mutex> lk(sync_mutex_);
+        // FrameItem holds rs2::frame; clear queues to drop refs.
+        color_queue_.clear();
+        depth_queue_.clear();
+    }
+
     // Step 2: drop the old rs2::context. rs2::device handles cached
     // inside it survive USB enumeration but point at the pre-unplug
     // device path; that's exactly the "No such device" the cheap
