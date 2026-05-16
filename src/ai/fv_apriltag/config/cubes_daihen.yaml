@@ -1,13 +1,17 @@
 # Cube bundle definitions for daihen_vc4l_teleop profile.
 #
-# Two cameras: D405 arm_camera (depth-refine enabled) and C920 side_camera
-# (2D only).
+# ID layout (must match docs/印刷物/cube_kit/MANIFEST.txt):
+#   0        hand-eye calibration tag (handled separately, not a cube)
+#   1-6      cube60_a faces (top, front, right, back, left, bottom)
+#   7-12     cube60_b
+#   13-18    cube60_c
+#   19-20    reserved buffer
+#   21-26    cube100_a
+#   27-32    cube100_b
+#   33-38    cube100_c
 #
-# NOTE: side_camera intrinsics are currently uncalibrated (CameraInfo
-# distortion is zero, focal length is a default 1000px). AprilTag will
-# detect tags but cube pose accuracy from side_camera alone has a
-# systematic bias. Calibrate the C920 with ros2's camera_calibration
-# tool when accuracy matters.
+# Operator: when you re-print a cube with different IDs, update only
+# this file (no node rebuild needed) and run ./restart.
 
 fusion:
   max_age: 0.5
@@ -32,26 +36,38 @@ cameras:
     camera_frame:     side_camera_optical_frame
 
 cubes:
-  cube_60mm_a:
+  cube60_a:
     size: 0.060
     tag_size: 0.050
     origin: bottom_center
-    faces:
-      top: 0
-      front: 1
-      right: 2
-      back: 3
-      left: 4
-      bottom: 5
+    faces: {top: 1, front: 2, right: 3, back: 4, left: 5, bottom: 6}
 
-  cube_100mm_a:
-    size: 0.100
-    tag_size: 0.080
+  cube60_b:
+    size: 0.060
+    tag_size: 0.050
     origin: bottom_center
-    faces:
-      top: 10
-      front: 11
-      right: 12
-      back: 13
-      left: 14
-      bottom: 15
+    faces: {top: 7, front: 8, right: 9, back: 10, left: 11, bottom: 12}
+
+  cube60_c:
+    size: 0.060
+    tag_size: 0.050
+    origin: bottom_center
+    faces: {top: 13, front: 14, right: 15, back: 16, left: 17, bottom: 18}
+
+  cube100_a:
+    size: 0.100
+    tag_size: 0.050
+    origin: bottom_center
+    faces: {top: 21, front: 22, right: 23, back: 24, left: 25, bottom: 26}
+
+  cube100_b:
+    size: 0.100
+    tag_size: 0.050
+    origin: bottom_center
+    faces: {top: 27, front: 28, right: 29, back: 30, left: 31, bottom: 32}
+
+  cube100_c:
+    size: 0.100
+    tag_size: 0.050
+    origin: bottom_center
+    faces: {top: 33, front: 34, right: 35, back: 36, left: 37, bottom: 38}
