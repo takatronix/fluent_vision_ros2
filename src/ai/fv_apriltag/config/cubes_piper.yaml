@@ -1,0 +1,53 @@
+# Cube bundle definitions for piper_single_teleop profile.
+#
+# Schema 1 (simplest): face name -> tag ID.
+#   - Each face uses one AprilTag (tag36h11 by default).
+#   - Tag orientation on each face is assumed standard (tag's "up arrow"
+#     points toward cube +Z for side faces, cube +Y for top/bottom).
+#   - Tag size is uniform per cube (overridable per face later if needed).
+#   - Faces not listed are simply ignored (e.g. omit "bottom" for cubes
+#     placed on a table).
+#
+# Multi-cube: define as many cubes as you want, with disjoint tag ID
+# ranges to avoid ambiguity (any tag ID listed under one cube must not
+# appear in another).
+
+fusion:
+  max_age: 0.5            # seconds — observations older than this drop
+  publish_rate: 30.0      # Hz — pose/marker output rate
+  use_depth_refine: true  # rescale PnP translation by depth at tag center
+  min_decision_margin: 50.0
+  world_frame: ""         # empty: publish in dominant camera's optical frame
+
+cameras:
+  - name: d405
+    detections_topic: /d405_apriltag/detections
+    poses_topic:      /d405_apriltag/poses
+    depth_topic:      /d405_depth/image_rect_raw
+    depth_info_topic: /d405_depth/camera_info
+    camera_frame:     d405_optical_frame
+
+cubes:
+  cube_60mm_a:
+    size: 0.060           # cube edge length in metres
+    tag_size: 0.050       # tag36h11 black-square edge in metres
+    origin: bottom_center # geometric_center | bottom_center | top_center
+    faces:
+      top: 0
+      front: 1
+      right: 2
+      back: 3
+      left: 4
+      bottom: 5
+
+  cube_100mm_a:
+    size: 0.100
+    tag_size: 0.080
+    origin: bottom_center
+    faces:
+      top: 10
+      front: 11
+      right: 12
+      back: 13
+      left: 14
+      bottom: 15

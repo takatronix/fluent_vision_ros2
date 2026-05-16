@@ -1,0 +1,57 @@
+# Cube bundle definitions for daihen_vc4l_teleop profile.
+#
+# Two cameras: D405 arm_camera (depth-refine enabled) and C920 side_camera
+# (2D only).
+#
+# NOTE: side_camera intrinsics are currently uncalibrated (CameraInfo
+# distortion is zero, focal length is a default 1000px). AprilTag will
+# detect tags but cube pose accuracy from side_camera alone has a
+# systematic bias. Calibrate the C920 with ros2's camera_calibration
+# tool when accuracy matters.
+
+fusion:
+  max_age: 0.5
+  publish_rate: 30.0
+  use_depth_refine: true
+  min_decision_margin: 50.0
+  world_frame: ""
+
+cameras:
+  - name: arm_camera
+    detections_topic: /arm_camera_apriltag/detections
+    poses_topic:      /arm_camera_apriltag/poses
+    depth_topic:      /d405_depth/image_rect_raw
+    depth_info_topic: /d405_depth/camera_info
+    camera_frame:     d405_optical_frame
+
+  - name: side_camera
+    detections_topic: /side_camera_apriltag/detections
+    poses_topic:      /side_camera_apriltag/poses
+    depth_topic:      ""
+    depth_info_topic: ""
+    camera_frame:     side_camera_optical_frame
+
+cubes:
+  cube_60mm_a:
+    size: 0.060
+    tag_size: 0.050
+    origin: bottom_center
+    faces:
+      top: 0
+      front: 1
+      right: 2
+      back: 3
+      left: 4
+      bottom: 5
+
+  cube_100mm_a:
+    size: 0.100
+    tag_size: 0.080
+    origin: bottom_center
+    faces:
+      top: 10
+      front: 11
+      right: 12
+      back: 13
+      left: 14
+      bottom: 15
