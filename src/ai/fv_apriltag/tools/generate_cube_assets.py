@@ -199,64 +199,195 @@ def write_stl_ascii(tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]],
     output_path.write_text('\n'.join(lines) + '\n')
 
 
-def generate_face_panel_stl(
+def generate_tag_plate_stl(
     tag_id: int,
-    panel_size_mm: float,
     tag_size_mm: float,
     base_path: Path,
     pattern_path: Path,
-    base_thickness_mm: float = 3.0,
-    pillar_height_mm: float = 0.6,
+    plate_thickness_mm: float = 3.0,
+    pattern_height_mm: float = 1.0,
 ) -> None:
-    """Two-piece face panel STL for true multi-colour print.
+    """Drop-in tag plate that fits into the cube body's face pocket.
 
-    Writes two files at the same coordinate origin so a slicer (Bambu
-    Studio, PrusaSlicer, OrcaSlicer) treats them as a single assembly
-    when both are imported, and the operator just assigns one filament
-    per part instead of slicing-time layer changes:
+    Two-piece multi-colour print:
 
-    - <stem>_base.stl    : panel_size × panel_size × base_thickness
+    - <stem>_base.stl    : tag_size × tag_size × (plate_thickness -
+                           pattern_height) flat plate
                            (intended white filament)
-    - <stem>_pattern.stl : raised cells matching the tag's black cells,
+    - <stem>_pattern.stl : raised pillars at the AprilTag dark cells,
                            sitting on top of the base
                            (intended black filament)
 
-    The 10 × 10 raw tag pattern includes a 1-cell black border, so the
-    pattern STL already carries the required black outer frame.
+    Both files share the same origin so the slicer can merge them as
+    sub-parts and apply one filament per part. Total plate thickness
+    = base + pattern = plate_thickness_mm, matched to the cube body's
+    pocket depth.
     """
     pattern = fetch_tag_array(tag_id)  # 0 = black, 1 = white
     cell_size = tag_size_mm / 10.0
-    tag_offset = (panel_size_mm - tag_size_mm) / 2.0
+    base_thickness = plate_thickness_mm - pattern_height_mm
+    if base_thickness <= 0.0:
+        raise ValueError(
+            f'plate_thickness ({plate_thickness_mm}) must exceed '
+            f'pattern_height ({pattern_height_mm})'
+        )
 
-    # Base plate.
     base_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = _box_triangles(
         0.0, 0.0, 0.0,
-        panel_size_mm, panel_size_mm, base_thickness_mm,
+        tag_size_mm, tag_size_mm, base_thickness,
     )
     write_stl_ascii(
         base_tris, base_path,
-        name=f'fv_apriltag_panel_id{tag_id:03d}_base',
+        name=f'fv_apriltag_plate_id{tag_id:03d}_base',
     )
 
-    # Pattern pillars (one box per black cell).
-    # AprilTag PNGs convention: row 0 is the top of the tag pattern, but
-    # we treat the panel surface with row 0 at +Y (panel "up").
-    # Result: panel orientation when looking at it matches the PNG image.
     pattern_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
     for row in range(10):
         for col in range(10):
             if pattern[row, col] == 0:  # black
-                x0 = tag_offset + col * cell_size
-                y0 = tag_offset + (9 - row) * cell_size
+                x0 = col * cell_size
+                y0 = (9 - row) * cell_size
                 pattern_tris.extend(_box_triangles(
-                    x0, y0, base_thickness_mm,
+                    x0, y0, base_thickness,
                     x0 + cell_size, y0 + cell_size,
-                    base_thickness_mm + pillar_height_mm,
+                    base_thickness + pattern_height_mm,
                 ))
-
     write_stl_ascii(
         pattern_tris, pattern_path,
-        name=f'fv_apriltag_panel_id{tag_id:03d}_pattern',
+        name=f'fv_apriltag_plate_id{tag_id:03d}_pattern',
+    )
+
+
+def _face_frame_at(
+    tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+    cube_size_mm: float,
+    wall_thickness_mm: float,
+    pocket_size_mm: float,
+    pocket_depth_mm: float,
+    hole_size_mm: float,
+    face_axis: str,  # 'top', 'front', 'back', 'left', 'right'
+) -> None:
+    """Append face-frame box geometry (pocket + lip) for the requested face.
+
+    The face frame is the outer 4 mm-thick wall slab with a centred
+    50.4 × 50.4 pocket cut to pocket_depth from the outside surface
+    and a 48.4 × 48.4 through-hole through the remaining 1 mm of wall.
+    The cube body is assembled from one such frame per non-blank face,
+    plus a solid bottom slab.
+    """
+    cs = cube_size_mm
+    wt = wall_thickness_mm
+    ps = pocket_size_mm
+    pd = pocket_depth_mm
+    hs = hole_size_mm
+    # Rim around pocket on the outside (pocket cuts 50.4 wide hole in a 60 wide
+    # face → outer rim = (60 - 50.4)/2 = 4.8 mm).
+    rim_p = (cs - ps) / 2.0
+    # Rim around through-hole at the lip (48.4 hole in 60 face → 5.8 mm).
+    rim_h = (cs - hs) / 2.0
+
+    def add(x0, y0, z0, x1, y1, z1):
+        tris.extend(_box_triangles(x0, y0, z0, x1, y1, z1))
+
+    if face_axis == 'top':
+        # Outer rim at z = cs - pd .. cs (the front face of the frame).
+        add(0, 0,        cs-pd, cs,        rim_p,    cs)  # -Y edge
+        add(0, cs-rim_p, cs-pd, cs,        cs,       cs)  # +Y edge
+        add(0, rim_p,    cs-pd, rim_p,     cs-rim_p, cs)  # -X edge
+        add(cs-rim_p, rim_p, cs-pd, cs, cs-rim_p,   cs)  # +X edge
+        # Lip ring at z = cs - wt .. cs - pd (1 mm thick, narrower hole).
+        add(0, 0,        cs-wt, cs,        rim_h,    cs-pd)
+        add(0, cs-rim_h, cs-wt, cs,        cs,       cs-pd)
+        add(0, rim_h,    cs-wt, rim_h,     cs-rim_h, cs-pd)
+        add(cs-rim_h, rim_h, cs-wt, cs, cs-rim_h,   cs-pd)
+    elif face_axis == 'front':
+        # Front face = +X direction (cube +X forward per REP-103). The
+        # wall slab is at x = cs - wt .. cs and the pocket cuts in from
+        # x = cs back to x = cs - pd.
+        add(cs-pd, 0,        0, cs, rim_p,    cs)
+        add(cs-pd, cs-rim_p, 0, cs, cs,       cs)
+        add(cs-pd, rim_p,    0, cs, cs-rim_p, rim_p)
+        add(cs-pd, rim_p,    cs-rim_p, cs, cs-rim_p, cs)
+        add(cs-wt, 0,        0, cs-pd, rim_h,    cs)
+        add(cs-wt, cs-rim_h, 0, cs-pd, cs,       cs)
+        add(cs-wt, rim_h,    0, cs-pd, cs-rim_h, rim_h)
+        add(cs-wt, rim_h,    cs-rim_h, cs-pd, cs-rim_h, cs)
+    elif face_axis == 'back':
+        # Back face = -X.
+        add(0,    0,        0, pd,    rim_p,    cs)
+        add(0,    cs-rim_p, 0, pd,    cs,       cs)
+        add(0,    rim_p,    0, pd,    cs-rim_p, rim_p)
+        add(0,    rim_p,    cs-rim_p, pd,    cs-rim_p, cs)
+        add(pd,   0,        0, wt,    rim_h,    cs)
+        add(pd,   cs-rim_h, 0, wt,    cs,       cs)
+        add(pd,   rim_h,    0, wt,    cs-rim_h, rim_h)
+        add(pd,   rim_h,    cs-rim_h, wt, cs-rim_h, cs)
+    elif face_axis == 'left':
+        # Left face = +Y.
+        add(0,        cs-pd, 0,  rim_p,    cs, cs)
+        add(cs-rim_p, cs-pd, 0,  cs,       cs, cs)
+        add(rim_p,    cs-pd, 0,  cs-rim_p, cs, rim_p)
+        add(rim_p,    cs-pd, cs-rim_p, cs-rim_p, cs, cs)
+        add(0,        cs-wt, 0,  rim_h,    cs-pd, cs)
+        add(cs-rim_h, cs-wt, 0,  cs,       cs-pd, cs)
+        add(rim_h,    cs-wt, 0,  cs-rim_h, cs-pd, rim_h)
+        add(rim_h,    cs-wt, cs-rim_h, cs-rim_h, cs-pd, cs)
+    elif face_axis == 'right':
+        # Right face = -Y.
+        add(0,        0,    0, rim_p,    pd, cs)
+        add(cs-rim_p, 0,    0, cs,       pd, cs)
+        add(rim_p,    0,    0, cs-rim_p, pd, rim_p)
+        add(rim_p,    0,    cs-rim_p, cs-rim_p, pd, cs)
+        add(0,        pd,   0, rim_h,    wt, cs)
+        add(cs-rim_h, pd,   0, cs,       wt, cs)
+        add(rim_h,    pd,   0, cs-rim_h, wt, rim_h)
+        add(rim_h,    pd,   cs-rim_h, cs-rim_h, wt, cs)
+    else:
+        raise ValueError(f'unknown face_axis: {face_axis}')
+
+
+def generate_cube_body_stl(
+    cube_size_mm: float,
+    output_path: Path,
+    wall_thickness_mm: float = 4.0,
+    pocket_size_mm: float = 50.4,
+    pocket_depth_mm: float = 3.0,
+    hole_size_mm: float = 48.4,
+    blank_face: str = 'bottom',
+) -> None:
+    """Hollow cube body STL with face pockets for the tag plates.
+
+    `blank_face` (default `'bottom'`) is left as a solid slab — used as
+    the print-bed contact face and as the orientation reference when
+    the cube is placed on a table. The other five faces receive a
+    pocket + retaining lip sized for the 50 × 50 × 3 mm tag plates
+    produced by `generate_tag_plate_stl`.
+
+    Mesh is a union of axis-aligned boxes (slicer-friendly even with
+    duplicated/overlapping triangles at corners). A 60 mm cube body
+    ends up ~520 triangles.
+    """
+    cs = cube_size_mm
+    wt = wall_thickness_mm
+    tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
+
+    # Bottom (blank face if blank_face == 'bottom') — solid 4 mm slab.
+    # If a different face is the blank face, swap by rotating in-slicer.
+    tris.extend(_box_triangles(0, 0, 0, cs, cs, wt))
+
+    for face in ('top', 'front', 'back', 'left', 'right'):
+        if face == blank_face:
+            # If the operator wants a different blank face, generate the
+            # cube and rotate post-hoc in the slicer.
+            continue
+        _face_frame_at(
+            tris, cs, wt, pocket_size_mm, pocket_depth_mm, hole_size_mm,
+            face_axis=face,
+        )
+
+    write_stl_ascii(
+        tris, output_path,
+        name=f'fv_apriltag_cube_body_{int(round(cs))}mm',
     )
 
 
@@ -292,10 +423,12 @@ def generate_all(out_dir: Path) -> None:
     cubes = default_cube_set()
     tag_png_dir = out_dir / 'tag_pngs'
     tag_pdf_dir = out_dir / 'tag_pdfs'
-    stl_dir = out_dir / 'stl'
+    body_dir = out_dir / 'stl' / 'body'
+    plate_dir = out_dir / 'stl' / 'plates'
     tag_png_dir.mkdir(parents=True, exist_ok=True)
     tag_pdf_dir.mkdir(parents=True, exist_ok=True)
-    stl_dir.mkdir(parents=True, exist_ok=True)
+    body_dir.mkdir(parents=True, exist_ok=True)
+    plate_dir.mkdir(parents=True, exist_ok=True)
 
     def write_tag_assets(tag_id: int, tag_size_mm: float, stem: str) -> None:
         label = f'tag36h11 id={tag_id}  size={tag_size_mm:g}mm  ({stem})'
@@ -306,15 +439,27 @@ def generate_all(out_dir: Path) -> None:
             tag_id, tag_size_mm, tag_pdf_dir / f'{stem}.pdf', label=label,
         )
 
-    # Calibration tag (ID 0). Single-page print, no STL panel needed —
+    # Cube body STLs — one per unique cube size, shared across the
+    # cube60_{a,b,c} (or cube100_{a,b,c}) variants since the plates
+    # decide the identity.
+    body_sizes = sorted({c.cube_size_mm for c in cubes})
+    for size_mm in body_sizes:
+        body_path = body_dir / f'cube{int(round(size_mm))}_body.stl'
+        generate_cube_body_stl(size_mm, body_path)
+        print(f'wrote cube body {body_path.name} ({size_mm:g} mm)')
+
+    # Calibration tag (ID 0). Single-page print, no STL plate needed —
     # operator mounts it on the existing 60×60 calibration plate.
     cal_id = 0
     write_tag_assets(cal_id, 50.0, f'tag36h11_id{cal_id:03d}_calibration_50mm')
     print(f'wrote calibration tag (id {cal_id})')
 
-    # Cube tags + face panels.
+    # Cube tags + drop-in plate pairs. Skip the `bottom` face — that
+    # face is the blank/solid side of the cube body, used as the print-
+    # bed contact face and the operator-facing "this side down" cue.
     used_ids: List[int] = [cal_id]
     for cube in cubes:
+        plates_written = 0
         for face_name, tag_id in cube.face_to_id.items():
             if tag_id in used_ids:
                 raise RuntimeError(
@@ -327,20 +472,26 @@ def generate_all(out_dir: Path) -> None:
             )
             write_tag_assets(tag_id, cube.tag_size_mm, stem)
 
-            stl_stem = stl_dir / (
+            if face_name == 'bottom':
+                # PNG/PDF still emitted in case the operator sticker-
+                # applies the bottom tag later; no STL plate because the
+                # body has no pocket for it.
+                continue
+
+            stl_stem = plate_dir / (
                 f'{cube.label}_{face_name}_id{tag_id:03d}'
             )
-            generate_face_panel_stl(
+            generate_tag_plate_stl(
                 tag_id=tag_id,
-                panel_size_mm=cube.cube_size_mm,
                 tag_size_mm=cube.tag_size_mm,
                 base_path=stl_stem.with_name(stl_stem.name + '_base.stl'),
                 pattern_path=stl_stem.with_name(stl_stem.name + '_pattern.stl'),
             )
+            plates_written += 1
         print(
             f'cube {cube.label}: '
             f'IDs {sorted(cube.face_to_id.values())} '
-            f'-> {len(cube.face_to_id)} panels'
+            f'-> {plates_written} plate pairs (bottom skipped)'
         )
 
     # Manifest for downstream tooling.
