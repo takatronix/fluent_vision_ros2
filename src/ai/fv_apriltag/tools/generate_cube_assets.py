@@ -203,44 +203,60 @@ def generate_face_panel_stl(
     tag_id: int,
     panel_size_mm: float,
     tag_size_mm: float,
-    output_path: Path,
+    base_path: Path,
+    pattern_path: Path,
     base_thickness_mm: float = 3.0,
     pillar_height_mm: float = 0.6,
 ) -> None:
-    """Single-piece face panel STL with raised pillars at AprilTag black cells.
+    """Two-piece face panel STL for true multi-colour print.
 
-    The 10×10 raw tag pattern includes a 1-cell black border, so the
-    pillars naturally include the AprilTag-required outer black frame.
+    Writes two files at the same coordinate origin so a slicer (Bambu
+    Studio, PrusaSlicer, OrcaSlicer) treats them as a single assembly
+    when both are imported, and the operator just assigns one filament
+    per part instead of slicing-time layer changes:
+
+    - <stem>_base.stl    : panel_size × panel_size × base_thickness
+                           (intended white filament)
+    - <stem>_pattern.stl : raised cells matching the tag's black cells,
+                           sitting on top of the base
+                           (intended black filament)
+
+    The 10 × 10 raw tag pattern includes a 1-cell black border, so the
+    pattern STL already carries the required black outer frame.
     """
     pattern = fetch_tag_array(tag_id)  # 0 = black, 1 = white
     cell_size = tag_size_mm / 10.0
     tag_offset = (panel_size_mm - tag_size_mm) / 2.0
 
-    tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
     # Base plate.
-    tris.extend(_box_triangles(
+    base_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = _box_triangles(
         0.0, 0.0, 0.0,
         panel_size_mm, panel_size_mm, base_thickness_mm,
-    ))
+    )
+    write_stl_ascii(
+        base_tris, base_path,
+        name=f'fv_apriltag_panel_id{tag_id:03d}_base',
+    )
 
-    # Raised pillars for every black cell.
+    # Pattern pillars (one box per black cell).
     # AprilTag PNGs convention: row 0 is the top of the tag pattern, but
     # we treat the panel surface with row 0 at +Y (panel "up").
     # Result: panel orientation when looking at it matches the PNG image.
+    pattern_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
     for row in range(10):
         for col in range(10):
             if pattern[row, col] == 0:  # black
                 x0 = tag_offset + col * cell_size
-                y0 = tag_offset + (9 - row) * cell_size  # flip Y so row 0 = +Y
-                tris.extend(_box_triangles(
+                y0 = tag_offset + (9 - row) * cell_size
+                pattern_tris.extend(_box_triangles(
                     x0, y0, base_thickness_mm,
                     x0 + cell_size, y0 + cell_size,
                     base_thickness_mm + pillar_height_mm,
                 ))
 
     write_stl_ascii(
-        tris, output_path,
-        name=f'fv_apriltag_panel_id{tag_id:03d}',
+        pattern_tris, pattern_path,
+        name=f'fv_apriltag_panel_id{tag_id:03d}_pattern',
     )
 
 
@@ -311,14 +327,15 @@ def generate_all(out_dir: Path) -> None:
             )
             write_tag_assets(tag_id, cube.tag_size_mm, stem)
 
-            stl_path = stl_dir / (
-                f'{cube.label}_{face_name}_id{tag_id:03d}.stl'
+            stl_stem = stl_dir / (
+                f'{cube.label}_{face_name}_id{tag_id:03d}'
             )
             generate_face_panel_stl(
                 tag_id=tag_id,
                 panel_size_mm=cube.cube_size_mm,
                 tag_size_mm=cube.tag_size_mm,
-                output_path=stl_path,
+                base_path=stl_stem.with_name(stl_stem.name + '_base.stl'),
+                pattern_path=stl_stem.with_name(stl_stem.name + '_pattern.stl'),
             )
         print(
             f'cube {cube.label}: '
