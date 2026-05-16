@@ -258,132 +258,100 @@ def generate_tag_plate_stl(
     )
 
 
-def _face_frame_at(
-    tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]],
-    cube_size_mm: float,
-    wall_thickness_mm: float,
-    pocket_size_mm: float,
-    pocket_depth_mm: float,
-    hole_size_mm: float,
-    face_axis: str,  # 'top', 'front', 'back', 'left', 'right'
-) -> None:
-    """Append face-frame box geometry (pocket + lip) for the requested face.
-
-    The face frame is the outer 4 mm-thick wall slab with a centred
-    50.4 × 50.4 pocket cut to pocket_depth from the outside surface
-    and a 48.4 × 48.4 through-hole through the remaining 1 mm of wall.
-    The cube body is assembled from one such frame per non-blank face,
-    plus a solid bottom slab.
-    """
-    cs = cube_size_mm
-    wt = wall_thickness_mm
-    ps = pocket_size_mm
-    pd = pocket_depth_mm
-    hs = hole_size_mm
-    # Rim around pocket on the outside (pocket cuts 50.4 wide hole in a 60 wide
-    # face → outer rim = (60 - 50.4)/2 = 4.8 mm).
-    rim_p = (cs - ps) / 2.0
-    # Rim around through-hole at the lip (48.4 hole in 60 face → 5.8 mm).
-    rim_h = (cs - hs) / 2.0
-
-    def add(x0, y0, z0, x1, y1, z1):
-        tris.extend(_box_triangles(x0, y0, z0, x1, y1, z1))
-
-    if face_axis == 'top':
-        # Outer rim at z = cs - pd .. cs (the front face of the frame).
-        add(0, 0,        cs-pd, cs,        rim_p,    cs)  # -Y edge
-        add(0, cs-rim_p, cs-pd, cs,        cs,       cs)  # +Y edge
-        add(0, rim_p,    cs-pd, rim_p,     cs-rim_p, cs)  # -X edge
-        add(cs-rim_p, rim_p, cs-pd, cs, cs-rim_p,   cs)  # +X edge
-        # Lip ring at z = cs - wt .. cs - pd (1 mm thick, narrower hole).
-        add(0, 0,        cs-wt, cs,        rim_h,    cs-pd)
-        add(0, cs-rim_h, cs-wt, cs,        cs,       cs-pd)
-        add(0, rim_h,    cs-wt, rim_h,     cs-rim_h, cs-pd)
-        add(cs-rim_h, rim_h, cs-wt, cs, cs-rim_h,   cs-pd)
-    elif face_axis == 'front':
-        # Front face = +X direction (cube +X forward per REP-103). The
-        # wall slab is at x = cs - wt .. cs and the pocket cuts in from
-        # x = cs back to x = cs - pd.
-        add(cs-pd, 0,        0, cs, rim_p,    cs)
-        add(cs-pd, cs-rim_p, 0, cs, cs,       cs)
-        add(cs-pd, rim_p,    0, cs, cs-rim_p, rim_p)
-        add(cs-pd, rim_p,    cs-rim_p, cs, cs-rim_p, cs)
-        add(cs-wt, 0,        0, cs-pd, rim_h,    cs)
-        add(cs-wt, cs-rim_h, 0, cs-pd, cs,       cs)
-        add(cs-wt, rim_h,    0, cs-pd, cs-rim_h, rim_h)
-        add(cs-wt, rim_h,    cs-rim_h, cs-pd, cs-rim_h, cs)
-    elif face_axis == 'back':
-        # Back face = -X.
-        add(0,    0,        0, pd,    rim_p,    cs)
-        add(0,    cs-rim_p, 0, pd,    cs,       cs)
-        add(0,    rim_p,    0, pd,    cs-rim_p, rim_p)
-        add(0,    rim_p,    cs-rim_p, pd,    cs-rim_p, cs)
-        add(pd,   0,        0, wt,    rim_h,    cs)
-        add(pd,   cs-rim_h, 0, wt,    cs,       cs)
-        add(pd,   rim_h,    0, wt,    cs-rim_h, rim_h)
-        add(pd,   rim_h,    cs-rim_h, wt, cs-rim_h, cs)
-    elif face_axis == 'left':
-        # Left face = +Y.
-        add(0,        cs-pd, 0,  rim_p,    cs, cs)
-        add(cs-rim_p, cs-pd, 0,  cs,       cs, cs)
-        add(rim_p,    cs-pd, 0,  cs-rim_p, cs, rim_p)
-        add(rim_p,    cs-pd, cs-rim_p, cs-rim_p, cs, cs)
-        add(0,        cs-wt, 0,  rim_h,    cs-pd, cs)
-        add(cs-rim_h, cs-wt, 0,  cs,       cs-pd, cs)
-        add(rim_h,    cs-wt, 0,  cs-rim_h, cs-pd, rim_h)
-        add(rim_h,    cs-wt, cs-rim_h, cs-rim_h, cs-pd, cs)
-    elif face_axis == 'right':
-        # Right face = -Y.
-        add(0,        0,    0, rim_p,    pd, cs)
-        add(cs-rim_p, 0,    0, cs,       pd, cs)
-        add(rim_p,    0,    0, cs-rim_p, pd, rim_p)
-        add(rim_p,    0,    cs-rim_p, cs-rim_p, pd, cs)
-        add(0,        pd,   0, rim_h,    wt, cs)
-        add(cs-rim_h, pd,   0, cs,       wt, cs)
-        add(rim_h,    pd,   0, cs-rim_h, wt, rim_h)
-        add(rim_h,    pd,   cs-rim_h, cs-rim_h, wt, cs)
-    else:
-        raise ValueError(f'unknown face_axis: {face_axis}')
-
-
 def generate_cube_body_stl(
     cube_size_mm: float,
     output_path: Path,
-    wall_thickness_mm: float = 4.0,
-    pocket_size_mm: float = 50.4,
+    pocket_size_mm: float = 50.2,
     pocket_depth_mm: float = 3.0,
-    hole_size_mm: float = 48.4,
-    blank_face: str = 'bottom',
 ) -> None:
-    """Hollow cube body STL with face pockets for the tag plates.
+    """Solid cube body STL with 6 face pockets for the tag plates.
 
-    `blank_face` (default `'bottom'`) is left as a solid slab — used as
-    the print-bed contact face and as the orientation reference when
-    the cube is placed on a table. The other five faces receive a
-    pocket + retaining lip sized for the 50 × 50 × 3 mm tag plates
-    produced by `generate_tag_plate_stl`.
+    The body is a solid `cube_size`³ block with a `pocket_size` ×
+    `pocket_size` × `pocket_depth` rectangular pocket cut from the
+    centre of each of the 6 faces. Total six pockets — all faces are
+    detachable, gripper-friendly because the interior is solid (the
+    slicer's infill carries the load).
 
-    Mesh is a union of axis-aligned boxes (slicer-friendly even with
-    duplicated/overlapping triangles at corners). A 60 mm cube body
-    ends up ~520 triangles.
+    Mesh is expressed as a union of overlapping axis-aligned boxes:
+      - 1 inner core box (rim × rim × rim from each face)
+      - 6 face-rim frames (4 strip bars each) covering the wall around
+        every pocket
+      - 6 pocket-back slabs filling the material directly behind each
+        pocket up to the inner core
+    Total ≈ 31 boxes ≈ 372 triangles per cube body, with redundant
+    internal triangles at edges — slicer-fine.
+
+    Plate-to-pocket clearance defaults to 0.1 mm per side
+    (pocket 50.2 → plate 50.0). Adjust by passing different
+    pocket_size_mm if the operator's printer is more dimensionally
+    forgiving or tighter.
     """
     cs = cube_size_mm
-    wt = wall_thickness_mm
+    ps = pocket_size_mm
+    pd = pocket_depth_mm
+    rim = (cs - ps) / 2.0  # 4.9 mm rim around each pocket on a 60 mm cube
+    if pd >= rim:
+        raise ValueError(
+            f'pocket_depth ({pd}) must be smaller than the rim '
+            f'((cs - ps)/2 = {rim}); otherwise opposite pockets would '
+            f'punch through to each other'
+        )
+
     tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
 
-    # Bottom (blank face if blank_face == 'bottom') — solid 4 mm slab.
-    # If a different face is the blank face, swap by rotating in-slicer.
-    tris.extend(_box_triangles(0, 0, 0, cs, cs, wt))
+    def box(x0, y0, z0, x1, y1, z1):
+        tris.extend(_box_triangles(x0, y0, z0, x1, y1, z1))
 
-    for face in ('top', 'front', 'back', 'left', 'right'):
-        if face == blank_face:
-            # If the operator wants a different blank face, generate the
-            # cube and rotate post-hoc in the slicer.
-            continue
-        _face_frame_at(
-            tris, cs, wt, pocket_size_mm, pocket_depth_mm, hole_size_mm,
-            face_axis=face,
-        )
+    # 1. Inner core — fully solid central region, untouched by any pocket.
+    box(rim, rim, rim, cs-rim, cs-rim, cs-rim)
+
+    # 2. Six face-rim frames (4 strip bars each), forming the picture-
+    #    frame ring of solid material around each face pocket.
+    # +Z (top) wall: z = cs-rim .. cs
+    box(0,        0,        cs-rim, cs,        rim,      cs)
+    box(0,        cs-rim,   cs-rim, cs,        cs,       cs)
+    box(0,        rim,      cs-rim, rim,       cs-rim,   cs)
+    box(cs-rim,   rim,      cs-rim, cs,        cs-rim,   cs)
+    # -Z (bottom) wall: z = 0 .. rim
+    box(0,        0,        0,      cs,        rim,      rim)
+    box(0,        cs-rim,   0,      cs,        cs,       rim)
+    box(0,        rim,      0,      rim,       cs-rim,   rim)
+    box(cs-rim,   rim,      0,      cs,        cs-rim,   rim)
+    # +X (front) wall: x = cs-rim .. cs
+    box(cs-rim,   0,        0,      cs,        rim,      cs)
+    box(cs-rim,   cs-rim,   0,      cs,        cs,       cs)
+    box(cs-rim,   rim,      0,      cs,        cs-rim,   rim)
+    box(cs-rim,   rim,      cs-rim, cs,        cs-rim,   cs)
+    # -X (back) wall: x = 0 .. rim
+    box(0,        0,        0,      rim,       rim,      cs)
+    box(0,        cs-rim,   0,      rim,       cs,       cs)
+    box(0,        rim,      0,      rim,       cs-rim,   rim)
+    box(0,        rim,      cs-rim, rim,       cs-rim,   cs)
+    # +Y (left) wall: y = cs-rim .. cs
+    box(0,        cs-rim,   0,      cs,        cs,       rim)
+    box(0,        cs-rim,   cs-rim, cs,        cs,       cs)
+    box(0,        cs-rim,   rim,    rim,       cs,       cs-rim)
+    box(cs-rim,   cs-rim,   rim,    cs,        cs,       cs-rim)
+    # -Y (right) wall: y = 0 .. rim
+    box(0,        0,        0,      cs,        rim,      rim)
+    box(0,        0,        cs-rim, cs,        rim,      cs)
+    box(0,        0,        rim,    rim,       rim,      cs-rim)
+    box(cs-rim,   0,        rim,    cs,        rim,      cs-rim)
+
+    # 3. Six pocket-back slabs — solid material immediately behind each
+    #    pocket, bridging the inner core to the pocket back surface.
+    # +Z back: z = cs-rim .. cs-pd  (thickness rim - pd = 1.9 mm)
+    box(rim, rim,    cs-rim,  cs-rim, cs-rim, cs-pd)
+    # -Z back: z = pd .. rim
+    box(rim, rim,    pd,      cs-rim, cs-rim, rim)
+    # +X back: x = cs-rim .. cs-pd
+    box(cs-rim, rim, rim,     cs-pd,  cs-rim, cs-rim)
+    # -X back: x = pd .. rim
+    box(pd,     rim, rim,     rim,    cs-rim, cs-rim)
+    # +Y back: y = cs-rim .. cs-pd
+    box(rim, cs-rim, rim,     cs-rim, cs-pd,  cs-rim)
+    # -Y back: y = pd .. rim
+    box(rim, pd,     rim,     cs-rim, rim,    cs-rim)
 
     write_stl_ascii(
         tris, output_path,
@@ -454,9 +422,8 @@ def generate_all(out_dir: Path) -> None:
     write_tag_assets(cal_id, 50.0, f'tag36h11_id{cal_id:03d}_calibration_50mm')
     print(f'wrote calibration tag (id {cal_id})')
 
-    # Cube tags + drop-in plate pairs. Skip the `bottom` face — that
-    # face is the blank/solid side of the cube body, used as the print-
-    # bed contact face and the operator-facing "this side down" cue.
+    # Cube tags + drop-in plate pairs. All 6 faces are now detachable
+    # (the cube body has a pocket on every face including the bottom).
     used_ids: List[int] = [cal_id]
     for cube in cubes:
         plates_written = 0
@@ -472,12 +439,6 @@ def generate_all(out_dir: Path) -> None:
             )
             write_tag_assets(tag_id, cube.tag_size_mm, stem)
 
-            if face_name == 'bottom':
-                # PNG/PDF still emitted in case the operator sticker-
-                # applies the bottom tag later; no STL plate because the
-                # body has no pocket for it.
-                continue
-
             stl_stem = plate_dir / (
                 f'{cube.label}_{face_name}_id{tag_id:03d}'
             )
@@ -491,7 +452,7 @@ def generate_all(out_dir: Path) -> None:
         print(
             f'cube {cube.label}: '
             f'IDs {sorted(cube.face_to_id.values())} '
-            f'-> {plates_written} plate pairs (bottom skipped)'
+            f'-> {plates_written} plate pairs (all 6 faces)'
         )
 
     # Manifest for downstream tooling.
