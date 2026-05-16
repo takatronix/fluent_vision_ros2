@@ -69,40 +69,78 @@ def fetch_tag_array(tag_id: int) -> np.ndarray:
     return (arr > 127).astype(np.uint8)
 
 
-def generate_tag_print_png(
-    tag_id: int, tag_size_mm: float, output_path: Path, dpi: int = 300,
-    white_margin_mm: float = 5.0,
-) -> None:
-    """Upscale the 10×10 tag image to printable size with white margin."""
+def _render_tag_print_image(
+    tag_id: int, tag_size_mm: float, dpi: int,
+    white_margin_mm: float, label: str,
+) -> Image.Image:
+    """Render the printable tag as a PIL grayscale image with embedded DPI."""
+    from PIL import ImageDraw, ImageFont
+
     pattern = fetch_tag_array(tag_id)
-    # Pixels for the tag area at the requested DPI.
     px_per_mm = dpi / 25.4
     tag_px = int(round(tag_size_mm * px_per_mm))
     margin_px = int(round(white_margin_mm * px_per_mm))
     cell_px = tag_px // 10
 
-    # Build the high-res tag image.
     tag_img = np.zeros((tag_px, tag_px), dtype=np.uint8)
     for r in range(10):
         for c in range(10):
             v = 255 if pattern[r, c] else 0
             tag_img[r * cell_px:(r + 1) * cell_px,
                     c * cell_px:(c + 1) * cell_px] = v
-    # If tag_px isn't a perfect multiple of 10, fill the remainder rows/cols
-    # with the last-row/last-column colour (cosmetic only).
     if cell_px * 10 < tag_px:
         tag_img[cell_px * 10:, :] = tag_img[cell_px * 10 - 1, :]
         tag_img[:, cell_px * 10:] = tag_img[:, cell_px * 10 - 1:cell_px * 10]
 
+    label_band_px = int(round(8 * px_per_mm))
     full_w = tag_px + margin_px * 2
-    full_h = tag_px + margin_px * 2 + int(round(8 * px_per_mm))  # extra space for label below
+    full_h = tag_px + margin_px * 2 + label_band_px
     full = np.ones((full_h, full_w), dtype=np.uint8) * 255
     full[margin_px:margin_px + tag_px,
          margin_px:margin_px + tag_px] = tag_img
 
     out_img = Image.fromarray(full, mode='L')
-    # Embed DPI so the printed size matches tag_size_mm.
-    out_img.save(output_path, dpi=(dpi, dpi))
+
+    # Add a small caption under the tag so prints are self-identifying.
+    draw = ImageDraw.Draw(out_img)
+    try:
+        font_size = int(round(3.5 * px_per_mm))
+        font = ImageFont.truetype(
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', font_size,
+        )
+    except Exception:
+        font = ImageFont.load_default()
+    text_y = margin_px + tag_px + int(round(2 * px_per_mm))
+    draw.text((margin_px, text_y), label, fill=0, font=font)
+    return out_img
+
+
+def generate_tag_print_png(
+    tag_id: int, tag_size_mm: float, output_path: Path, dpi: int = 300,
+    white_margin_mm: float = 5.0, label: str = '',
+) -> None:
+    """Write the printable tag as a PNG with embedded DPI metadata."""
+    img = _render_tag_print_image(
+        tag_id, tag_size_mm, dpi, white_margin_mm,
+        label or f'tag36h11 id={tag_id}  size={tag_size_mm:g}mm',
+    )
+    img.save(output_path, dpi=(dpi, dpi))
+
+
+def generate_tag_print_pdf(
+    tag_id: int, tag_size_mm: float, output_path: Path, dpi: int = 300,
+    white_margin_mm: float = 5.0, label: str = '',
+) -> None:
+    """Write the printable tag as a single-page PDF (PIL native PDF writer).
+
+    PDF resolution is set to `dpi` so the tag prints at exactly
+    `tag_size_mm`, independent of the receiving printer's default scale.
+    """
+    img = _render_tag_print_image(
+        tag_id, tag_size_mm, dpi, white_margin_mm,
+        label or f'tag36h11 id={tag_id}  size={tag_size_mm:g}mm',
+    )
+    img.save(output_path, 'PDF', resolution=float(dpi))
 
 
 # --- STL geometry helpers ---------------------------------------------------
@@ -236,17 +274,27 @@ def default_cube_set() -> List[CubeSpec]:
 
 def generate_all(out_dir: Path) -> None:
     cubes = default_cube_set()
-    tag_dir = out_dir / 'tag_pngs'
+    tag_png_dir = out_dir / 'tag_pngs'
+    tag_pdf_dir = out_dir / 'tag_pdfs'
     stl_dir = out_dir / 'stl'
-    tag_dir.mkdir(parents=True, exist_ok=True)
+    tag_png_dir.mkdir(parents=True, exist_ok=True)
+    tag_pdf_dir.mkdir(parents=True, exist_ok=True)
     stl_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_tag_assets(tag_id: int, tag_size_mm: float, stem: str) -> None:
+        label = f'tag36h11 id={tag_id}  size={tag_size_mm:g}mm  ({stem})'
+        generate_tag_print_png(
+            tag_id, tag_size_mm, tag_png_dir / f'{stem}.png', label=label,
+        )
+        generate_tag_print_pdf(
+            tag_id, tag_size_mm, tag_pdf_dir / f'{stem}.pdf', label=label,
+        )
 
     # Calibration tag (ID 0). Single-page print, no STL panel needed —
     # operator mounts it on the existing 60×60 calibration plate.
     cal_id = 0
-    cal_path = tag_dir / f'tag36h11_id{cal_id:03d}_calibration_50mm.png'
-    generate_tag_print_png(cal_id, 50.0, cal_path)
-    print(f'wrote {cal_path}')
+    write_tag_assets(cal_id, 50.0, f'tag36h11_id{cal_id:03d}_calibration_50mm')
+    print(f'wrote calibration tag (id {cal_id})')
 
     # Cube tags + face panels.
     used_ids: List[int] = [cal_id]
@@ -258,10 +306,10 @@ def generate_all(out_dir: Path) -> None:
                 )
             used_ids.append(tag_id)
 
-            png_path = tag_dir / (
-                f'tag36h11_id{tag_id:03d}_{cube.label}_{face_name}_50mm.png'
+            stem = (
+                f'tag36h11_id{tag_id:03d}_{cube.label}_{face_name}_50mm'
             )
-            generate_tag_print_png(tag_id, cube.tag_size_mm, png_path)
+            write_tag_assets(tag_id, cube.tag_size_mm, stem)
 
             stl_path = stl_dir / (
                 f'{cube.label}_{face_name}_id{tag_id:03d}.stl'
