@@ -204,7 +204,7 @@ def generate_tag_plate_stl(
     tag_size_mm: float,
     base_path: Path,
     pattern_path: Path,
-    plate_thickness_mm: float = 3.0,
+    plate_thickness_mm: float = 5.0,
     pattern_height_mm: float = 1.0,
 ) -> None:
     """Drop-in tag plate that fits into the cube body's face pocket.
@@ -262,96 +262,77 @@ def generate_cube_body_stl(
     cube_size_mm: float,
     output_path: Path,
     pocket_size_mm: float = 50.2,
-    pocket_depth_mm: float = 3.0,
+    pocket_depth_mm: float = 5.0,
 ) -> None:
     """Solid cube body STL with 6 face pockets for the tag plates.
 
     The body is a solid `cube_size`³ block with a `pocket_size` ×
     `pocket_size` × `pocket_depth` rectangular pocket cut from the
-    centre of each of the 6 faces. Total six pockets — all faces are
-    detachable, gripper-friendly because the interior is solid (the
-    slicer's infill carries the load).
+    centre of each of the 6 faces. All six pockets — every face is
+    detachable. Interior is solid in the STL so the slicer's infill
+    carries the gripper-squeeze load.
 
-    Mesh is expressed as a union of overlapping axis-aligned boxes:
-      - 1 inner core box (rim × rim × rim from each face)
-      - 6 face-rim frames (4 strip bars each) covering the wall around
-        every pocket
-      - 6 pocket-back slabs filling the material directly behind each
-        pocket up to the inner core
-    Total ≈ 31 boxes ≈ 372 triangles per cube body, with redundant
-    internal triangles at edges — slicer-fine.
-
-    Plate-to-pocket clearance defaults to 0.1 mm per side
-    (pocket 50.2 → plate 50.0). Adjust by passing different
-    pocket_size_mm if the operator's printer is more dimensionally
-    forgiving or tighter.
+    Implementation: split the cube along all relevant planes (pocket
+    boundaries on each axis), then output any sub-cell whose centre
+    lies outside every pocket. Works for any pocket_depth < cs/2,
+    including the case where opposite pockets get close to each other
+    or where pocket_depth exceeds the pocket-edge rim (cs - ps)/2.
+    A 60 mm cube ends up roughly 50 sub-boxes / 600 triangles.
     """
     cs = cube_size_mm
     ps = pocket_size_mm
     pd = pocket_depth_mm
-    rim = (cs - ps) / 2.0  # 4.9 mm rim around each pocket on a 60 mm cube
-    if pd >= rim:
+    if pd >= cs / 2.0:
         raise ValueError(
-            f'pocket_depth ({pd}) must be smaller than the rim '
-            f'((cs - ps)/2 = {rim}); otherwise opposite pockets would '
-            f'punch through to each other'
+            f'pocket_depth ({pd}) must be smaller than cs/2 '
+            f'({cs/2}) so opposite pockets do not punch through'
         )
+    pmin = (cs - ps) / 2.0   # pocket-edge rim on each face (4.9 mm)
+    pmax = cs - pmin
+
+    # Define pockets in (xrange, yrange, zrange) form for the
+    # solid-region test below.
+    pockets = (
+        ((pmin, pmax), (pmin, pmax), (cs - pd, cs)),  # +Z
+        ((pmin, pmax), (pmin, pmax), (0.0, pd)),       # -Z
+        ((cs - pd, cs), (pmin, pmax), (pmin, pmax)),   # +X
+        ((0.0, pd),    (pmin, pmax), (pmin, pmax)),    # -X
+        ((pmin, pmax), (cs - pd, cs), (pmin, pmax)),   # +Y
+        ((pmin, pmax), (0.0, pd),    (pmin, pmax)),    # -Y
+    )
+
+    def in_any_pocket(x: float, y: float, z: float) -> bool:
+        for (x0, x1), (y0, y1), (z0, z1) in pockets:
+            if x0 < x < x1 and y0 < y < y1 and z0 < z < z1:
+                return True
+        return False
+
+    # Sort and dedupe split planes per axis. The pocket geometry only
+    # has variation along the cube's own axes, so a 1D split per axis
+    # is sufficient.
+    splits = sorted({0.0, pd, pmin, pmax, cs - pd, cs})
 
     tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
-
-    def box(x0, y0, z0, x1, y1, z1):
-        tris.extend(_box_triangles(x0, y0, z0, x1, y1, z1))
-
-    # 1. Inner core — fully solid central region, untouched by any pocket.
-    box(rim, rim, rim, cs-rim, cs-rim, cs-rim)
-
-    # 2. Six face-rim frames (4 strip bars each), forming the picture-
-    #    frame ring of solid material around each face pocket.
-    # +Z (top) wall: z = cs-rim .. cs
-    box(0,        0,        cs-rim, cs,        rim,      cs)
-    box(0,        cs-rim,   cs-rim, cs,        cs,       cs)
-    box(0,        rim,      cs-rim, rim,       cs-rim,   cs)
-    box(cs-rim,   rim,      cs-rim, cs,        cs-rim,   cs)
-    # -Z (bottom) wall: z = 0 .. rim
-    box(0,        0,        0,      cs,        rim,      rim)
-    box(0,        cs-rim,   0,      cs,        cs,       rim)
-    box(0,        rim,      0,      rim,       cs-rim,   rim)
-    box(cs-rim,   rim,      0,      cs,        cs-rim,   rim)
-    # +X (front) wall: x = cs-rim .. cs
-    box(cs-rim,   0,        0,      cs,        rim,      cs)
-    box(cs-rim,   cs-rim,   0,      cs,        cs,       cs)
-    box(cs-rim,   rim,      0,      cs,        cs-rim,   rim)
-    box(cs-rim,   rim,      cs-rim, cs,        cs-rim,   cs)
-    # -X (back) wall: x = 0 .. rim
-    box(0,        0,        0,      rim,       rim,      cs)
-    box(0,        cs-rim,   0,      rim,       cs,       cs)
-    box(0,        rim,      0,      rim,       cs-rim,   rim)
-    box(0,        rim,      cs-rim, rim,       cs-rim,   cs)
-    # +Y (left) wall: y = cs-rim .. cs
-    box(0,        cs-rim,   0,      cs,        cs,       rim)
-    box(0,        cs-rim,   cs-rim, cs,        cs,       cs)
-    box(0,        cs-rim,   rim,    rim,       cs,       cs-rim)
-    box(cs-rim,   cs-rim,   rim,    cs,        cs,       cs-rim)
-    # -Y (right) wall: y = 0 .. rim
-    box(0,        0,        0,      cs,        rim,      rim)
-    box(0,        0,        cs-rim, cs,        rim,      cs)
-    box(0,        0,        rim,    rim,       rim,      cs-rim)
-    box(cs-rim,   0,        rim,    cs,        rim,      cs-rim)
-
-    # 3. Six pocket-back slabs — solid material immediately behind each
-    #    pocket, bridging the inner core to the pocket back surface.
-    # +Z back: z = cs-rim .. cs-pd  (thickness rim - pd = 1.9 mm)
-    box(rim, rim,    cs-rim,  cs-rim, cs-rim, cs-pd)
-    # -Z back: z = pd .. rim
-    box(rim, rim,    pd,      cs-rim, cs-rim, rim)
-    # +X back: x = cs-rim .. cs-pd
-    box(cs-rim, rim, rim,     cs-pd,  cs-rim, cs-rim)
-    # -X back: x = pd .. rim
-    box(pd,     rim, rim,     rim,    cs-rim, cs-rim)
-    # +Y back: y = cs-rim .. cs-pd
-    box(rim, cs-rim, rim,     cs-rim, cs-pd,  cs-rim)
-    # -Y back: y = pd .. rim
-    box(rim, pd,     rim,     cs-rim, rim,    cs-rim)
+    box_count = 0
+    for i in range(len(splits) - 1):
+        x0, x1 = splits[i], splits[i + 1]
+        if x1 - x0 < 1e-6:
+            continue
+        for j in range(len(splits) - 1):
+            y0, y1 = splits[j], splits[j + 1]
+            if y1 - y0 < 1e-6:
+                continue
+            for k in range(len(splits) - 1):
+                z0, z1 = splits[k], splits[k + 1]
+                if z1 - z0 < 1e-6:
+                    continue
+                cx = (x0 + x1) * 0.5
+                cy = (y0 + y1) * 0.5
+                cz = (z0 + z1) * 0.5
+                if in_any_pocket(cx, cy, cz):
+                    continue
+                tris.extend(_box_triangles(x0, y0, z0, x1, y1, z1))
+                box_count += 1
 
     write_stl_ascii(
         tris, output_path,
