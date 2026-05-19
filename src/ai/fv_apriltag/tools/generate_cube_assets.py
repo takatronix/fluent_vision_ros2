@@ -672,11 +672,99 @@ def write_plate_3mf(
         z.writestr('3D/3dmodel.model', model_xml)
 
 
+def _face_engraving_pockets(
+    face: str, cs: float, label: str,
+    depth: float = 0.5,
+    text_width_mm: float = 24.0,
+    text_height_mm: float = 3.6,
+    dpi: float = 20.0,
+) -> List[Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]]:
+    """Per-pixel engraving sub-pockets for the face's name label.
+
+    Returns a list of (xrange, yrange, zrange) boxes — each one a tiny
+    recess into the cube body's outer face surface — so the grid
+    decomposition in generate_cube_body_stl carves the text out
+    naturally. Text is centred on the "top" rim of the face:
+      side faces (front/back/left/right): top rim = +Z side
+      top / bottom:                       top rim = +X side (cube's "front")
+    Text reads with its top toward the same rim direction so a
+    plate slotted into the pocket inherits a matching orientation.
+    """
+    mask = _render_text_mask([label], text_width_mm, text_height_mm, dpi=dpi)
+    h_px, w_px = mask.shape
+    cw = text_width_mm / w_px
+    ch = text_height_mm / h_px
+    rim = (cs - 50.2) / 2.0  # mirror generate_cube_body_stl's pmin
+    rim_centre_v = cs / 2.0 + (cs / 2.0 - rim / 2.0 - cs / 2.0)  # = cs - rim/2
+    rim_centre_v = cs - rim / 2.0
+    v_start = rim_centre_v - text_height_mm / 2.0
+    u_start = (cs / 2.0) - text_width_mm / 2.0
+
+    pockets: List[Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]] = []
+
+    def cell_to_uv(row: int, col: int) -> Tuple[float, float, float, float]:
+        u0 = u_start + col * cw
+        u1 = u_start + (col + 1) * cw
+        v0 = v_start + (h_px - 1 - row) * ch
+        v1 = v_start + (h_px - row) * ch
+        return u0, u1, v0, v1
+
+    for row in range(h_px):
+        for col in range(w_px):
+            if not mask[row, col]:
+                continue
+            u0, u1, v0, v1 = cell_to_uv(row, col)
+            if face == 'front':
+                # +X face: u → cube +Y (image left = small y after Y-flip), v → +Z
+                pockets.append((
+                    (cs - depth, cs),
+                    (cs - u1, cs - u0),
+                    (v0, v1),
+                ))
+            elif face == 'back':
+                # -X face: u → +y (no Y-flip since back view), v → +Z
+                pockets.append((
+                    (0.0, depth),
+                    (u0, u1),
+                    (v0, v1),
+                ))
+            elif face == 'left':
+                # +Y face: u → +X (image col 0 = small x after X-flip), v → +Z
+                pockets.append((
+                    (cs - u1, cs - u0),
+                    (cs - depth, cs),
+                    (v0, v1),
+                ))
+            elif face == 'right':
+                # -Y face: u → +X (left-to-right), v → +Z
+                pockets.append((
+                    (u0, u1),
+                    (0.0, depth),
+                    (v0, v1),
+                ))
+            elif face == 'top':
+                # +Z face: u → -Y (image left = +Y), v → +X (top rim = front)
+                pockets.append((
+                    (v0, v1),
+                    (cs - u1, cs - u0),
+                    (cs - depth, cs),
+                ))
+            elif face == 'bottom':
+                # -Z face: u → +Y, v → +X
+                pockets.append((
+                    (v0, v1),
+                    (u0, u1),
+                    (0.0, depth),
+                ))
+    return pockets
+
+
 def generate_cube_body_stl(
     cube_size_mm: float,
     output_path: Path,
     pocket_size_mm: float = 50.2,
     pocket_depth_mm: float = 3.0,
+    engrave_face_names: bool = True,
 ) -> None:
     """Solid cube body STL with 6 face pockets for the tag plates.
 
@@ -721,14 +809,28 @@ def generate_cube_body_stl(
 
     # Define pockets in (xrange, yrange, zrange) form for the
     # solid-region test below.
-    pockets = (
+    pockets: List[Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]] = [
         ((pmin, pmax), (pmin, pmax), (cs - pd, cs)),  # +Z
         ((pmin, pmax), (pmin, pmax), (0.0, pd)),       # -Z
         ((cs - pd, cs), (pmin, pmax), (pmin, pmax)),   # +X
         ((0.0, pd),    (pmin, pmax), (pmin, pmax)),    # -X
         ((pmin, pmax), (cs - pd, cs), (pmin, pmax)),   # +Y
         ((pmin, pmax), (0.0, pd),    (pmin, pmax)),    # -Y
-    )
+    ]
+
+    # Per-face name engravings — each text pixel is a tiny sub-pocket
+    # carved into the cube body's outer face. Single-colour print:
+    # the recess is visible by surface relief on a monochrome print.
+    if engrave_face_names:
+        labels = {
+            'front': 'FRONT', 'back': 'BACK',
+            'left': 'LEFT', 'right': 'RIGHT',
+            'top': 'TOP', 'bottom': 'BOTTOM',
+        }
+        for face_name, label in labels.items():
+            pockets.extend(
+                _face_engraving_pockets(face_name, cs, label)
+            )
 
     def in_any_pocket(x: float, y: float, z: float) -> bool:
         for (x0, x1), (y0, y1), (z0, z1) in pockets:
@@ -736,23 +838,24 @@ def generate_cube_body_stl(
                 return True
         return False
 
-    # Sort and dedupe split planes per axis. The pocket geometry only
-    # has variation along the cube's own axes, so a 1D split per axis
-    # is sufficient.
-    splits = sorted({0.0, pd, pmin, pmax, cs - pd, cs})
+    # Per-axis split planes — face engravings need finer granularity
+    # than the 6 face pockets (text pixels are small) so split each
+    # axis only at the boundaries actually referenced.
+    splits_x = sorted({0.0, cs} | {b for p in pockets for b in p[0]})
+    splits_y = sorted({0.0, cs} | {b for p in pockets for b in p[1]})
+    splits_z = sorted({0.0, cs} | {b for p in pockets for b in p[2]})
 
     tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
-    box_count = 0
-    for i in range(len(splits) - 1):
-        x0, x1 = splits[i], splits[i + 1]
+    for i in range(len(splits_x) - 1):
+        x0, x1 = splits_x[i], splits_x[i + 1]
         if x1 - x0 < 1e-6:
             continue
-        for j in range(len(splits) - 1):
-            y0, y1 = splits[j], splits[j + 1]
+        for j in range(len(splits_y) - 1):
+            y0, y1 = splits_y[j], splits_y[j + 1]
             if y1 - y0 < 1e-6:
                 continue
-            for k in range(len(splits) - 1):
-                z0, z1 = splits[k], splits[k + 1]
+            for k in range(len(splits_z) - 1):
+                z0, z1 = splits_z[k], splits_z[k + 1]
                 if z1 - z0 < 1e-6:
                     continue
                 cx = (x0 + x1) * 0.5
@@ -761,7 +864,6 @@ def generate_cube_body_stl(
                 if in_any_pocket(cx, cy, cz):
                     continue
                 tris.extend(_box_triangles(x0, y0, z0, x1, y1, z1))
-                box_count += 1
 
     write_stl_ascii(
         tris, output_path,
@@ -861,17 +963,19 @@ def generate_all(out_dir: Path) -> None:
             stl_stem = plate_dir / (
                 f'{cube.label}_{face_name}_id{tag_id:03d}'
             )
-            # Two-line back label, kept short so 50 DPI text stays
-            # legible. The arrow points to the plate edge that aligns
-            # with cube +Z (side faces) or cube +X (top/bottom);
-            # the per-face mapping is in the README.
+            # Two-line back label — face name + cube short code. The
+            # orientation reference now lives on the cube body itself
+            # (engraved FRONT / TOP / etc. on each rim) so the plate
+            # doesn't need an arrow: align the plate text to read in
+            # the same direction as the cube body engraving of the
+            # matching face.
             base_tris, pattern_tris, text_tris = generate_tag_plate_stl(
                 tag_id=tag_id,
                 tag_size_mm=cube.tag_size_mm,
                 base_path=stl_stem.with_name(stl_stem.name + '_base.stl'),
                 pattern_path=stl_stem.with_name(stl_stem.name + '_pattern.stl'),
                 text_path=stl_stem.with_name(stl_stem.name + '_text.stl'),
-                label_top=f'↑{face_name.upper()}',
+                label_top=face_name.upper(),
                 label_bottom=cube.label.replace('cube', '').replace('_', ''),
             )
             # Drop-in 3MF: same plate as one merged file with materials
