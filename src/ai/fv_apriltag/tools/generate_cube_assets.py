@@ -27,12 +27,13 @@ import argparse
 import os
 import sys
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 TAG_FAMILY = 'tag36h11'
@@ -199,17 +200,96 @@ def write_stl_ascii(tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]],
     output_path.write_text('\n'.join(lines) + '\n')
 
 
+def _font_for_box(text: str, max_w_px: int, max_h_px: int) -> ImageFont.ImageFont:
+    """Return the largest DejaVu Bold font that fits `text` in (w,h)."""
+    for candidate in (
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    ):
+        if os.path.exists(candidate):
+            font_path = candidate
+            break
+    else:
+        return ImageFont.load_default()
+
+    size = max(8, max_h_px)
+    while size > 4:
+        font = ImageFont.truetype(font_path, size)
+        bbox = font.getbbox(text)
+        if (bbox[2] - bbox[0]) <= max_w_px and (bbox[3] - bbox[1]) <= max_h_px:
+            return font
+        size -= 1
+    return ImageFont.truetype(font_path, 8)
+
+
+def _render_text_mask(
+    lines: List[str], width_mm: float, height_mm: float, dpi: float = 50.0,
+) -> np.ndarray:
+    """Render `lines` to a (h_px × w_px) bool mask. True = ink pixel.
+
+    Used to extrude the face / cube label onto the back of each plate.
+    50 DPI keeps the resulting voxel count manageable (~200 cells per
+    plate) while still being legible at arm's length.
+    """
+    px_per_mm = dpi / 25.4
+    w_px = max(8, int(round(width_mm * px_per_mm)))
+    h_px = max(8, int(round(height_mm * px_per_mm)))
+    img = Image.new('L', (w_px, h_px), color=255)
+    draw = ImageDraw.Draw(img)
+    line_h_px = h_px // max(1, len(lines))
+    for i, line in enumerate(lines):
+        font = _font_for_box(line, w_px - 4, line_h_px - 2)
+        bbox = font.getbbox(line)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        x = (w_px - tw) // 2 - bbox[0]
+        y = i * line_h_px + (line_h_px - th) // 2 - bbox[1]
+        draw.text((x, y), line, fill=0, font=font)
+    arr = np.array(img)
+    return arr < 128
+
+
+def _mask_to_boxes(
+    mask: np.ndarray, x_offset_mm: float, y_offset_mm: float,
+    width_mm: float, height_mm: float, z_low: float, z_high: float,
+) -> List[Tuple[Vec3, Vec3, Vec3, Vec3]]:
+    """Extrude `mask` to a list of axis-aligned voxel boxes (triangles)."""
+    h_px, w_px = mask.shape
+    cell_w = width_mm / w_px
+    cell_h = height_mm / h_px
+    tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
+    for row in range(h_px):
+        for col in range(w_px):
+            if not mask[row, col]:
+                continue
+            x0 = x_offset_mm + col * cell_w
+            # Flip Y so the printed orientation matches what `draw.text`
+            # produced (row 0 = top of the image).
+            y0 = y_offset_mm + (h_px - 1 - row) * cell_h
+            tris.extend(_box_triangles(
+                x0, y0, z_low,
+                x0 + cell_w, y0 + cell_h, z_high,
+            ))
+    return tris
+
+
 def generate_tag_plate_stl(
     tag_id: int,
     tag_size_mm: float,
     base_path: Path,
     pattern_path: Path,
+    text_path: Path,
+    label_top: str = '',
+    label_bottom: str = '',
     plate_thickness_mm: float = 3.0,
     pattern_height_mm: float = 1.0,
-) -> None:
+    text_height_mm: float = 0.4,
+) -> Tuple[List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+           List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+           List[Tuple[Vec3, Vec3, Vec3, Vec3]]]:
     """Drop-in tag plate that fits into the cube body's face pocket.
 
-    Two-piece multi-colour print:
+    Three-part multi-colour print:
 
     - <stem>_base.stl    : tag_size × tag_size × (plate_thickness -
                            pattern_height) flat plate
@@ -217,11 +297,20 @@ def generate_tag_plate_stl(
     - <stem>_pattern.stl : raised pillars at the AprilTag dark cells,
                            sitting on top of the base
                            (intended black filament)
+    - <stem>_text.stl    : face + cube labels embossed on the back
+                           side of the base (intended black filament,
+                           shows through the white as text inlay when
+                           assembled in a slicer that prioritises
+                           sub-parts over the main part)
 
-    Both files share the same origin so the slicer can merge them as
-    sub-parts and apply one filament per part. Total plate thickness
-    = base + pattern = plate_thickness_mm, matched to the cube body's
-    pocket depth.
+    The text occupies the bottom `text_height_mm` of the plate
+    (z = 0 .. text_height_mm). Bambu Studio / OrcaSlicer / PrusaSlicer
+    treat the text part as a modifier overriding the base in that
+    region, so the print shows black inlay text on the white back of
+    the plate without changing the plate's external dimensions.
+
+    Returns (base_tris, pattern_tris, text_tris) so the caller can
+    re-use the same geometry for the 3MF export below.
     """
     pattern = fetch_tag_array(tag_id)  # 0 = black, 1 = white
     cell_size = tag_size_mm / 10.0
@@ -231,7 +320,15 @@ def generate_tag_plate_stl(
             f'plate_thickness ({plate_thickness_mm}) must exceed '
             f'pattern_height ({pattern_height_mm})'
         )
+    if text_height_mm >= base_thickness:
+        raise ValueError(
+            f'text_height ({text_height_mm}) must be smaller than '
+            f'base_thickness ({base_thickness})'
+        )
 
+    # White base — full solid box; the slicer relies on the text part
+    # being declared after the base in the 3MF/slicer object tree so
+    # the text region is overridden by black filament at print time.
     base_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = _box_triangles(
         0.0, 0.0, 0.0,
         tag_size_mm, tag_size_mm, base_thickness,
@@ -241,6 +338,7 @@ def generate_tag_plate_stl(
         name=f'fv_apriltag_plate_id{tag_id:03d}_base',
     )
 
+    # Black AprilTag pattern on the front face.
     pattern_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
     for row in range(10):
         for col in range(10):
@@ -256,6 +354,132 @@ def generate_tag_plate_stl(
         pattern_tris, pattern_path,
         name=f'fv_apriltag_plate_id{tag_id:03d}_pattern',
     )
+
+    # Black text on the back face — multi-line label.
+    text_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
+    lines = [s for s in (label_top, label_bottom) if s]
+    if lines:
+        # Centred in a 40 × 30 mm region (leave 5 mm margin around the
+        # 50 mm plate so the slicer's first-layer brim doesn't bleed
+        # into the text).
+        text_w = tag_size_mm - 10.0
+        text_h = tag_size_mm * 0.6
+        mask = _render_text_mask(lines, text_w, text_h, dpi=50.0)
+        text_tris = _mask_to_boxes(
+            mask,
+            x_offset_mm=(tag_size_mm - text_w) / 2.0,
+            y_offset_mm=(tag_size_mm - text_h) / 2.0,
+            width_mm=text_w, height_mm=text_h,
+            z_low=0.0, z_high=text_height_mm,
+        )
+    write_stl_ascii(
+        text_tris, text_path,
+        name=f'fv_apriltag_plate_id{tag_id:03d}_text',
+    )
+
+    return base_tris, pattern_tris, text_tris
+
+
+# --- 3MF writer -------------------------------------------------------------
+
+_3MF_NS = 'http://schemas.microsoft.com/3dmanufacturing/core/2015/02'
+
+
+def _build_mesh_xml(triangles: List[Tuple[Vec3, Vec3, Vec3, Vec3]]) -> str:
+    """Render mesh as `<mesh>...</mesh>` XML string. No vertex dedup —
+    each triangle owns its 3 vertices."""
+    if not triangles:
+        return '<mesh><vertices/><triangles/></mesh>'
+    verts: List[str] = []
+    tris: List[str] = []
+    for i, (_, v1, v2, v3) in enumerate(triangles):
+        base = i * 3
+        for v in (v1, v2, v3):
+            verts.append(
+                f'<vertex x="{v[0]:.6f}" y="{v[1]:.6f}" z="{v[2]:.6f}"/>'
+            )
+        tris.append(
+            f'<triangle v1="{base}" v2="{base+1}" v3="{base+2}"/>'
+        )
+    return (
+        '<mesh><vertices>'
+        + ''.join(verts)
+        + '</vertices><triangles>'
+        + ''.join(tris)
+        + '</triangles></mesh>'
+    )
+
+
+def write_plate_3mf(
+    output_path: Path,
+    base_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+    pattern_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+    text_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+    tag_id: int,
+) -> None:
+    """Single-file 3MF combining base (white), pattern (black) and text
+    (black) as one composite object. Operator drops the file into
+    Bambu Studio, picks the two filaments, slices — no per-part Add
+    Part dance.
+    """
+    has_text = bool(text_tris)
+    # Resources: 2 base materials, 3 component objects, 1 composite.
+    body_parts = [
+        '<basematerials id="1">'
+        '<base name="WhitePLA" displaycolor="#FFFFFFFF"/>'
+        '<base name="BlackPLA" displaycolor="#000000FF"/>'
+        '</basematerials>',
+        f'<object id="2" name="base" type="model" pid="1" pindex="0">'
+        f'{_build_mesh_xml(base_tris)}</object>',
+        f'<object id="3" name="pattern" type="model" pid="1" pindex="1">'
+        f'{_build_mesh_xml(pattern_tris)}</object>',
+    ]
+    components = [
+        '<component objectid="2"/>',
+        '<component objectid="3"/>',
+    ]
+    if has_text:
+        body_parts.append(
+            f'<object id="4" name="text" type="model" pid="1" pindex="1">'
+            f'{_build_mesh_xml(text_tris)}</object>'
+        )
+        components.append('<component objectid="4"/>')
+    body_parts.append(
+        f'<object id="5" name="plate_id{tag_id:03d}" type="model">'
+        f'<components>{"".join(components)}</components></object>'
+    )
+    resources = '<resources>' + ''.join(body_parts) + '</resources>'
+    build = '<build><item objectid="5"/></build>'
+    model_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<model unit="millimeter" xml:lang="en-US" xmlns="{_3MF_NS}">'
+        f'{resources}{build}</model>'
+    )
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/'
+        'content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.'
+        'openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="model" ContentType="application/vnd.'
+        'ms-package.3dmanufacturing-3dmodel+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/'
+        'package/2006/relationships">'
+        '<Relationship Id="rel-1" '
+        'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/'
+        '3dmodel" Target="/3D/3dmodel.model"/>'
+        '</Relationships>'
+    )
+
+    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml', content_types)
+        z.writestr('_rels/.rels', rels)
+        z.writestr('3D/3dmodel.model', model_xml)
 
 
 def generate_cube_body_stl(
@@ -438,17 +662,30 @@ def generate_all(out_dir: Path) -> None:
             stl_stem = plate_dir / (
                 f'{cube.label}_{face_name}_id{tag_id:03d}'
             )
-            generate_tag_plate_stl(
+            base_tris, pattern_tris, text_tris = generate_tag_plate_stl(
                 tag_id=tag_id,
                 tag_size_mm=cube.tag_size_mm,
                 base_path=stl_stem.with_name(stl_stem.name + '_base.stl'),
                 pattern_path=stl_stem.with_name(stl_stem.name + '_pattern.stl'),
+                text_path=stl_stem.with_name(stl_stem.name + '_text.stl'),
+                label_top=face_name.upper(),
+                # Cube label e.g. "cube60_a" → "60 a" → easier to read.
+                label_bottom=cube.label.replace('cube', '').replace('_', ' '),
+            )
+            # Drop-in 3MF: same plate as one merged file with materials
+            # pre-assigned (white = base, black = pattern + text).
+            write_plate_3mf(
+                output_path=stl_stem.with_name(stl_stem.name + '.3mf'),
+                base_tris=base_tris,
+                pattern_tris=pattern_tris,
+                text_tris=text_tris,
+                tag_id=tag_id,
             )
             plates_written += 1
         print(
             f'cube {cube.label}: '
             f'IDs {sorted(cube.face_to_id.values())} '
-            f'-> {plates_written} plate pairs (all 6 faces)'
+            f'-> {plates_written} plate sets (STL trio + 3MF, all 6 faces)'
         )
 
     # Manifest for downstream tooling.
