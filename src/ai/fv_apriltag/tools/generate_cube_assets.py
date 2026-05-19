@@ -357,12 +357,18 @@ def generate_tag_plate_stl(
     text_x_off = (tag_size_mm - text_region_w_mm) / 2.0
     text_y_off = (tag_size_mm - text_region_h_mm) / 2.0
     if lines:
-        # 30 DPI → ~0.85 mm cell on a 40 × 30 mm region, ~1 600 cells
-        # total. 50 DPI is sharper but quadruples the triangle count
-        # for both base voids and text fill.
+        # 50 DPI → ~0.5 mm cell on a 40 × 30 mm region, sharper letters
+        # than the earlier 30 DPI without the 4× triangle blow-up
+        # because RLE merges runs.
         mask = _render_text_mask(
-            lines, text_region_w_mm, text_region_h_mm, dpi=30.0,
+            lines, text_region_w_mm, text_region_h_mm, dpi=50.0,
         )
+        # Mirror horizontally so the text reads correctly when the
+        # plate is viewed from the BACK side (the side that faces
+        # into the cube pocket). Without this the print-bed-side
+        # text shows up mirror-reversed to the operator inspecting
+        # the plate they just popped out.
+        mask = np.fliplr(mask)
         text_tris = _mask_to_boxes(
             mask,
             x_offset_mm=text_x_off,
@@ -855,28 +861,18 @@ def generate_all(out_dir: Path) -> None:
             stl_stem = plate_dir / (
                 f'{cube.label}_{face_name}_id{tag_id:03d}'
             )
-            # Up-axis hint per face — what the plate's "up edge"
-            # (the side the ↑ arrow points to in the back text) maps
-            # to in the cube's REP-103 frame:
-            #   side faces (front/back/left/right) → cube +Z (gravity up)
-            #   top / bottom faces                 → cube +X (front)
-            up_axis = '+X' if face_name in ('top', 'bottom') else '+Z'
+            # Two-line back label, kept short so 50 DPI text stays
+            # legible. The arrow points to the plate edge that aligns
+            # with cube +Z (side faces) or cube +X (top/bottom);
+            # the per-face mapping is in the README.
             base_tris, pattern_tris, text_tris = generate_tag_plate_stl(
                 tag_id=tag_id,
                 tag_size_mm=cube.tag_size_mm,
                 base_path=stl_stem.with_name(stl_stem.name + '_base.stl'),
                 pattern_path=stl_stem.with_name(stl_stem.name + '_pattern.stl'),
                 text_path=stl_stem.with_name(stl_stem.name + '_text.stl'),
-                # Line 1: ↑ <FACE>  — arrow indicates the plate edge
-                # that should point toward up_axis when inserted.
-                label_top=f'↑ {face_name.upper()}',
-                # Line 2: cube label + axis the arrow points to so the
-                # operator can match without consulting the README.
-                # Example: "60 a  ↑=+Z" or "100 c  ↑=+X"
-                label_bottom=(
-                    f'{cube.label.replace("cube", "").replace("_", " ")} '
-                    f' ↑={up_axis}'
-                ),
+                label_top=f'↑{face_name.upper()}',
+                label_bottom=cube.label.replace('cube', '').replace('_', ''),
             )
             # Drop-in 3MF: same plate as one merged file with materials
             # pre-assigned (white = base, black = pattern + text).
