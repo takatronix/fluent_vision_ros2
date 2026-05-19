@@ -662,15 +662,28 @@ def generate_all(out_dir: Path) -> None:
             stl_stem = plate_dir / (
                 f'{cube.label}_{face_name}_id{tag_id:03d}'
             )
+            # Up-axis hint per face — what the plate's "up edge"
+            # (the side the ↑ arrow points to in the back text) maps
+            # to in the cube's REP-103 frame:
+            #   side faces (front/back/left/right) → cube +Z (gravity up)
+            #   top / bottom faces                 → cube +X (front)
+            up_axis = '+X' if face_name in ('top', 'bottom') else '+Z'
             base_tris, pattern_tris, text_tris = generate_tag_plate_stl(
                 tag_id=tag_id,
                 tag_size_mm=cube.tag_size_mm,
                 base_path=stl_stem.with_name(stl_stem.name + '_base.stl'),
                 pattern_path=stl_stem.with_name(stl_stem.name + '_pattern.stl'),
                 text_path=stl_stem.with_name(stl_stem.name + '_text.stl'),
-                label_top=face_name.upper(),
-                # Cube label e.g. "cube60_a" → "60 a" → easier to read.
-                label_bottom=cube.label.replace('cube', '').replace('_', ' '),
+                # Line 1: ↑ <FACE>  — arrow indicates the plate edge
+                # that should point toward up_axis when inserted.
+                label_top=f'↑ {face_name.upper()}',
+                # Line 2: cube label + axis the arrow points to so the
+                # operator can match without consulting the README.
+                # Example: "60 a  ↑=+Z" or "100 c  ↑=+X"
+                label_bottom=(
+                    f'{cube.label.replace("cube", "").replace("_", " ")} '
+                    f' ↑={up_axis}'
+                ),
             )
             # Drop-in 3MF: same plate as one merged file with materials
             # pre-assigned (white = base, black = pattern + text).
