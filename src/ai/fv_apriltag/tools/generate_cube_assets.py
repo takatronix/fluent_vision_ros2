@@ -410,6 +410,123 @@ def _build_mesh_xml(triangles: List[Tuple[Vec3, Vec3, Vec3, Vec3]]) -> str:
     )
 
 
+def write_cube_plates_3mf(
+    output_path: Path,
+    plates: List[Tuple[
+        str, int,
+        List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+        List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+        List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+    ]],
+    cube_label: str,
+    plate_size_mm: float = 50.0,
+    gap_mm: float = 5.0,
+    cols: int = 3,
+) -> None:
+    """Pack one cube's six tag plates into a single 3MF.
+
+    `plates` is a list of (face_name, tag_id, base_tris, pattern_tris,
+    text_tris). Each plate becomes a composite object (base + pattern
+    [+ text]) with material assignments, and the build references
+    them with translation transforms so they land on the bed in a
+    cols × ceil(N/cols) grid. Operator drags one .3mf, sees all six
+    plates arranged ready to slice.
+    """
+    materials_xml = (
+        '<basematerials id="1">'
+        '<base name="WhitePLA" displaycolor="#FFFFFFFF"/>'
+        '<base name="BlackPLA" displaycolor="#000000FF"/>'
+        '</basematerials>'
+    )
+
+    objects_xml: List[str] = []
+    items_xml: List[str] = []
+    next_id = 2  # 1 is reserved for basematerials
+
+    for plate_idx, (face_name, tag_id, base_tris,
+                    pattern_tris, text_tris) in enumerate(plates):
+        row = plate_idx // cols
+        col = plate_idx % cols
+        dx = col * (plate_size_mm + gap_mm)
+        dy = row * (plate_size_mm + gap_mm)
+
+        base_id = next_id
+        next_id += 1
+        objects_xml.append(
+            f'<object id="{base_id}" name="{face_name}_base" '
+            f'type="model" pid="1" pindex="0">'
+            f'{_build_mesh_xml(base_tris)}</object>'
+        )
+
+        pattern_id = next_id
+        next_id += 1
+        objects_xml.append(
+            f'<object id="{pattern_id}" name="{face_name}_pattern" '
+            f'type="model" pid="1" pindex="1">'
+            f'{_build_mesh_xml(pattern_tris)}</object>'
+        )
+
+        components = [
+            f'<component objectid="{base_id}"/>',
+            f'<component objectid="{pattern_id}"/>',
+        ]
+        if text_tris:
+            text_id = next_id
+            next_id += 1
+            objects_xml.append(
+                f'<object id="{text_id}" name="{face_name}_text" '
+                f'type="model" pid="1" pindex="1">'
+                f'{_build_mesh_xml(text_tris)}</object>'
+            )
+            components.append(f'<component objectid="{text_id}"/>')
+
+        composite_id = next_id
+        next_id += 1
+        objects_xml.append(
+            f'<object id="{composite_id}" '
+            f'name="{face_name}_id{tag_id:03d}" type="model">'
+            f'<components>{"".join(components)}</components></object>'
+        )
+
+        items_xml.append(
+            f'<item objectid="{composite_id}" '
+            f'transform="1 0 0 0 1 0 0 0 1 {dx:.3f} {dy:.3f} 0"/>'
+        )
+
+    resources = '<resources>' + materials_xml + ''.join(objects_xml) + '</resources>'
+    build = '<build>' + ''.join(items_xml) + '</build>'
+    model_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<model unit="millimeter" xml:lang="en-US" xmlns="{_3MF_NS}">'
+        + resources + build + '</model>'
+    )
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/'
+        'content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.'
+        'openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="model" ContentType="application/vnd.'
+        'ms-package.3dmanufacturing-3dmodel+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/'
+        'package/2006/relationships">'
+        '<Relationship Id="rel-1" '
+        'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/'
+        '3dmodel" Target="/3D/3dmodel.model"/>'
+        '</Relationships>'
+    )
+
+    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml', content_types)
+        z.writestr('_rels/.rels', rels)
+        z.writestr('3D/3dmodel.model', model_xml)
+
+
 def write_plate_3mf(
     output_path: Path,
     base_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]],
@@ -644,9 +761,18 @@ def generate_all(out_dir: Path) -> None:
 
     # Cube tags + drop-in plate pairs. All 6 faces are now detachable
     # (the cube body has a pocket on every face including the bottom).
+    cube_3mf_dir = out_dir / 'stl' / 'cube_3mf'
+    cube_3mf_dir.mkdir(parents=True, exist_ok=True)
     used_ids: List[int] = [cal_id]
     for cube in cubes:
         plates_written = 0
+        # Aggregate the 6 plates of this cube for the combined 3MF.
+        combined_plates: List[Tuple[
+            str, int,
+            List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+            List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+            List[Tuple[Vec3, Vec3, Vec3, Vec3]],
+        ]] = []
         for face_name, tag_id in cube.face_to_id.items():
             if tag_id in used_ids:
                 raise RuntimeError(
@@ -694,11 +820,24 @@ def generate_all(out_dir: Path) -> None:
                 text_tris=text_tris,
                 tag_id=tag_id,
             )
+            combined_plates.append(
+                (face_name, tag_id, base_tris, pattern_tris, text_tris)
+            )
             plates_written += 1
+
+        # One-file-per-cube 3MF: all 6 plates arranged on the bed.
+        combined_path = cube_3mf_dir / f'{cube.label}_all6plates.3mf'
+        write_cube_plates_3mf(
+            output_path=combined_path,
+            plates=combined_plates,
+            cube_label=cube.label,
+            plate_size_mm=cube.tag_size_mm,
+        )
         print(
             f'cube {cube.label}: '
             f'IDs {sorted(cube.face_to_id.values())} '
-            f'-> {plates_written} plate sets (STL trio + 3MF, all 6 faces)'
+            f'-> {plates_written} plate sets + combined 3MF '
+            f'({combined_path.name})'
         )
 
     # Manifest for downstream tooling.
