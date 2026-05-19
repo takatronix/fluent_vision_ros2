@@ -240,6 +240,14 @@ void FVDepthCameraNode::loadParameters()
     // Timestamping: map RealSense device timestamp to ROS time
     use_device_timestamp_ = this->declare_parameter("streams.use_device_timestamp", true);
     device_ts_reset_threshold_ms_ = this->declare_parameter("streams.device_ts_reset_threshold_ms", 1000.0);
+    // Anti-drift guard for librealsense GLOBAL_TIME — re-anchor the
+    // device→ROS time mapping whenever the computed stamp deviates from
+    // this->now() by more than this many ms. 250 ms keeps frame-to-frame
+    // relative timing from D405 (sub-ms jitter) while bounding the
+    // absolute offset against ROS time so tf2 lookups don't drift past
+    // the URDF horizon. Set to 0 to anchor every frame; set very large
+    // to disable the guard (legacy behaviour).
+    drift_resync_ms_ = this->declare_parameter("streams.device_ts_drift_resync_ms", 250.0);
     // Sync warning threshold (ms)
     sync_warn_ms_ = this->declare_parameter("streams.sync_warn_ms", 1.0);
     sync_max_skew_ms_ = this->declare_parameter("streams.sync_max_skew_ms", 20.0);
@@ -1336,6 +1344,37 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
     const double dt_ms = device_ts_ms - base_device_ts_ms_;
     const int64_t dt_ns = static_cast<int64_t>(dt_ms * 1e6);
     rclcpp::Time stamp = base_ros_stamp_ + rclcpp::Duration(std::chrono::nanoseconds(dt_ns));
+
+    // Drift guard: if the device-time-derived stamp diverges from ROS
+    // time by more than drift_resync_ms_, re-anchor the baseline to the
+    // present. Catches GLOBAL_TIME offset estimation slippage in
+    // librealsense and prevents downstream tf2 future-extrapolation
+    // failures.
+    if (drift_resync_ms_ >= 0.0) {
+        const rclcpp::Duration drift = stamp - now;
+        const int64_t drift_ns = std::abs(drift.nanoseconds());
+        const int64_t threshold_ns =
+            static_cast<int64_t>(drift_resync_ms_ * 1e6);
+        if (drift_ns > threshold_ns) {
+            base_device_ts_ms_ = device_ts_ms;
+            base_ros_stamp_ = now;
+            stamp = now;
+            last_device_ts_ms_ = device_ts_ms;
+            last_ros_stamp_ = now;
+            // Surface the event at most once per 10 s to avoid log spam.
+            static rclcpp::Time s_last_log{0, 0, RCL_SYSTEM_TIME};
+            if ((now - s_last_log).nanoseconds() > static_cast<int64_t>(1e10)) {
+                s_last_log = now;
+                RCLCPP_INFO(
+                    this->get_logger(),
+                    "device->ROS time mapping re-anchored "
+                    "(drift was %.3f s; threshold %.3f s)",
+                    drift.seconds(), drift_resync_ms_ / 1000.0);
+            }
+            return stamp;
+        }
+    }
+
     if (stamp < last_ros_stamp_) {
         stamp = last_ros_stamp_;
     }

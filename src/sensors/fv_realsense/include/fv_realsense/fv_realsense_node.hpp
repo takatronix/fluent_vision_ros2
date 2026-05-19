@@ -142,9 +142,22 @@ private:
     double sync_max_skew_ms_ = 20.0;
     int sync_max_wait_ms_ = 15;
     std::size_t sync_queue_size_ = 5;
-    // Timestamping: map device timestamp to ROS time
+    // Timestamping: map device timestamp to ROS time.
+    // librealsense's GLOBAL_TIME (default) is hardware-clock + an offset
+    // estimated against the host. Both the underlying crystal drift and
+    // the offset re-estimation cadence are imperfect, so over a long
+    // session the mapping drifts forward — observed +44–48 s after a
+    // few hours of D405 / container uptime. When that happens
+    // downstream tf2 lookups fail because the requested time is past
+    // the URDF publisher's horizon.
+    //
+    // Defence: drift_resync_ms_ caps how far the computed stamp may
+    // diverge from this->now() before the (base_device, base_ros)
+    // mapping is re-anchored to the present. With drift_resync_ms_ = 0
+    // we anchor every frame (= identical to use_device_timestamp_=false).
     bool use_device_timestamp_ = true;
     double device_ts_reset_threshold_ms_ = 1000.0;
+    double drift_resync_ms_ = 250.0;
     std::mutex device_time_mutex_;
     bool device_time_initialized_ = false;
     rs2_timestamp_domain device_time_domain_{RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK};
