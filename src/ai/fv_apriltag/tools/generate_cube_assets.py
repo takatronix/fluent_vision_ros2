@@ -204,7 +204,7 @@ def generate_tag_plate_stl(
     tag_size_mm: float,
     base_path: Path,
     pattern_path: Path,
-    plate_thickness_mm: float = 5.0,
+    plate_thickness_mm: float = 3.0,
     pattern_height_mm: float = 1.0,
 ) -> None:
     """Drop-in tag plate that fits into the cube body's face pocket.
@@ -262,7 +262,7 @@ def generate_cube_body_stl(
     cube_size_mm: float,
     output_path: Path,
     pocket_size_mm: float = 50.2,
-    pocket_depth_mm: float = 5.0,
+    pocket_depth_mm: float = 3.0,
 ) -> None:
     """Solid cube body STL with 6 face pockets for the tag plates.
 
@@ -289,6 +289,21 @@ def generate_cube_body_stl(
         )
     pmin = (cs - ps) / 2.0   # pocket-edge rim on each face (4.9 mm)
     pmax = cs - pmin
+    # Sanity: opposite pockets on the same axis don't merge (handled by
+    # the cs/2 check above), but adjacent pockets on perpendicular
+    # faces ALSO need to keep their share of the cube edge alive. If
+    # pocket_depth exceeds the per-face rim, the central solid block
+    # loses its face-neighbour connections to the outer corners /
+    # edges (the "pocket-back slab" in the grid decomposition vanishes
+    # and the slicer ends up printing the centre as a free-floating
+    # object that drops out of the cube). Bail out early so the
+    # operator gets a clear error instead of a structurally bad print.
+    if pd >= pmin:
+        raise ValueError(
+            f'pocket_depth ({pd} mm) >= rim ((cs - ps)/2 = {pmin} mm). '
+            f'Adjacent pockets would isolate the central block. Reduce '
+            f'pocket_depth, shrink pocket_size, or enlarge cube_size.'
+        )
 
     # Define pockets in (xrange, yrange, zrange) form for the
     # solid-region test below.
