@@ -252,23 +252,44 @@ def _render_text_mask(
 def _mask_to_boxes(
     mask: np.ndarray, x_offset_mm: float, y_offset_mm: float,
     width_mm: float, height_mm: float, z_low: float, z_high: float,
+    inverted: bool = False,
 ) -> List[Tuple[Vec3, Vec3, Vec3, Vec3]]:
-    """Extrude `mask` to a list of axis-aligned voxel boxes (triangles)."""
+    """Extrude `mask` to axis-aligned voxel boxes, RLE'd per row.
+
+    `inverted=False` emits boxes for True pixels (e.g. the ink of a
+    text mask). `inverted=True` emits boxes for False pixels (e.g.
+    the "white" cells that fill around the engraved text). Per-row
+    run-length encoding collapses contiguous pixels into one wider
+    box — roughly a 10× triangle reduction on text-shaped masks
+    compared with one box per pixel.
+    """
     h_px, w_px = mask.shape
     cell_w = width_mm / w_px
     cell_h = height_mm / h_px
     tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
     for row in range(h_px):
-        for col in range(w_px):
-            if not mask[row, col]:
+        # Flip Y so the printed orientation matches what `draw.text`
+        # produced (row 0 = top of the image).
+        cy0 = y_offset_mm + (h_px - 1 - row) * cell_h
+        cy1 = cy0 + cell_h
+        col = 0
+        while col < w_px:
+            pixel = bool(mask[row, col])
+            in_run = (not pixel) if inverted else pixel
+            if not in_run:
+                col += 1
                 continue
-            x0 = x_offset_mm + col * cell_w
-            # Flip Y so the printed orientation matches what `draw.text`
-            # produced (row 0 = top of the image).
-            y0 = y_offset_mm + (h_px - 1 - row) * cell_h
+            start = col
+            while col < w_px:
+                pixel = bool(mask[row, col])
+                in_run = (not pixel) if inverted else pixel
+                if not in_run:
+                    break
+                col += 1
+            cx0 = x_offset_mm + start * cell_w
+            cx1 = x_offset_mm + col * cell_w
             tris.extend(_box_triangles(
-                x0, y0, z_low,
-                x0 + cell_w, y0 + cell_h, z_high,
+                cx0, cy0, z_low, cx1, cy1, z_high,
             ))
     return tris
 
@@ -326,19 +347,82 @@ def generate_tag_plate_stl(
             f'base_thickness ({base_thickness})'
         )
 
-    # White base — full solid box; the slicer relies on the text part
-    # being declared after the base in the 3MF/slicer object tree so
-    # the text region is overridden by black filament at print time.
-    base_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = _box_triangles(
-        0.0, 0.0, 0.0,
-        tag_size_mm, tag_size_mm, base_thickness,
-    )
+    # Render the back-text mask once so the base can carve matching
+    # voids and the text part can fill them with black material — no
+    # overlap, no slicer guesswork about which filament wins.
+    text_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
+    lines = [s for s in (label_top, label_bottom) if s]
+    text_region_w_mm = tag_size_mm - 10.0  # 5 mm margin each side
+    text_region_h_mm = tag_size_mm * 0.6
+    text_x_off = (tag_size_mm - text_region_w_mm) / 2.0
+    text_y_off = (tag_size_mm - text_region_h_mm) / 2.0
+    if lines:
+        # 30 DPI → ~0.85 mm cell on a 40 × 30 mm region, ~1 600 cells
+        # total. 50 DPI is sharper but quadruples the triangle count
+        # for both base voids and text fill.
+        mask = _render_text_mask(
+            lines, text_region_w_mm, text_region_h_mm, dpi=30.0,
+        )
+        text_tris = _mask_to_boxes(
+            mask,
+            x_offset_mm=text_x_off,
+            y_offset_mm=text_y_off,
+            width_mm=text_region_w_mm, height_mm=text_region_h_mm,
+            z_low=0.0, z_high=text_height_mm,
+            inverted=False,
+        )
+    else:
+        mask = None
+
+    # White base — carve out the text-shape voids from the bottom
+    # `text_height_mm` so the black text part fills them with no
+    # overlap. Decomposes as:
+    #   - top slab            z=text_height..base_thickness (full 50×50)
+    #   - four margin strips  z=0..text_height around the text region
+    #   - per-cell white box  z=0..text_height for each NON-text pixel
+    base_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
+    th = text_height_mm
+    if mask is None:
+        # No text — keep the base a single solid box.
+        base_tris.extend(_box_triangles(
+            0.0, 0.0, 0.0,
+            tag_size_mm, tag_size_mm, base_thickness,
+        ))
+    else:
+        # Top slab covering the whole face above the text layer.
+        base_tris.extend(_box_triangles(
+            0.0, 0.0, th,
+            tag_size_mm, tag_size_mm, base_thickness,
+        ))
+        # 4 margin strips around the centred text region.
+        x0 = text_x_off
+        y0 = text_y_off
+        x1 = x0 + text_region_w_mm
+        y1 = y0 + text_region_h_mm
+        base_tris.extend(_box_triangles(0.0, 0.0, 0.0,
+                                        tag_size_mm, y0, th))  # -Y strip
+        base_tris.extend(_box_triangles(0.0, y1, 0.0,
+                                        tag_size_mm, tag_size_mm, th))  # +Y strip
+        base_tris.extend(_box_triangles(0.0, y0, 0.0,
+                                        x0, y1, th))           # -X strip
+        base_tris.extend(_box_triangles(x1, y0, 0.0,
+                                        tag_size_mm, y1, th))  # +X strip
+        # White fill for non-text pixels inside the text region —
+        # leaves text-shaped voids for the black text part to slot
+        # into without overlap. RLE keeps the triangle count tame.
+        base_tris.extend(_mask_to_boxes(
+            mask,
+            x_offset_mm=x0, y_offset_mm=y0,
+            width_mm=text_region_w_mm, height_mm=text_region_h_mm,
+            z_low=0.0, z_high=th,
+            inverted=True,
+        ))
     write_stl_ascii(
         base_tris, base_path,
         name=f'fv_apriltag_plate_id{tag_id:03d}_base',
     )
 
-    # Black AprilTag pattern on the front face.
+    # Black AprilTag pattern on the front face (unchanged).
     pattern_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
     for row in range(10):
         for col in range(10):
@@ -355,23 +439,6 @@ def generate_tag_plate_stl(
         name=f'fv_apriltag_plate_id{tag_id:03d}_pattern',
     )
 
-    # Black text on the back face — multi-line label.
-    text_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
-    lines = [s for s in (label_top, label_bottom) if s]
-    if lines:
-        # Centred in a 40 × 30 mm region (leave 5 mm margin around the
-        # 50 mm plate so the slicer's first-layer brim doesn't bleed
-        # into the text).
-        text_w = tag_size_mm - 10.0
-        text_h = tag_size_mm * 0.6
-        mask = _render_text_mask(lines, text_w, text_h, dpi=50.0)
-        text_tris = _mask_to_boxes(
-            mask,
-            x_offset_mm=(tag_size_mm - text_w) / 2.0,
-            y_offset_mm=(tag_size_mm - text_h) / 2.0,
-            width_mm=text_w, height_mm=text_h,
-            z_low=0.0, z_high=text_height_mm,
-        )
     write_stl_ascii(
         text_tris, text_path,
         name=f'fv_apriltag_plate_id{tag_id:03d}_text',
