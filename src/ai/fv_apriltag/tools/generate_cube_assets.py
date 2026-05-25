@@ -249,48 +249,73 @@ def _render_text_mask(
     return arr < 128
 
 
+def _mask_to_rects(
+    mask: np.ndarray, inverted: bool = False,
+) -> List[Tuple[int, int, int, int]]:
+    """Greedy 2D rectangle decomposition of `mask`.
+
+    Returns a list of (col0, row0, col1, row1) half-open rectangles
+    covering every "active" pixel (True if inverted=False else False)
+    exactly once. The algorithm picks the longest horizontal run at
+    each unvisited active pixel, then extends it downward while
+    consecutive rows match the same run exactly. Greedy — not
+    minimal — but vertical strokes collapse into single tall
+    rectangles instead of the row-only RLE that left them as
+    fragile 1-cell-tall stacks the slicer renders as broken lines.
+    """
+    h_px, w_px = mask.shape
+    if inverted:
+        active = ~mask.astype(bool)
+    else:
+        active = mask.astype(bool)
+    visited = np.zeros_like(active)
+    rects: List[Tuple[int, int, int, int]] = []
+    for r in range(h_px):
+        c = 0
+        while c < w_px:
+            if not active[r, c] or visited[r, c]:
+                c += 1
+                continue
+            c2 = c
+            while c2 < w_px and active[r, c2] and not visited[r, c2]:
+                c2 += 1
+            r2 = r + 1
+            while r2 < h_px:
+                row = active[r2, c:c2]
+                if not row.all() or visited[r2, c:c2].any():
+                    break
+                r2 += 1
+            visited[r:r2, c:c2] = True
+            rects.append((c, r, c2, r2))
+            c = c2
+    return rects
+
+
 def _mask_to_boxes(
     mask: np.ndarray, x_offset_mm: float, y_offset_mm: float,
     width_mm: float, height_mm: float, z_low: float, z_high: float,
     inverted: bool = False,
 ) -> List[Tuple[Vec3, Vec3, Vec3, Vec3]]:
-    """Extrude `mask` to axis-aligned voxel boxes, RLE'd per row.
+    """Extrude `mask` to axis-aligned boxes via 2D rect decomposition.
 
     `inverted=False` emits boxes for True pixels (e.g. the ink of a
     text mask). `inverted=True` emits boxes for False pixels (e.g.
-    the "white" cells that fill around the engraved text). Per-row
-    run-length encoding collapses contiguous pixels into one wider
-    box — roughly a 10× triangle reduction on text-shaped masks
-    compared with one box per pixel.
+    the "white" cells that fill around the engraved text). Uses
+    `_mask_to_rects` so vertical strokes merge instead of degenerating
+    into stacks of slicer-unfriendly 1-row boxes.
     """
     h_px, w_px = mask.shape
     cell_w = width_mm / w_px
     cell_h = height_mm / h_px
+    rects = _mask_to_rects(mask, inverted=inverted)
     tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
-    for row in range(h_px):
-        # Flip Y so the printed orientation matches what `draw.text`
-        # produced (row 0 = top of the image).
-        cy0 = y_offset_mm + (h_px - 1 - row) * cell_h
-        cy1 = cy0 + cell_h
-        col = 0
-        while col < w_px:
-            pixel = bool(mask[row, col])
-            in_run = (not pixel) if inverted else pixel
-            if not in_run:
-                col += 1
-                continue
-            start = col
-            while col < w_px:
-                pixel = bool(mask[row, col])
-                in_run = (not pixel) if inverted else pixel
-                if not in_run:
-                    break
-                col += 1
-            cx0 = x_offset_mm + start * cell_w
-            cx1 = x_offset_mm + col * cell_w
-            tris.extend(_box_triangles(
-                cx0, cy0, z_low, cx1, cy1, z_high,
-            ))
+    for c0, r0, c1, r1 in rects:
+        cx0 = x_offset_mm + c0 * cell_w
+        cx1 = x_offset_mm + c1 * cell_w
+        # Image row 0 is the TOP of the rendered text; flip to STL +Y up.
+        cy0 = y_offset_mm + (h_px - r1) * cell_h
+        cy1 = y_offset_mm + (h_px - r0) * cell_h
+        tris.extend(_box_triangles(cx0, cy0, z_low, cx1, cy1, z_high))
     return tris
 
 
@@ -313,25 +338,26 @@ def generate_tag_plate_stl(
     Three-part multi-colour print:
 
     - <stem>_base.stl    : tag_size × tag_size × (plate_thickness -
-                           pattern_height) flat plate
-                           (intended white filament)
+                           pattern_height) flat plate with
+                           text-shaped depressions engraved into
+                           the bottom `text_height_mm` of the back
+                           face (intended white filament)
     - <stem>_pattern.stl : raised pillars at the AprilTag dark cells,
                            sitting on top of the base
                            (intended black filament)
-    - <stem>_text.stl    : face + cube labels embossed on the back
-                           side of the base (intended black filament,
-                           shows through the white as text inlay when
-                           assembled in a slicer that prioritises
-                           sub-parts over the main part)
+    - <stem>_text.stl    : empty placeholder, kept for path
+                           compatibility with earlier two-material
+                           inlay design
 
-    The text occupies the bottom `text_height_mm` of the plate
-    (z = 0 .. text_height_mm). Bambu Studio / OrcaSlicer / PrusaSlicer
-    treat the text part as a modifier overriding the base in that
-    region, so the print shows black inlay text on the white back of
-    the plate without changing the plate's external dimensions.
+    Single-colour engraving (option C): the back face has
+    text-shaped voids carved `text_height_mm` deep into the white
+    slab. Previous design emitted a separate black text mesh to
+    fill those voids, but the row-only RLE of the text mesh
+    produced fragmented vertical strokes that slicers rendered as
+    broken letters. Single-colour engrave avoids the two-material
+    boundary precision problem entirely.
 
-    Returns (base_tris, pattern_tris, text_tris) so the caller can
-    re-use the same geometry for the 3MF export below.
+    Returns (base_tris, pattern_tris, []) — text mesh is dropped.
     """
     pattern = fetch_tag_array(tag_id)  # 0 = black, 1 = white
     cell_size = tag_size_mm / 10.0
@@ -347,21 +373,22 @@ def generate_tag_plate_stl(
             f'base_thickness ({base_thickness})'
         )
 
-    # Render the back-text mask once so the base can carve matching
-    # voids and the text part can fill them with black material — no
-    # overlap, no slicer guesswork about which filament wins.
-    text_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
+    # Render the back-text mask. The base mesh carves text-shaped
+    # voids at z=0..text_height_mm; a single-colour print shows the
+    # voids as engraved depressions on the back face.
     lines = [s for s in (label_top, label_bottom) if s]
     text_region_w_mm = tag_size_mm - 10.0  # 5 mm margin each side
     text_region_h_mm = tag_size_mm * 0.6
     text_x_off = (tag_size_mm - text_region_w_mm) / 2.0
     text_y_off = (tag_size_mm - text_region_h_mm) / 2.0
     if lines:
-        # 50 DPI → ~0.5 mm cell on a 40 × 30 mm region, sharper letters
-        # than the earlier 30 DPI without the 4× triangle blow-up
-        # because RLE merges runs.
+        # 80 DPI → ~0.32 mm cell on a 40 × 30 mm region. Smaller
+        # than the 0.4 mm typical line width, so vertical strokes
+        # (after rect-merging in _mask_to_rects) consolidate into
+        # solid columns rather than splitting into per-line-width
+        # walls the slicer might skip.
         mask = _render_text_mask(
-            lines, text_region_w_mm, text_region_h_mm, dpi=50.0,
+            lines, text_region_w_mm, text_region_h_mm, dpi=80.0,
         )
         # Mirror horizontally so the text reads correctly when the
         # plate is viewed from the BACK side (the side that faces
@@ -369,14 +396,6 @@ def generate_tag_plate_stl(
         # text shows up mirror-reversed to the operator inspecting
         # the plate they just popped out.
         mask = np.fliplr(mask)
-        text_tris = _mask_to_boxes(
-            mask,
-            x_offset_mm=text_x_off,
-            y_offset_mm=text_y_off,
-            width_mm=text_region_w_mm, height_mm=text_region_h_mm,
-            z_low=0.0, z_high=text_height_mm,
-            inverted=False,
-        )
     else:
         mask = None
 
@@ -445,10 +464,12 @@ def generate_tag_plate_stl(
         name=f'fv_apriltag_plate_id{tag_id:03d}_pattern',
     )
 
-    write_stl_ascii(
-        text_tris, text_path,
-        name=f'fv_apriltag_plate_id{tag_id:03d}_text',
-    )
+    # Option C (engrave) leaves the text mesh empty — the back-face
+    # voids carry the text relief. Skip the empty STL to keep the
+    # output directory clean.
+    text_tris: List[Tuple[Vec3, Vec3, Vec3, Vec3]] = []
+    if text_path.exists():
+        text_path.unlink()
 
     return base_tris, pattern_tris, text_tris
 
@@ -674,17 +695,26 @@ def write_plate_3mf(
 
 def _face_engraving_pockets(
     face: str, cs: float, label: str,
-    depth: float = 0.5,
-    text_width_mm: float = 24.0,
-    text_height_mm: float = 3.6,
-    dpi: float = 20.0,
+    depth: float = 0.6,
+    text_width_mm: float = 28.0,
+    text_height_mm: float = 4.0,
+    dpi: float = 80.0,
 ) -> List[Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]]:
-    """Per-pixel engraving sub-pockets for the face's name label.
+    """Engraving sub-pockets for the face's name label.
 
-    Returns a list of (xrange, yrange, zrange) boxes — each one a tiny
-    recess into the cube body's outer face surface — so the grid
-    decomposition in generate_cube_body_stl carves the text out
-    naturally. Text is centred on the "top" rim of the face:
+    Returns a list of (xrange, yrange, zrange) boxes — recesses into
+    the cube body's outer face surface — so the grid decomposition
+    in generate_cube_body_stl carves the text out naturally. Each
+    box covers a merged rectangle from `_mask_to_rects`, so vertical
+    strokes stay as single tall pockets (not per-pixel stacks that
+    blow up the cube grid split count without being readable).
+
+    Defaults: 28 × 4 mm text area at 80 DPI → letters ~4 mm tall on
+    the 60 mm cube faces (fits inside the 4.9 mm pocket rim with
+    margin), readable at arm's length. Depth 0.6 mm gives clearly
+    visible relief on a single-colour print.
+
+    Text is centred on the "top" rim of the face:
       side faces (front/back/left/right): top rim = +Z side
       top / bottom:                       top rim = +X side (cube's "front")
     Text reads with its top toward the same rim direction so a
@@ -695,67 +725,61 @@ def _face_engraving_pockets(
     cw = text_width_mm / w_px
     ch = text_height_mm / h_px
     rim = (cs - 50.2) / 2.0  # mirror generate_cube_body_stl's pmin
-    rim_centre_v = cs / 2.0 + (cs / 2.0 - rim / 2.0 - cs / 2.0)  # = cs - rim/2
     rim_centre_v = cs - rim / 2.0
     v_start = rim_centre_v - text_height_mm / 2.0
     u_start = (cs / 2.0) - text_width_mm / 2.0
 
+    rects = _mask_to_rects(mask, inverted=False)
+
     pockets: List[Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]] = []
-
-    def cell_to_uv(row: int, col: int) -> Tuple[float, float, float, float]:
-        u0 = u_start + col * cw
-        u1 = u_start + (col + 1) * cw
-        v0 = v_start + (h_px - 1 - row) * ch
-        v1 = v_start + (h_px - row) * ch
-        return u0, u1, v0, v1
-
-    for row in range(h_px):
-        for col in range(w_px):
-            if not mask[row, col]:
-                continue
-            u0, u1, v0, v1 = cell_to_uv(row, col)
-            if face == 'front':
-                # +X face: u → cube +Y (image left = small y after Y-flip), v → +Z
-                pockets.append((
-                    (cs - depth, cs),
-                    (cs - u1, cs - u0),
-                    (v0, v1),
-                ))
-            elif face == 'back':
-                # -X face: u → +y (no Y-flip since back view), v → +Z
-                pockets.append((
-                    (0.0, depth),
-                    (u0, u1),
-                    (v0, v1),
-                ))
-            elif face == 'left':
-                # +Y face: u → +X (image col 0 = small x after X-flip), v → +Z
-                pockets.append((
-                    (cs - u1, cs - u0),
-                    (cs - depth, cs),
-                    (v0, v1),
-                ))
-            elif face == 'right':
-                # -Y face: u → +X (left-to-right), v → +Z
-                pockets.append((
-                    (u0, u1),
-                    (0.0, depth),
-                    (v0, v1),
-                ))
-            elif face == 'top':
-                # +Z face: u → -Y (image left = +Y), v → +X (top rim = front)
-                pockets.append((
-                    (v0, v1),
-                    (cs - u1, cs - u0),
-                    (cs - depth, cs),
-                ))
-            elif face == 'bottom':
-                # -Z face: u → +Y, v → +X
-                pockets.append((
-                    (v0, v1),
-                    (u0, u1),
-                    (0.0, depth),
-                ))
+    for c0, r0, c1, r1 in rects:
+        u0 = u_start + c0 * cw
+        u1 = u_start + c1 * cw
+        # Image row 0 is the TOP of the rendered text; flip to face-frame +v up.
+        v0 = v_start + (h_px - r1) * ch
+        v1 = v_start + (h_px - r0) * ch
+        if face == 'front':
+            # +X face: u → cube +Y (image left = small y after Y-flip), v → +Z
+            pockets.append((
+                (cs - depth, cs),
+                (cs - u1, cs - u0),
+                (v0, v1),
+            ))
+        elif face == 'back':
+            # -X face: u → +y (no Y-flip since back view), v → +Z
+            pockets.append((
+                (0.0, depth),
+                (u0, u1),
+                (v0, v1),
+            ))
+        elif face == 'left':
+            # +Y face: u → +X (image col 0 = small x after X-flip), v → +Z
+            pockets.append((
+                (cs - u1, cs - u0),
+                (cs - depth, cs),
+                (v0, v1),
+            ))
+        elif face == 'right':
+            # -Y face: u → +X (left-to-right), v → +Z
+            pockets.append((
+                (u0, u1),
+                (0.0, depth),
+                (v0, v1),
+            ))
+        elif face == 'top':
+            # +Z face: u → -Y (image left = +Y), v → +X (top rim = front)
+            pockets.append((
+                (v0, v1),
+                (cs - u1, cs - u0),
+                (cs - depth, cs),
+            ))
+        elif face == 'bottom':
+            # -Z face: u → +Y, v → +X
+            pockets.append((
+                (v0, v1),
+                (u0, u1),
+                (0.0, depth),
+            ))
     return pockets
 
 
