@@ -432,9 +432,11 @@ class CubeEstimatorNode(Node):
             if not state.obs:
                 continue
             self._fuse_and_publish(name, state.obs)
-            # Clear after publishing to avoid double-counting next tick.
-            # Re-queueing happens on next message.
-            state.obs.clear()
+            # NOTE: don't clear obs here — the max_age cutoff above is the
+            # sliding window. Clearing made publishes bursty when the timer
+            # rate (publish_rate) exceeded the detector rate, which the
+            # viewer showed as flicker. Re-fusing the same observation on
+            # the next tick is a no-op for the weighted average.
 
     def _fuse_and_publish(self, name: str, obs: List[CubeObs]) -> None:
         weights = np.array(
@@ -479,7 +481,12 @@ class CubeEstimatorNode(Node):
         if not frame_id:
             frame_id = f'{ref_cam}_optical_frame'
 
-        stamp = self.get_clock().now().to_msg()
+        # Stamp with the most recent observation's sensor time, not "now":
+        # downstream TF lookups (scene_viewer markers, RViz) interpolate
+        # source_frame in the past but cannot extrapolate into the future,
+        # so a future-stamped marker is silently dropped.
+        latest_obs_ns = max(o.stamp_ns for o in ref_obs)
+        stamp = rclpy.time.Time(nanoseconds=latest_obs_ns).to_msg()
 
         pwc = PoseWithCovarianceStamped()
         pwc.header.stamp = stamp
@@ -495,12 +502,12 @@ class CubeEstimatorNode(Node):
         sigma_pos = 0.005 / math.sqrt(len(ref_obs))
         sigma_rot = math.radians(1.0) / math.sqrt(len(ref_obs))
         pwc.pose.covariance = [
-            sigma_pos**2, 0, 0, 0, 0, 0,
-            0, sigma_pos**2, 0, 0, 0, 0,
-            0, 0, sigma_pos**2, 0, 0, 0,
-            0, 0, 0, sigma_rot**2, 0, 0,
-            0, 0, 0, 0, sigma_rot**2, 0,
-            0, 0, 0, 0, 0, sigma_rot**2,
+            sigma_pos**2, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, sigma_pos**2, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, sigma_pos**2, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, sigma_rot**2, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, sigma_rot**2, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, sigma_rot**2,
         ]
         self._pub_pose[name].publish(pwc)
 

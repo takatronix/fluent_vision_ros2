@@ -15,7 +15,9 @@
 
 fusion:
   max_age: 0.5
-  publish_rate: 30.0
+  # 10Hz: dispose/recreate at 30Hz in scene_viewer's Three.js layer
+  # produced "polygon missing" flicker; the viewer is not yet retained.
+  publish_rate: 10.0
   use_depth_refine: true
   min_decision_margin: 50.0
   world_frame: ""
