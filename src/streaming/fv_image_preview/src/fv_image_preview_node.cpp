@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -14,6 +16,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/compressed_image.hpp"
 #include "sensor_msgs/msg/image.hpp"
+#include "std_msgs/msg/string.hpp"
 
 namespace
 {
@@ -22,6 +25,22 @@ bool is_yuyv(const std::string & encoding)
 {
   return encoding == "yuv422_yuy2" || encoding == "yuyv" || encoding == "yuyv422" ||
          encoding == "YUYV" || encoding == "YUY2";
+}
+
+std::vector<std::string> split_csv(const std::string & text)
+{
+  std::vector<std::string> out;
+  std::stringstream ss(text);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    const auto begin = item.find_first_not_of(" \t\n\r");
+    if (begin == std::string::npos) {
+      continue;
+    }
+    const auto end = item.find_last_not_of(" \t\n\r");
+    out.push_back(item.substr(begin, end - begin + 1));
+  }
+  return out;
 }
 
 cv::Mat resize_preview(const cv::Mat & image, int max_width)
@@ -51,6 +70,8 @@ public:
     labels_ = declare_parameter<std::vector<std::string>>("labels", std::vector<std::string>{});
     max_width_ = std::max(160, static_cast<int>(declare_parameter<int>("max_width", 480)));
     max_fps_ = std::max(0.2, declare_parameter<double>("max_fps", 2.0));
+    idle_fps_ = std::max(0.05, declare_parameter<double>("idle_fps", 0.25));
+    focus_topics_topic_ = declare_parameter<std::string>("focus_topics_topic", "/fv_image_preview/focus_topics");
     jpeg_quality_ = std::clamp(static_cast<int>(declare_parameter<int>("jpeg_quality", 45)), 1, 100);
     diagnostics_interval_sec_ = std::max(0.0, declare_parameter<double>("diagnostics_interval_sec", 5.0));
     depth_min_mm_ = std::max(0.0, declare_parameter<double>("depth_min_mm", 200.0));
@@ -84,11 +105,19 @@ public:
         get_logger(), "preview channel: %s -> %s",
         channels_[i].input_topic.c_str(), channels_[i].output_topic.c_str());
     }
+    focus_sub_ = create_subscription<std_msgs::msg::String>(
+      focus_topics_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile(),
+      [this](std_msgs::msg::String::ConstSharedPtr msg) {
+        focused_topics_.clear();
+        for (const auto & token : split_csv(msg->data)) {
+          focused_topics_.insert(token);
+        }
+      });
 
     RCLCPP_INFO(
       get_logger(),
-      "fv_image_preview ready: channels=%zu max_width=%d max_fps=%.1f quality=%d",
-      channels_.size(), max_width_, max_fps_, jpeg_quality_);
+      "fv_image_preview ready: channels=%zu max_width=%d max_fps=%.1f idle_fps=%.2f focus_topic=%s quality=%d",
+      channels_.size(), max_width_, max_fps_, idle_fps_, focus_topics_topic_.c_str(), jpeg_quality_);
 
     if (diagnostics_interval_sec_ > 0.0) {
       diagnostics_timer_ = create_wall_timer(
@@ -108,6 +137,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub;
     std::chrono::steady_clock::time_point last_input;
     std::chrono::steady_clock::time_point last_pub;
+    std::deque<std::chrono::steady_clock::time_point> raw_window;
     uint64_t raw_frames{0};
     uint64_t encoded_frames{0};
     uint64_t skipped_no_sub{0};
@@ -120,14 +150,24 @@ private:
     const auto steady_now = std::chrono::steady_clock::now();
     channel.raw_frames++;
     channel.last_input = steady_now;
-    if (channel.pub->get_subscription_count() == 0) {
+    channel.raw_window.push_back(steady_now);
+    const auto raw_cutoff = steady_now - std::chrono::seconds(10);
+    while (!channel.raw_window.empty() && channel.raw_window.front() < raw_cutoff) {
+      channel.raw_window.pop_front();
+    }
+    const size_t subscribers = channel.pub->get_subscription_count();
+    if (subscribers == 0) {
       channel.skipped_no_sub++;
       return;
     }
 
+    const bool focused = focused_topics_.count(channel.output_topic) > 0 ||
+      focused_topics_.count(channel.input_topic) > 0 ||
+      focused_topics_.count(channel.label) > 0;
+    const double target_fps = focused ? max_fps_ : idle_fps_;
     if (channel.last_pub.time_since_epoch().count() > 0) {
       const double dt = std::chrono::duration<double>(steady_now - channel.last_pub).count();
-      if (dt < (1.0 / max_fps_)) {
+      if (dt < (1.0 / target_fps)) {
         return;
       }
     }
@@ -158,6 +198,7 @@ private:
            << "; source_width=" << msg->width
            << "; source_height=" << msg->height
            << "; encoding=" << msg->encoding
+           << "; source_hz=" << raw_hz(channel)
            << "; label=" << channel.label;
     out.format = format.str();
     out.data.assign(jpg.begin(), jpg.end());
@@ -232,6 +273,19 @@ private:
     return false;
   }
 
+  static double raw_hz(const Channel & channel)
+  {
+    if (channel.raw_window.size() < 2) {
+      return 0.0;
+    }
+    const auto span = std::chrono::duration<double>(
+      channel.raw_window.back() - channel.raw_window.front()).count();
+    if (span <= 0.0) {
+      return 0.0;
+    }
+    return static_cast<double>(channel.raw_window.size() - 1) / span;
+  }
+
   void log_diagnostics()
   {
     const auto now = std::chrono::steady_clock::now();
@@ -244,9 +298,11 @@ private:
         : std::chrono::duration<double>(now - channel.last_pub).count();
       RCLCPP_INFO(
         get_logger(),
-        "%s stats: sub=%zu raw=%llu encoded=%llu no_sub=%llu conversion_errors=%llu input_age=%.1fs pub_age=%.1fs",
+        "%s stats: sub=%zu focused=%s source_hz=%.1f raw=%llu encoded=%llu no_sub=%llu conversion_errors=%llu input_age=%.1fs pub_age=%.1fs",
         channel.label.c_str(),
         channel.pub->get_subscription_count(),
+        focused_topics_.count(channel.output_topic) > 0 ? "yes" : "no",
+        raw_hz(channel),
         static_cast<unsigned long long>(channel.raw_frames),
         static_cast<unsigned long long>(channel.encoded_frames),
         static_cast<unsigned long long>(channel.skipped_no_sub),
@@ -260,12 +316,16 @@ private:
   std::vector<std::string> output_topics_;
   std::vector<std::string> labels_;
   std::vector<Channel> channels_;
+  std::string focus_topics_topic_;
+  std::unordered_set<std::string> focused_topics_;
   int max_width_{480};
   double max_fps_{2.0};
+  double idle_fps_{0.25};
   int jpeg_quality_{45};
   double diagnostics_interval_sec_{5.0};
   double depth_min_mm_{200.0};
   double depth_max_mm_{5000.0};
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr focus_sub_;
   rclcpp::TimerBase::SharedPtr diagnostics_timer_;
 };
 
