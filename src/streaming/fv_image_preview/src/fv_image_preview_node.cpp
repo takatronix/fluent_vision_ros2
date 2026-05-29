@@ -43,6 +43,34 @@ std::vector<std::string> split_csv(const std::string & text)
   return out;
 }
 
+std::string json_escape(const std::string & text)
+{
+  std::ostringstream out;
+  for (const char ch : text) {
+    switch (ch) {
+      case '\\':
+        out << "\\\\";
+        break;
+      case '"':
+        out << "\\\"";
+        break;
+      case '\n':
+        out << "\\n";
+        break;
+      case '\r':
+        out << "\\r";
+        break;
+      case '\t':
+        out << "\\t";
+        break;
+      default:
+        out << ch;
+        break;
+    }
+  }
+  return out.str();
+}
+
 cv::Mat resize_preview(const cv::Mat & image, int max_width)
 {
   if (image.empty() || max_width <= 0 || image.cols <= max_width) {
@@ -72,6 +100,7 @@ public:
     max_fps_ = std::max(0.2, declare_parameter<double>("max_fps", 2.0));
     idle_fps_ = std::max(0.05, declare_parameter<double>("idle_fps", 0.25));
     focus_topics_topic_ = declare_parameter<std::string>("focus_topics_topic", "/fv_image_preview/focus_topics");
+    stats_topic_ = declare_parameter<std::string>("stats_topic", "/fv_image_preview/source_stats");
     jpeg_quality_ = std::clamp(static_cast<int>(declare_parameter<int>("jpeg_quality", 45)), 1, 100);
     diagnostics_interval_sec_ = std::max(0.0, declare_parameter<double>("diagnostics_interval_sec", 5.0));
     depth_min_mm_ = std::max(0.0, declare_parameter<double>("depth_min_mm", 200.0));
@@ -113,11 +142,13 @@ public:
           focused_topics_.insert(token);
         }
       });
+    stats_pub_ = create_publisher<std_msgs::msg::String>(
+      stats_topic_, rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile());
 
     RCLCPP_INFO(
       get_logger(),
-      "fv_image_preview ready: channels=%zu max_width=%d max_fps=%.1f idle_fps=%.2f focus_topic=%s quality=%d",
-      channels_.size(), max_width_, max_fps_, idle_fps_, focus_topics_topic_.c_str(), jpeg_quality_);
+      "fv_image_preview ready: channels=%zu max_width=%d max_fps=%.1f idle_fps=%.2f focus_topic=%s stats_topic=%s quality=%d",
+      channels_.size(), max_width_, max_fps_, idle_fps_, focus_topics_topic_.c_str(), stats_topic_.c_str(), jpeg_quality_);
 
     if (diagnostics_interval_sec_ > 0.0) {
       diagnostics_timer_ = create_wall_timer(
@@ -289,6 +320,9 @@ private:
   void log_diagnostics()
   {
     const auto now = std::chrono::steady_clock::now();
+    std::ostringstream stats;
+    stats << "{\"channels\":[";
+    bool first = true;
     for (const auto & channel : channels_) {
       const double input_age = channel.last_input.time_since_epoch().count() == 0
         ? -1.0
@@ -296,20 +330,38 @@ private:
       const double pub_age = channel.last_pub.time_since_epoch().count() == 0
         ? -1.0
         : std::chrono::duration<double>(now - channel.last_pub).count();
+      const double source_hz = raw_hz(channel);
+      const bool focused = focused_topics_.count(channel.output_topic) > 0;
       RCLCPP_INFO(
         get_logger(),
         "%s stats: sub=%zu focused=%s source_hz=%.1f raw=%llu encoded=%llu no_sub=%llu conversion_errors=%llu input_age=%.1fs pub_age=%.1fs",
         channel.label.c_str(),
         channel.pub->get_subscription_count(),
-        focused_topics_.count(channel.output_topic) > 0 ? "yes" : "no",
-        raw_hz(channel),
+        focused ? "yes" : "no",
+        source_hz,
         static_cast<unsigned long long>(channel.raw_frames),
         static_cast<unsigned long long>(channel.encoded_frames),
         static_cast<unsigned long long>(channel.skipped_no_sub),
         static_cast<unsigned long long>(channel.conversion_errors),
         input_age,
         pub_age);
+      if (!first) {
+        stats << ",";
+      }
+      first = false;
+      stats << "{\"label\":\"" << json_escape(channel.label)
+            << "\",\"input_topic\":\"" << json_escape(channel.input_topic)
+            << "\",\"output_topic\":\"" << json_escape(channel.output_topic)
+            << "\",\"source_hz\":" << source_hz
+            << ",\"input_age_sec\":" << input_age
+            << ",\"subscribers\":" << channel.pub->get_subscription_count()
+            << ",\"focused\":" << (focused ? "true" : "false")
+            << "}";
     }
+    stats << "]}";
+    std_msgs::msg::String msg;
+    msg.data = stats.str();
+    stats_pub_->publish(msg);
   }
 
   std::vector<std::string> input_topics_;
@@ -317,6 +369,7 @@ private:
   std::vector<std::string> labels_;
   std::vector<Channel> channels_;
   std::string focus_topics_topic_;
+  std::string stats_topic_;
   std::unordered_set<std::string> focused_topics_;
   int max_width_{480};
   double max_fps_{2.0};
@@ -326,6 +379,7 @@ private:
   double depth_min_mm_{200.0};
   double depth_max_mm_{5000.0};
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr focus_sub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr stats_pub_;
   rclcpp::TimerBase::SharedPtr diagnostics_timer_;
 };
 

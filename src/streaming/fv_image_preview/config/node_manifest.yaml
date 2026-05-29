@@ -20,6 +20,7 @@ nodes:
       max_fps: 2.0
       idle_fps: 0.25
       focus_topics_topic: /fv_image_preview/focus_topics
+      stats_topic: /fv_image_preview/source_stats
       jpeg_quality: 45
       depth_min_mm: 200.0
       depth_max_mm: 5000.0
