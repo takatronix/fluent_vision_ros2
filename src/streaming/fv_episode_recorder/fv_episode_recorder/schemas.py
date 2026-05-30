@@ -23,6 +23,7 @@ class StartEpisodeRequest(BaseModel):
     expected_duration_s: Optional[float] = Field(default=None, ge=0)
     env_config: Optional[dict[str, Any]] = None
     record_topics_override: Optional[list[dict[str, Any]]] = None
+    record_bag_topics: Optional[list[str]] = None  # Step 2: simple topic name list for bag
     cameras_override: Optional[list[dict[str, Any]]] = None
     fps: int = Field(default=30, ge=1, le=120)
     record_bag: bool = True

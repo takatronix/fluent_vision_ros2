@@ -1,0 +1,172 @@
+"""Profile-driven topic discovery (Codex #5 対応).
+
+Reads a profile yaml (vlabor_launch/config/profiles/*.yaml) and derives the set
+of topics to record + the camera list, so recorder does not hardcode topic
+names that differ per profile (Piper VR=pos_cmd, AI=joint_cmd,
+daihen=joint_position_command, aspa-navigation=different again).
+
+Output (matches meta.json.recorded_topics schema):
+  [{"topic": str, "role": "state"|"command"|"mux"|"tf"|"annotation"|"other",
+    "qos": "reliable"|"best_effort"|"sensor_data"|"default",
+    "stamp_source": "message_header"|"rosbag_recv"|"system"}, ...]
+
+Cameras: [{"name": str, "topic": str, "codec": str?}, ...]
+
+Phase 1 Step 4: best-effort. Phase 4+ may extend with role detection per arm.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Any, Optional
+
+import yaml
+
+LOG = logging.getLogger("fv_episode_recorder.discovery")
+
+# Topics every episode should include regardless of profile.
+ALWAYS_INCLUDE: list[dict[str, str]] = [
+    {"topic": "/tf",          "role": "tf",         "qos": "reliable",         "stamp_source": "message_header"},
+    {"topic": "/tf_static",   "role": "tf",         "qos": "transient_local",  "stamp_source": "message_header"},
+    {"topic": "/episode/markers", "role": "annotation", "qos": "reliable",     "stamp_source": "message_header"},
+]
+
+
+def load_profile_yaml(profile_name: str, profiles_dir: Path | str) -> Optional[dict[str, Any]]:
+    """Load profile yaml by name. Returns the inner `profile:` block if present
+    (vlabor convention nests everything under `profile:`), else the raw dict."""
+    profiles_dir = Path(profiles_dir)
+    for candidate in (profiles_dir / f"{profile_name}.yaml", profiles_dir / f"{profile_name}.yml"):
+        if candidate.exists():
+            try:
+                with candidate.open() as f:
+                    raw = yaml.safe_load(f) or {}
+                # Unwrap the conventional `profile:` root if present.
+                if isinstance(raw, dict) and isinstance(raw.get("profile"), dict):
+                    return raw["profile"]
+                return raw
+            except yaml.YAMLError as exc:
+                LOG.error("profile yaml parse error %s: %s", candidate, exc)
+                return None
+    LOG.warning("profile yaml not found: %s in %s", profile_name, profiles_dir)
+    return None
+
+
+def discover_topics(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Walk profile yaml and emit a deduped, role-tagged topic list."""
+    discovered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(topic: str, role: str, qos: str = "default",
+            stamp_source: str = "rosbag_recv", msg_type: Optional[str] = None):
+        if not topic or topic in seen:
+            return
+        seen.add(topic)
+        entry = {"topic": topic, "role": role, "qos": qos, "stamp_source": stamp_source}
+        if msg_type:
+            entry["msg_type"] = msg_type
+        discovered.append(entry)
+
+    # episode_recorder block has highest priority
+    er = profile.get("episode_recorder") or {}
+    for t in er.get("record_topics_override") or []:
+        if isinstance(t, str):
+            add(t, role="override", qos="default")
+        elif isinstance(t, dict) and "topic" in t:
+            add(t["topic"], role=t.get("role", "override"),
+                qos=t.get("qos", "default"),
+                stamp_source=t.get("stamp_source", "rosbag_recv"))
+    if er.get("record_topics_override"):
+        # If profile says "use exactly this list", skip discovery
+        return discovered + [d for d in ALWAYS_INCLUDE if d["topic"] not in seen]
+
+    # arm streams (Piper / daihen / SO101)
+    for stream in profile.get("arm_streams") or []:
+        rx = stream.get("rx", {}) or {}
+        tx = stream.get("tx", {}) or {}
+        # rx = state
+        js = rx.get("joint_state") if isinstance(rx, dict) else None
+        if isinstance(js, dict):
+            add(js.get("topic"), role="state", qos=js.get("qos", "reliable"),
+                stamp_source="message_header", msg_type=js.get("type"))
+        elif isinstance(js, str):
+            add(js, role="state", qos="reliable", stamp_source="message_header")
+        # tx = commands (varies per profile)
+        for tx_key in ("joint_cmd", "pos_cmd", "gripper_cmd"):
+            entry = tx.get(tx_key) if isinstance(tx, dict) else None
+            if isinstance(entry, dict):
+                add(entry.get("topic"), role="command", qos=entry.get("qos", "reliable"),
+                    msg_type=entry.get("type"))
+            elif isinstance(entry, str):
+                add(entry, role="command", qos="reliable")
+
+    # teleop mux status
+    teleop = profile.get("teleop") or {}
+    mux = teleop.get("mux") or {}
+    status_topic = mux.get("status_topic") or mux.get("status")
+    if status_topic:
+        add(status_topic, role="mux", qos="reliable")
+
+    # lerobot block may carry arm_streams legacy (Piper teleop yaml uses this)
+    lerobot = profile.get("lerobot") or {}
+    for stream in lerobot.get("arm_streams") or []:
+        for side in ("follower", "leader"):
+            side_block = stream.get(side) if isinstance(stream, dict) else None
+            if not isinstance(side_block, dict):
+                continue
+            rx = side_block.get("rx") or {}
+            tx = side_block.get("tx") or {}
+            js = rx.get("joint_state")
+            if isinstance(js, dict):
+                add(js.get("topic"), role="state",
+                    qos=js.get("qos", "reliable"), stamp_source="message_header",
+                    msg_type=js.get("type"))
+            elif isinstance(js, str):
+                add(js, role="state", qos="reliable", stamp_source="message_header")
+            for tx_key in ("joint_cmd", "pos_cmd", "gripper_cmd"):
+                ent = tx.get(tx_key)
+                if isinstance(ent, dict):
+                    add(ent.get("topic"), role="command",
+                        qos=ent.get("qos", "reliable"), msg_type=ent.get("type"))
+                elif isinstance(ent, str):
+                    add(ent, role="command", qos="reliable")
+
+    # always include tf, tf_static, /episode/markers
+    for d in ALWAYS_INCLUDE:
+        if d["topic"] not in seen:
+            discovered.append(d)
+            seen.add(d["topic"])
+    return discovered
+
+
+def discover_cameras(profile: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return camera list from profile.episode_recorder.cameras (explicit only)."""
+    er = profile.get("episode_recorder") or {}
+    cams = er.get("cameras") or []
+    out: list[dict[str, Any]] = []
+    for c in cams:
+        if not isinstance(c, dict):
+            continue
+        if "name" not in c or "topic" not in c:
+            continue
+        out.append({
+            "name": str(c["name"]),
+            "topic": str(c["topic"]),
+            "codec": str(c.get("codec", "mp4v")),
+        })
+    return out
+
+
+def discover_episode_recorder_config(profile: dict[str, Any]) -> dict[str, Any]:
+    """Extract episode_recorder block (Phase 1: subset used; full schema later)."""
+    er = profile.get("episode_recorder") or {}
+    return {
+        "enabled": bool(er.get("enabled", False)),
+        "output_dir": er.get("output_dir"),
+        "fps": int(er.get("fps", 30)),
+        "auto_pin": er.get("auto_pin") or {},
+        "retention": er.get("retention") or {},
+        "segment": er.get("segment") or {},
+    }
