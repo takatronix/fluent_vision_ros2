@@ -71,7 +71,7 @@
     profile: string;
     duration_s: number | null;
     started_at: string;
-    cameras: Array<{ name: string; topic: string; segments?: Array<{ file: string }> }>;
+    cameras: Array<{ name: string; topic: string; kind?: string; frame_count?: number; segments?: Array<{ file: string }> }>;
     markers: MarkerItem[];
     trim_start_s?: number | null;
     trim_end_s?: number | null;
@@ -878,25 +878,47 @@
       {#if playEpisode.cameras.length === 0}
         <div class="text-center py-12 text-(--color-text-mute)">カメラ録画なし</div>
       {:else}
-        <!-- Multi-camera grid -->
-        <div
-          class="grid gap-2 mb-3 overflow-auto min-h-0"
-          style="grid-template-columns: repeat({Math.min(playEpisode.cameras.length, 2)}, minmax(0, 1fr));">
+        <!-- Camera thumbnail strip — horizontal, scrollable, like the dashboard
+             Cameras tab. Color cams render their mp4 inline; depth cams show
+             a placeholder card with a download link (16-bit PNG sequence is
+             not browser-playable). Every video shares the timeline via the
+             existing sync handlers. -->
+        <div class="flex gap-2 mb-3 overflow-x-auto shrink-0 pb-1">
           {#each playEpisode.cameras as cam (cam.name)}
             {@const segments = cam.segments || [{ file: '0000.mp4' }]}
-            <div class="flex flex-col">
-              <div class="text-[11px] text-(--color-accent) mb-1 font-medium">{cam.name}</div>
-              <video
-                preload="metadata"
-                bind:this={videoEls[cam.name]}
-                onloadedmetadata={() => onVideoMetadata(cam.name)}
-                onplay={() => syncPlayFrom(cam.name)}
-                onpause={() => syncPauseFrom(cam.name)}
-                onseeked={() => syncSeekFrom(cam.name)}
-                ontimeupdate={() => onTimeUpdate(cam.name)}
-                class="w-full rounded-md bg-black aspect-video"
-                src={videoUrl(playEpisode.episode_id, cam.name, segments[0].file)}>
-              </video>
+            {@const isDepth = cam.kind === 'depth_png_seq'}
+            <div class="shrink-0 flex flex-col rounded-md overflow-hidden border border-(--color-border) bg-(--color-bg-3)"
+                 style="width: 280px;">
+              <div class="px-2 py-1 text-[11px] font-medium text-(--color-accent) bg-(--color-accent-soft) flex items-center justify-between">
+                <span>{cam.name}</span>
+                {#if isDepth}<span class="text-[9px] opacity-70">depth · {cam.frame_count || 0}f</span>{/if}
+              </div>
+              {#if isDepth}
+                <div class="aspect-video flex flex-col items-center justify-center text-[11px] text-(--color-text-mute) gap-2 p-3">
+                  <div class="text-3xl opacity-40">📐</div>
+                  <div>16-bit PNG sequence</div>
+                  <a href={`${API}/episodes/${playEpisode.episode_id}/files/videos/${cam.name}/`}
+                     class="text-(--color-accent) hover:underline text-[10px]"
+                     target="_blank" rel="noopener">
+                    フォルダを開く →
+                  </a>
+                  <div class="text-[9px] opacity-70">tar で一括 DL</div>
+                </div>
+              {:else}
+                <video
+                  preload="metadata"
+                  bind:this={videoEls[cam.name]}
+                  onloadedmetadata={() => onVideoMetadata(cam.name)}
+                  onplay={() => syncPlayFrom(cam.name)}
+                  onpause={() => syncPauseFrom(cam.name)}
+                  onseeked={() => syncSeekFrom(cam.name)}
+                  ontimeupdate={() => onTimeUpdate(cam.name)}
+                  class="w-full aspect-video bg-black cursor-pointer"
+                  muted
+                  ondblclick={(e) => { try { (e.currentTarget as HTMLVideoElement).requestFullscreen(); } catch {} }}
+                  src={videoUrl(playEpisode.episode_id, cam.name, segments[0].file)}>
+                </video>
+              {/if}
             </div>
           {/each}
         </div>

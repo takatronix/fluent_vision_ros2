@@ -28,7 +28,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, Image
 
 from .frames_sidecar import FramesSidecar
 
@@ -239,22 +239,158 @@ class CameraWriter:
         }
 
 
+class DepthCameraWriter:
+    """16-bit depth (sensor_msgs/Image, encoding 16UC1) → PNG sequence sidecar.
+
+    mp4 can't carry 16-bit single-channel losslessly without exotic codecs,
+    so each frame goes to videos/<name>/<frame:06d>.png (16-bit grayscale,
+    cv2.imwrite handles this natively). frames.parquet still indexes them
+    so the bag + sidecar workflow stays consistent. The play modal shows
+    a placeholder card pointing at the download link — no live preview."""
+
+    def __init__(self, name: str, topic: str, output_dir: Path, fps: int = 30,
+                 node: Optional[Node] = None):
+        self.name = name
+        self.topic = topic
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.fps_nominal = fps
+        self._node = node
+        self._sidecar = FramesSidecar(self.output_dir / "frames.parquet")
+        self._sub = None
+        self._lock = threading.Lock()
+        self._frame_index = 0
+        self._last_recv_ns = 0
+        self._start_wall_ns = 0
+        self._stopped = False
+        self.frame_count = 0
+        self.width = 0
+        self.height = 0
+        self.fps_actual = 0.0
+        self._encoding_seen = ""
+
+    def start(self) -> None:
+        if self._node is None:
+            raise RuntimeError("DepthCameraWriter requires a rclpy Node")
+        self._sub = self._node.create_subscription(
+            Image, self.topic, self._on_image, qos_profile_sensor_data,
+        )
+        self._start_wall_ns = time.time_ns()
+        LOG.info("depth writer started: %s topic=%s out=%s",
+                 self.name, self.topic, self.output_dir)
+
+    def _on_image(self, msg: Image) -> None:
+        if self._stopped:
+            return
+        with self._lock:
+            recv_ns = time.time_ns()
+            self._encoding_seen = msg.encoding
+            # Depth conventions: 16UC1 (mm, RealSense) or mono16 (also 16-bit).
+            # 32FC1 (m, float) is converted to mm so we get a fixed-range PNG.
+            try:
+                if msg.encoding in ("16UC1", "mono16"):
+                    arr = np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(msg.height, msg.width)
+                elif msg.encoding == "32FC1":
+                    f = np.frombuffer(bytes(msg.data), dtype=np.float32).reshape(msg.height, msg.width)
+                    arr = np.nan_to_num(f * 1000.0, nan=0.0, posinf=0.0, neginf=0.0).astype(np.uint16)
+                else:
+                    LOG.warning("[%s] unsupported depth encoding %s, skipping",
+                                self.name, msg.encoding)
+                    return
+            except ValueError as exc:
+                LOG.warning("[%s] depth reshape failed: %s", self.name, exc)
+                return
+            png_path = self.output_dir / f"{self._frame_index:06d}.png"
+            if not cv2.imwrite(str(png_path), arr):
+                LOG.warning("[%s] cv2.imwrite failed for %s", self.name, png_path)
+                return
+            self.width = msg.width
+            self.height = msg.height
+            ros_stamp_ns = (
+                msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+                if msg.header.stamp.sec or msg.header.stamp.nanosec else recv_ns
+            )
+            self._sidecar.append({
+                "frame_index": self._frame_index,
+                "segment_file": png_path.name,
+                "segment_local_frame": self._frame_index,
+                "ros_stamp_ns": ros_stamp_ns,
+                "recv_stamp_ns": recv_ns,
+                "source_seq": -1,
+                "dropped_before": 0,
+                "keyframe": True,
+            })
+            self._frame_index += 1
+            self.frame_count += 1
+            self._last_recv_ns = recv_ns
+
+    def stop(self) -> dict:
+        with self._lock:
+            self._stopped = True
+            if self._sub is not None and self._node is not None:
+                try:
+                    self._node.destroy_subscription(self._sub)
+                except Exception:
+                    pass
+                self._sub = None
+            self._sidecar.close()
+            elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
+            self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
+        return self.summary()
+
+    def summary(self) -> dict:
+        # No single segment file — depth is a PNG sequence. Surface that so
+        # the play modal can show a download-only placeholder instead of
+        # trying to embed a <video>.
+        total_bytes = 0
+        try:
+            for p in self.output_dir.glob("*.png"):
+                total_bytes += p.stat().st_size
+        except OSError:
+            pass
+        return {
+            "name": self.name,
+            "topic": self.topic,
+            "kind": "depth_png_seq",
+            "encoding": self._encoding_seen,
+            "width": self.width,
+            "height": self.height,
+            "fps_nominal": self.fps_nominal,
+            "fps_actual": round(self.fps_actual, 2),
+            "frame_count": self.frame_count,
+            "video_dir": str(self.output_dir.name) + "/",
+            "sidecar_file": f"{self.output_dir.name}/frames.parquet",
+            "segments": [],  # PNG sequence — listed via /files/ if needed
+            "total_png_bytes": total_bytes,
+        }
+
+
 class CameraWriterPool:
     """Manage multiple CameraWriter instances for one episode."""
 
     def __init__(self, node: Node):
         self._node = node
-        self._writers: dict[str, CameraWriter] = {}
+        self._writers: dict[str, CameraWriter | DepthCameraWriter] = {}
 
     def start_all(self, episode_dir: Path, cameras: list[dict], fps: int = 30) -> list[dict]:
-        """cameras: [{name, topic, codec?}, ...]. Returns initial summary list."""
+        """cameras: [{name, topic, kind?, codec?}, ...]. kind="depth" routes
+        to DepthCameraWriter (16-bit PNG sidecar); anything else uses the
+        normal H.264 mp4 path. Returns initial summary list."""
         videos_root = episode_dir / "videos"
         videos_root.mkdir(exist_ok=True)
         for cam in cameras:
             name = cam["name"]
             topic = cam["topic"]
+            kind = (cam.get("kind") or "color").lower()
             cam_dir = videos_root / name
-            writer = CameraWriter(name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node)
+            if kind == "depth":
+                writer: CameraWriter | DepthCameraWriter = DepthCameraWriter(
+                    name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
+                )
+            else:
+                writer = CameraWriter(
+                    name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
+                )
             writer.start()
             self._writers[name] = writer
         return [w.summary() for w in self._writers.values()]
