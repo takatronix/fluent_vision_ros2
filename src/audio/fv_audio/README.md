@@ -33,4 +33,4 @@ ros2 run fv_audio radio_streamer.py \
 
 ※ `ffmpeg`が必要です（`sudo apt install ffmpeg`）。
 
-詳細な設計は `docs/fv_audio_design.md` を参照してください。
+詳細な設計は [`DESIGN.md`](DESIGN.md) を参照してください。
