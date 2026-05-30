@@ -1092,6 +1092,7 @@
           </div>
         {/if}
       {/if}
+      {/if}<!-- closes {#if playEpisode.cameras.length === 0} ... {:else} ... at line 819 -->
 
       <div class="mt-3 text-[10px] text-(--color-text-mute) font-mono shrink-0">
         ID: {playEpisode.episode_id}
