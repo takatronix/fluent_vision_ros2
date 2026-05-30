@@ -1,0 +1,183 @@
+"""Episode store — directory layout + meta.json + (Phase 2) sqlite index.
+
+Phase 1 Step 1 — minimum viable: ULID id, dir layout, meta.json read/write.
+sqlite index / FTS / tags table are Phase 2.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from ulid import ULID
+
+
+SCHEMA_VERSION = 1
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def utc_today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def new_episode_id() -> str:
+    return str(ULID())
+
+
+@dataclass
+class EpisodeMeta:
+    schema_version: int = SCHEMA_VERSION
+    episode_id: str = ""
+    state: str = "recording"  # recording | finalizing | finished | failed | discarded
+    task_description: str = ""
+    profile: str = ""
+    robot_id: Optional[str] = None
+    operator: Optional[str] = None
+    tags: list[str] = field(default_factory=list)
+    parent_session_id: Optional[str] = None
+    expected_duration_s: Optional[float] = None
+    started_at: str = ""
+    stopped_at: Optional[str] = None
+    duration_s: Optional[float] = None
+    outcome: Optional[str] = None
+    pinned: bool = False
+    pin_reason: Optional[str] = None
+    cameras: list[dict[str, Any]] = field(default_factory=list)
+    recorded_topics: list[dict[str, Any]] = field(default_factory=list)
+    topic_discovery_source: str = "profile"
+    bag_path: str = "bag/"
+    bag_split_count: int = 0
+    annotation_revisions: list[dict[str, Any]] = field(default_factory=list)
+    markers: list[dict[str, Any]] = field(default_factory=list)
+    recorder_version: str = "fv_episode_recorder/0.1.0"
+    container_image_tag: Optional[str] = None
+    stale_input_events: list[dict[str, Any]] = field(default_factory=list)
+    quality_metrics: Optional[dict[str, Any]] = None
+    manifest_file: Optional[str] = None
+    # remote import (Phase 4.5+ reserved)
+    source: str = "local"  # local | remote_imported | remote_proxy
+    remote_manifest_url: Optional[str] = None
+    remote_signed_urls: Optional[dict[str, Any]] = None
+    # env / scene (Phase 2.7+ optional)
+    env_config: Optional[dict[str, Any]] = None
+
+
+class EpisodeStore:
+    """Filesystem-backed episode store.
+
+    Layout:
+        <output_dir>/episodes/<profile>/<YYYY-MM-DD>/<episode_id>/
+            meta.json
+            bag/                  # Phase 1 Step 2 で書き込み開始
+            videos/<camera>/      # Phase 1 Step 3
+            manifest.json         # Phase 1.5
+    """
+
+    def __init__(self, output_dir: str | Path):
+        self.output_dir = Path(output_dir)
+        self._lock = threading.Lock()
+        self._active_episode: Optional[EpisodeMeta] = None
+        self._active_dir: Optional[Path] = None
+
+    # ---- active episode tracking (Phase 1 Step 1 — single active enforcement) ----
+
+    @property
+    def active(self) -> Optional[EpisodeMeta]:
+        return self._active_episode
+
+    def start_episode(self, meta: EpisodeMeta) -> Path:
+        """Create episode directory and write initial meta.json. Returns episode dir."""
+        with self._lock:
+            if self._active_episode is not None:
+                raise RuntimeError(
+                    f"another episode already active: {self._active_episode.episode_id}"
+                )
+            ep_dir = self._episode_dir(meta)
+            ep_dir.mkdir(parents=True, exist_ok=True)
+            (ep_dir / "bag").mkdir(exist_ok=True)
+            (ep_dir / "videos").mkdir(exist_ok=True)
+            self._active_episode = meta
+            self._active_dir = ep_dir
+            self._write_meta(ep_dir, meta)
+            return ep_dir
+
+    def stop_active(self, outcome: str) -> tuple[EpisodeMeta, Path]:
+        """Finalize active episode. Returns (meta, dir)."""
+        with self._lock:
+            if self._active_episode is None:
+                raise RuntimeError("no active episode")
+            meta = self._active_episode
+            ep_dir = self._active_dir
+            meta.stopped_at = utc_now_iso()
+            meta.outcome = outcome
+            started = datetime.strptime(
+                meta.started_at, "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=timezone.utc)
+            stopped = datetime.strptime(
+                meta.stopped_at, "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=timezone.utc)
+            meta.duration_s = (stopped - started).total_seconds()
+            if outcome == "discard":
+                meta.state = "discarded"
+            elif outcome == "abort":
+                meta.state = "failed"
+            else:
+                meta.state = "finished"
+            self._write_meta(ep_dir, meta)
+            self._active_episode = None
+            self._active_dir = None
+            return meta, ep_dir
+
+    # ---- list / get (Phase 1 Step 1 — filesystem walk; Phase 2 will use sqlite) ----
+
+    def list_episodes(self, limit: int = 50) -> list[EpisodeMeta]:
+        results: list[EpisodeMeta] = []
+        episodes_root = self.output_dir / "episodes"
+        if not episodes_root.exists():
+            return results
+        # Walk profile/date/id/meta.json
+        for meta_path in sorted(
+            episodes_root.glob("*/*/*/meta.json"), key=lambda p: p.stat().st_mtime, reverse=True
+        ):
+            try:
+                with meta_path.open() as f:
+                    data = json.load(f)
+                results.append(EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__}))
+                if len(results) >= limit:
+                    break
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        return results
+
+    def get_episode(self, episode_id: str) -> Optional[tuple[EpisodeMeta, Path]]:
+        episodes_root = self.output_dir / "episodes"
+        if not episodes_root.exists():
+            return None
+        for meta_path in episodes_root.glob(f"*/*/{episode_id}/meta.json"):
+            with meta_path.open() as f:
+                data = json.load(f)
+            return (
+                EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__}),
+                meta_path.parent,
+            )
+        return None
+
+    # ---- internals ----
+
+    def _episode_dir(self, meta: EpisodeMeta) -> Path:
+        date_str = meta.started_at[:10]  # YYYY-MM-DD prefix of ISO string
+        return self.output_dir / "episodes" / meta.profile / date_str / meta.episode_id
+
+    def _write_meta(self, ep_dir: Path, meta: EpisodeMeta) -> None:
+        meta_path = ep_dir / "meta.json"
+        tmp_path = meta_path.with_suffix(".json.tmp")
+        with tmp_path.open("w") as f:
+            json.dump(asdict(meta), f, ensure_ascii=False, indent=2)
+        tmp_path.replace(meta_path)
