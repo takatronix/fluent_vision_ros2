@@ -17,6 +17,8 @@
     marker_count: number;
     tags: string[];
     source: string;
+    env?: 'real' | 'sim';
+    controller_label?: string | null;
   };
 
   type Disk = {
@@ -765,6 +767,7 @@
                 {/if}
               </button>
             </th>
+            <th class="text-left px-4 py-2.5 font-medium">ソース</th>
             <th class="text-left px-4 py-2.5 font-medium">
               <button class="hover:text-white transition" onclick={() => toggleSort('started_at')}>
                 開始
@@ -823,6 +826,24 @@
                       <span class="text-[10px] px-1.5 py-0.5 rounded bg-(--color-accent-soft) text-(--color-accent)">{t}</span>
                     {/each}
                   </div>
+                {/if}
+              </td>
+              <td class="px-4 py-2.5 text-xs whitespace-nowrap">
+                {#if ep.env === 'sim'}
+                  <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-violet-500/15 text-violet-300 border border-violet-500/30 mr-1">sim</span>
+                {:else}
+                  <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-zinc-500/15 text-zinc-400 border border-zinc-500/30 mr-1">実機</span>
+                {/if}
+                {#if ep.controller_label}
+                  {#if ep.controller_label.startsWith('VLA')}
+                    <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">🤖 {ep.controller_label}</span>
+                  {:else if ep.controller_label === 'teleop'}
+                    <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-amber-500/15 text-amber-300 border border-amber-500/30">🎮 teleop</span>
+                  {:else}
+                    <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-zinc-500/15 text-zinc-400 border border-zinc-500/30">{ep.controller_label}</span>
+                  {/if}
+                {:else}
+                  <span class="text-(--color-text-mute) text-[10px]">—</span>
                 {/if}
               </td>
               <td class="px-4 py-2.5 text-(--color-text-dim) text-xs font-mono">{fmtTime(ep.started_at)}</td>
