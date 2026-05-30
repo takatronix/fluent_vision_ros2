@@ -34,6 +34,7 @@ from .api_server import build_app
 from .bag_recorder import BagRecorder
 from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeStore
+from .marker_manager import MarkerManager
 from .topic_discovery import (
     discover_cameras,
     discover_episode_recorder_config,
@@ -67,6 +68,7 @@ class FVEpisodeRecorderNode(Node):
         self.bag_recorder = BagRecorder(max_bag_size_mb=1024)
         self.camera_pool = CameraWriterPool(node=self)
         self.active_lock = ActiveLock(self.output_dir)
+        self.marker_manager = MarkerManager()
         self.profile_cache: dict = {}  # profile_name -> parsed yaml dict
         self._orphan_payload: dict = {}
 
@@ -156,6 +158,7 @@ def main(args=None):
     asyncio.set_event_loop(loop)
     app = build_app(node.store, node.bag_recorder, node.camera_pool,
                     active_lock=node.active_lock,
+                    marker_manager=node.marker_manager,
                     get_profile=node.get_profile)
 
     runner = web.AppRunner(app)

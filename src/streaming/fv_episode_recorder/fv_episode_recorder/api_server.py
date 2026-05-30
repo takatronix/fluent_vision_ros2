@@ -24,6 +24,7 @@ from .active_lock import ActiveLock
 from .bag_recorder import BagRecorder
 from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeMeta, EpisodeStore, new_episode_id, utc_now_iso
+from .marker_manager import MarkerManager
 from .preflight import run_preflight
 from .schemas import (
     EpisodeSummary,
@@ -37,18 +38,39 @@ from .schemas import (
 LOG = logging.getLogger("fv_episode_recorder.api")
 
 
+@web.middleware
+async def _cors_middleware(request, handler):
+    """Permissive CORS so the vlabor dashboard at :8888 can fetch from :8083.
+    Same-LAN dev convenience; tighten for production deploys."""
+    if request.method == "OPTIONS":
+        return web.Response(
+            status=204,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type,Authorization",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+    resp = await handler(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 def build_app(
     store: EpisodeStore,
     bag_recorder: BagRecorder,
     camera_pool: CameraWriterPool,
     active_lock: Optional[ActiveLock] = None,
+    marker_manager: Optional[MarkerManager] = None,
     get_profile=None,  # callable: name -> dict; None = no profile lookup (override only)
 ) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[_cors_middleware])
     app["store"] = store
     app["bag_recorder"] = bag_recorder
     app["camera_pool"] = camera_pool
     app["active_lock"] = active_lock
+    app["marker_manager"] = marker_manager or MarkerManager()
     app["get_profile"] = get_profile
 
     app.router.add_get("/api/v1/healthz", _healthz)
@@ -57,7 +79,15 @@ def build_app(
     app.router.add_post("/api/v1/episodes/{episode_id}/recover", _recover_episode)
     app.router.add_get("/api/v1/episodes", _list_episodes)
     app.router.add_get("/api/v1/episodes/{episode_id}", _get_episode)
+    app.router.add_get("/api/v1/episodes/{episode_id}/files/{tail:.*}", _episode_file)
     app.router.add_get("/api/v1/disk/status", _disk_status)
+
+    # Phase 2: marker endpoints (subtask / event / note + post-hoc edits)
+    app.router.add_get("/api/v1/episodes/{episode_id}/markers", _list_markers)
+    app.router.add_post("/api/v1/episodes/{episode_id}/markers/start", _start_marker)
+    app.router.add_post("/api/v1/markers/{marker_id}/stop", _stop_marker)
+    app.router.add_patch("/api/v1/markers/{marker_id}", _patch_marker)
+    app.router.add_delete("/api/v1/markers/{marker_id}", _delete_marker)
 
     return app
 
@@ -65,19 +95,109 @@ def build_app(
 async def _healthz(request: web.Request) -> web.Response:
     store: EpisodeStore = request.app["store"]
     camera_pool: CameraWriterPool = request.app["camera_pool"]
+    marker_manager: MarkerManager = request.app["marker_manager"]
     payload = {"status": "ok", "active_episode": None}
     if store.active is not None:
         meta = store.active
-        # Cheap stats — total size is too expensive at 1Hz; use frame counts
-        # and the started_at for the dashboard to compute elapsed locally.
+        active_markers = [
+            {
+                "marker_id": m.marker_id,
+                "kind": m.kind,
+                "task_description": m.task_description,
+                "started_at": m.started_at,
+            }
+            for m in marker_manager.active(meta.episode_id)
+        ]
         payload["active_episode"] = {
             "episode_id": meta.episode_id,
             "task_description": meta.task_description,
             "profile": meta.profile,
             "started_at": meta.started_at,
             "fps_per_camera": camera_pool.frame_counts(),
+            "active_markers": active_markers,
         }
     return web.json_response(payload)
+
+
+# ---------- Marker handlers ----------
+
+async def _list_markers(request: web.Request) -> web.Response:
+    episode_id = request.match_info["episode_id"]
+    mm: MarkerManager = request.app["marker_manager"]
+    store: EpisodeStore = request.app["store"]
+    in_memory = [m.to_meta_dict() for m in mm.list(episode_id)]
+    if in_memory:
+        return web.json_response({"episode_id": episode_id, "markers": in_memory})
+    # fall back to finalized episode meta
+    found = store.get_episode(episode_id)
+    if found is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    meta, _ = found
+    return web.json_response({"episode_id": episode_id, "markers": meta.markers})
+
+
+async def _start_marker(request: web.Request) -> web.Response:
+    episode_id = request.match_info["episode_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    task_desc = (body.get("task_description") or "").strip()
+    if not task_desc:
+        return web.json_response({"error": "task_description_required"}, status=400)
+    kind = body.get("kind") or body.get("marker_kind") or "subtask"
+    tags = body.get("tags") or []
+    store: EpisodeStore = request.app["store"]
+    if store.active is None or store.active.episode_id != episode_id:
+        return web.json_response(
+            {"error": "episode_not_active",
+             "detail": "markers can only be added to the active recording episode in Phase 2"},
+            status=409,
+        )
+    mm: MarkerManager = request.app["marker_manager"]
+    try:
+        m = mm.start(episode_id, task_desc, kind=kind, tags=tags)
+    except ValueError as exc:
+        return web.json_response({"error": "invalid_kind", "detail": str(exc)}, status=400)
+    LOG.info("marker started: %s episode=%s kind=%s task=%s",
+             m.marker_id, episode_id, kind, task_desc)
+    return web.json_response(m.to_meta_dict(), status=201)
+
+
+async def _stop_marker(request: web.Request) -> web.Response:
+    marker_id = request.match_info["marker_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    outcome = body.get("outcome", "success")
+    mm: MarkerManager = request.app["marker_manager"]
+    m = mm.stop(marker_id, outcome=outcome)
+    if m is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    LOG.info("marker stopped: %s outcome=%s", marker_id, outcome)
+    return web.json_response(m.to_meta_dict())
+
+
+async def _patch_marker(request: web.Request) -> web.Response:
+    marker_id = request.match_info["marker_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    mm: MarkerManager = request.app["marker_manager"]
+    m = mm.patch(marker_id, **body)
+    if m is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    return web.json_response(m.to_meta_dict())
+
+
+async def _delete_marker(request: web.Request) -> web.Response:
+    marker_id = request.match_info["marker_id"]
+    mm: MarkerManager = request.app["marker_manager"]
+    if not mm.delete(marker_id):
+        return web.json_response({"error": "not_found"}, status=404)
+    return web.json_response({"marker_id": marker_id, "deleted": True})
 
 
 async def _start_episode(request: web.Request) -> web.Response:
@@ -254,11 +374,17 @@ async def _stop_episode(request: web.Request) -> web.Response:
             for seg in cs.get("segments", []):
                 video_size_bytes += int(seg.get("size_bytes", 0))
 
+    # Flush markers (Phase 2) from in-memory manager into meta.json
+    mm: MarkerManager = request.app["marker_manager"]
+    pending_markers = mm.flush(episode_id)
+
     meta, ep_dir = store.stop_active(req.outcome)
-    # Update meta with bag size + split_count + camera summaries
+    # Update meta with bag size + split_count + camera summaries + markers
     meta.bag_split_count = int(bag_summary.get("split_count", 0))
     if camera_summaries:
         meta.cameras = camera_summaries
+    if pending_markers:
+        meta.markers = pending_markers
     store._write_meta(ep_dir, meta)  # noqa: SLF001 — local helper, store is single owner
 
     # If discard, blow away the dir entirely
@@ -358,21 +484,23 @@ async def _disk_status(request: web.Request) -> web.Response:
             except OSError:
                 continue
 
-    # Active episode write rate estimate.
+    # Active episode write rate estimate — walk store.active_dir (the recorder
+    # already knows where it is; folder name format is no longer ULID-only).
     active_rate_bytes_per_s = 0.0
     active_elapsed_s = 0.0
-    if store.active is not None:
+    if store.active is not None and store.active_dir is not None:
         meta = store.active
         from datetime import datetime, timezone
         started = datetime.strptime(meta.started_at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
         active_elapsed_s = max((datetime.now(timezone.utc) - started).total_seconds(), 1.0)
-        ep_root = episodes_root / meta.profile
-        for candidate in ep_root.glob(f"*/{meta.episode_id}"):
-            for f in candidate.rglob("*"):
-                if f.is_file():
-                    active_rate_bytes_per_s += f.stat().st_size
-            break
-        active_rate_bytes_per_s /= active_elapsed_s
+        total_active_bytes = 0
+        for f in store.active_dir.rglob("*"):
+            if f.is_file():
+                try:
+                    total_active_bytes += f.stat().st_size
+                except OSError:
+                    pass
+        active_rate_bytes_per_s = total_active_bytes / active_elapsed_s
 
     # Hours of recording left at current rate (only meaningful if recording).
     hours_left = None
@@ -400,6 +528,32 @@ async def _disk_status(request: web.Request) -> web.Response:
             "note": "Phase 1.5: thresholds hardcoded; Phase 2 will read from profile.episode_recorder.retention",
         },
     })
+
+
+async def _episode_file(request: web.Request) -> web.Response:
+    """Serve a file from inside an episode directory (mp4, parquet, bag, etc).
+
+    URL: /api/v1/episodes/{episode_id}/files/{tail}
+    e.g. /api/v1/episodes/01KSX.../files/videos/top_camera/0000.mp4
+
+    Path traversal protected — resolved path must stay under the episode dir.
+    """
+    store: EpisodeStore = request.app["store"]
+    episode_id = request.match_info["episode_id"]
+    tail = request.match_info["tail"]
+    found = store.get_episode(episode_id)
+    if found is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    _meta, ep_dir = found
+    path = (ep_dir / tail).resolve()
+    ep_dir_resolved = ep_dir.resolve()
+    try:
+        path.relative_to(ep_dir_resolved)
+    except ValueError:
+        return web.json_response({"error": "forbidden", "detail": "path escape"}, status=403)
+    if not path.exists() or not path.is_file():
+        return web.json_response({"error": "not_found", "path": str(path.relative_to(ep_dir_resolved))}, status=404)
+    return web.FileResponse(path)
 
 
 async def _recover_episode(request: web.Request) -> web.Response:

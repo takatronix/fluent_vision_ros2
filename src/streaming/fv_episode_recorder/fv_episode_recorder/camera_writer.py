@@ -16,6 +16,8 @@ Future steps:
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -31,6 +33,63 @@ from sensor_msgs.msg import CompressedImage
 from .frames_sidecar import FramesSidecar
 
 LOG = logging.getLogger("fv_episode_recorder.camera")
+
+
+def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> tuple[subprocess.Popen, str] | None:
+    """Try ffmpeg with H.264 encoders in priority order. Returns (proc, codec_used)
+    or None if all encoders failed. Output is faststart mp4 for HTML5 video.
+
+    Priority: h264_nvenc (Tegra HW encode) → libx264 (CPU). Both produce
+    browser-native H.264 mp4 (Chrome / Safari / Firefox HW decode)."""
+    if not shutil.which("ffmpeg"):
+        LOG.error("ffmpeg not found in PATH")
+        return None
+    encoder_tries = [
+        # (codec, extra args)
+        ("h264_nvenc", ["-preset", "p1", "-tune", "ll"]),    # Tegra HW, fastest
+        ("libx264",    ["-preset", "ultrafast", "-tune", "zerolatency"]),
+    ]
+    for codec, extra in encoder_tries:
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-r", str(fps),
+            "-i", "pipe:0",
+            "-c:v", codec,
+            *extra,
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        try:
+            # Probe encoder availability first (some builds list h264_nvenc but
+            # fail at runtime if no GPU). Spawn a tiny test pipe.
+            test = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.04:r=25",
+                 "-c:v", codec, *extra, "-f", "null", "-"],
+                stderr=subprocess.PIPE, timeout=10,
+            )
+            if test.returncode != 0:
+                LOG.warning("[encoder probe] %s unavailable: %s", codec,
+                            test.stderr.decode("utf-8", errors="replace")[:200])
+                continue
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            LOG.warning("[encoder probe] %s probe failed: %s", codec, exc)
+            continue
+        # Launch the real encoder pipe.
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            LOG.info("ffmpeg encoder ready: %s → %s (%dx%d @ %dfps)",
+                     codec, out_path.name, width, height, fps)
+            return proc, codec
+        except Exception as exc:
+            LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
+            continue
+    LOG.error("no H.264 encoder available (tried %s)", [c for c, _ in encoder_tries])
+    return None
 
 
 class CameraWriter:
@@ -54,7 +113,10 @@ class CameraWriter:
         self._segment_file = self.output_dir / "0000.mp4"
         self._sidecar = FramesSidecar(self.output_dir / "frames.parquet")
 
-        self._writer: Optional[cv2.VideoWriter] = None
+        # ffmpeg subprocess (H.264 encoder) replaces cv2.VideoWriter which
+        # only had MPEG-4 part 2 — that codec is not browser-playable.
+        self._ffmpeg: Optional[subprocess.Popen] = None
+        self._codec_in_use: str = ""
         self._frame_index = 0
         self._segment_local = 0
         self._last_recv_ns = 0
@@ -92,20 +154,22 @@ class CameraWriter:
                 LOG.warning("[%s] decode failed, skipping frame", self.name)
                 return
             h, w = img.shape[:2]
-            if self._writer is None:
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                self._writer = cv2.VideoWriter(
-                    str(self._segment_file), fourcc, float(self.fps_nominal), (w, h)
-                )
-                if not self._writer.isOpened():
-                    LOG.error("[%s] cv2.VideoWriter open failed", self.name)
-                    self._writer = None
+            if self._ffmpeg is None:
+                spawned = _spawn_ffmpeg_encoder(self._segment_file, w, h, self.fps_nominal)
+                if spawned is None:
+                    LOG.error("[%s] no H.264 encoder available — frame dropped", self.name)
                     return
+                self._ffmpeg, self._codec_in_use = spawned
                 self.width = w
                 self.height = h
-                LOG.info("[%s] first frame %dx%d → %s", self.name, w, h, self._segment_file)
+                LOG.info("[%s] first frame %dx%d → %s (%s)",
+                         self.name, w, h, self._segment_file, self._codec_in_use)
 
-            self._writer.write(img)
+            try:
+                self._ffmpeg.stdin.write(img.tobytes())
+            except (BrokenPipeError, ValueError) as exc:
+                LOG.warning("[%s] ffmpeg pipe write failed: %s", self.name, exc)
+                return
 
             ros_stamp_ns = (
                 msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
@@ -136,9 +200,18 @@ class CameraWriter:
                 except Exception:
                     pass
                 self._sub = None
-            if self._writer is not None:
-                self._writer.release()
-                self._writer = None
+            if self._ffmpeg is not None:
+                try:
+                    self._ffmpeg.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    self._ffmpeg.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    LOG.warning("[%s] ffmpeg flush timeout, killing", self.name)
+                    self._ffmpeg.kill()
+                    self._ffmpeg.wait(timeout=3)
+                self._ffmpeg = None
             self._sidecar.close()
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0

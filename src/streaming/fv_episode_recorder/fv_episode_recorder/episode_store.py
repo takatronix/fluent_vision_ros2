@@ -117,6 +117,10 @@ class EpisodeStore:
     def active(self) -> Optional[EpisodeMeta]:
         return self._active_episode
 
+    @property
+    def active_dir(self) -> Optional[Path]:
+        return self._active_dir
+
     def start_episode(self, meta: EpisodeMeta) -> Path:
         """Create episode directory and write initial meta.json. Returns episode dir."""
         with self._lock:
@@ -182,16 +186,27 @@ class EpisodeStore:
         return results
 
     def get_episode(self, episode_id: str) -> Optional[tuple[EpisodeMeta, Path]]:
+        """Find an episode by full ULID. Folder name format is now
+        <HHMMSS>_<slug>_<ULID8>, so glob by the ULID 8-suffix then
+        verify the full episode_id against meta.json (collision-safe)."""
         episodes_root = self.output_dir / "episodes"
         if not episodes_root.exists():
             return None
-        for meta_path in episodes_root.glob(f"*/*/{episode_id}/meta.json"):
-            with meta_path.open() as f:
-                data = json.load(f)
-            return (
-                EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__}),
-                meta_path.parent,
-            )
+        suffix = episode_id[-8:] if len(episode_id) >= 8 else episode_id
+        # Try new pattern first (suffix match), then legacy pattern (ULID == folder).
+        for pattern in (f"*/*/*{suffix}/meta.json", f"*/*/{episode_id}/meta.json"):
+            for meta_path in episodes_root.glob(pattern):
+                try:
+                    with meta_path.open() as f:
+                        data = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if data.get("episode_id") != episode_id:
+                    continue
+                return (
+                    EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__}),
+                    meta_path.parent,
+                )
         return None
 
     # ---- internals ----
