@@ -474,6 +474,18 @@
     }
   }
 
+  // Disk-card derived thresholds. Pulled out of the markup because
+  // Svelte 5 only allows {@const} as an immediate child of control-flow
+  // blocks like {#if} / {#each}, not inside a regular <section>.
+  const diskWarnPct = $derived(disk?.policy?.warn_pct_free ?? 20);
+  const diskCritPct = $derived(disk?.policy?.crit_pct_free ?? 10);
+  const diskStage = $derived(
+    !disk ? 'ok'
+      : disk.percent_free < diskCritPct ? 'crit'
+      : disk.percent_free < diskWarnPct ? 'warn'
+      : 'ok'
+  );
+
   const filteredEpisodes = $derived(
     episodes
       .filter(e => {
@@ -574,26 +586,26 @@
 
       <!-- Auto-maintenance (retention) explanation. Phase 1.5 = alert only,
            no auto-delete yet. Be explicit so the operator knows what to expect
-           (otherwise they assume "保存先" silently rotates and lose data). -->
-      {@const warnPct = disk.policy?.warn_pct_free ?? 20}
-      {@const critPct = disk.policy?.crit_pct_free ?? 10}
-      {@const stage = disk.percent_free < critPct ? 'crit' : disk.percent_free < warnPct ? 'warn' : 'ok'}
-      <details class="mt-3 pt-3 border-t border-(--color-border) text-xs" open={stage !== 'ok'}>
+           (otherwise they assume "保存先" silently rotates and lose data).
+           Thresholds come from $derived diskWarnPct / diskCritPct / diskStage
+           in the script (Svelte 5 forbids {@const} as a direct child of a
+           non-control-flow element like <section>). -->
+      <details class="mt-3 pt-3 border-t border-(--color-border) text-xs" open={diskStage !== 'ok'}>
         <summary class="cursor-pointer text-(--color-text-dim) hover:text-(--color-text) select-none flex items-center gap-2">
           <span>自動メンテ</span>
-          {#if stage === 'ok'}
+          {#if diskStage === 'ok'}
             <span class="text-emerald-400">● 正常</span>
-          {:else if stage === 'warn'}
-            <span class="text-amber-400">● 警告 (空き {disk.percent_free.toFixed(1)}% &lt; {warnPct}%)</span>
+          {:else if diskStage === 'warn'}
+            <span class="text-amber-400">● 警告 (空き {disk.percent_free.toFixed(1)}% &lt; {diskWarnPct}%)</span>
           {:else}
-            <span class="text-red-400">● 危険 (空き {disk.percent_free.toFixed(1)}% &lt; {critPct}%)</span>
+            <span class="text-red-400">● 危険 (空き {disk.percent_free.toFixed(1)}% &lt; {diskCritPct}%)</span>
           {/if}
         </summary>
         <div class="mt-2 space-y-1.5 text-(--color-text-mute) pl-1">
           <div>
             <span class="text-(--color-text-dim)">しきい値:</span>
-            空き <b class="text-amber-400">{warnPct}%</b> で警告 /
-            <b class="text-red-400">{critPct}%</b> で危険 (header 右上のチップが色変化)
+            空き <b class="text-amber-400">{diskWarnPct}%</b> で警告 /
+            <b class="text-red-400">{diskCritPct}%</b> で危険 (header 右上のチップが色変化)
           </div>
           <div>
             <span class="text-(--color-text-dim)">通知:</span>
