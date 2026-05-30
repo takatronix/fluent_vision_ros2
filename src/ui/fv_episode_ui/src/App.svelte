@@ -915,15 +915,28 @@
                 {#if isDepth}<span class="text-[9px] opacity-70">depth · {cam.frame_count || 0}f</span>{/if}
               </div>
               {#if isDepth}
-                <div class="aspect-video flex flex-col items-center justify-center text-[11px] text-(--color-text-mute) gap-2 p-3">
-                  <div class="text-3xl opacity-40">📐</div>
-                  <div>16-bit PNG sequence</div>
-                  <a href={`${API}/episodes/${playEpisode.episode_id}/files/videos/${cam.name}/`}
-                     class="text-(--color-accent) hover:underline text-[10px]"
-                     target="_blank" rel="noopener">
-                    フォルダを開く →
-                  </a>
-                  <div class="text-[9px] opacity-70">tar で一括 DL</div>
+                {@const fps = cam.fps_actual || 30}
+                {@const total = cam.frame_count || 0}
+                {@const fIdx = total > 0 ? Math.max(0, Math.min(total - 1, Math.floor(sharedTime * fps))) : 0}
+                {@const fStr = String(fIdx).padStart(6, '0')}
+                <div class="aspect-video bg-black relative group/depth">
+                  {#if total > 0}
+                    <img src={`${API}/episodes/${playEpisode.episode_id}/depth_preview/${cam.name}/${fStr}.jpg?cmap=turbo&max=4000`}
+                         alt="depth"
+                         class="w-full h-full object-contain"
+                         loading="lazy" />
+                    <div class="absolute top-1 left-1 text-[9px] px-1.5 py-0.5 rounded bg-black/70 text-white font-mono">
+                      f{fIdx}/{total - 1}
+                    </div>
+                    <div class="absolute bottom-1 right-1 text-[9px] px-1.5 py-0.5 rounded bg-black/70 text-(--color-accent)">
+                      turbo · 0–4m
+                    </div>
+                  {:else}
+                    <div class="w-full h-full flex flex-col items-center justify-center text-[11px] text-(--color-text-mute) gap-1">
+                      <div class="text-2xl opacity-40">📐</div>
+                      <div>0 frames</div>
+                    </div>
+                  {/if}
                 </div>
               {:else}
                 <video

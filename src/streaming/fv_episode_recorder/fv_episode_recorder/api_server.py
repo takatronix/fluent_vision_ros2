@@ -84,6 +84,7 @@ def build_app(
     app.router.add_delete("/api/v1/episodes/{episode_id}", _delete_episode)
     app.router.add_patch("/api/v1/episodes/{episode_id}", _patch_episode)
     app.router.add_get("/api/v1/episodes/{episode_id}/files/{tail:.*}", _episode_file)
+    app.router.add_get("/api/v1/episodes/{episode_id}/depth_preview/{camera}/{frame}", _depth_preview)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints", _episode_joints)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints.csv", _episode_joints_csv)
     app.router.add_get("/api/v1/episodes/{episode_id}/download.tar", _episode_download_tar)
@@ -786,6 +787,76 @@ async def _episode_joints_csv(request: web.Request) -> web.Response:
         text=body,
         content_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="joints_{request.match_info["episode_id"][-8:]}.csv"'},
+    )
+
+
+async def _depth_preview(request: web.Request) -> web.Response:
+    """Render a single 16-bit depth PNG into a colormapped JPEG so it can
+    be previewed in the browser (HTML5 video can't carry 16-bit single-
+    channel and direct PNG can't show the depth range).
+
+    URL: /api/v1/episodes/{episode_id}/depth_preview/{camera}/{frame:06d}.jpg
+    Query:
+        cmap = turbo (default) | jet | viridis | plasma | inferno
+        max  = max depth in mm to clip at (default 4000 for indoor 4m)
+    """
+    import cv2
+    store: EpisodeStore = request.app["store"]
+    episode_id = request.match_info["episode_id"]
+    camera = request.match_info["camera"]
+    frame = request.match_info["frame"]
+    found = store.get_episode(episode_id)
+    if found is None:
+        return web.Response(status=404, text="episode not found")
+    _meta, ep_dir = found
+    png_path = (ep_dir / "videos" / camera / frame).resolve()
+    # path traversal guard
+    if not str(png_path).startswith(str(ep_dir.resolve())):
+        return web.Response(status=400, text="bad path")
+    if not png_path.exists() or not png_path.suffix.lower() in (".png", ".jpg"):
+        # accept .jpg in the URL but rewrite to .png on disk
+        png_path = png_path.with_suffix(".png")
+        if not png_path.exists():
+            return web.Response(status=404, text="frame not found")
+
+    arr = cv2.imread(str(png_path), cv2.IMREAD_UNCHANGED)
+    if arr is None:
+        return web.Response(status=500, text="png decode failed")
+
+    try:
+        max_mm = max(100, min(20000, int(request.query.get("max", "4000"))))
+    except ValueError:
+        max_mm = 4000
+
+    if arr.dtype != cv2.CV_8U and arr.ndim == 2:
+        # Treat 0 as "no data" so it stays black; clip the rest to [1, max_mm].
+        mask = arr > 0
+        scaled = arr.astype("float32")
+        scaled[~mask] = 0
+        scaled = (scaled.clip(0, max_mm) / max_mm * 255).astype("uint8")
+    else:
+        scaled = arr.astype("uint8") if arr.dtype != "uint8" else arr
+
+    cmap_name = (request.query.get("cmap") or "turbo").lower()
+    cmap_map = {
+        "turbo":   cv2.COLORMAP_TURBO,
+        "jet":     cv2.COLORMAP_JET,
+        "viridis": cv2.COLORMAP_VIRIDIS,
+        "plasma":  cv2.COLORMAP_PLASMA,
+        "inferno": cv2.COLORMAP_INFERNO,
+    }
+    color = cv2.applyColorMap(scaled, cmap_map.get(cmap_name, cv2.COLORMAP_TURBO))
+    # Black out the "no data" pixels so nearest 0mm doesn't bleed bright red.
+    if arr.ndim == 2:
+        color[arr == 0] = (0, 0, 0)
+
+    ok, jpg = cv2.imencode(".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        return web.Response(status=500, text="jpeg encode failed")
+    return web.Response(
+        body=jpg.tobytes(),
+        content_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600"},
     )
 
 

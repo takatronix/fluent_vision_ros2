@@ -190,11 +190,17 @@ def discover_cameras(profile: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if "name" not in c or "topic" not in c:
             continue
-        out.append({
+        entry = {
             "name": str(c["name"]),
             "topic": str(c["topic"]),
             "codec": str(c.get("codec", "mp4v")),
-        })
+        }
+        # Preserve kind so CameraWriterPool dispatches color → mp4 vs depth →
+        # 16-bit PNG sequence. Dropping this field was why arm_depth recorded
+        # 0 frames (the color writer was instantiated for an Image topic).
+        if c.get("kind"):
+            entry["kind"] = str(c["kind"])
+        out.append(entry)
     return out
 
 
