@@ -23,6 +23,10 @@ class Marker:
     stopped_at: Optional[str] = None
     outcome: Optional[str] = None
     tags: list = field(default_factory=list)
+    # Free-form post-hoc attributes (e.g. asparagus weight_g=65, grade="A").
+    # Each entry: {key, value, unit?, note?}. Set later via PATCH while
+    # reviewing the episode in fv_episode_ui.
+    attributes: list = field(default_factory=list)
     rev: int = 0
 
     def to_meta_dict(self) -> dict:
@@ -72,7 +76,8 @@ class MarkerManager:
 
     def patch(self, marker_id: str, **changes) -> Optional[Marker]:
         """Time shift / label edit / outcome change (Phase 2 minimum)."""
-        allowed = {"started_at", "stopped_at", "task_description", "tags", "outcome", "kind"}
+        allowed = {"started_at", "stopped_at", "task_description", "tags",
+                   "outcome", "kind", "attributes"}
         with self._lock:
             for eps in self._by_episode.values():
                 if marker_id in eps:

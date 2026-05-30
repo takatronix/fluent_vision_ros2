@@ -166,24 +166,133 @@ class EpisodeStore:
 
     # ---- list / get (Phase 1 Step 1 — filesystem walk; Phase 2 will use sqlite) ----
 
-    def list_episodes(self, limit: int = 50) -> list[EpisodeMeta]:
-        results: list[EpisodeMeta] = []
+    def list_episodes(self, limit: int = 50) -> list[tuple[EpisodeMeta, int]]:
+        """Return (meta, size_bytes) tuples for episodes on disk, newest first.
+
+        size_bytes is computed by walking the episode dir. Phase 2 will move
+        this to a sqlite index since 500+ episodes walked per request gets slow."""
+        results: list[tuple[EpisodeMeta, int]] = []
         episodes_root = self.output_dir / "episodes"
         if not episodes_root.exists():
             return results
-        # Walk profile/date/id/meta.json
         for meta_path in sorted(
             episodes_root.glob("*/*/*/meta.json"), key=lambda p: p.stat().st_mtime, reverse=True
         ):
             try:
                 with meta_path.open() as f:
                     data = json.load(f)
-                results.append(EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__}))
+                meta = EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__})
+                # Aggregate size of the episode directory (bag + mp4 + sidecar + meta).
+                ep_dir = meta_path.parent
+                size = 0
+                try:
+                    for f in ep_dir.rglob("*"):
+                        if f.is_file():
+                            size += f.stat().st_size
+                except OSError:
+                    pass
+                results.append((meta, size))
                 if len(results) >= limit:
                     break
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
         return results
+
+    def add_finalized_marker(self, episode_id: str, marker: dict) -> Optional[dict]:
+        """Append a marker entry into a finalized episode's meta.json.
+
+        Phase 4 review workflow: while reviewing a past recording the operator
+        often spots a moment worth tagging (collision, lifted gripper too
+        early, etc.). The marker manager only handles the active episode in
+        memory, so for finalized episodes we write directly into the file."""
+        found = self.get_episode(episode_id)
+        if found is None:
+            return None
+        _meta, ep_dir = found
+        meta_path = ep_dir / "meta.json"
+        try:
+            with meta_path.open() as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        markers = data.setdefault("markers", [])
+        markers.append(marker)
+        tmp = meta_path.with_suffix(".json.tmp")
+        with tmp.open("w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp.replace(meta_path)
+        return marker
+
+    def delete_finalized_marker(self, marker_id: str) -> bool:
+        """Remove a marker by id from whichever finalized meta.json holds it."""
+        episodes_root = self.output_dir / "episodes"
+        if not episodes_root.exists():
+            return False
+        for meta_path in episodes_root.glob("*/*/*/meta.json"):
+            try:
+                with meta_path.open() as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            markers = data.get("markers", []) or []
+            new_markers = [m for m in markers if m.get("marker_id") != marker_id]
+            if len(new_markers) != len(markers):
+                data["markers"] = new_markers
+                tmp = meta_path.with_suffix(".json.tmp")
+                with tmp.open("w") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                tmp.replace(meta_path)
+                return True
+        return False
+
+    def patch_finalized_marker(self, marker_id: str, changes: dict) -> Optional[dict]:
+        """Update one marker inside a finalized episode's meta.json on disk.
+
+        After an episode stops, MarkerManager flushes its markers and clears
+        them from memory — so the in-memory PATCH path can't edit them.
+        This walks meta.json files until it finds the marker_id, applies the
+        allowed changes, and rewrites the file atomically. Returns the
+        updated marker dict, or None if not found."""
+        allowed = {"started_at", "stopped_at", "task_description", "tags",
+                   "outcome", "kind", "attributes"}
+        episodes_root = self.output_dir / "episodes"
+        if not episodes_root.exists():
+            return None
+        for meta_path in episodes_root.glob("*/*/*/meta.json"):
+            try:
+                with meta_path.open() as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            markers = data.get("markers", []) or []
+            for m in markers:
+                if m.get("marker_id") != marker_id:
+                    continue
+                for k, v in (changes or {}).items():
+                    if k in allowed and v is not None:
+                        m[k] = v
+                m["rev"] = (m.get("rev", 0) or 0) + 1
+                tmp = meta_path.with_suffix(".json.tmp")
+                with tmp.open("w") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                tmp.replace(meta_path)
+                return m
+        return None
+
+    def delete_episode(self, episode_id: str, force: bool = False) -> bool:
+        """Remove the entire episode directory. Returns True if removed.
+        Refuses pinned episodes unless force=True (Phase 1 audit log via api)."""
+        found = self.get_episode(episode_id)
+        if found is None:
+            return False
+        meta, ep_dir = found
+        if meta.pinned and not force:
+            raise PermissionError("episode is pinned; use force=true")
+        if self._active_episode is not None and self._active_episode.episode_id == episode_id:
+            raise RuntimeError("cannot delete the active recording episode")
+        import shutil
+        shutil.rmtree(ep_dir, ignore_errors=True)
+        return True
 
     def get_episode(self, episode_id: str) -> Optional[tuple[EpisodeMeta, Path]]:
         """Find an episode by full ULID. Folder name format is now

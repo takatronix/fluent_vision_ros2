@@ -79,7 +79,11 @@ def build_app(
     app.router.add_post("/api/v1/episodes/{episode_id}/recover", _recover_episode)
     app.router.add_get("/api/v1/episodes", _list_episodes)
     app.router.add_get("/api/v1/episodes/{episode_id}", _get_episode)
+    app.router.add_delete("/api/v1/episodes/{episode_id}", _delete_episode)
     app.router.add_get("/api/v1/episodes/{episode_id}/files/{tail:.*}", _episode_file)
+    app.router.add_get("/api/v1/episodes/{episode_id}/joints", _episode_joints)
+    app.router.add_get("/api/v1/episodes/{episode_id}/joints.csv", _episode_joints_csv)
+    app.router.add_get("/api/v1/episodes/{episode_id}/download.tar", _episode_download_tar)
     app.router.add_get("/api/v1/disk/status", _disk_status)
 
     # Phase 2: marker endpoints (subtask / event / note + post-hoc edits)
@@ -146,22 +150,56 @@ async def _start_marker(request: web.Request) -> web.Response:
     if not task_desc:
         return web.json_response({"error": "task_description_required"}, status=400)
     kind = body.get("kind") or body.get("marker_kind") or "subtask"
+    if kind not in ("subtask", "event", "note"):
+        return web.json_response({"error": "invalid_kind", "detail": f"kind must be subtask/event/note, got {kind}"}, status=400)
     tags = body.get("tags") or []
     store: EpisodeStore = request.app["store"]
-    if store.active is None or store.active.episode_id != episode_id:
+
+    # Active-episode path → live marker (real-time start).
+    if store.active is not None and store.active.episode_id == episode_id:
+        mm: MarkerManager = request.app["marker_manager"]
+        try:
+            m = mm.start(episode_id, task_desc, kind=kind, tags=tags)
+        except ValueError as exc:
+            return web.json_response({"error": "invalid_kind", "detail": str(exc)}, status=400)
+        LOG.info("marker started: %s episode=%s kind=%s task=%s",
+                 m.marker_id, episode_id, kind, task_desc)
+        return web.json_response(m.to_meta_dict(), status=201)
+
+    # Finalized-episode path (Phase 4 review workflow): the client supplies
+    # explicit started_at (and stopped_at for subtask) computed from the
+    # joint-chart / video-timeline click position.
+    started_at = body.get("started_at")
+    stopped_at = body.get("stopped_at")
+    if not started_at:
         return web.json_response(
-            {"error": "episode_not_active",
-             "detail": "markers can only be added to the active recording episode in Phase 2"},
-            status=409,
+            {"error": "started_at_required",
+             "detail": "for finalized episodes the client must supply started_at (ISO 8601 UTC)"},
+            status=400,
         )
-    mm: MarkerManager = request.app["marker_manager"]
-    try:
-        m = mm.start(episode_id, task_desc, kind=kind, tags=tags)
-    except ValueError as exc:
-        return web.json_response({"error": "invalid_kind", "detail": str(exc)}, status=400)
-    LOG.info("marker started: %s episode=%s kind=%s task=%s",
-             m.marker_id, episode_id, kind, task_desc)
-    return web.json_response(m.to_meta_dict(), status=201)
+    if kind == "subtask" and not stopped_at:
+        return web.json_response(
+            {"error": "stopped_at_required",
+             "detail": "subtask markers on finalized episodes need stopped_at"},
+            status=400,
+        )
+    from ulid import ULID
+    marker = {
+        "marker_id": str(ULID()),
+        "kind": kind,
+        "task_description": task_desc,
+        "tags": tags,
+        "started_at": started_at,
+        "stopped_at": stopped_at if kind == "subtask" else None,
+        "outcome": body.get("outcome"),
+        "rev": 1,
+    }
+    saved = store.add_finalized_marker(episode_id, marker)
+    if saved is None:
+        return web.json_response({"error": "episode_not_found"}, status=404)
+    LOG.info("marker added (finalized): %s episode=%s kind=%s task=%s",
+             marker["marker_id"], episode_id, kind, task_desc)
+    return web.json_response(saved, status=201)
 
 
 async def _stop_marker(request: web.Request) -> web.Response:
@@ -187,17 +225,28 @@ async def _patch_marker(request: web.Request) -> web.Response:
         body = {}
     mm: MarkerManager = request.app["marker_manager"]
     m = mm.patch(marker_id, **body)
-    if m is None:
-        return web.json_response({"error": "not_found"}, status=404)
-    return web.json_response(m.to_meta_dict())
+    if m is not None:
+        return web.json_response(m.to_meta_dict())
+    # Not in the active episode's in-memory state — search finalized meta.json
+    # files. This is what the timeline-drag editor in fv_episode_ui hits when
+    # editing markers on past episodes.
+    store: EpisodeStore = request.app["store"]
+    updated = store.patch_finalized_marker(marker_id, body)
+    if updated is not None:
+        return web.json_response(updated)
+    return web.json_response({"error": "not_found"}, status=404)
 
 
 async def _delete_marker(request: web.Request) -> web.Response:
     marker_id = request.match_info["marker_id"]
     mm: MarkerManager = request.app["marker_manager"]
-    if not mm.delete(marker_id):
-        return web.json_response({"error": "not_found"}, status=404)
-    return web.json_response({"marker_id": marker_id, "deleted": True})
+    if mm.delete(marker_id):
+        return web.json_response({"marker_id": marker_id, "deleted": True})
+    # Fall back to meta.json rewrite for finalized episodes.
+    store: EpisodeStore = request.app["store"]
+    if store.delete_finalized_marker(marker_id):
+        return web.json_response({"marker_id": marker_id, "deleted": True})
+    return web.json_response({"error": "not_found"}, status=404)
 
 
 async def _start_episode(request: web.Request) -> web.Response:
@@ -423,7 +472,7 @@ async def _list_episodes(request: web.Request) -> web.Response:
     limit = max(1, min(limit, 500))
 
     summaries: list[dict[str, Any]] = []
-    for meta in store.list_episodes(limit=limit):
+    for meta, size in store.list_episodes(limit=limit):
         summaries.append(EpisodeSummary(
             episode_id=meta.episode_id,
             state=meta.state,
@@ -435,6 +484,7 @@ async def _list_episodes(request: web.Request) -> web.Response:
             duration_s=meta.duration_s,
             outcome=meta.outcome,
             pinned=meta.pinned,
+            size_bytes=size,
             marker_count=len(meta.markers),
             tags=meta.tags,
             source=meta.source,
@@ -530,6 +580,178 @@ async def _disk_status(request: web.Request) -> web.Response:
     })
 
 
+async def _episode_joints(request: web.Request) -> web.Response:
+    """Extract sensor_msgs/JointState time series from the episode's bag.
+
+    Phase 3a replay-preview support: the play modal renders a synced line
+    chart so the operator can see the joints alongside the video. The bag
+    is opened with rosbag2_py and only JointState messages are decoded —
+    everything else (tf, mux, images) is skipped to keep this fast.
+
+    Output: {
+        episode_id, started_at, duration_s,
+        joints: [{topic, names: [str], t_ms: [int], q: [[float, ...]]}, ...]
+    }
+    Timestamps are relative to the episode's started_at (in milliseconds)
+    so the frontend can map them straight onto the video timeline."""
+    from datetime import datetime, timezone
+    store: EpisodeStore = request.app["store"]
+    episode_id = request.match_info["episode_id"]
+    found = store.get_episode(episode_id)
+    if found is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    meta, ep_dir = found
+    bag_dir = ep_dir / "bag"
+    if not bag_dir.exists():
+        return web.json_response({"episode_id": episode_id, "joints": [], "warning": "no bag"})
+
+    # Filter: query param `topic=` restricts to one topic (default = all
+    # JointState topics found in the bag).
+    only_topic = request.query.get("topic")
+
+    def _decode_bag() -> dict:
+        # Runs in a thread (executor) to avoid blocking the aiohttp loop —
+        # bag decode of a 1 hour episode can take a few hundred ms.
+        import rosbag2_py
+        from rclpy.serialization import deserialize_message
+        from rosidl_runtime_py.utilities import get_message
+
+        storage_options = rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id="sqlite3")
+        converter_options = rosbag2_py.ConverterOptions(
+            input_serialization_format="cdr", output_serialization_format="cdr"
+        )
+        reader = rosbag2_py.SequentialReader()
+        try:
+            reader.open(storage_options, converter_options)
+        except Exception as exc:
+            return {"error": "bag_open_failed", "detail": str(exc)}
+
+        topic_types = {t.name: t.type for t in reader.get_all_topics_and_types()}
+        joint_topics = {n: tp for n, tp in topic_types.items()
+                        if tp == "sensor_msgs/msg/JointState"
+                        and (only_topic is None or n == only_topic)}
+        if not joint_topics:
+            return {"joints": [], "warning": "no JointState topics in bag",
+                    "all_topics": list(topic_types.keys())}
+
+        # Episode start as nanoseconds (UTC) — used to compute relative offsets.
+        ep_start_ns = int(datetime.strptime(
+            meta.started_at, "%Y-%m-%dT%H:%M:%S.%fZ"
+        ).replace(tzinfo=timezone.utc).timestamp() * 1e9)
+
+        per_topic: dict[str, dict] = {}
+        msg_cls_cache: dict[str, type] = {}
+        while reader.has_next():
+            topic, raw, t_ns = reader.read_next()
+            if topic not in joint_topics:
+                continue
+            cls = msg_cls_cache.get(topic)
+            if cls is None:
+                cls = get_message(joint_topics[topic])
+                msg_cls_cache[topic] = cls
+            msg = deserialize_message(raw, cls)
+            entry = per_topic.setdefault(topic, {"topic": topic, "names": list(msg.name or []),
+                                                 "t_ms": [], "q": []})
+            # Use bag receive time for the X axis — joint_state stamps are
+            # usually identical to receive time and this saves a stamp-vs-recv
+            # decision the caller doesn't care about.
+            t_ms = (t_ns - ep_start_ns) // 1_000_000
+            entry["t_ms"].append(int(t_ms))
+            entry["q"].append([float(x) for x in msg.position])
+        return {"joints": list(per_topic.values())}
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(None, _decode_bag)
+    except Exception as exc:
+        return web.json_response({"error": "decode_failed", "detail": str(exc)}, status=500)
+    result["episode_id"] = episode_id
+    result["started_at"] = meta.started_at
+    result["duration_s"] = meta.duration_s
+    return web.json_response(result)
+
+
+async def _episode_download_tar(request: web.Request) -> web.StreamResponse:
+    """Stream the whole episode dir as an uncompressed tar.
+
+    Use case: teleop-vs-VLA jerkiness investigation — operator wants the bag
+    + mp4s on a laptop for offline pandas / rosbag2 analysis. Streams via
+    `tar -cf -` so we never buffer the whole thing in memory."""
+    import asyncio
+    store: EpisodeStore = request.app["store"]
+    episode_id = request.match_info["episode_id"]
+    found = store.get_episode(episode_id)
+    if found is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    meta, ep_dir = found
+    safe_name = (meta.task_description or "episode").replace("/", "_").replace(" ", "_")[:40]
+    fname = f"{safe_name}_{episode_id[-8:]}.tar"
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "application/x-tar",
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "X-Episode-Id": episode_id,
+        },
+    )
+    await response.prepare(request)
+    # Use -C parent so the tar's top-level entry is the episode folder name.
+    proc = await asyncio.create_subprocess_exec(
+        "tar", "-cf", "-", "-C", str(ep_dir.parent), ep_dir.name,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        while True:
+            chunk = await proc.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            await response.write(chunk)
+    finally:
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+    await response.write_eof()
+    return response
+
+
+async def _episode_joints_csv(request: web.Request) -> web.Response:
+    """Convenience CSV export of joint angles for one topic.
+
+    Same data as /joints (JSON) but flat CSV — pandas-friendly:
+        t_s, <joint_name_0>, <joint_name_1>, ...
+    Angles are converted from radians → degrees so the CSV matches the
+    chart displayed in the play modal."""
+    # Reuse the JSON endpoint's decoder.
+    json_resp = await _episode_joints(request)
+    if json_resp.status != 200:
+        return json_resp
+    import json as _json
+    data = _json.loads(json_resp.body)
+    only_topic = request.query.get("topic")
+    series_list = data.get("joints", [])
+    if only_topic:
+        series_list = [s for s in series_list if s["topic"] == only_topic]
+    if not series_list:
+        return web.Response(status=404, text="no joint topic")
+    s = series_list[0]
+    import math
+    lines = []
+    header = ["t_s"] + (s["names"] or [f"j{i}" for i in range(len(s["q"][0]) if s["q"] else 0)])
+    lines.append(",".join(header))
+    for t_ms, row in zip(s["t_ms"], s["q"]):
+        lines.append(",".join([f"{t_ms/1000.0:.3f}"] + [f"{v*180/math.pi:.4f}" for v in row]))
+    body = "\n".join(lines) + "\n"
+    return web.Response(
+        text=body,
+        content_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="joints_{request.match_info["episode_id"][-8:]}.csv"'},
+    )
+
+
 async def _episode_file(request: web.Request) -> web.Response:
     """Serve a file from inside an episode directory (mp4, parquet, bag, etc).
 
@@ -554,6 +776,25 @@ async def _episode_file(request: web.Request) -> web.Response:
     if not path.exists() or not path.is_file():
         return web.json_response({"error": "not_found", "path": str(path.relative_to(ep_dir_resolved))}, status=404)
     return web.FileResponse(path)
+
+
+async def _delete_episode(request: web.Request) -> web.Response:
+    """Hard-delete an episode directory. ?force=true bypasses the pin guard.
+
+    Refuses to delete the currently active recording (must stop first)."""
+    episode_id = request.match_info["episode_id"]
+    force = request.query.get("force", "").lower() in ("1", "true", "yes")
+    store: EpisodeStore = request.app["store"]
+    try:
+        removed = store.delete_episode(episode_id, force=force)
+    except PermissionError as exc:
+        return web.json_response({"error": "pinned", "detail": str(exc)}, status=409)
+    except RuntimeError as exc:
+        return web.json_response({"error": "active", "detail": str(exc)}, status=409)
+    if not removed:
+        return web.json_response({"error": "not_found"}, status=404)
+    LOG.info("episode deleted: %s force=%s", episode_id, force)
+    return web.json_response({"episode_id": episode_id, "deleted": True}, status=200)
 
 
 async def _recover_episode(request: web.Request) -> web.Response:
