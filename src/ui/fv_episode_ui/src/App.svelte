@@ -234,6 +234,26 @@
     if (!attrEditor) return;
     attrEditor = { ...attrEditor, rows: attrEditor.rows.filter((_, idx) => idx !== i) };
   }
+  async function deleteMarker(m: MarkerItem, e: MouseEvent) {
+    e.stopPropagation();
+    if (!playEpisode) return;
+    const label = m.task_description || m.marker_id.slice(-8);
+    if (!confirm(`マーカーを削除しますか？\n\n  ${m.kind}: ${label}\n\nこの操作は取り消せません。`)) return;
+    try {
+      const r = await fetch(`${API}/markers/${m.marker_id}`, {method: 'DELETE'});
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${r.status}`);
+      }
+      playEpisode = {
+        ...playEpisode,
+        markers: playEpisode.markers.filter(x => x.marker_id !== m.marker_id),
+      };
+    } catch (err: any) {
+      alert('マーカー削除失敗: ' + (err.message || err));
+    }
+  }
+
   async function saveAttrs() {
     if (!attrEditor || !playEpisode) return;
     const clean = attrEditor.rows
@@ -969,11 +989,16 @@
                       {:else if m.outcome === 'abort'}<span class="text-red-400">✗</span>
                       {/if}
                     </td>
-                    <td class="px-2 py-1.5 text-right w-10">
+                    <td class="px-2 py-1.5 text-right w-20 whitespace-nowrap">
                       <button onclick={(e) => openAttrEditor(m, e)}
-                              class="opacity-30 group-hover:opacity-100 text-(--color-text-mute) hover:text-(--color-accent) transition text-[10px] px-1.5 py-0.5 rounded border border-(--color-border)"
+                              class="opacity-30 group-hover:opacity-100 text-(--color-text-mute) hover:text-(--color-accent) transition text-[10px] px-1.5 py-0.5 rounded border border-(--color-border) mr-1"
                               title="属性 (重量・グレード等) を編集">
                         + 属性
+                      </button>
+                      <button onclick={(e) => deleteMarker(m, e)}
+                              class="opacity-30 group-hover:opacity-100 text-(--color-text-mute) hover:text-red-400 transition p-1 rounded hover:bg-red-500/10 align-middle"
+                              title="マーカーを削除">
+                        <Trash2 class="size-3.5 inline" />
                       </button>
                     </td>
                   </tr>
