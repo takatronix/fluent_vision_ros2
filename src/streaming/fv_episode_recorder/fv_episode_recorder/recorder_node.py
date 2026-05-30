@@ -35,6 +35,7 @@ from .bag_recorder import BagRecorder
 from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeStore
 from .marker_manager import MarkerManager
+from .mux_tracker import MuxTracker
 from .topic_discovery import (
     discover_cameras,
     discover_episode_recorder_config,
@@ -69,6 +70,11 @@ class FVEpisodeRecorderNode(Node):
         self.camera_pool = CameraWriterPool(node=self)
         self.active_lock = ActiveLock(self.output_dir)
         self.marker_manager = MarkerManager()
+        # Track mux source (teleop vs VLA + controller name) so the play
+        # modal can label each recording without having to decode the bag.
+        # Subscribes lazily — auto-discovers any `*/teleop_mux/status`
+        # topic that shows up on the graph.
+        self.mux_tracker = MuxTracker(self)
         self.profile_cache: dict = {}  # profile_name -> parsed yaml dict
         self._orphan_payload: dict = {}
 
@@ -159,7 +165,15 @@ def main(args=None):
     app = build_app(node.store, node.bag_recorder, node.camera_pool,
                     active_lock=node.active_lock,
                     marker_manager=node.marker_manager,
+                    mux_tracker=node.mux_tracker,
                     get_profile=node.get_profile)
+    # First mux discovery sweep happens on the 2s timer; trigger one now so
+    # the very first POST /episodes already has a snapshot if publishers
+    # came up before us.
+    try:
+        node.mux_tracker._discover()  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())

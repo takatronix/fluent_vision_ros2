@@ -97,6 +97,14 @@ class EpisodeMeta:
     # mp4 stay intact so the operator can widen the trim later.
     trim_start_s: Optional[float] = None
     trim_end_s: Optional[float] = None
+    # Mux / controller snapshot — used to answer "was this VLA or teleop?"
+    # without decoding the bag. Populated by recorder_node from the latest
+    # `*/teleop_mux/status` JSON at start + stop.
+    # Shape: {"<arm_topic>": {"source": "ai|leader|none",
+    #                          "ai_controller": "<name>", "ai_route_key": "...",
+    #                          "enabled": bool}}
+    controller_at_start: Optional[dict[str, Any]] = None
+    controller_at_end: Optional[dict[str, Any]] = None
 
 
 class EpisodeStore:

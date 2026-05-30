@@ -70,6 +70,10 @@ class EpisodeSummary(BaseModel):
     derived_from: Optional[str] = None
     tags: list[str] = Field(default_factory=list)
     source: str = "local"
+    # UX-only derived flags so the list table can render badges without
+    # decoding meta.json client-side.
+    env: str = "real"          # "real" | "sim"  (profile.endswith("_sim"))
+    controller_label: Optional[str] = None  # e.g. "VLA: pi0", "teleop", "停止"
 
 
 class ListEpisodesResponse(BaseModel):

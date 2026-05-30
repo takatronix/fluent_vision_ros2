@@ -63,10 +63,12 @@ def build_app(
     camera_pool: CameraWriterPool,
     active_lock: Optional[ActiveLock] = None,
     marker_manager: Optional[MarkerManager] = None,
+    mux_tracker=None,  # MuxTracker — used to label each ep VLA vs teleop
     get_profile=None,  # callable: name -> dict; None = no profile lookup (override only)
 ) -> web.Application:
     app = web.Application(middlewares=[_cors_middleware])
     app["store"] = store
+    app["mux_tracker"] = mux_tracker
     app["bag_recorder"] = bag_recorder
     app["camera_pool"] = camera_pool
     app["active_lock"] = active_lock
@@ -318,6 +320,11 @@ async def _start_episode(request: web.Request) -> web.Response:
             status=503,
         )
 
+    # Snapshot mux state so the recording is labeled VLA vs teleop without
+    # having to decode the bag.
+    mux_tracker = request.app.get("mux_tracker")
+    controller_at_start = mux_tracker.snapshot() if mux_tracker is not None else None
+
     meta = EpisodeMeta(
         episode_id=ep_id,
         state="recording",
@@ -333,6 +340,7 @@ async def _start_episode(request: web.Request) -> web.Response:
         recorded_topics=recorded_topics_meta,
         cameras=cameras_resolved,
         topic_discovery_source=discovery_source,
+        controller_at_start=controller_at_start,
     )
     try:
         ep_dir = store.start_episode(meta)
@@ -435,6 +443,11 @@ async def _stop_episode(request: web.Request) -> web.Response:
         meta.cameras = camera_summaries
     if pending_markers:
         meta.markers = pending_markers
+    # Snapshot mux state at stop — used by the UI to tell operator-after-
+    # the-fact whether THIS run was VLA (with which controller) or teleop.
+    mux_tracker = request.app.get("mux_tracker")
+    if mux_tracker is not None:
+        meta.controller_at_end = mux_tracker.snapshot()
     store._write_meta(ep_dir, meta)  # noqa: SLF001 — local helper, store is single owner
 
     # If discard, blow away the dir entirely
@@ -489,8 +502,31 @@ async def _list_episodes(request: web.Request) -> web.Response:
             marker_count=len(meta.markers),
             tags=meta.tags,
             source=meta.source,
+            env="sim" if (meta.profile or "").endswith("_sim") else "real",
+            controller_label=_summarize_controller(meta.controller_at_end or meta.controller_at_start),
         ).model_dump())
     return web.json_response(ListEpisodesResponse(episodes=summaries).model_dump())
+
+
+def _summarize_controller(snap: Optional[dict[str, Any]]) -> Optional[str]:
+    """Pick one short label from a mux snapshot. Prefers the first arm
+    found; multi-arm rigs may want per-arm rendering in the future."""
+    if not snap:
+        return None
+    for _topic, d in snap.items():
+        if not isinstance(d, dict):
+            continue
+        src = (d.get("source") or "").strip()
+        if src in ("ai", "ai_route"):
+            ctl = (d.get("ai_controller") or "ai").strip() or "ai"
+            return f"VLA: {ctl}"
+        if src == "leader":
+            return "teleop"
+        if src == "none":
+            return "停止"
+        if src:
+            return src
+    return None
 
 
 async def _get_episode(request: web.Request) -> web.Response:
