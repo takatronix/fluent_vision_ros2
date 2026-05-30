@@ -57,17 +57,27 @@ def build_app(
     app.router.add_post("/api/v1/episodes/{episode_id}/recover", _recover_episode)
     app.router.add_get("/api/v1/episodes", _list_episodes)
     app.router.add_get("/api/v1/episodes/{episode_id}", _get_episode)
+    app.router.add_get("/api/v1/disk/status", _disk_status)
 
     return app
 
 
 async def _healthz(request: web.Request) -> web.Response:
-    return web.json_response({
-        "status": "ok",
-        "active_episode": (
-            request.app["store"].active.episode_id if request.app["store"].active else None
-        ),
-    })
+    store: EpisodeStore = request.app["store"]
+    camera_pool: CameraWriterPool = request.app["camera_pool"]
+    payload = {"status": "ok", "active_episode": None}
+    if store.active is not None:
+        meta = store.active
+        # Cheap stats — total size is too expensive at 1Hz; use frame counts
+        # and the started_at for the dashboard to compute elapsed locally.
+        payload["active_episode"] = {
+            "episode_id": meta.episode_id,
+            "task_description": meta.task_description,
+            "profile": meta.profile,
+            "started_at": meta.started_at,
+            "fps_per_camera": camera_pool.frame_counts(),
+        }
+    return web.json_response(payload)
 
 
 async def _start_episode(request: web.Request) -> web.Response:
@@ -314,6 +324,82 @@ async def _get_episode(request: web.Request) -> web.Response:
         return web.json_response({"error": "not_found"}, status=404)
     meta, _ep_dir = found
     return web.json_response(asdict(meta))
+
+
+async def _disk_status(request: web.Request) -> web.Response:
+    """Disk + retention status snapshot (Phase 1.5 minimal).
+
+    Returns: current usage, recent write rate, estimated "hours of recording
+    left at current rate", episode count + total bytes.
+    """
+    import time
+    store: EpisodeStore = request.app["store"]
+    output_dir = store.output_dir
+    usage = shutil.disk_usage(output_dir)
+    percent_used = round(100.0 * usage.used / usage.total, 1) if usage.total else 0.0
+    percent_free = round(100.0 * usage.free / usage.total, 1) if usage.total else 0.0
+
+    # Episode aggregate (cheap walk; Phase 2 will switch to sqlite index).
+    episode_count = 0
+    total_episode_bytes = 0
+    profile_counts: dict[str, int] = {}
+    episodes_root = output_dir / "episodes"
+    if episodes_root.exists():
+        for ep_dir in episodes_root.glob("*/*/*"):
+            if not ep_dir.is_dir():
+                continue
+            episode_count += 1
+            profile = ep_dir.parts[-3]
+            profile_counts[profile] = profile_counts.get(profile, 0) + 1
+            try:
+                for f in ep_dir.rglob("*"):
+                    if f.is_file():
+                        total_episode_bytes += f.stat().st_size
+            except OSError:
+                continue
+
+    # Active episode write rate estimate.
+    active_rate_bytes_per_s = 0.0
+    active_elapsed_s = 0.0
+    if store.active is not None:
+        meta = store.active
+        from datetime import datetime, timezone
+        started = datetime.strptime(meta.started_at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        active_elapsed_s = max((datetime.now(timezone.utc) - started).total_seconds(), 1.0)
+        ep_root = episodes_root / meta.profile
+        for candidate in ep_root.glob(f"*/{meta.episode_id}"):
+            for f in candidate.rglob("*"):
+                if f.is_file():
+                    active_rate_bytes_per_s += f.stat().st_size
+            break
+        active_rate_bytes_per_s /= active_elapsed_s
+
+    # Hours of recording left at current rate (only meaningful if recording).
+    hours_left = None
+    if active_rate_bytes_per_s > 0:
+        hours_left = round(usage.free / (active_rate_bytes_per_s * 3600), 2)
+
+    return web.json_response({
+        "path": str(output_dir),
+        "bytes_used": usage.used,
+        "bytes_free": usage.free,
+        "bytes_total": usage.total,
+        "percent_used": percent_used,
+        "percent_free": percent_free,
+        "episode_count": episode_count,
+        "episode_count_by_profile": profile_counts,
+        "total_episode_bytes": total_episode_bytes,
+        "active": {
+            "rate_bytes_per_s": int(active_rate_bytes_per_s),
+            "elapsed_s": round(active_elapsed_s, 1),
+            "hours_left_at_current_rate": hours_left,
+        } if store.active else None,
+        "policy": {
+            "warn_pct_free": 20.0,
+            "crit_pct_free": 10.0,
+            "note": "Phase 1.5: thresholds hardcoded; Phase 2 will read from profile.episode_recorder.retention",
+        },
+    })
 
 
 async def _recover_episode(request: web.Request) -> web.Response:

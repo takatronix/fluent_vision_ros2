@@ -7,6 +7,7 @@ sqlite index / FTS / tags table are Phase 2.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -17,6 +18,12 @@ from ulid import ULID
 
 
 SCHEMA_VERSION = 1
+
+# Reject filesystem-hostile chars + control chars. Japanese / non-ASCII kept
+# (ext4 is utf-8 native; ls/ros2 bag handle them fine).
+_FORBIDDEN_FS_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+_WHITESPACE = re.compile(r'\s+')
+_MULTI_UNDERSCORE = re.compile(r'_+')
 
 
 def utc_now_iso() -> str:
@@ -29,6 +36,24 @@ def utc_today_str() -> str:
 
 def new_episode_id() -> str:
     return str(ULID())
+
+
+def slugify_task(task: str, max_len: int = 40) -> str:
+    """Build a filesystem-friendly slug from task_description for the episode
+    directory name. Japanese / hiragana / kanji are preserved (ext4 utf-8);
+    only path-hostile chars are stripped."""
+    if not task:
+        return "untitled"
+    s = task.strip()
+    s = _FORBIDDEN_FS_CHARS.sub("_", s)
+    s = _WHITESPACE.sub("_", s)
+    s = _MULTI_UNDERSCORE.sub("_", s)
+    s = s.strip("._")
+    if not s:
+        return "untitled"
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("._")
+    return s
 
 
 @dataclass
@@ -172,8 +197,16 @@ class EpisodeStore:
     # ---- internals ----
 
     def _episode_dir(self, meta: EpisodeMeta) -> Path:
-        date_str = meta.started_at[:10]  # YYYY-MM-DD prefix of ISO string
-        return self.output_dir / "episodes" / meta.profile / date_str / meta.episode_id
+        # Folder name convention: <HHMMSS>_<task-slug>_<ULID-suffix-8>
+        # - HHMMSS prefix → ls sorts chronologically within the date folder
+        # - task slug → operator can tell what the episode was without reading meta.json
+        # - ULID suffix-8 → guarantees uniqueness even for same-second collisions
+        date_str = meta.started_at[:10]            # YYYY-MM-DD
+        hhmmss = meta.started_at[11:19].replace(":", "")  # HHMMSS
+        slug = slugify_task(meta.task_description)
+        suffix = meta.episode_id[-8:] if len(meta.episode_id) >= 8 else meta.episode_id
+        folder_name = f"{hhmmss}_{slug}_{suffix}"
+        return self.output_dir / "episodes" / meta.profile / date_str / folder_name
 
     def _write_meta(self, ep_dir: Path, meta: EpisodeMeta) -> None:
         meta_path = ep_dir / "meta.json"

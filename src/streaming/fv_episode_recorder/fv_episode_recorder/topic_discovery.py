@@ -34,24 +34,63 @@ ALWAYS_INCLUDE: list[dict[str, str]] = [
 ]
 
 
-def load_profile_yaml(profile_name: str, profiles_dir: Path | str) -> Optional[dict[str, Any]]:
-    """Load profile yaml by name. Returns the inner `profile:` block if present
-    (vlabor convention nests everything under `profile:`), else the raw dict."""
-    profiles_dir = Path(profiles_dir)
+def _read_profile_inner(profile_name: str, profiles_dir: Path) -> Optional[dict[str, Any]]:
+    """Raw single-file load (no extends resolution)."""
     for candidate in (profiles_dir / f"{profile_name}.yaml", profiles_dir / f"{profile_name}.yml"):
         if candidate.exists():
             try:
                 with candidate.open() as f:
                     raw = yaml.safe_load(f) or {}
-                # Unwrap the conventional `profile:` root if present.
                 if isinstance(raw, dict) and isinstance(raw.get("profile"), dict):
                     return raw["profile"]
                 return raw
             except yaml.YAMLError as exc:
                 LOG.error("profile yaml parse error %s: %s", candidate, exc)
                 return None
-    LOG.warning("profile yaml not found: %s in %s", profile_name, profiles_dir)
     return None
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Deep merge mimicking vlabor profile_loader: dicts merge recursively,
+    lists are replaced wholesale (vlabor convention)."""
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_profile_yaml(
+    profile_name: str,
+    profiles_dir: Path | str,
+    _visited: Optional[set[str]] = None,
+) -> Optional[dict[str, Any]]:
+    """Load profile yaml by name + resolve `extends:` chain.
+
+    Returns the inner `profile:` block (vlabor convention) with parent merged
+    in. Lists are replaced wholesale on conflict; dicts merge recursively.
+    """
+    profiles_dir = Path(profiles_dir)
+    if _visited is None:
+        _visited = set()
+    if profile_name in _visited:
+        LOG.error("profile extends cycle detected at %s", profile_name)
+        return None
+    _visited.add(profile_name)
+
+    inner = _read_profile_inner(profile_name, profiles_dir)
+    if inner is None:
+        LOG.warning("profile yaml not found: %s in %s", profile_name, profiles_dir)
+        return None
+
+    parent_name = inner.get("extends")
+    if isinstance(parent_name, str) and parent_name:
+        parent = load_profile_yaml(parent_name, profiles_dir, _visited)
+        if parent:
+            inner = _deep_merge(parent, inner)
+    return inner
 
 
 def discover_topics(profile: dict[str, Any]) -> list[dict[str, Any]]:
