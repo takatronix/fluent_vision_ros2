@@ -908,18 +908,22 @@
           {#each playEpisode.cameras as cam (cam.name)}
             {@const segments = cam.segments || [{ file: '0000.mp4' }]}
             {@const isDepth = cam.kind === 'depth_png_seq'}
+            {@const w = (cam as any).width || 640}
+            {@const h = (cam as any).height || 480}
             <div class="shrink-0 flex flex-col rounded-md overflow-hidden border border-(--color-border) bg-(--color-bg-3)"
                  style="width: 280px;">
               <div class="px-2 py-1 text-[11px] font-medium text-(--color-accent) bg-(--color-accent-soft) flex items-center justify-between">
                 <span>{cam.name}</span>
-                {#if isDepth}<span class="text-[9px] opacity-70">depth · {cam.frame_count || 0}f</span>{/if}
+                <span class="text-[9px] opacity-70 font-mono">
+                  {w}×{h}{#if isDepth} · depth · {cam.frame_count || 0}f{/if}
+                </span>
               </div>
               {#if isDepth}
-                {@const fps = cam.fps_actual || 30}
+                {@const fps = (cam as any).fps_actual || 30}
                 {@const total = cam.frame_count || 0}
                 {@const fIdx = total > 0 ? Math.max(0, Math.min(total - 1, Math.floor(sharedTime * fps))) : 0}
                 {@const fStr = String(fIdx).padStart(6, '0')}
-                <div class="aspect-video bg-black relative group/depth">
+                <div class="bg-black relative group/depth" style="aspect-ratio: {w} / {h};">
                   {#if total > 0}
                     <img src={`${API}/episodes/${playEpisode.episode_id}/depth_preview/${cam.name}/${fStr}.jpg?cmap=turbo&max=4000`}
                          alt="depth"
@@ -947,7 +951,8 @@
                   onpause={() => syncPauseFrom(cam.name)}
                   onseeked={() => syncSeekFrom(cam.name)}
                   ontimeupdate={() => onTimeUpdate(cam.name)}
-                  class="w-full aspect-video bg-black cursor-pointer"
+                  class="w-full bg-black cursor-pointer object-contain"
+                  style="aspect-ratio: {w} / {h};"
                   muted
                   ondblclick={(e) => { try { (e.currentTarget as HTMLVideoElement).requestFullscreen(); } catch {} }}
                   src={videoUrl(playEpisode.episode_id, cam.name, segments[0].file)}>
