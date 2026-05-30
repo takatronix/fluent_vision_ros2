@@ -92,6 +92,11 @@ class EpisodeMeta:
     remote_signed_urls: Optional[dict[str, Any]] = None
     # env / scene (Phase 2.7+ optional)
     env_config: Optional[dict[str, Any]] = None
+    # Non-destructive clip trim. Seconds from started_at. None = no trim.
+    # Playback / joint chart / future exports honor these; underlying bag +
+    # mp4 stay intact so the operator can widen the trim later.
+    trim_start_s: Optional[float] = None
+    trim_end_s: Optional[float] = None
 
 
 class EpisodeStore:
@@ -197,6 +202,32 @@ class EpisodeStore:
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
         return results
+
+    def patch_episode_meta(self, episode_id: str, changes: dict) -> Optional[dict]:
+        """Update a small allow-list of meta fields on disk (trim / task /
+        tags / pinned + reason). Returns the updated meta dict, or None
+        if the episode isn't found."""
+        allowed = {"trim_start_s", "trim_end_s", "task_description",
+                   "tags", "pinned", "pin_reason", "outcome"}
+        found = self.get_episode(episode_id)
+        if found is None:
+            return None
+        _meta, ep_dir = found
+        meta_path = ep_dir / "meta.json"
+        try:
+            with meta_path.open() as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        for k, v in (changes or {}).items():
+            if k in allowed:
+                # Allow explicit null/None to clear trim_*.
+                data[k] = v
+        tmp = meta_path.with_suffix(".json.tmp")
+        with tmp.open("w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp.replace(meta_path)
+        return data
 
     def add_finalized_marker(self, episode_id: str, marker: dict) -> Optional[dict]:
         """Append a marker entry into a finalized episode's meta.json.

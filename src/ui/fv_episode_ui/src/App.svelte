@@ -73,6 +73,8 @@
     started_at: string;
     cameras: Array<{ name: string; topic: string; segments?: Array<{ file: string }> }>;
     markers: MarkerItem[];
+    trim_start_s?: number | null;
+    trim_end_s?: number | null;
   };
   let playEpisode = $state<EpisodeDetail | null>(null);
   let selectedCamera = $state<string>('');
@@ -283,6 +285,43 @@
     } catch (e: any) {
       alert('属性保存失敗: ' + (e.message || e));
     }
+  }
+
+  // -------- Clip trim (non-destructive) --------
+  // Saves trim_start_s / trim_end_s into meta.json via PATCH /episodes/{id}.
+  // The underlying bag + mp4 stay intact; playback + future exports honor
+  // the trim and the operator can widen it later.
+  async function patchTrim(start: number | null, end: number | null) {
+    if (!playEpisode) return;
+    try {
+      const r = await fetch(`${API}/episodes/${playEpisode.episode_id}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({trim_start_s: start, trim_end_s: end}),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${r.status}`);
+      }
+      playEpisode = { ...playEpisode, trim_start_s: start, trim_end_s: end };
+    } catch (e: any) {
+      alert('クリップ範囲の保存失敗: ' + (e.message || e));
+    }
+  }
+  function setTrimStart() {
+    if (!playEpisode) return;
+    const end = playEpisode.trim_end_s ?? null;
+    const start = Math.min(sharedTime, end != null ? end - 0.1 : maxDuration);
+    patchTrim(start, end);
+  }
+  function setTrimEnd() {
+    if (!playEpisode) return;
+    const start = playEpisode.trim_start_s ?? null;
+    const end = Math.max(sharedTime, start != null ? start + 0.1 : 0);
+    patchTrim(start, end);
+  }
+  function clearTrim() {
+    patchTrim(null, null);
   }
 
   // -------- Add marker on finalized episode (Phase 4 review workflow) --------
@@ -884,6 +923,26 @@
                 oninput={(e) => seekAll(parseFloat(e.currentTarget.value))}
                 class="w-full accent-(--color-accent)"
               />
+              <!-- Trim overlay (dim the regions outside [trim_start, trim_end]).
+                   Sits above the range slider but visually under the marker band. -->
+              {#if (playEpisode.trim_start_s != null || playEpisode.trim_end_s != null) && maxDuration > 0}
+                {@const ts = playEpisode.trim_start_s ?? 0}
+                {@const te = playEpisode.trim_end_s ?? maxDuration}
+                {@const lPct = (ts / maxDuration) * 100}
+                {@const rPct = 100 - (te / maxDuration) * 100}
+                <div class="pointer-events-none absolute inset-x-0 top-0 h-5 overflow-hidden rounded-sm">
+                  {#if lPct > 0}
+                    <div class="absolute top-0 left-0 h-full bg-black/55" style="width:{lPct}%"></div>
+                  {/if}
+                  {#if rPct > 0}
+                    <div class="absolute top-0 right-0 h-full bg-black/55" style="width:{rPct}%"></div>
+                  {/if}
+                  <!-- Bright tick marks at trim boundaries -->
+                  <div class="absolute top-0 h-full w-[2px] bg-(--color-accent)" style="left:calc({lPct}% - 1px)"></div>
+                  <div class="absolute top-0 h-full w-[2px] bg-(--color-accent)" style="right:calc({rPct}% - 1px)"></div>
+                </div>
+              {/if}
+
               <!-- Marker band: colored segments + event dots overlaid on the timeline.
                    Subtask markers are draggable: left/right ~8px = resize handles,
                    middle = move. Single-click on event/note still seeks. -->
@@ -930,6 +989,36 @@
               <option value={2}>2×</option>
               <option value={4}>4×</option>
             </select>
+          </div>
+
+          <!-- Clip trim controls (non-destructive). Sets meta.trim_start_s /
+               trim_end_s; underlying bag+mp4 untouched, future exports can
+               honor the range. -->
+          <div class="flex items-center gap-2 mt-2 text-[11px]">
+            <span class="text-(--color-text-mute)">クリップ</span>
+            <button onclick={setTrimStart}
+                    class="px-2 py-0.5 rounded border border-(--color-border) text-(--color-text-dim) hover:border-(--color-accent) hover:text-(--color-accent) transition"
+                    title="現在のプレイヘッド位置を開始点に">
+              ✂ ここから ({fmtTimeSec(sharedTime)})
+            </button>
+            <button onclick={setTrimEnd}
+                    class="px-2 py-0.5 rounded border border-(--color-border) text-(--color-text-dim) hover:border-(--color-accent) hover:text-(--color-accent) transition"
+                    title="現在のプレイヘッド位置を終了点に">
+              ここまで ({fmtTimeSec(sharedTime)}) ✂
+            </button>
+            {#if playEpisode.trim_start_s != null || playEpisode.trim_end_s != null}
+              <span class="text-(--color-accent) font-mono">
+                範囲: {fmtTimeSec(playEpisode.trim_start_s ?? 0)} – {fmtTimeSec(playEpisode.trim_end_s ?? maxDuration)}
+                ({(((playEpisode.trim_end_s ?? maxDuration) - (playEpisode.trim_start_s ?? 0))).toFixed(1)}s)
+              </span>
+              <button onclick={clearTrim}
+                      class="ml-auto px-2 py-0.5 rounded text-(--color-text-mute) hover:text-red-400 transition"
+                      title="クリップ範囲をクリア">
+                クリア
+              </button>
+            {:else}
+              <span class="text-(--color-text-mute) ml-auto">未設定 — bag/mp4 は変更されません</span>
+            {/if}
           </div>
         </div>
 

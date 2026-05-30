@@ -80,6 +80,7 @@ def build_app(
     app.router.add_get("/api/v1/episodes", _list_episodes)
     app.router.add_get("/api/v1/episodes/{episode_id}", _get_episode)
     app.router.add_delete("/api/v1/episodes/{episode_id}", _delete_episode)
+    app.router.add_patch("/api/v1/episodes/{episode_id}", _patch_episode)
     app.router.add_get("/api/v1/episodes/{episode_id}/files/{tail:.*}", _episode_file)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints", _episode_joints)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints.csv", _episode_joints_csv)
@@ -776,6 +777,21 @@ async def _episode_file(request: web.Request) -> web.Response:
     if not path.exists() or not path.is_file():
         return web.json_response({"error": "not_found", "path": str(path.relative_to(ep_dir_resolved))}, status=404)
     return web.FileResponse(path)
+
+
+async def _patch_episode(request: web.Request) -> web.Response:
+    """Update a small allow-list of episode fields (trim, task_description,
+    tags, pinned). Used by the play modal's clip / rename / pin actions."""
+    episode_id = request.match_info["episode_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    store: EpisodeStore = request.app["store"]
+    updated = store.patch_episode_meta(episode_id, body)
+    if updated is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    return web.json_response(updated)
 
 
 async def _delete_episode(request: web.Request) -> web.Response:
