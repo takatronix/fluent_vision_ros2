@@ -265,20 +265,51 @@
     }
   }
 
-  // Click on chart background → add an event marker at that time.
-  // Click on a series line → just seek (handled by chart pointermove +
-  // shift-click is reserved for "add note", future).
-  async function addEventAtTime(seconds: number) {
+  // -------- Add marker on finalized episode (Phase 4 review workflow) --------
+  // Opens a small modal so the operator can pick kind / label / start / end.
+  // Defaults: start = current playhead, kind = event, end = start + 3s (subtask).
+  let addMarkerForm = $state<{
+    kind: 'subtask' | 'event' | 'note';
+    label: string;
+    start_s: number;
+    end_s: number;
+  } | null>(null);
+
+  function openAddMarker(defaultKind: 'subtask' | 'event' | 'note' = 'event') {
     if (!playEpisode) return;
-    const label = prompt('イベント名:', '気になる動き');
-    if (!label) return;
+    const s = sharedTime || 0;
+    addMarkerForm = {
+      kind: defaultKind,
+      label: '',
+      start_s: Math.max(0, Math.min(maxDuration, s)),
+      end_s: Math.max(0, Math.min(maxDuration, s + 3)),
+    };
+  }
+
+  async function submitAddMarker() {
+    if (!playEpisode || !addMarkerForm) return;
+    const f = addMarkerForm;
+    if (!f.label.trim()) {
+      alert('ラベルを入力してください');
+      return;
+    }
+    if (f.kind === 'subtask' && f.end_s <= f.start_s) {
+      alert('subtask の終了時刻は開始より後にしてください');
+      return;
+    }
     const epStartMs = new Date(playEpisode.started_at).getTime();
-    const tIso = _isoFromMs(epStartMs + seconds * 1000);
+    const startIso = _isoFromMs(epStartMs + f.start_s * 1000);
+    const stopIso = f.kind === 'subtask' ? _isoFromMs(epStartMs + f.end_s * 1000) : undefined;
     try {
       const r = await fetch(`${API}/episodes/${playEpisode.episode_id}/markers/start`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({task_description: label, kind: 'event', started_at: tIso}),
+        body: JSON.stringify({
+          task_description: f.label.trim(),
+          kind: f.kind,
+          started_at: startIso,
+          ...(stopIso ? {stopped_at: stopIso} : {}),
+        }),
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
@@ -286,8 +317,18 @@
       }
       const m = await r.json();
       playEpisode = { ...playEpisode, markers: [...playEpisode.markers, m] };
+      addMarkerForm = null;
     } catch (e: any) {
-      alert('イベント追加失敗: ' + (e.message || e));
+      alert('マーカー追加失敗: ' + (e.message || e));
+    }
+  }
+
+  // Click on joint chart background → quick-add an event at that time (legacy
+  // fast path; opens the proper modal so the operator can change kind / label).
+  function addEventAtTime(seconds: number) {
+    openAddMarker('event');
+    if (addMarkerForm) {
+      addMarkerForm = { ...addMarkerForm, start_s: seconds, end_s: seconds + 3 };
     }
   }
 
@@ -872,26 +913,32 @@
           </div>
         </div>
 
-        <!-- Marker list (Phase 2 minimum: read + click-to-seek; drag editing is Phase 4) -->
+        <!-- Marker list — read + click-to-seek + per-row "+ 属性" editor.
+             "+ マーカー追加" button always visible (even with zero markers) so
+             post-hoc marker creation is discoverable. -->
+        <div class="shrink-0 mt-3 max-h-40 overflow-auto border-t border-(--color-border) pt-2">
+          <div class="text-[11px] text-(--color-text-mute) mb-1.5 flex items-center gap-3 flex-wrap">
+            <span>マーカー ({playEpisode.markers?.length || 0})</span>
+            <span class="flex items-center gap-1">
+              <span class="inline-block size-2 rounded-sm" style="background:{kindColor('subtask')}"></span>
+              <span>subtask</span>
+            </span>
+            <span class="flex items-center gap-1">
+              <span class="inline-block size-2 rounded-sm" style="background:{kindColor('event')}"></span>
+              <span>event</span>
+            </span>
+            <span class="flex items-center gap-1">
+              <span class="inline-block size-2 rounded-sm" style="background:{kindColor('note')}"></span>
+              <span>note</span>
+            </span>
+            <button onclick={() => openAddMarker('event')}
+                    class="ml-auto px-2 py-0.5 rounded border border-(--color-accent-glow) bg-(--color-accent-soft) text-(--color-accent) hover:brightness-125 transition text-[11px]">
+              + マーカー追加 <span class="opacity-60">({fmtTimeSec(sharedTime)})</span>
+            </button>
+          </div>
         {#if playEpisode.markers && playEpisode.markers.length > 0}
-          <div class="shrink-0 mt-3 max-h-32 overflow-auto border-t border-(--color-border) pt-2">
-            <div class="text-[11px] text-(--color-text-mute) mb-1.5 flex items-center gap-3">
-              <span>マーカー ({playEpisode.markers.length})</span>
-              <span class="flex items-center gap-1">
-                <span class="inline-block size-2 rounded-sm" style="background:{kindColor('subtask')}"></span>
-                <span>subtask</span>
-              </span>
-              <span class="flex items-center gap-1">
-                <span class="inline-block size-2 rounded-sm" style="background:{kindColor('event')}"></span>
-                <span>event</span>
-              </span>
-              <span class="flex items-center gap-1">
-                <span class="inline-block size-2 rounded-sm" style="background:{kindColor('note')}"></span>
-                <span>note</span>
-              </span>
-            </div>
-            <table class="w-full text-xs">
-              <tbody>
+          <table class="w-full text-xs">
+            <tbody>
                 {#each playEpisode.markers as m (m.marker_id)}
                   {@const start = markerOffset(m.started_at)}
                   {@const dur = markerDuration(m)}
@@ -931,11 +978,10 @@
                     </td>
                   </tr>
                 {/each}
-              </tbody>
-            </table>
-          </div>
+            </tbody>
+          </table>
         {/if}
-      {/if}
+        </div>
 
       <!-- Joint angle chart (Phase 3a) — synced playhead, click bg to add event -->
       {#if jointLoading}
@@ -1049,6 +1095,93 @@
 
       <div class="mt-3 text-[10px] text-(--color-text-mute) font-mono shrink-0">
         ID: {playEpisode.episode_id}
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Add marker (post-hoc) modal — pick kind/label/start/end, defaults to playhead -->
+{#if addMarkerForm}
+  <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 backdrop-blur-sm p-4"
+       onclick={(e) => { if (e.target === e.currentTarget) addMarkerForm = null; }}
+       onkeydown={(e) => { if (e.key === 'Escape') addMarkerForm = null; }}
+       role="dialog"
+       tabindex="-1">
+    <div class="card w-full max-w-md p-5">
+      <header class="flex items-start justify-between mb-3">
+        <h2 class="text-base font-semibold text-white">マーカー追加</h2>
+        <button onclick={() => (addMarkerForm = null)} class="text-(--color-text-mute) hover:text-white text-2xl leading-none">×</button>
+      </header>
+
+      <div class="space-y-3">
+        <!-- Kind selector -->
+        <div>
+          <div class="text-[11px] text-(--color-text-mute) mb-1">種類</div>
+          <div class="flex gap-1.5">
+            {#each ['subtask','event','note'] as k}
+              <button
+                onclick={() => (addMarkerForm = {...addMarkerForm!, kind: k as any})}
+                class="flex-1 px-2 py-1.5 rounded text-xs border transition"
+                style="border-color: {addMarkerForm.kind === k ? kindColor(k) : 'rgba(255,255,255,0.1)'}; background: {addMarkerForm.kind === k ? kindColor(k) + '22' : 'transparent'}; color: {addMarkerForm.kind === k ? kindColor(k) : 'rgba(255,255,255,0.6)'}">
+                {k === 'subtask' ? '区間 (subtask)' : k === 'event' ? 'イベント' : 'メモ (note)'}
+              </button>
+            {/each}
+          </div>
+        </div>
+
+        <!-- Label -->
+        <div>
+          <div class="text-[11px] text-(--color-text-mute) mb-1">ラベル</div>
+          <input type="text"
+                 bind:value={addMarkerForm.label}
+                 placeholder={addMarkerForm.kind === 'subtask' ? '採取 / アスパラをカット' : addMarkerForm.kind === 'event' ? '気になる動き / 衝突' : '気づきメモ'}
+                 class="w-full bg-(--color-bg-2) border border-(--color-border) rounded px-3 py-2 text-sm focus:border-(--color-accent-glow) focus:outline-none"
+                 autofocus
+                 onkeydown={(e) => { if (e.key === 'Enter') submitAddMarker(); }} />
+        </div>
+
+        <!-- Time(s) -->
+        <div class="grid {addMarkerForm.kind === 'subtask' ? 'grid-cols-2' : 'grid-cols-1'} gap-2">
+          <div>
+            <div class="text-[11px] text-(--color-text-mute) mb-1">開始 (秒)</div>
+            <input type="number" step="0.1" min="0" max={maxDuration}
+                   bind:value={addMarkerForm.start_s}
+                   class="w-full bg-(--color-bg-2) border border-(--color-border) rounded px-3 py-2 text-sm font-mono focus:border-(--color-accent-glow) focus:outline-none" />
+            <div class="text-[10px] text-(--color-text-mute) mt-1">= {fmtTimeSec(addMarkerForm.start_s)}</div>
+          </div>
+          {#if addMarkerForm.kind === 'subtask'}
+            <div>
+              <div class="text-[11px] text-(--color-text-mute) mb-1">終了 (秒)</div>
+              <input type="number" step="0.1" min="0" max={maxDuration}
+                     bind:value={addMarkerForm.end_s}
+                     class="w-full bg-(--color-bg-2) border border-(--color-border) rounded px-3 py-2 text-sm font-mono focus:border-(--color-accent-glow) focus:outline-none" />
+              <div class="text-[10px] text-(--color-text-mute) mt-1">= {fmtTimeSec(addMarkerForm.end_s)} (長さ {(addMarkerForm.end_s - addMarkerForm.start_s).toFixed(1)}s)</div>
+            </div>
+          {/if}
+        </div>
+
+        <!-- Quick time helpers -->
+        <div class="flex flex-wrap gap-1.5 text-[10px]">
+          <span class="text-(--color-text-mute)">クイック設定:</span>
+          <button class="px-2 py-0.5 rounded border border-(--color-border) hover:border-(--color-accent) text-(--color-text-mute) hover:text-(--color-accent)"
+                  onclick={() => { addMarkerForm = {...addMarkerForm!, start_s: sharedTime, end_s: sharedTime + (addMarkerForm!.end_s - addMarkerForm!.start_s)}; }}>
+            開始を今 ({fmtTimeSec(sharedTime)}) に
+          </button>
+          {#if addMarkerForm.kind === 'subtask'}
+            <button class="px-2 py-0.5 rounded border border-(--color-border) hover:border-(--color-accent) text-(--color-text-mute) hover:text-(--color-accent)"
+                    onclick={() => { addMarkerForm = {...addMarkerForm!, end_s: sharedTime}; }}>
+              終了を今に
+            </button>
+          {/if}
+        </div>
+      </div>
+
+      <div class="mt-5 flex justify-end gap-2">
+        <button onclick={() => (addMarkerForm = null)} class="px-3 py-1.5 text-sm rounded bg-(--color-bg-3) text-(--color-text-dim) hover:text-white">キャンセル</button>
+        <button onclick={submitAddMarker} class="px-4 py-1.5 text-sm rounded font-semibold hover:brightness-110"
+                style="background:{kindColor(addMarkerForm.kind)}; color:#0a0a0f;">
+          追加
+        </button>
       </div>
     </div>
   </div>
