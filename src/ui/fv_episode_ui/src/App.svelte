@@ -965,6 +965,33 @@
     return m?.task_description || replayState.episode_id.slice(-8);
   });
 
+  async function startBagPlayRow(ep: Episode, e: MouseEvent, speed: number = 1.0) {
+    e.stopPropagation();
+    if (replayState?.running) {
+      alert('既に bag_play 実行中です (停止後に再試行)');
+      return;
+    }
+    const profile = ep.profile || '';
+    const simWarning = profile.endsWith('_sim')
+      ? `${profile} (sim) で再走行します。`
+      : `⚠ ${profile} は実機 profile の可能性 — 安全 gate 未実装 (Phase 3c)。ロボットが記録通り動きます。`;
+    if (!confirm(`bag_play モード\n\n  ${ep.task_description || '(no task)'}\n  ${simWarning}\n  速度: ${speed}x\n\n他の teleop / mux source を停止しておくこと。`)) return;
+    try {
+      const r = await fetch(`${API}/episodes/${ep.episode_id}/replay`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mode: 'bag_play', speed}),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || err.error || `HTTP ${r.status}`);
+      }
+      replayState = await r.json();
+    } catch (err: any) {
+      alert('bag_play 開始失敗: ' + (err.message || err));
+    }
+  }
+
   async function togglePin(ep: Episode, e: MouseEvent) {
     e.stopPropagation();
     const next = !ep.pinned;
@@ -1456,6 +1483,13 @@
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{fmtBytes(ep.size_bytes)}</td>
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{ep.marker_count}</td>
                 <td class="px-2 py-2.5 text-right whitespace-nowrap">
+                  <button
+                    onclick={(e) => startBagPlayRow(ep, e, 1.0)}
+                    disabled={!!replayState?.running}
+                    class="opacity-0 group-hover:opacity-100 text-(--color-text-mute) hover:text-amber-300 disabled:opacity-30 disabled:cursor-not-allowed transition p-1 rounded hover:bg-amber-500/10 mr-1"
+                    title="🎬 bag_play 1×で再走行 (sim 推奨 — safety gate 未実装)">
+                    🎬
+                  </button>
                   <button
                     onclick={(e) => togglePin(ep, e)}
                     class="{ep.pinned ? 'opacity-100 text-amber-400' : 'opacity-0 group-hover:opacity-100 text-(--color-text-mute)'} hover:text-amber-400 transition p-1 rounded hover:bg-amber-500/10 mr-1"

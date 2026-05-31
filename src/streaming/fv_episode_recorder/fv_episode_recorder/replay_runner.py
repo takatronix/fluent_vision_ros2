@@ -104,7 +104,18 @@ class ReplayRunner:
         )
 
         # Build ros2 bag play command.
-        cmd = ["ros2", "bag", "play", str(bag_dir), "--rate", f"{state.speed:.3f}"]
+        # `--clock 100` publishes /clock at 100Hz so time-aware subscribers
+        # (mujoco bridge, anything using ros::Time::now) stay in lockstep with
+        # the bag's timeline → less jitter perceived on the replay.
+        # `--read-ahead-queue-size 10000` (default 1000) keeps the publisher
+        # ahead enough to absorb decode hiccups, especially for large mp4
+        # interleaved bags.
+        cmd = [
+            "ros2", "bag", "play", str(bag_dir),
+            "--rate", f"{state.speed:.3f}",
+            "--clock", "100",
+            "--read-ahead-queue-size", "10000",
+        ]
         if state.start_offset_s > 0:
             cmd.extend(["--start-offset", f"{state.start_offset_s:.3f}"])
 
