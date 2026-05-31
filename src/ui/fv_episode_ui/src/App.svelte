@@ -717,6 +717,32 @@
     return rows;
   });
 
+  let bulkDeleteProgress = $state<{ total: number; done: number; failed: number } | null>(null);
+  async function deleteAllEpisodes() {
+    const targets = episodes.filter(e => !e.pinned && e.state !== 'recording');
+    if (targets.length === 0) {
+      alert('削除対象なし (録画中・pinned を除く)');
+      return;
+    }
+    const totalBytes = targets.reduce((s, e) => s + (e.size_bytes || 0), 0);
+    // Two-step confirm so a stray click doesn't nuke everything.
+    if (!confirm(`【全削除】 ${targets.length} 件のエピソード (${fmtBytes(totalBytes)}) を削除します。\n\npinned エピソードは保護されます。録画中エピソードも対象外。\nこの操作は取り消せません。`)) return;
+    if (!confirm(`本当にすべて削除しますか？\n(${targets.length} 件 / ${fmtBytes(totalBytes)})`)) return;
+    bulkDeleteProgress = { total: targets.length, done: 0, failed: 0 };
+    for (const ep of targets) {
+      try {
+        const r = await fetch(`${API}/episodes/${ep.episode_id}`, { method: 'DELETE' });
+        if (r.ok) bulkDeleteProgress.done++; else bulkDeleteProgress.failed++;
+      } catch { bulkDeleteProgress.failed++; }
+      bulkDeleteProgress = { ...bulkDeleteProgress };
+    }
+    const removed = bulkDeleteProgress.done;
+    const failed = bulkDeleteProgress.failed;
+    bulkDeleteProgress = null;
+    await load();
+    alert(`完了: ${removed} 件削除 / ${failed} 件失敗`);
+  }
+
   async function deleteBatch(batchId: string, eps: Episode[], e: MouseEvent) {
     e.stopPropagation();
     const totalBytes = eps.reduce((s, x) => s + (x.size_bytes || 0), 0);
@@ -821,6 +847,20 @@
                       class="w-full px-3 py-1.5 rounded text-(--color-text-mute) hover:text-amber-400 transition text-[11px]">
                 設定を初期化
               </button>
+            </div>
+            <div class="border-t border-red-500/30 pt-3 mt-1">
+              <div class="text-[10px] text-red-400/70 mb-1.5">⚠ 危険ゾーン</div>
+              <button onclick={() => { settingsOpen = false; deleteAllEpisodes(); }}
+                      class="w-full px-3 py-1.5 rounded bg-red-500/15 border border-red-500/40 text-red-300 hover:bg-red-500/25 transition text-xs"
+                      disabled={bulkDeleteProgress !== null}>
+                🗑 全ての録画を削除 (pinned 除く)
+              </button>
+              {#if bulkDeleteProgress}
+                <div class="text-[10px] text-(--color-text-mute) mt-1 font-mono">
+                  削除中… {bulkDeleteProgress.done + bulkDeleteProgress.failed}/{bulkDeleteProgress.total}
+                  {#if bulkDeleteProgress.failed > 0}<span class="text-red-400">(失敗 {bulkDeleteProgress.failed})</span>{/if}
+                </div>
+              {/if}
             </div>
             <div class="text-[10px] text-(--color-text-mute) pt-2 border-t border-(--color-border)">
               fv_episode_ui v0.1.0 · API: <code class="text-(--color-accent)">{API}</code>
