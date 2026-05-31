@@ -22,6 +22,7 @@ from aiohttp import web
 
 from .active_lock import ActiveLock
 from .batch_runner import BatchConfig, BatchRunner
+from .replay_runner import ReplayRunner
 from .bag_recorder import BagRecorder
 from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeMeta, EpisodeStore, new_episode_id, utc_now_iso
@@ -73,6 +74,7 @@ def build_app(
     app["mux_tracker"] = mux_tracker
     app["batch_runner"] = BatchRunner()
     app["retention_runner"] = retention_runner
+    app["replay_runner"] = ReplayRunner()
     app["bag_recorder"] = bag_recorder
     app["camera_pool"] = camera_pool
     app["active_lock"] = active_lock
@@ -103,6 +105,10 @@ def build_app(
     app.router.add_post("/api/v1/retention/run", _retention_run)
     app.router.add_get("/api/v1/retention/policy", _retention_get_policy)
     app.router.add_put("/api/v1/retention/policy", _retention_put_policy)
+    # Replay — Phase 3b/3c minimum (sim only, no safety gate yet)
+    app.router.add_post("/api/v1/episodes/{episode_id}/replay", _replay_start)
+    app.router.add_get("/api/v1/replay/status", _replay_status)
+    app.router.add_post("/api/v1/replay/stop", _replay_stop)
     app.router.add_get("/api/v1/episodes/{episode_id}/download.tar", _episode_download_tar)
     app.router.add_get("/api/v1/disk/status", _disk_status)
 
@@ -1081,6 +1087,108 @@ async def _retention_run(request: web.Request) -> web.Response:
     loop = asyncio.get_running_loop()
     summary = await loop.run_in_executor(None, lambda: runner.tick(dry_run=dry_run, policy=override))
     return web.json_response(summary)
+
+
+async def _replay_start(request: web.Request) -> web.Response:
+    """Phase 3b/3c MVP — spawns `ros2 bag play <bag_dir>` so the recorded
+    joint_cmd / tf / mux topics get republished. Downstream subscribers
+    (mujoco arm in sim, or inference_bridge in policy_feed mode) pick the
+    messages up as if live.
+
+    Body:
+      mode: "bag_play" (default) | "preview" | "policy_feed"
+      speed: 0.1..4.0 (default 1.0)
+      start_offset_s: float (default 0)
+      duration_s: float (optional — SIGINT bag play at this elapsed time)
+      marker_id: str (optional — resolves to start_offset_s from marker.started_at)
+
+    SAFETY: no physical safety gate in this MVP. Caller is expected to ensure
+    sim profile / mux is configured for bag_replay source. Phase 3c will add
+    person/home_pose/e-stop precheck + ack token before real-hardware mode.
+    """
+    from datetime import datetime, timezone
+    store: EpisodeStore = request.app["store"]
+    episode_id = request.match_info["episode_id"]
+    found = store.get_episode(episode_id)
+    if found is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    meta, ep_dir = found
+    bag_dir = ep_dir / "bag"
+    if not bag_dir.exists() or not (bag_dir / "metadata.yaml").exists():
+        return web.json_response({"error": "no_bag", "detail": f"missing bag at {bag_dir}"}, status=400)
+
+    runner: ReplayRunner = request.app["replay_runner"]
+    if runner.is_running():
+        return web.json_response(
+            {"error": "replay_busy", "current": runner.state.to_dict() if runner.state else None},
+            status=409,
+        )
+    # Refuse concurrent record + replay so the runners don't fight over /tf
+    # and joint_cmd topics (and so the operator doesn't accidentally record
+    # the replay).
+    if store.active is not None:
+        return web.json_response(
+            {"error": "recording_active",
+             "detail": "stop the active recording before starting a replay"},
+            status=409,
+        )
+
+    try:
+        body = await request.json() if request.can_read_body else {}
+    except Exception:
+        body = {}
+
+    mode = body.get("mode") or "bag_play"
+    speed = float(body.get("speed", 1.0))
+    start_offset_s = float(body.get("start_offset_s", 0.0))
+    duration_s = body.get("duration_s")
+    if duration_s is not None:
+        duration_s = float(duration_s)
+
+    # Resolve marker_id → start_offset_s / duration_s if provided.
+    marker_id = body.get("marker_id")
+    if marker_id:
+        for m in (meta.markers or []):
+            if m.get("marker_id") == marker_id:
+                try:
+                    ep_start = datetime.strptime(meta.started_at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+                    m_start = datetime.strptime(m["started_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+                    start_offset_s = max(0.0, (m_start - ep_start).total_seconds())
+                    if m.get("stopped_at"):
+                        m_stop = datetime.strptime(m["stopped_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+                        duration_s = (m_stop - m_start).total_seconds()
+                except Exception as exc:
+                    return web.json_response(
+                        {"error": "marker_time_parse_failed", "detail": str(exc)}, status=400)
+                break
+
+    try:
+        state = await runner.start(
+            episode_id=episode_id,
+            bag_dir=bag_dir,
+            speed=speed,
+            start_offset_s=start_offset_s,
+            duration_s=duration_s,
+            mode=mode,
+        )
+    except (RuntimeError, FileNotFoundError) as exc:
+        return web.json_response({"error": "replay_start_failed", "detail": str(exc)}, status=500)
+    return web.json_response(state.to_dict(), status=202)
+
+
+async def _replay_status(request: web.Request) -> web.Response:
+    runner: ReplayRunner = request.app["replay_runner"]
+    if runner.state is None:
+        return web.json_response({"phase": "idle"})
+    return web.json_response(runner.state.to_dict())
+
+
+async def _replay_stop(request: web.Request) -> web.Response:
+    runner: ReplayRunner = request.app["replay_runner"]
+    if not runner.is_running():
+        return web.json_response({"error": "no_replay_running"}, status=404)
+    await runner.stop()
+    return web.json_response({"stopping": True, "state": runner.state.to_dict() if runner.state else None})
 
 
 async def _retention_get_policy(request: web.Request) -> web.Response:

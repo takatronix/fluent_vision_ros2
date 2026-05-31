@@ -890,6 +890,72 @@
     if (failed > 0) alert(`削除: ${removed} 件成功 / ${failed} 件失敗`);
   }
 
+  // ---- Bag replay (Phase 3b/3c MVP — sim only, no safety gate) ----
+  type ReplayState = {
+    replay_id: string;
+    episode_id: string;
+    mode: string;
+    started_at: number;
+    finished_at: number | null;
+    exit_code: number | null;
+    last_error: string | null;
+    pid: number | null;
+    speed: number;
+    start_offset_s: number;
+    duration_s: number | null;
+    running: boolean;
+  };
+  let replayState = $state<ReplayState | null>(null);
+  let replayBusy = $state(false);
+
+  async function refreshReplayStatus() {
+    try {
+      const r = await fetch(`${API}/replay/status`);
+      if (r.ok) {
+        const d = await r.json();
+        replayState = (d && d.replay_id) ? d as ReplayState : null;
+      }
+    } catch {}
+  }
+  async function startBagPlay(speed: number = 1.0) {
+    if (!playEpisode) return;
+    const profile = playEpisode.profile || '';
+    const simWarning = profile.endsWith('_sim')
+      ? `${profile} (sim) で再走行します。`
+      : `⚠ ${profile} は実機 profile の可能性があります。安全 gate 未実装 (Phase 3c) — ロボットがバッグの記録通りに動きます。本当に続けますか？`;
+    if (!confirm(`bag_play モード\n\n  ${simWarning}\n  速度: ${speed}x\n  duration: 全長\n\n他の teleop / mux source を停止しておくこと。`)) return;
+    replayBusy = true;
+    try {
+      const r = await fetch(`${API}/episodes/${playEpisode.episode_id}/replay`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mode: 'bag_play', speed}),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || err.error || `HTTP ${r.status}`);
+      }
+      replayState = await r.json();
+    } catch (e: any) {
+      alert('bag_play 開始失敗: ' + (e.message || e));
+    } finally { replayBusy = false; }
+  }
+  async function stopReplay() {
+    if (!replayState?.running) return;
+    replayBusy = true;
+    try {
+      await fetch(`${API}/replay/stop`, {method: 'POST'});
+      await refreshReplayStatus();
+    } finally { replayBusy = false; }
+  }
+  // Poll replay status while play modal is open + replay is active.
+  $effect(() => {
+    if (!playEpisode) { replayState = null; return; }
+    refreshReplayStatus();
+    const t = window.setInterval(refreshReplayStatus, 1000);
+    return () => clearInterval(t);
+  });
+
   async function togglePin(ep: Episode, e: MouseEvent) {
     e.stopPropagation();
     const next = !ep.pinned;
@@ -1414,14 +1480,42 @@
     role="dialog"
     tabindex="-1">
     <div class="card w-full max-w-6xl p-5 flex flex-col" style="max-height: 92vh;">
-      <header class="flex items-start justify-between mb-3 shrink-0">
-        <div>
-          <h2 class="text-lg font-semibold text-white">{playEpisode.task_description}</h2>
+      <header class="flex items-start justify-between mb-3 shrink-0 gap-3">
+        <div class="min-w-0 flex-1">
+          <h2 class="text-lg font-semibold text-white truncate">{playEpisode.task_description}</h2>
           <p class="text-xs text-(--color-text-mute) mt-1">
             {playEpisode.profile} · {fmtDuration(playEpisode.duration_s)} · {playEpisode.cameras.length} カメラ
           </p>
         </div>
-        <button onclick={closePlay} class="text-(--color-text-mute) hover:text-white text-2xl leading-none">×</button>
+        <!-- bag_play controls (Phase 3b/3c MVP) — sim only, no physical safety -->
+        <div class="flex items-center gap-1.5">
+          {#if replayState?.running}
+            <span class="text-[10px] text-red-400 font-mono flex items-center gap-1">
+              <span class="size-2 rounded-full bg-red-500" style="animation: rec-pulse 1.4s ease-in-out infinite"></span>
+              REPLAY {replayState.speed}×
+            </span>
+            <button onclick={stopReplay} disabled={replayBusy}
+                    class="px-2 py-1 rounded bg-red-500/15 border border-red-500/40 text-red-300 hover:bg-red-500/25 transition text-xs">
+              ⏹ 停止
+            </button>
+          {:else}
+            <button onclick={() => startBagPlay(1.0)} disabled={replayBusy}
+                    class="px-2 py-1 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 transition text-xs"
+                    title="ros2 bag play で記録 topic を再 publish → mujoco / 実機の subscriber が動作 (safety gate 未実装, sim 推奨)">
+              🎬 bag再走行
+            </button>
+            <select onchange={(e) => startBagPlay(parseFloat(e.currentTarget.value))} disabled={replayBusy}
+                    class="text-[10px] bg-(--color-bg-2) border border-(--color-border) rounded px-1 py-1"
+                    title="速度を変えて bag_play 開始">
+              <option value="" disabled selected>速度</option>
+              <option value="0.5">0.5×</option>
+              <option value="1.0">1.0×</option>
+              <option value="2.0">2.0×</option>
+              <option value="4.0">4.0×</option>
+            </select>
+          {/if}
+        </div>
+        <button onclick={closePlay} class="text-(--color-text-mute) hover:text-white text-2xl leading-none shrink-0">×</button>
       </header>
 
       {#if playEpisode.cameras.length === 0}
