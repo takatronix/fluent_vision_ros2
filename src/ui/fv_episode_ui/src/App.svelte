@@ -817,6 +817,30 @@
     if (failed > 0) alert(`削除: ${removed} 件成功 / ${failed} 件失敗`);
   }
 
+  async function togglePin(ep: Episode, e: MouseEvent) {
+    e.stopPropagation();
+    const next = !ep.pinned;
+    try {
+      const r = await fetch(`${API}/episodes/${ep.episode_id}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({pinned: next}),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${r.status}`);
+      }
+      // Optimistic local update so the icon flips without waiting for poll.
+      const idx = episodes.findIndex(x => x.episode_id === ep.episode_id);
+      if (idx >= 0) {
+        episodes[idx] = { ...episodes[idx], pinned: next };
+        episodes = [...episodes];
+      }
+    } catch (err: any) {
+      alert('pin 切替失敗: ' + (err.message || err));
+    }
+  }
+
   async function deleteEpisode(ep: Episode, e: MouseEvent) {
     e.stopPropagation();
     const label = ep.task_description || ep.episode_id.slice(-8);
@@ -1257,6 +1281,12 @@
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{fmtBytes(ep.size_bytes)}</td>
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{ep.marker_count}</td>
                 <td class="px-2 py-2.5 text-right whitespace-nowrap">
+                  <button
+                    onclick={(e) => togglePin(ep, e)}
+                    class="{ep.pinned ? 'opacity-100 text-amber-400' : 'opacity-0 group-hover:opacity-100 text-(--color-text-mute)'} hover:text-amber-400 transition p-1 rounded hover:bg-amber-500/10 mr-1"
+                    title={ep.pinned ? '📌 pinned — クリックで解除 (retention 保護解除)' : 'pin (retention から保護)'}>
+                    <Pin class="size-4" />
+                  </button>
                   <a
                     href={`${API}/episodes/${ep.episode_id}/download.tar`}
                     onclick={(e) => e.stopPropagation()}
