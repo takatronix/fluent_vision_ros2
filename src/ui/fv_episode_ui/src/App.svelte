@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { Search, RefreshCw, Pin, Trash2, HardDrive, ArrowUp, ArrowDown, Download } from 'lucide-svelte';
+  import { Search, RefreshCw, Pin, Trash2, HardDrive, ArrowUp, ArrowDown, Download, Settings } from 'lucide-svelte';
 
   type Episode = {
     episode_id: string;
@@ -607,6 +607,30 @@
   let expandedBatches = $state<Set<string>>(new Set());
   let groupBatches = $state(true);  // toggle to disable grouping
 
+  // ---- Settings (⚙ popover) ----
+  let settingsOpen = $state(false);
+  let pollIntervalS = $state(5);   // auto-refresh seconds; 0 = off
+  let confirmDelete = $state(true);
+  // Persist across sessions so the operator's preferences survive reload.
+  try {
+    const saved = JSON.parse(localStorage.getItem('fv_episode_ui.settings') || '{}');
+    if (typeof saved.pollIntervalS === 'number') pollIntervalS = saved.pollIntervalS;
+    if (typeof saved.confirmDelete === 'boolean') confirmDelete = saved.confirmDelete;
+    if (typeof saved.groupBatches === 'boolean') groupBatches = saved.groupBatches;
+  } catch {}
+  $effect(() => {
+    try {
+      localStorage.setItem('fv_episode_ui.settings', JSON.stringify({
+        pollIntervalS, confirmDelete, groupBatches,
+      }));
+    } catch {}
+    // Re-arm the poll timer when interval changes.
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (pollIntervalS > 0) {
+      pollTimer = window.setInterval(load, pollIntervalS * 1000);
+    }
+  });
+
   function batchTagOf(ep: Episode): string | null {
     const t = ep.tags?.find(tag => tag.startsWith('batch:'));
     return t ? t.slice(6) : null;
@@ -697,7 +721,7 @@
     e.stopPropagation();
     const totalBytes = eps.reduce((s, x) => s + (x.size_bytes || 0), 0);
     const label = (eps[0]?.task_description || '').replace(/\s+#\d+\/\d+$/, '');
-    if (!confirm(`バッチ全体を削除しますか？\n\n  タスク: ${label}\n  本数: ${eps.length}\n  合計: ${fmtBytes(totalBytes)}\n\nこの操作は取り消せません。`)) return;
+    if (confirmDelete && !confirm(`バッチ全体を削除しますか？\n\n  タスク: ${label}\n  本数: ${eps.length}\n  合計: ${fmtBytes(totalBytes)}\n\nこの操作は取り消せません。`)) return;
     let removed = 0, failed = 0;
     for (const ep of eps) {
       try {
@@ -714,7 +738,7 @@
   async function deleteEpisode(ep: Episode, e: MouseEvent) {
     e.stopPropagation();
     const label = ep.task_description || ep.episode_id.slice(-8);
-    if (!confirm(`削除しますか？\n\n  タスク: ${label}\n  サイズ: ${fmtBytes(ep.size_bytes)}\n\nこの操作は取り消せません。`)) return;
+    if (confirmDelete && !confirm(`削除しますか？\n\n  タスク: ${label}\n  サイズ: ${fmtBytes(ep.size_bytes)}\n\nこの操作は取り消せません。`)) return;
     try {
       const res = await fetch(`${API}/episodes/${ep.episode_id}${ep.pinned ? '?force=true' : ''}`, { method: 'DELETE' });
       if (!res.ok) {
@@ -729,7 +753,7 @@
 
   onMount(() => {
     load();
-    pollTimer = window.setInterval(load, 5000);
+    // $effect (above) arms the poll timer from pollIntervalS — no double-arming here.
   });
   onDestroy(() => { if (pollTimer) clearInterval(pollTimer); });
 </script>
@@ -744,12 +768,67 @@
         {#if activeProfile} · <span class="text-(--color-accent)">profile: {activeProfile}</span>{/if}
       </p>
     </div>
-    <button
-      onclick={load}
-      class="flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg bg-(--color-accent-soft) border border-(--color-accent-glow) text-(--color-accent) hover:bg-[color-mix(in_oklch,_var(--color-accent-soft),_white_5%)] transition">
-      <RefreshCw class="size-4 {loading ? 'animate-spin' : ''}" />
-      更新
-    </button>
+    <div class="flex items-center gap-2 relative">
+      <!-- Live indicator (spinning while polling) replaces the manual button -->
+      <div class="flex items-center gap-1.5 text-[11px] text-(--color-text-mute)" title="自動更新中">
+        <RefreshCw class="size-3 {loading ? 'animate-spin text-(--color-accent)' : ''}" />
+        {#if pollIntervalS > 0}<span>{pollIntervalS}s 毎</span>{:else}<span>off</span>{/if}
+      </div>
+      <button
+        onclick={() => (settingsOpen = !settingsOpen)}
+        class="flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg bg-(--color-bg-2) border border-(--color-border) text-(--color-text-dim) hover:text-(--color-accent) hover:border-(--color-accent-glow) transition"
+        title="設定">
+        <Settings class="size-4 {settingsOpen ? 'rotate-45' : ''} transition-transform" />
+        設定
+      </button>
+      {#if settingsOpen}
+        <div class="absolute right-0 top-full mt-2 w-72 z-50 card p-4 shadow-2xl"
+             onclick={(e) => e.stopPropagation()}
+             role="dialog">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-white">設定</h3>
+            <button onclick={() => (settingsOpen = false)} class="text-(--color-text-mute) hover:text-white text-xl leading-none">×</button>
+          </div>
+          <div class="space-y-3 text-xs">
+            <label class="flex flex-col gap-1">
+              <span class="text-(--color-text-dim)">自動更新</span>
+              <select bind:value={pollIntervalS} class="bg-(--color-bg-2) border border-(--color-border) rounded px-2 py-1.5 text-(--color-text)">
+                <option value={0}>off (手動のみ)</option>
+                <option value={2}>2 秒</option>
+                <option value={5}>5 秒 (推奨)</option>
+                <option value={10}>10 秒</option>
+                <option value={30}>30 秒</option>
+                <option value={60}>1 分</option>
+              </select>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" bind:checked={groupBatches} class="accent-(--color-accent)" />
+              <span>🔁 バッチを折り畳む</span>
+            </label>
+            <label class="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" bind:checked={confirmDelete} class="accent-(--color-accent)" />
+              <span>削除前に確認ダイアログ</span>
+            </label>
+            <div class="border-t border-(--color-border) pt-3 space-y-2">
+              <button onclick={() => { load(); }} class="w-full px-3 py-1.5 rounded bg-(--color-accent-soft) text-(--color-accent) border border-(--color-accent-glow) hover:brightness-125 transition">
+                ↻ 今すぐ更新
+              </button>
+              <button onclick={() => { expandedBatches = new Set(); }}
+                      class="w-full px-3 py-1.5 rounded bg-(--color-bg-2) border border-(--color-border) text-(--color-text-dim) hover:text-white transition">
+                バッチを全部畳む
+              </button>
+              <button onclick={() => { localStorage.removeItem('fv_episode_ui.settings'); pollIntervalS = 5; confirmDelete = true; groupBatches = true; }}
+                      class="w-full px-3 py-1.5 rounded text-(--color-text-mute) hover:text-amber-400 transition text-[11px]">
+                設定を初期化
+              </button>
+            </div>
+            <div class="text-[10px] text-(--color-text-mute) pt-2 border-t border-(--color-border)">
+              fv_episode_ui v0.1.0 · API: <code class="text-(--color-accent)">{API}</code>
+            </div>
+          </div>
+        </div>
+      {/if}
+    </div>
   </header>
 
   <!-- Disk summary card -->
@@ -832,21 +911,15 @@
     </section>
   {/if}
 
-  <!-- Search bar + grouping toggle -->
-  <div class="mb-3 flex gap-2 items-center">
-    <div class="relative flex-1">
-      <Search class="size-4 absolute left-3 top-1/2 -translate-y-1/2 text-(--color-text-mute)" />
-      <input
-        type="text"
-        bind:value={query}
-        placeholder="タスク名 / タグで検索…"
-        class="w-full pl-9 pr-4 py-2 rounded-lg bg-(--color-bg-2) border border-(--color-border) text-sm placeholder:text-(--color-text-mute) focus:border-(--color-accent-glow) focus:outline-none transition"
-      />
-    </div>
-    <label class="flex items-center gap-1.5 text-xs text-(--color-text-dim) px-3 py-2 rounded-lg bg-(--color-bg-2) border border-(--color-border) cursor-pointer hover:border-(--color-accent-glow) transition whitespace-nowrap">
-      <input type="checkbox" bind:checked={groupBatches} class="accent-(--color-accent)" />
-      🔁 バッチ折り畳み
-    </label>
+  <!-- Search bar (grouping toggle moved to ⚙ 設定) -->
+  <div class="mb-3 relative">
+    <Search class="size-4 absolute left-3 top-1/2 -translate-y-1/2 text-(--color-text-mute)" />
+    <input
+      type="text"
+      bind:value={query}
+      placeholder="タスク名 / タグで検索…"
+      class="w-full pl-9 pr-4 py-2 rounded-lg bg-(--color-bg-2) border border-(--color-border) text-sm placeholder:text-(--color-text-mute) focus:border-(--color-accent-glow) focus:outline-none transition"
+    />
   </div>
 
   <!-- Episodes table -->
