@@ -33,6 +33,7 @@ from .active_lock import ActiveLock
 from .api_server import build_app
 from .bag_recorder import BagRecorder
 from .camera_writer import CameraWriterPool
+from .depth_republisher import DepthRepublisherPool
 from .episode_store import EpisodeStore
 from .marker_manager import MarkerManager
 from .mux_tracker import MuxTracker
@@ -75,6 +76,10 @@ class FVEpisodeRecorderNode(Node):
             self.get_logger().warning(f"episode index consistency check failed: {exc}")
         self.bag_recorder = BagRecorder(max_bag_size_mb=1024)
         self.camera_pool = CameraWriterPool(node=self)
+        # Depth republisher: compresses raw 16UC1 → CompressedImage (png) so
+        # the bag stores depth at ~5-10× smaller size losslessly. Lifecycle
+        # bound to the active episode (start_all / stop_all).
+        self.depth_pool = DepthRepublisherPool(node=self)
         self.active_lock = ActiveLock(self.output_dir)
         self.marker_manager = MarkerManager()
         # Track mux source (teleop vs VLA + controller name) so the play
@@ -201,6 +206,7 @@ def main(args=None):
                     marker_manager=node.marker_manager,
                     mux_tracker=node.mux_tracker,
                     retention_runner=node.retention_runner,
+                    depth_pool=node.depth_pool,
                     get_profile=node.get_profile)
     # First mux discovery sweep happens on the 2s timer; trigger one now so
     # the very first POST /episodes already has a snapshot if publishers

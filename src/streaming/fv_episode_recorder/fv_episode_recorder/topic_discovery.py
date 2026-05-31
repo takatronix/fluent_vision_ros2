@@ -118,7 +118,21 @@ def discover_topics(profile: dict[str, Any]) -> list[dict[str, Any]]:
                 qos=t.get("qos", "default"),
                 stamp_source=t.get("stamp_source", "rosbag_recv"))
     if er.get("record_topics_override"):
-        # If profile says "use exactly this list", skip discovery
+        # If profile says "use exactly this list", skip arm/teleop/lerobot
+        # discovery — but STILL append depth cameras (kind=depth) since they
+        # live under the cameras: block, and ALWAYS_INCLUDE (tf/markers).
+        # Depth is recorded via the compressedDepth image_transport plugin
+        # (lossless rvl/png ~5-10× compression) — recorder spawns a republisher
+        # so we record the <topic>_compressed/compressedDepth topic, not raw.
+        for c in er.get("cameras") or []:
+            if not isinstance(c, dict) or (c.get("kind") or "").lower() != "depth":
+                continue
+            t = c.get("topic")
+            if t:
+                compressed = f"{t.rstrip('/')}_compressed/compressedDepth"
+                add(compressed, role="camera_depth_compressed", qos="best_effort",
+                    stamp_source="message_header",
+                    msg_type="sensor_msgs/msg/CompressedImage")
         return discovered + [d for d in ALWAYS_INCLUDE if d["topic"] not in seen]
 
     # arm streams (Piper / daihen / SO101)
@@ -171,6 +185,21 @@ def discover_topics(profile: dict[str, Any]) -> list[dict[str, Any]]:
                         qos=ent.get("qos", "reliable"), msg_type=ent.get("type"))
                 elif isinstance(ent, str):
                     add(ent, role="command", qos="reliable")
+
+    # Depth cameras → bag, recorded as CompressedImage via the
+    # compressed_depth_image_transport plugin (lossless rvl/png 5-10×). The
+    # recorder spawns `ros2 run image_transport republish` per depth camera
+    # at episode start to feed the compressed topic that we record here.
+    for c in er.get("cameras") or []:
+        if not isinstance(c, dict) or (c.get("kind") or "").lower() != "depth":
+            continue
+        t = c.get("topic")
+        if not t:
+            continue
+        compressed = f"{t.rstrip('/')}_compressed/compressedDepth"
+        add(compressed, role="camera_depth_compressed", qos="best_effort",
+            stamp_source="message_header",
+            msg_type="sensor_msgs/msg/CompressedImage")
 
     # always include tf, tf_static, /episode/markers
     for d in ALWAYS_INCLUDE:

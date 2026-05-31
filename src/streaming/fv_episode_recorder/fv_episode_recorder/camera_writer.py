@@ -371,36 +371,59 @@ class CameraWriterPool:
     def __init__(self, node: Node):
         self._node = node
         self._writers: dict[str, CameraWriter | DepthCameraWriter] = {}
+        # Depth cameras don't have a writer (they go into the bag) but the
+        # play modal still needs them in cameras[]. Stored here so stop_all
+        # can re-emit the placeholders alongside the real writers' summaries.
+        self._depth_placeholders: list[dict] = []
 
     def start_all(self, episode_dir: Path, cameras: list[dict], fps: int = 30) -> list[dict]:
-        """cameras: [{name, topic, kind?, codec?}, ...]. kind="depth" routes
-        to DepthCameraWriter (16-bit PNG sidecar); anything else uses the
-        normal H.264 mp4 path. Returns initial summary list."""
+        """cameras: [{name, topic, kind?, codec?}, ...]. Color cameras get a
+        CameraWriter (H.264 mp4); depth cameras (kind="depth") are now
+        recorded into the rosbag2 sqlite instead — this method just emits a
+        placeholder summary so the play modal still knows the depth track
+        exists (preview reads from bag via /depth_preview endpoint). The
+        topic is appended to bag_topics by topic_discovery."""
         videos_root = episode_dir / "videos"
         videos_root.mkdir(exist_ok=True)
+        self._depth_placeholders = []
         for cam in cameras:
             name = cam["name"]
             topic = cam["topic"]
             kind = (cam.get("kind") or "color").lower()
-            cam_dir = videos_root / name
             if kind == "depth":
-                writer: CameraWriter | DepthCameraWriter = DepthCameraWriter(
-                    name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
-                )
-            else:
-                writer = CameraWriter(
-                    name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
-                )
+                # No on-disk writer — depth lives in the bag. Synthesize a
+                # summary entry so the UI shows the depth thumbnail and can
+                # pull preview frames from /depth_preview/{cam}/{frame_idx}.
+                self._depth_placeholders.append({
+                    "name": name,
+                    "topic": topic,
+                    "kind": "depth_bag",
+                    "video_dir": None,
+                    "sidecar_file": None,
+                    "segments": [],
+                    "frame_count": 0,         # filled in at stop from bag
+                    "width": 0, "height": 0,
+                    "fps_actual": 0.0,
+                    "fps_nominal": fps,
+                })
+                continue
+            cam_dir = videos_root / name
+            writer = CameraWriter(
+                name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
+            )
             writer.start()
             self._writers[name] = writer
-        return [w.summary() for w in self._writers.values()]
+        return [w.summary() for w in self._writers.values()] + self._depth_placeholders
 
     def stop_all(self) -> list[dict]:
         summaries = []
         for name, writer in list(self._writers.items()):
             summaries.append(writer.stop())
         self._writers.clear()
-        return summaries
+        # Re-emit depth placeholders so meta.cameras keeps them.
+        out = summaries + list(self._depth_placeholders)
+        self._depth_placeholders = []
+        return out
 
     def is_active(self) -> bool:
         return bool(self._writers)

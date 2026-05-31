@@ -67,6 +67,7 @@ def build_app(
     marker_manager: Optional[MarkerManager] = None,
     mux_tracker=None,  # MuxTracker — used to label each ep VLA vs teleop
     retention_runner=None,  # RetentionRunner — exposes plan/tick via /retention/*
+    depth_pool=None,  # DepthRepublisherPool — compress raw depth to bag
     get_profile=None,  # callable: name -> dict; None = no profile lookup (override only)
 ) -> web.Application:
     app = web.Application(middlewares=[_cors_middleware])
@@ -75,6 +76,7 @@ def build_app(
     app["batch_runner"] = BatchRunner()
     app["retention_runner"] = retention_runner
     app["replay_runner"] = ReplayRunner()
+    app["depth_pool"] = depth_pool
     app["bag_recorder"] = bag_recorder
     app["camera_pool"] = camera_pool
     app["active_lock"] = active_lock
@@ -390,6 +392,23 @@ async def _start_episode(request: web.Request) -> web.Response:
         except Exception as exc:
             LOG.warning("active lock acquire failed: %s", exc)
 
+    # Step 2a: start depth republishers BEFORE bag recorder so the compressed
+    # topics have publishers before rosbag2 subscribes. Each depth camera
+    # gets an in-process Image → CompressedImage relay (PNG-compressed,
+    # lossless). Fail-loud: a republisher spawn failure aborts the episode.
+    depth_pool = request.app.get("depth_pool")
+    depth_cams = [c for c in cameras_resolved
+                  if isinstance(c, dict) and (c.get("kind") or "").lower() == "depth"]
+    if depth_cams and depth_pool is not None:
+        try:
+            depth_pool.start_all(depth_cams)
+        except Exception as exc:
+            LOG.error("depth republisher start failed: %s", exc)
+            return web.json_response(
+                {"error": "depth_republisher_failed", "detail": str(exc)},
+                status=500,
+            )
+
     # Step 2: start bag recorder if topics provided and record_bag=true
     bag_recorder: BagRecorder = request.app["bag_recorder"]
     bag_started = False
@@ -404,7 +423,9 @@ async def _start_episode(request: web.Request) -> web.Response:
                 LOG.error("bag recorder start failed: %s", exc)
                 # Don't fail the whole episode; record meta and continue.
 
-    # Step 3+4: start camera writers (resolved from override or profile)
+    # Step 3+4: start camera writers (resolved from override or profile).
+    # kind=depth entries are skipped here — they're bagged via the
+    # republisher, not written to disk as a separate mp4/png stream.
     camera_pool: CameraWriterPool = request.app["camera_pool"]
     cameras_started: list[dict] = []
     if cameras_resolved:
@@ -454,6 +475,15 @@ async def _stop_episode(request: web.Request) -> web.Response:
         bag_summary = bag_recorder.stop(timeout_s=10.0)
     elif req.outcome == "discard":
         bag_recorder.abort()
+
+    # Step 2b: stop depth republishers AFTER bag (so any in-flight compressed
+    # frames make it into the bag's final flush).
+    depth_pool = request.app.get("depth_pool")
+    if depth_pool is not None:
+        try:
+            depth_pool.stop_all()
+        except Exception as exc:
+            LOG.warning("depth republisher stop failed: %s", exc)
 
     # Step 3: stop camera writers, gather frame_count summaries
     camera_pool: CameraWriterPool = request.app["camera_pool"]
@@ -847,16 +877,20 @@ async def _episode_joints_csv(request: web.Request) -> web.Response:
 
 
 async def _depth_preview(request: web.Request) -> web.Response:
-    """Render a single 16-bit depth PNG into a colormapped JPEG so it can
-    be previewed in the browser (HTML5 video can't carry 16-bit single-
-    channel and direct PNG can't show the depth range).
+    """Render a single 16-bit depth frame from the bag into a colormapped
+    JPEG for browser preview. Depth is now stored inside the rosbag
+    (sensor_msgs/Image) instead of PNG-per-frame on disk, so this reads
+    the Nth Image message from the matching topic.
 
     URL: /api/v1/episodes/{episode_id}/depth_preview/{camera}/{frame:06d}.jpg
     Query:
         cmap = turbo (default) | jet | viridis | plasma | inferno
         max  = max depth in mm to clip at (default 4000 for indoor 4m)
+
+    Legacy: if a per-frame PNG file exists at the old path (pre-2026-05-31
+    recordings before the bag-integration switch), serve that instead.
     """
-    import cv2
+    import cv2, asyncio, numpy as np
     store: EpisodeStore = request.app["store"]
     episode_id = request.match_info["episode_id"]
     camera = request.match_info["camera"]
@@ -864,35 +898,18 @@ async def _depth_preview(request: web.Request) -> web.Response:
     found = store.get_episode(episode_id)
     if found is None:
         return web.Response(status=404, text="episode not found")
-    _meta, ep_dir = found
-    png_path = (ep_dir / "videos" / camera / frame).resolve()
-    # path traversal guard
-    if not str(png_path).startswith(str(ep_dir.resolve())):
-        return web.Response(status=400, text="bad path")
-    if not png_path.exists() or not png_path.suffix.lower() in (".png", ".jpg"):
-        # accept .jpg in the URL but rewrite to .png on disk
-        png_path = png_path.with_suffix(".png")
-        if not png_path.exists():
-            return web.Response(status=404, text="frame not found")
+    meta, ep_dir = found
 
-    arr = cv2.imread(str(png_path), cv2.IMREAD_UNCHANGED)
-    if arr is None:
-        return web.Response(status=500, text="png decode failed")
+    # Parse frame index (strip ".jpg"/".png" suffix if present).
+    try:
+        frame_idx = int(frame.split('.', 1)[0])
+    except ValueError:
+        return web.Response(status=400, text="bad frame index")
 
     try:
         max_mm = max(100, min(20000, int(request.query.get("max", "4000"))))
     except ValueError:
         max_mm = 4000
-
-    if arr.dtype != cv2.CV_8U and arr.ndim == 2:
-        # Treat 0 as "no data" so it stays black; clip the rest to [1, max_mm].
-        mask = arr > 0
-        scaled = arr.astype("float32")
-        scaled[~mask] = 0
-        scaled = (scaled.clip(0, max_mm) / max_mm * 255).astype("uint8")
-    else:
-        scaled = arr.astype("uint8") if arr.dtype != "uint8" else arr
-
     cmap_name = (request.query.get("cmap") or "turbo").lower()
     cmap_map = {
         "turbo":   cv2.COLORMAP_TURBO,
@@ -901,8 +918,105 @@ async def _depth_preview(request: web.Request) -> web.Response:
         "plasma":  cv2.COLORMAP_PLASMA,
         "inferno": cv2.COLORMAP_INFERNO,
     }
-    color = cv2.applyColorMap(scaled, cmap_map.get(cmap_name, cv2.COLORMAP_TURBO))
-    # Black out the "no data" pixels so nearest 0mm doesn't bleed bright red.
+    cmap = cmap_map.get(cmap_name, cv2.COLORMAP_TURBO)
+
+    # --- Legacy path: per-frame PNG file (pre-bag-integration recordings) ---
+    legacy_path = ep_dir / "videos" / camera / f"{frame_idx:06d}.png"
+    if legacy_path.exists():
+        arr = cv2.imread(str(legacy_path), cv2.IMREAD_UNCHANGED)
+        if arr is None:
+            return web.Response(status=500, text="png decode failed")
+    else:
+        # --- New path: read Nth Image message from bag ---
+        bag_dir = ep_dir / "bag"
+        if not bag_dir.exists():
+            return web.Response(status=404, text="no bag")
+        # Resolve camera name → topic (from meta.cameras).
+        topic = None
+        for c in (meta.cameras or []):
+            if c.get("name") == camera:
+                topic = c.get("topic")
+                break
+        if not topic:
+            return web.Response(status=404, text=f"camera {camera!r} not in meta")
+
+        def _read_nth_image() -> np.ndarray | None:
+            import rosbag2_py
+            from rclpy.serialization import deserialize_message
+            from rosidl_runtime_py.utilities import get_message
+            storage_options = rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id="sqlite3")
+            converter_options = rosbag2_py.ConverterOptions(
+                input_serialization_format="cdr", output_serialization_format="cdr"
+            )
+            reader = rosbag2_py.SequentialReader()
+            try:
+                reader.open(storage_options, converter_options)
+            except Exception:
+                return None
+            topic_types = {t.name: t.type for t in reader.get_all_topics_and_types()}
+            # Prefer compressedDepth (current pipeline); fall back to raw Image
+            # if the bag was recorded under the older spec.
+            candidate_topics = []
+            comp_topic = f"{topic.rstrip('/')}_compressed/compressedDepth"
+            if comp_topic in topic_types and topic_types[comp_topic] == "sensor_msgs/msg/CompressedImage":
+                candidate_topics.append((comp_topic, "compressed"))
+            if topic in topic_types and topic_types[topic] == "sensor_msgs/msg/Image":
+                candidate_topics.append((topic, "raw"))
+            if not candidate_topics:
+                return None
+            chosen_topic, chosen_kind = candidate_topics[0]
+            if chosen_kind == "compressed":
+                msg_cls = get_message("sensor_msgs/msg/CompressedImage")
+            else:
+                msg_cls = get_message("sensor_msgs/msg/Image")
+            count = 0
+            while reader.has_next():
+                t, raw, _ts = reader.read_next()
+                if t != chosen_topic:
+                    continue
+                if count == frame_idx:
+                    msg = deserialize_message(raw, msg_cls)
+                    if chosen_kind == "compressed":
+                        # compressed_depth_image_transport prepends a 12-byte
+                        # ConfigHeader (format, depth_quantization, depth_max)
+                        # then the PNG-compressed depth payload.
+                        data = bytes(msg.data)
+                        if len(data) <= 12:
+                            return None
+                        png_bytes = data[12:]
+                        arr_in = np.frombuffer(png_bytes, dtype=np.uint8)
+                        img = cv2.imdecode(arr_in, cv2.IMREAD_UNCHANGED)
+                        if img is None or img.ndim != 2:
+                            return None
+                        return img.astype(np.uint16) if img.dtype != np.uint16 else img
+                    # raw Image
+                    enc = msg.encoding
+                    if enc in ("16UC1", "mono16"):
+                        return np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(msg.height, msg.width)
+                    if enc == "32FC1":
+                        f = np.frombuffer(bytes(msg.data), dtype=np.float32).reshape(msg.height, msg.width)
+                        return np.nan_to_num(f * 1000.0, nan=0.0, posinf=0.0, neginf=0.0).astype(np.uint16)
+                    return None
+                count += 1
+            return None
+
+        loop = asyncio.get_running_loop()
+        try:
+            arr = await loop.run_in_executor(None, _read_nth_image)
+        except Exception as exc:
+            return web.Response(status=500, text=f"bag decode failed: {exc}")
+        if arr is None:
+            return web.Response(status=404, text="frame not in bag")
+
+    if arr.ndim == 2 and arr.dtype != np.uint8:
+        mask = arr > 0
+        scaled = arr.astype("float32")
+        scaled[~mask] = 0
+        scaled = (scaled.clip(0, max_mm) / max_mm * 255).astype("uint8")
+    else:
+        scaled = arr.astype("uint8") if arr.dtype != np.uint8 else arr
+
+    color = cv2.applyColorMap(scaled, cmap)
     if arr.ndim == 2:
         color[arr == 0] = (0, 0, 0)
 
