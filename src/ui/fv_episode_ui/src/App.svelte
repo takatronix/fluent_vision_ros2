@@ -539,6 +539,8 @@
 
   const fmtDuration = (s: number | null) => {
     if (s == null) return '—';
+    if (!isFinite(s)) return '—';
+    if (s < 0) return '⚠︎ <0';   // clock skew / manual meta edit — surface, don't silently render "-1:00:-5"
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
     const sec = Math.floor(s % 60);
