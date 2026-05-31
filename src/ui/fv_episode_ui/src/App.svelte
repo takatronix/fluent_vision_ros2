@@ -588,6 +588,51 @@
       : 'ok'
   );
 
+  // ---- Batch grouping (LeRobot-style runs collapse into one folder row) ----
+  type BatchStats = {
+    rawTask: string;
+    count: number; success: number; abort: number; pending: number;
+    totalBytes: number; totalMarkers: number;
+    durMin: number | null; durMax: number | null; durMedian: number | null;
+    controllers: string[]; envs: string[];
+    earliest: string; latest: string;
+  };
+  type Row =
+    | { type: 'single'; ep: Episode }
+    | { type: 'batchHeader'; batchId: string; eps: Episode[]; stats: BatchStats }
+    | { type: 'batchChild'; ep: Episode; batchId: string };
+
+  let expandedBatches = $state<Set<string>>(new Set());
+  let groupBatches = $state(true);  // toggle to disable grouping
+
+  function batchTagOf(ep: Episode): string | null {
+    const t = ep.tags?.find(tag => tag.startsWith('batch:'));
+    return t ? t.slice(6) : null;
+  }
+  function toggleBatch(id: string) {
+    const next = new Set(expandedBatches);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    expandedBatches = next;
+  }
+  function computeBatchStats(eps: Episode[]): BatchStats {
+    const rawTask = (eps[0]?.task_description || '').replace(/\s+#\d+\/\d+$/, '');
+    const success = eps.filter(e => e.outcome === 'success').length;
+    const abort   = eps.filter(e => e.outcome === 'abort').length;
+    const pending = eps.filter(e => e.outcome == null).length;
+    const totalBytes   = eps.reduce((s, e) => s + (e.size_bytes   || 0), 0);
+    const totalMarkers = eps.reduce((s, e) => s + (e.marker_count || 0), 0);
+    const durs = eps.map(e => e.duration_s).filter((d): d is number => d != null).slice().sort((a, b) => a - b);
+    const durMin    = durs.length ? durs[0] : null;
+    const durMax    = durs.length ? durs[durs.length - 1] : null;
+    const durMedian = durs.length ? durs[Math.floor(durs.length / 2)] : null;
+    const controllers = Array.from(new Set(eps.map(e => e.controller_label).filter((x): x is string => !!x)));
+    const envs = Array.from(new Set(eps.map(e => e.env).filter((x): x is string => !!x)));
+    const dates = eps.map(e => e.started_at).filter(Boolean).slice().sort();
+    return { rawTask, count: eps.length, success, abort, pending,
+             totalBytes, totalMarkers, durMin, durMax, durMedian,
+             controllers, envs, earliest: dates[0] || '', latest: dates[dates.length - 1] || '' };
+  }
+
   const filteredEpisodes = $derived(
     episodes
       .filter(e => {
@@ -615,6 +660,54 @@
         return (av - bv) * dir;
       })
   );
+
+  // Fold same-batch episodes into one collapsible "folder" row. Singletons
+  // (no batch tag) render unchanged. Preserves the outer sort order — a
+  // batch occupies the position of its first (highest-sorted) episode.
+  const groupedRows = $derived.by((): Row[] => {
+    if (!groupBatches) return filteredEpisodes.map(ep => ({ type: 'single', ep } as Row));
+    const byBatch = new Map<string, Episode[]>();
+    for (const ep of filteredEpisodes) {
+      const bid = batchTagOf(ep);
+      if (!bid) continue;
+      const arr = byBatch.get(bid) ?? [];
+      arr.push(ep);
+      byBatch.set(bid, arr);
+    }
+    const seen = new Set<string>();
+    const rows: Row[] = [];
+    for (const ep of filteredEpisodes) {
+      const bid = batchTagOf(ep);
+      if (!bid) { rows.push({ type: 'single', ep }); continue; }
+      if (!seen.has(bid)) {
+        const eps = byBatch.get(bid)!;
+        rows.push({ type: 'batchHeader', batchId: bid, eps, stats: computeBatchStats(eps) });
+        seen.add(bid);
+      }
+      if (expandedBatches.has(bid)) {
+        rows.push({ type: 'batchChild', ep, batchId: bid });
+      }
+    }
+    return rows;
+  });
+
+  async function deleteBatch(batchId: string, eps: Episode[], e: MouseEvent) {
+    e.stopPropagation();
+    const totalBytes = eps.reduce((s, x) => s + (x.size_bytes || 0), 0);
+    const label = (eps[0]?.task_description || '').replace(/\s+#\d+\/\d+$/, '');
+    if (!confirm(`バッチ全体を削除しますか？\n\n  タスク: ${label}\n  本数: ${eps.length}\n  合計: ${fmtBytes(totalBytes)}\n\nこの操作は取り消せません。`)) return;
+    let removed = 0, failed = 0;
+    for (const ep of eps) {
+      try {
+        const res = await fetch(`${API}/episodes/${ep.episode_id}${ep.pinned ? '?force=true' : ''}`, { method: 'DELETE' });
+        if (res.ok) removed++; else failed++;
+      } catch { failed++; }
+    }
+    episodes = episodes.filter(x => !eps.some(e => e.episode_id === x.episode_id) || failed > 0 && !eps.find(e => e.episode_id === x.episode_id));
+    // Simpler: drop ones we attempted, then refetch.
+    episodes = episodes.filter(x => !eps.some(e => e.episode_id === x.episode_id));
+    if (failed > 0) alert(`削除: ${removed} 件成功 / ${failed} 件失敗`);
+  }
 
   async function deleteEpisode(ep: Episode, e: MouseEvent) {
     e.stopPropagation();
@@ -737,15 +830,21 @@
     </section>
   {/if}
 
-  <!-- Search bar -->
-  <div class="mb-3 relative">
-    <Search class="size-4 absolute left-3 top-1/2 -translate-y-1/2 text-(--color-text-mute)" />
-    <input
-      type="text"
-      bind:value={query}
-      placeholder="タスク名 / タグで検索…"
-      class="w-full pl-9 pr-4 py-2 rounded-lg bg-(--color-bg-2) border border-(--color-border) text-sm placeholder:text-(--color-text-mute) focus:border-(--color-accent-glow) focus:outline-none transition"
-    />
+  <!-- Search bar + grouping toggle -->
+  <div class="mb-3 flex gap-2 items-center">
+    <div class="relative flex-1">
+      <Search class="size-4 absolute left-3 top-1/2 -translate-y-1/2 text-(--color-text-mute)" />
+      <input
+        type="text"
+        bind:value={query}
+        placeholder="タスク名 / タグで検索…"
+        class="w-full pl-9 pr-4 py-2 rounded-lg bg-(--color-bg-2) border border-(--color-border) text-sm placeholder:text-(--color-text-mute) focus:border-(--color-accent-glow) focus:outline-none transition"
+      />
+    </div>
+    <label class="flex items-center gap-1.5 text-xs text-(--color-text-dim) px-3 py-2 rounded-lg bg-(--color-bg-2) border border-(--color-border) cursor-pointer hover:border-(--color-accent-glow) transition whitespace-nowrap">
+      <input type="checkbox" bind:checked={groupBatches} class="accent-(--color-accent)" />
+      🔁 バッチ折り畳み
+    </label>
   </div>
 
   <!-- Episodes table -->
@@ -808,70 +907,126 @@
           </tr>
         </thead>
         <tbody>
-          {#each filteredEpisodes as ep (ep.episode_id)}
-            {@const b = outcomeBadge(ep.outcome)}
-            {@const isRec = ep.state === 'recording'}
-            <tr class="group border-t border-(--color-border) hover:bg-(--color-bg-3)/40 transition-colors {isRec ? 'cursor-not-allowed' : 'cursor-pointer'}"
-                onclick={() => { if (!isRec) openPlay(ep); }}
-                title={isRec ? '録画中は再生できません (停止後に再生可能)' : 'クリックで再生'}>
-              <td class="px-4 py-2.5">
-                {#if isRec}
-                  <span class="inline-block px-2 py-0.5 rounded text-[11px] bg-red-500/20 text-red-400 border border-red-500/40" style="animation: rec-pulse 1.4s ease-in-out infinite">● 現在録画中</span>
-                {:else}
-                  <span class="inline-block px-2 py-0.5 rounded text-[11px] {b.cls}">{b.label}</span>
-                {/if}
-                {#if ep.pinned}
-                  <Pin class="inline size-3.5 ml-1 text-amber-400" />
-                {/if}
-              </td>
-              <td class="px-4 py-2.5">
-                <div class="text-(--color-text) font-medium">{ep.task_description}</div>
-                {#if ep.tags.length}
-                  <div class="flex gap-1 mt-1 flex-wrap">
-                    {#each ep.tags as t}
-                      <span class="text-[10px] px-1.5 py-0.5 rounded bg-(--color-accent-soft) text-(--color-accent)">{t}</span>
-                    {/each}
-                  </div>
-                {/if}
-              </td>
-              <td class="px-4 py-2.5 text-xs whitespace-nowrap">
-                {#if ep.env === 'sim'}
-                  <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-violet-500/15 text-violet-300 border border-violet-500/30 mr-1">sim</span>
-                {:else}
-                  <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-zinc-500/15 text-zinc-400 border border-zinc-500/30 mr-1">実機</span>
-                {/if}
-                {#if ep.controller_label}
-                  {#if ep.controller_label.startsWith('VLA')}
-                    <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">🤖 {ep.controller_label}</span>
-                  {:else if ep.controller_label === 'teleop'}
-                    <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-amber-500/15 text-amber-300 border border-amber-500/30">🎮 teleop</span>
+          {#each groupedRows as row, ri (row.type + ':' + (row.type === 'batchHeader' ? row.batchId : row.ep.episode_id))}
+            {#if row.type === 'batchHeader'}
+              {@const s = row.stats}
+              {@const open = expandedBatches.has(row.batchId)}
+              {@const successRate = s.count > 0 ? (s.success / s.count) * 100 : 0}
+              {@const rateColor = successRate >= 90 ? 'text-emerald-400' : successRate >= 50 ? 'text-amber-400' : 'text-red-400'}
+              <tr class="group border-t border-(--color-border) hover:bg-(--color-accent-soft)/30 cursor-pointer transition-colors"
+                  style="background: rgba(0,217,255,0.04);"
+                  onclick={() => toggleBatch(row.batchId)}
+                  title={open ? 'クリックで畳む' : `クリックで ${s.count} 件を展開`}>
+                <td class="px-4 py-2.5 whitespace-nowrap">
+                  <span class="text-(--color-accent) inline-block w-4 text-center">{open ? '▼' : '▶'}</span>
+                  <span class="inline-block px-2 py-0.5 rounded text-[11px] bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">🔁 ×{s.count}</span>
+                  <span class="ml-1 text-[11px] {rateColor} font-mono">{s.success}/{s.count}{#if s.abort > 0} <span class="text-red-400">✗{s.abort}</span>{/if}</span>
+                </td>
+                <td class="px-4 py-2.5">
+                  <div class="text-(--color-text) font-medium">{s.rawTask || '(no task)'}</div>
+                  <div class="text-[10px] text-(--color-text-mute) mt-0.5 font-mono">batch:{row.batchId.slice(0, 8)}…</div>
+                </td>
+                <td class="px-4 py-2.5 text-xs whitespace-nowrap">
+                  {#each s.envs as env}
+                    {#if env === 'sim'}
+                      <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-violet-500/15 text-violet-300 border border-violet-500/30 mr-1">sim</span>
+                    {:else}
+                      <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-zinc-500/15 text-zinc-400 border border-zinc-500/30 mr-1">実機</span>
+                    {/if}
+                  {/each}
+                  {#each s.controllers as ctl}
+                    {#if ctl.startsWith('VLA')}
+                      <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 mr-1">🤖 {ctl}</span>
+                    {:else if ctl === 'teleop'}
+                      <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-amber-500/15 text-amber-300 border border-amber-500/30 mr-1">🎮 teleop</span>
+                    {:else}
+                      <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-zinc-500/15 text-zinc-400 border border-zinc-500/30 mr-1">{ctl}</span>
+                    {/if}
+                  {/each}
+                </td>
+                <td class="px-4 py-2.5 text-(--color-text-dim) text-xs font-mono">{fmtTime(s.earliest)}</td>
+                <td class="px-4 py-2.5 text-right font-mono text-xs">
+                  {#if s.durMedian != null}
+                    <span class="text-(--color-text)">~{fmtDuration(s.durMedian)}</span>
+                    <div class="text-[10px] text-(--color-text-mute)">min {fmtDuration(s.durMin)} · max {fmtDuration(s.durMax)}</div>
                   {:else}
-                    <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-zinc-500/15 text-zinc-400 border border-zinc-500/30">{ep.controller_label}</span>
+                    —
                   {/if}
-                {:else}
-                  <span class="text-(--color-text-mute) text-[10px]">—</span>
-                {/if}
-              </td>
-              <td class="px-4 py-2.5 text-(--color-text-dim) text-xs font-mono">{fmtTime(ep.started_at)}</td>
-              <td class="px-4 py-2.5 text-right font-mono text-xs">{fmtDuration(ep.duration_s)}</td>
-              <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{fmtBytes(ep.size_bytes)}</td>
-              <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{ep.marker_count}</td>
-              <td class="px-2 py-2.5 text-right whitespace-nowrap">
-                <a
-                  href={`${API}/episodes/${ep.episode_id}/download.tar`}
-                  onclick={(e) => e.stopPropagation()}
-                  class="opacity-0 group-hover:opacity-100 inline-block text-(--color-text-mute) hover:text-(--color-accent) transition p-1 rounded hover:bg-(--color-accent-soft) mr-1"
-                  title="ダウンロード (tar)">
-                  <Download class="size-4" />
-                </a>
-                <button
-                  onclick={(e) => deleteEpisode(ep, e)}
-                  class="opacity-0 group-hover:opacity-100 text-(--color-text-mute) hover:text-red-400 transition p-1 rounded hover:bg-red-500/10"
-                  title={ep.pinned ? '削除 (pinned: force)' : '削除'}>
-                  <Trash2 class="size-4" />
-                </button>
-              </td>
-            </tr>
+                </td>
+                <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{fmtBytes(s.totalBytes)}</td>
+                <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{s.totalMarkers}</td>
+                <td class="px-2 py-2.5 text-right whitespace-nowrap">
+                  <button
+                    onclick={(e) => deleteBatch(row.batchId, row.eps, e)}
+                    class="opacity-0 group-hover:opacity-100 text-(--color-text-mute) hover:text-red-400 transition p-1 rounded hover:bg-red-500/10"
+                    title={`バッチ全体 (${s.count} 件) を削除`}>
+                    <Trash2 class="size-4" />
+                  </button>
+                </td>
+              </tr>
+            {:else}
+              {@const ep = row.ep}
+              {@const b = outcomeBadge(ep.outcome)}
+              {@const isChild = row.type === 'batchChild'}
+              <tr class="group border-t border-(--color-border) hover:bg-(--color-bg-3)/40 transition-colors cursor-pointer"
+                  onclick={() => openPlay(ep)}
+                  title="クリックで再生">
+                <td class="px-4 py-2.5">
+                  {#if isChild}<span class="inline-block w-4 text-(--color-text-mute) text-center">└</span>{/if}
+                  <span class="inline-block px-2 py-0.5 rounded text-[11px] {b.cls}">{b.label}</span>
+                  {#if ep.pinned}
+                    <Pin class="inline size-3.5 ml-1 text-amber-400" />
+                  {/if}
+                </td>
+                <td class="px-4 py-2.5" style={isChild ? 'padding-left: 32px;' : ''}>
+                  <div class="text-(--color-text) {isChild ? 'text-xs text-(--color-text-dim)' : 'font-medium'}">{ep.task_description}</div>
+                  {#if ep.tags.length && !isChild}
+                    <div class="flex gap-1 mt-1 flex-wrap">
+                      {#each ep.tags as t}
+                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-(--color-accent-soft) text-(--color-accent)">{t}</span>
+                      {/each}
+                    </div>
+                  {/if}
+                </td>
+                <td class="px-4 py-2.5 text-xs whitespace-nowrap">
+                  {#if !isChild}
+                    {#if ep.env === 'sim'}
+                      <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-violet-500/15 text-violet-300 border border-violet-500/30 mr-1">sim</span>
+                    {:else}
+                      <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-zinc-500/15 text-zinc-400 border border-zinc-500/30 mr-1">実機</span>
+                    {/if}
+                    {#if ep.controller_label}
+                      {#if ep.controller_label.startsWith('VLA')}
+                        <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">🤖 {ep.controller_label}</span>
+                      {:else if ep.controller_label === 'teleop'}
+                        <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-amber-500/15 text-amber-300 border border-amber-500/30">🎮 teleop</span>
+                      {:else}
+                        <span class="inline-block px-1.5 py-0.5 rounded text-[10px] bg-zinc-500/15 text-zinc-400 border border-zinc-500/30">{ep.controller_label}</span>
+                      {/if}
+                    {/if}
+                  {/if}
+                </td>
+                <td class="px-4 py-2.5 text-(--color-text-dim) text-xs font-mono">{fmtTime(ep.started_at)}</td>
+                <td class="px-4 py-2.5 text-right font-mono text-xs">{fmtDuration(ep.duration_s)}</td>
+                <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{fmtBytes(ep.size_bytes)}</td>
+                <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{ep.marker_count}</td>
+                <td class="px-2 py-2.5 text-right whitespace-nowrap">
+                  <a
+                    href={`${API}/episodes/${ep.episode_id}/download.tar`}
+                    onclick={(e) => e.stopPropagation()}
+                    class="opacity-0 group-hover:opacity-100 inline-block text-(--color-text-mute) hover:text-(--color-accent) transition p-1 rounded hover:bg-(--color-accent-soft) mr-1"
+                    title="ダウンロード (tar)">
+                    <Download class="size-4" />
+                  </a>
+                  <button
+                    onclick={(e) => deleteEpisode(ep, e)}
+                    class="opacity-0 group-hover:opacity-100 text-(--color-text-mute) hover:text-red-400 transition p-1 rounded hover:bg-red-500/10"
+                    title={ep.pinned ? '削除 (pinned: force)' : '削除'}>
+                    <Trash2 class="size-4" />
+                  </button>
+                </td>
+              </tr>
+            {/if}
           {/each}
         </tbody>
       </table>
