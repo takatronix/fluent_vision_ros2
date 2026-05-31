@@ -948,12 +948,21 @@
       await refreshReplayStatus();
     } finally { replayBusy = false; }
   }
-  // Poll replay status while play modal is open + replay is active.
+  // Poll replay status continuously (every 2s) so the top-of-page banner
+  // stays accurate even after the play modal is closed. Faster (1s) while
+  // a replay is actively running.
   $effect(() => {
-    if (!playEpisode) { replayState = null; return; }
     refreshReplayStatus();
-    const t = window.setInterval(refreshReplayStatus, 1000);
+    const interval = replayState?.running ? 1000 : 2000;
+    const t = window.setInterval(refreshReplayStatus, interval);
     return () => clearInterval(t);
+  });
+  // Lookup table episode_id → task_description so the banner can show
+  // what's being replayed even when it isn't the currently-open one.
+  const replayTaskLabel = $derived.by(() => {
+    if (!replayState) return null;
+    const m = episodes.find(e => e.episode_id === replayState!.episode_id);
+    return m?.task_description || replayState.episode_id.slice(-8);
   });
 
   async function togglePin(ep: Episode, e: MouseEvent) {
@@ -1162,6 +1171,28 @@
       {/if}
     </div>
   </header>
+
+  <!-- Sticky REPLAY banner — visible no matter which row/modal is open
+       while a bag_play is in progress (operator can stop without opening
+       the play modal). -->
+  {#if replayState?.running}
+    <div class="sticky top-0 z-40 mb-4 -mx-6 px-6 py-3 bg-red-500/15 border-y-2 border-red-500/50 flex items-center gap-3 backdrop-blur-sm"
+         style="animation: rec-pulse 1.6s ease-in-out infinite;">
+      <span class="size-3 rounded-full bg-red-500 shrink-0" style="animation: rec-pulse 1.4s ease-in-out infinite;"></span>
+      <div class="flex-1 min-w-0">
+        <div class="text-red-300 font-semibold text-sm">🎬 BAG REPLAY 実行中 ({replayState.speed}×)</div>
+        <div class="text-[11px] text-(--color-text-mute) truncate">
+          {replayTaskLabel || '(no task)'}
+          {#if replayState.start_offset_s > 0} · offset {replayState.start_offset_s.toFixed(1)}s{/if}
+          {#if replayState.duration_s} · 長さ {replayState.duration_s.toFixed(1)}s{/if}
+        </div>
+      </div>
+      <button onclick={stopReplay} disabled={replayBusy}
+              class="px-3 py-1.5 rounded bg-red-500 text-white font-semibold hover:bg-red-600 transition text-xs whitespace-nowrap">
+        ⏹ 停止
+      </button>
+    </div>
+  {/if}
 
   <!-- Disk summary card -->
   {#if disk}

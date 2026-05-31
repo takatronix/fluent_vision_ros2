@@ -152,6 +152,12 @@ async def _healthz(request: web.Request) -> web.Response:
     runner = request.app.get("batch_runner")
     if runner is not None and runner.state is not None:
         payload["batch"] = runner.state.to_dict()
+    # Include replay state for the same single-WS-message reason. Operator
+    # sees the REPLAY indicator in the dashboard chip regardless of which
+    # tab is active.
+    replay = request.app.get("replay_runner")
+    if replay is not None and replay.state is not None:
+        payload["replay"] = replay.state.to_dict()
     return web.json_response(payload)
 
 
