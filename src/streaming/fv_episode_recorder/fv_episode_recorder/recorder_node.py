@@ -36,6 +36,7 @@ from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeStore
 from .marker_manager import MarkerManager
 from .mux_tracker import MuxTracker
+from .retention import RetentionPolicy, RetentionRunner
 from .topic_discovery import (
     discover_cameras,
     discover_episode_recorder_config,
@@ -77,6 +78,11 @@ class FVEpisodeRecorderNode(Node):
         self.mux_tracker = MuxTracker(self)
         self.profile_cache: dict = {}  # profile_name -> parsed yaml dict
         self._orphan_payload: dict = {}
+        # Retention runner — policy is loaded lazily from whichever profile
+        # is currently active (operator may switch profiles without restart).
+        # Disabled until profile yaml opts in via episode_recorder.retention.
+        self.retention_runner = RetentionRunner(self.store, self._current_retention_policy)
+        self._retention_task = None  # asyncio.Task — set in main() after loop exists
 
         # Step 6: detect orphan from previous run (recorder crash mid-record)
         orphan = self.active_lock.detect_orphan()
@@ -117,6 +123,28 @@ class FVEpisodeRecorderNode(Node):
         loaded = load_profile_yaml(profile_name, self.profiles_dir)
         self.profile_cache[profile_name] = loaded or {}
         return self.profile_cache[profile_name]
+
+    def _current_retention_policy(self) -> RetentionPolicy:
+        """Read the retention block from the currently-active recording's
+        profile, falling back to the active-profile env hint, then disabled."""
+        # Prefer the profile of the in-flight episode so a long-running batch
+        # uses the policy it started with.
+        active_profile = None
+        if self.store.active is not None:
+            active_profile = self.store.active.profile
+        if not active_profile:
+            active_profile = os.environ.get("VLABOR_PROFILE")
+        if not active_profile:
+            # Last resort: read the dashboard's runtime profile file.
+            try:
+                path = Path.home() / ".vlabor" / "profiles" / ".active_profile"
+                if path.exists():
+                    active_profile = path.read_text().strip()
+            except Exception:
+                pass
+        if not active_profile:
+            return RetentionPolicy()  # disabled
+        return RetentionPolicy.from_profile(self.get_profile(active_profile))
 
     @staticmethod
     def _resolve_default_profiles_dir() -> str:
@@ -166,6 +194,7 @@ def main(args=None):
                     active_lock=node.active_lock,
                     marker_manager=node.marker_manager,
                     mux_tracker=node.mux_tracker,
+                    retention_runner=node.retention_runner,
                     get_profile=node.get_profile)
     # First mux discovery sweep happens on the 2s timer; trigger one now so
     # the very first POST /episodes already has a snapshot if publishers
@@ -181,6 +210,29 @@ def main(args=None):
     loop.run_until_complete(site.start())
 
     node.get_logger().info(f"aiohttp listening on http://{node.host}:{node.port}")
+
+    # Background retention loop: ticks every policy.interval_s (default 300s).
+    # No-op when policy.enabled is False (no episode_recorder.retention block
+    # in the active profile yaml). Wrapped so a single tick failure can't
+    # take down the whole recorder process.
+    async def _retention_loop():
+        import asyncio as _aio
+        while True:
+            try:
+                policy = node._current_retention_policy()
+                tick_interval = max(60, int(policy.interval_s))
+                if policy.enabled:
+                    summary = node.retention_runner.tick()
+                    if summary.get("deleted") or summary.get("newly_scheduled"):
+                        node.get_logger().info(
+                            f"retention tick: scheduled={len(summary.get('newly_scheduled', []))} "
+                            f"deleted={len(summary.get('deleted', []))}"
+                        )
+            except Exception as exc:
+                node.get_logger().warning(f"retention tick failed: {exc}")
+                tick_interval = 300
+            await _aio.sleep(tick_interval)
+    node._retention_task = loop.create_task(_retention_loop())
 
     try:
         loop.run_forever()

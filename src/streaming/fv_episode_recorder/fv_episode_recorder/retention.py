@@ -49,6 +49,28 @@ class RetentionPolicy:
             interval_s=int(ret.get("interval_s", 300)),
         )
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "RetentionPolicy":
+        """Operator-supplied policy (from the dashboard settings popover)."""
+        return cls(
+            enabled=bool(d.get("enabled", False)),
+            max_age_days=d.get("max_age_days"),
+            max_episodes=d.get("max_episodes"),
+            free_min_pct=d.get("free_min_pct"),
+            grace_period_s=int(d.get("grace_period_s", 60)),
+            interval_s=int(d.get("interval_s", 300)),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "max_age_days": self.max_age_days,
+            "max_episodes": self.max_episodes,
+            "free_min_pct": self.free_min_pct,
+            "grace_period_s": self.grace_period_s,
+            "interval_s": self.interval_s,
+        }
+
 
 @dataclass
 class Candidate:
@@ -150,20 +172,71 @@ class RetentionRunner:
     """Background loop. Schedules candidates with a grace period, deletes
     them on the next tick if they're still candidates and still unpinned.
 
-    State (`<output_dir>/.retention_scheduled.json`) survives restarts so
-    the grace period applies even across crashes."""
+    State files (survive restarts):
+      `<output_dir>/.retention_scheduled.json` — grace-period schedule
+      `<output_dir>/.retention_policy.json`    — operator-supplied policy
+                                                  (set via UI / API)"""
 
     SCHEDULE_FILE = ".retention_scheduled.json"
+    POLICY_FILE = ".retention_policy.json"
 
-    def __init__(self, store: EpisodeStore, policy_loader):
-        """policy_loader: callable returning current RetentionPolicy (so
-        profile yaml reloads are picked up without restart)."""
+    def __init__(self, store: EpisodeStore, profile_policy_loader=None):
+        """profile_policy_loader: optional callable returning the
+        profile-driven default RetentionPolicy. Operator overrides via
+        set_policy() take precedence over the profile default."""
         self.store = store
-        self._policy_loader = policy_loader
+        self._profile_policy_loader = profile_policy_loader
         self._planner = RetentionPlanner(store)
         self._scheduled: dict[str, float] = {}    # episode_id -> ready_at_epoch
+        self._policy_override: Optional[RetentionPolicy] = None
         self._load_schedule()
+        self._load_policy()
         self._last_tick = 0.0
+
+    # ---- policy ----
+
+    def current_policy(self) -> RetentionPolicy:
+        if self._policy_override is not None:
+            return self._policy_override
+        if self._profile_policy_loader is not None:
+            try:
+                return self._profile_policy_loader()
+            except Exception:
+                return RetentionPolicy()
+        return RetentionPolicy()
+
+    def set_policy(self, policy: RetentionPolicy) -> None:
+        self._policy_override = policy
+        self._save_policy()
+
+    def clear_override(self) -> None:
+        self._policy_override = None
+        self._save_policy()
+
+    def _load_policy(self) -> None:
+        path = self.store.output_dir / self.POLICY_FILE
+        if not path.exists():
+            return
+        try:
+            import json
+            with path.open() as f:
+                self._policy_override = RetentionPolicy.from_dict(json.load(f))
+        except Exception as exc:
+            LOG.warning("retention: failed to load policy: %s", exc)
+
+    def _save_policy(self) -> None:
+        path = self.store.output_dir / self.POLICY_FILE
+        try:
+            import json
+            if self._policy_override is None:
+                path.unlink(missing_ok=True)
+                return
+            tmp = path.with_suffix(".json.tmp")
+            with tmp.open("w") as f:
+                json.dump(self._policy_override.to_dict(), f)
+            tmp.replace(path)
+        except Exception as exc:
+            LOG.warning("retention: failed to save policy: %s", exc)
 
     def _load_schedule(self) -> None:
         path = self.store.output_dir / self.SCHEDULE_FILE
@@ -188,12 +261,15 @@ class RetentionRunner:
         except Exception as exc:
             LOG.warning("retention: failed to save schedule: %s", exc)
 
-    def tick(self, dry_run: bool = False) -> dict:
+    def tick(self, dry_run: bool = False, policy: Optional[RetentionPolicy] = None) -> dict:
         """One pass: plan → schedule new candidates → delete ripe ones.
-        Returns a summary dict (also suitable as POST response)."""
-        policy = self._policy_loader()
+        Returns a summary dict (also suitable as POST response).
+        Pass `policy` to override the stored policy for this single tick
+        (used by the dashboard's "プレビュー" button)."""
+        if policy is None:
+            policy = self.current_policy()
         if not policy.enabled:
-            return {"enabled": False, "scheduled": 0, "deleted": 0, "candidates": []}
+            return {"enabled": False, "scheduled": 0, "deleted": 0, "candidates": [], "policy": policy.to_dict()}
 
         candidates = self._planner.plan(policy)
         cand_ids = {c.meta.episode_id for c in candidates}

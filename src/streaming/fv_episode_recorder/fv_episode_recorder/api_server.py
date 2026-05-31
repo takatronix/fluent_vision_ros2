@@ -65,12 +65,14 @@ def build_app(
     active_lock: Optional[ActiveLock] = None,
     marker_manager: Optional[MarkerManager] = None,
     mux_tracker=None,  # MuxTracker — used to label each ep VLA vs teleop
+    retention_runner=None,  # RetentionRunner — exposes plan/tick via /retention/*
     get_profile=None,  # callable: name -> dict; None = no profile lookup (override only)
 ) -> web.Application:
     app = web.Application(middlewares=[_cors_middleware])
     app["store"] = store
     app["mux_tracker"] = mux_tracker
     app["batch_runner"] = BatchRunner()
+    app["retention_runner"] = retention_runner
     app["bag_recorder"] = bag_recorder
     app["camera_pool"] = camera_pool
     app["active_lock"] = active_lock
@@ -95,6 +97,12 @@ def build_app(
     app.router.add_post("/api/v1/episodes/batch_stop", _batch_stop)
     app.router.add_post("/api/v1/episodes/batch_retry", _batch_retry)
     app.router.add_post("/api/v1/episodes/batch_skip", _batch_skip)
+    # Retention — read current plan, run a manual tick, or update the policy
+    # (operator-facing settings live in the dashboard popover, persisted via PUT).
+    app.router.add_get("/api/v1/retention/status", _retention_status)
+    app.router.add_post("/api/v1/retention/run", _retention_run)
+    app.router.add_get("/api/v1/retention/policy", _retention_get_policy)
+    app.router.add_put("/api/v1/retention/policy", _retention_put_policy)
     app.router.add_get("/api/v1/episodes/{episode_id}/download.tar", _episode_download_tar)
     app.router.add_get("/api/v1/disk/status", _disk_status)
 
@@ -1015,6 +1023,68 @@ async def _batch_skip(request: web.Request) -> web.Response:
     if not runner.skip():
         return web.json_response({"error": "skip_failed"}, status=500)
     return web.json_response({"skipping": True, "state": runner.state.to_dict() if runner.state else None})
+
+
+async def _retention_status(request: web.Request) -> web.Response:
+    """Dry-run plan: return what would be deleted under the current policy
+    without actually deleting. Mirror of POST /retention/run?dry_run=true."""
+    runner = request.app.get("retention_runner")
+    if runner is None:
+        return web.json_response({"enabled": False, "error": "retention_runner_not_wired"}, status=503)
+    import asyncio
+    loop = asyncio.get_running_loop()
+    # tick() walks the FS — run in executor so the aiohttp loop stays free.
+    summary = await loop.run_in_executor(None, lambda: runner.tick(dry_run=True))
+    return web.json_response(summary)
+
+
+async def _retention_run(request: web.Request) -> web.Response:
+    """Manual retention tick. dry_run=true (default) just returns the plan;
+    dry_run=false executes ripe deletes (still respecting grace period).
+    Optional body: a policy override for THIS tick only (used by the
+    "プレビュー" button so the operator can preview a hypothetical policy
+    before saving it via PUT /retention/policy)."""
+    runner = request.app.get("retention_runner")
+    if runner is None:
+        return web.json_response({"enabled": False, "error": "retention_runner_not_wired"}, status=503)
+    dry_run = (request.query.get("dry_run", "true").lower() != "false")
+    body = {}
+    try:
+        body = await request.json() if request.can_read_body else {}
+    except Exception:
+        body = {}
+    from .retention import RetentionPolicy
+    override = RetentionPolicy.from_dict(body) if body else None
+    import asyncio
+    loop = asyncio.get_running_loop()
+    summary = await loop.run_in_executor(None, lambda: runner.tick(dry_run=dry_run, policy=override))
+    return web.json_response(summary)
+
+
+async def _retention_get_policy(request: web.Request) -> web.Response:
+    """Current effective policy (operator override > profile default > disabled)."""
+    runner = request.app.get("retention_runner")
+    if runner is None:
+        return web.json_response({"enabled": False, "error": "retention_runner_not_wired"}, status=503)
+    return web.json_response(runner.current_policy().to_dict())
+
+
+async def _retention_put_policy(request: web.Request) -> web.Response:
+    """Save an operator override policy. Pass {"enabled": false} or DELETE to
+    clear and fall back to the profile default."""
+    runner = request.app.get("retention_runner")
+    if runner is None:
+        return web.json_response({"enabled": False, "error": "retention_runner_not_wired"}, status=503)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    from .retention import RetentionPolicy
+    if not body or body.get("clear"):
+        runner.clear_override()
+    else:
+        runner.set_policy(RetentionPolicy.from_dict(body))
+    return web.json_response(runner.current_policy().to_dict())
 
 
 async def _patch_episode(request: web.Request) -> web.Response:
