@@ -1064,16 +1064,18 @@
             → dashboard の event log + 外部 MCP 購読者にも自動波及
           </div>
           <div>
-            <span class="text-(--color-text-dim)">現状の自動削除:</span>
-            <span class="text-amber-300">未実装 (Phase 2)</span>
-            — 古いタスクは手動で削除してください (各行 hover で 🗑 ボタン)
+            <span class="text-(--color-text-dim)">自動削除:</span>
+            <code class="px-1 rounded bg-(--color-bg-3)/50">max_age_days</code> /
+            <code class="px-1 rounded bg-(--color-bg-3)/50">max_episodes</code> /
+            <code class="px-1 rounded bg-(--color-bg-3)/50">free_min_pct</code>
+            の 3 ルール union (oldest-first)、grace 60s。pinned (📌) は保護。
           </div>
           <div class="text-(--color-text-mute)">
-            <span class="text-(--color-text-dim)">予定 (Phase 2):</span>
-            profile yaml <code>episode_recorder.retention</code> から
-            <code>max_age_days</code> / <code>max_episodes</code> /
-            <code>free_min_pct</code> を読み、60s grace 経過後に unpinned を削除。
-            pinned (📌) は対象外。
+            <span class="text-(--color-text-dim)">設定:</span>
+            ⚙ 設定 → 🧹 自動メンテ で ON/OFF + しきい値編集 + プレビュー / 今すぐ実行。
+            profile yaml デフォルトより operator 設定を優先 (
+            <code class="px-1 rounded bg-(--color-bg-3)/50">.retention_policy.json</code>
+            に永続化)。
           </div>
         </div>
       </details>
