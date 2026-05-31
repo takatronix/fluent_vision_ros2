@@ -1608,16 +1608,23 @@
               {#if isDepth}
                 {@const fps = (cam as any).fps_actual || 30}
                 {@const total = cam.frame_count || 0}
-                {@const fIdx = total > 0 ? Math.max(0, Math.min(total - 1, Math.floor(sharedTime * fps))) : 0}
+                {@const isBagDepth = cam.kind === 'depth_bag'}
+                <!-- For depth_bag we try the preview endpoint even when the
+                     placeholder summary says 0 frames: pre-2026-05-31 bags
+                     never had frame_count populated even though the bag
+                     itself has the depth messages. The endpoint scans the
+                     bag and 404s if a frame index is out of range. The img
+                     tag's onerror handler swaps to the empty-state below. -->
+                {@const fIdx = total > 0 ? Math.max(0, Math.min(total - 1, Math.floor(sharedTime * fps))) : Math.max(0, Math.floor(sharedTime * fps))}
                 {@const fStr = String(fIdx).padStart(6, '0')}
                 <div class="bg-black relative group/depth" style="aspect-ratio: {w} / {h};">
-                  {#if total > 0}
+                  {#if total > 0 || isBagDepth}
                     <img src={`${API}/episodes/${playEpisode.episode_id}/depth_preview/${cam.name}/${fStr}.jpg?cmap=turbo&max=4000`}
                          alt="depth"
                          class="w-full h-full object-contain"
                          loading="lazy" />
                     <div class="absolute top-1 left-1 text-[9px] px-1.5 py-0.5 rounded bg-black/70 text-white font-mono">
-                      f{fIdx}/{total - 1}
+                      f{fIdx}{total > 0 ? `/${total - 1}` : ''}
                     </div>
                     <div class="absolute bottom-1 right-1 text-[9px] px-1.5 py-0.5 rounded bg-black/70 text-(--color-accent)">
                       turbo · 0–4m

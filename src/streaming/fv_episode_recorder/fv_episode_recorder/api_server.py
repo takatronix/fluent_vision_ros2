@@ -477,25 +477,35 @@ async def _stop_episode(request: web.Request) -> web.Response:
         bag_recorder.abort()
 
     # Step 2b: stop depth republishers AFTER bag (so any in-flight compressed
-    # frames make it into the bag's final flush).
+    # frames make it into the bag's final flush). The republisher pool
+    # returns per-camera frame counts which we hand to camera_pool so the
+    # depth placeholder summaries carry a real frame_count (without this
+    # the play modal shows '0 frames' even though the bag has them).
     depth_pool = request.app.get("depth_pool")
+    depth_frame_counts: dict[str, int] = {}
     if depth_pool is not None:
         try:
-            depth_pool.stop_all()
+            depth_frame_counts = depth_pool.stop_all() or {}
         except Exception as exc:
             LOG.warning("depth republisher stop failed: %s", exc)
-
-    # Step 3: stop camera writers, gather frame_count summaries
     camera_pool: CameraWriterPool = request.app["camera_pool"]
-    camera_summaries: list[dict] = []
+    if depth_frame_counts:
+        try:
+            camera_pool.apply_depth_frame_counts(depth_frame_counts)
+        except Exception as exc:
+            LOG.warning("depth frame_count apply failed: %s", exc)
+
+    # Step 3: stop camera writers, gather frame_count summaries. Called
+    # unconditionally because depth_bag placeholders also need to flush —
+    # a depth-only episode has no mp4 writers so is_active() is False but
+    # the placeholders must still come out for the play modal.
+    camera_summaries: list[dict] = camera_pool.stop_all()
     frame_count_per_camera: dict[str, int] = {}
     video_size_bytes = 0
-    if camera_pool.is_active():
-        camera_summaries = camera_pool.stop_all()
-        for cs in camera_summaries:
-            frame_count_per_camera[cs["name"]] = cs["frame_count"]
-            for seg in cs.get("segments", []):
-                video_size_bytes += int(seg.get("size_bytes", 0))
+    for cs in camera_summaries:
+        frame_count_per_camera[cs["name"]] = cs["frame_count"]
+        for seg in cs.get("segments", []):
+            video_size_bytes += int(seg.get("size_bytes", 0))
 
     # Flush markers (Phase 2) from in-memory manager into meta.json
     mm: MarkerManager = request.app["marker_manager"]
@@ -622,8 +632,67 @@ async def _get_episode(request: web.Request) -> web.Response:
     found = store.get_episode(episode_id)
     if found is None:
         return web.json_response({"error": "not_found"}, status=404)
-    meta, _ep_dir = found
+    meta, ep_dir = found
+    # Lazy backfill for depth_bag cameras whose frame_count was never
+    # populated (pre-2026-05-31 bags + any episode stopped before the
+    # depth republisher's counter was wired into the placeholder). The
+    # count is cheap (sqlite COUNT on topic_id) so do it inline; persist
+    # so subsequent fetches stay O(1).
+    if _backfill_depth_frame_counts(meta, ep_dir):
+        try:
+            store._write_meta(ep_dir, meta)  # noqa: SLF001
+        except Exception as exc:
+            LOG.warning("depth frame_count backfill persist failed for %s: %s",
+                        episode_id, exc)
     return web.json_response(asdict(meta))
+
+
+def _backfill_depth_frame_counts(meta, ep_dir) -> bool:
+    """If any depth_bag camera summary has frame_count=0 (legacy / pre-fix),
+    run a sqlite COUNT against the bag's depth topic and patch the summary.
+    Returns True iff something was updated so the caller knows to persist."""
+    if not meta.cameras:
+        return False
+    needs_backfill = [
+        c for c in meta.cameras
+        if (c.get("kind") or "").startswith("depth") and not c.get("frame_count")
+    ]
+    if not needs_backfill:
+        return False
+    bag_dir = ep_dir / "bag"
+    db_files = sorted(bag_dir.glob("*.db3"))
+    if not db_files:
+        return False
+    import sqlite3
+    updated = False
+    try:
+        conn = sqlite3.connect(f"file:{db_files[0]}?mode=ro", uri=True)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id, name FROM topics")
+            topic_id_by_name = {row[1]: row[0] for row in cur.fetchall()}
+            for cam in needs_backfill:
+                raw_topic = (cam.get("topic") or "").rstrip("/")
+                candidates = [
+                    f"{raw_topic}_compressed/compressedDepth",
+                    raw_topic,
+                ]
+                for t in candidates:
+                    tid = topic_id_by_name.get(t)
+                    if tid is None:
+                        continue
+                    cur.execute("SELECT COUNT(*) FROM messages WHERE topic_id = ?", (tid,))
+                    n = int(cur.fetchone()[0])
+                    if n > 0:
+                        cam["frame_count"] = n
+                        updated = True
+                        break
+        finally:
+            conn.close()
+    except Exception as exc:
+        LOG.warning("depth backfill sqlite read failed: %s", exc)
+        return False
+    return updated
 
 
 async def _disk_status(request: web.Request) -> web.Response:

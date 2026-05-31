@@ -130,10 +130,21 @@ class DepthRepublisherPool:
             })
         return out
 
-    def stop_all(self) -> None:
+    def stop_all(self) -> dict[str, int]:
+        """Tear down all republishers and return the per-camera frame count
+        (republisher's internal counter, sampled before destruction so the
+        camera_pool can write it into the depth placeholder summary).
+        Without this the play modal sees frame_count=0 and renders the
+        '0 frames' empty-state even though the bag has the frames."""
+        counts: dict[str, int] = {}
         for r in self._pubs:
+            try:
+                counts[r.name] = int(getattr(r, "_frame_count", 0))
+            except Exception:
+                counts[r.name] = 0
             try:
                 r.stop()
             except Exception as exc:
                 LOG.warning("republisher stop failed for %s: %s", r.raw_topic, exc)
         self._pubs = []
+        return counts

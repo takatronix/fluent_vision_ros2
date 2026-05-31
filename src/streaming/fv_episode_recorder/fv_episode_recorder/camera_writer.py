@@ -415,6 +415,17 @@ class CameraWriterPool:
             self._writers[name] = writer
         return [w.summary() for w in self._writers.values()] + self._depth_placeholders
 
+    def apply_depth_frame_counts(self, counts: dict[str, int]) -> None:
+        """Patch the depth_bag placeholder summaries with the frame counts
+        sampled from the DepthRepublisher pool before its teardown. Without
+        this the play modal sees frame_count=0 and renders '0 frames' even
+        though the bag contains them. Idempotent — unknown names are ignored
+        so a profile that wires depth differently doesn't crash here."""
+        for ph in self._depth_placeholders:
+            name = ph.get("name")
+            if name in counts:
+                ph["frame_count"] = int(counts[name])
+
     def stop_all(self) -> list[dict]:
         summaries = []
         for name, writer in list(self._writers.items()):
