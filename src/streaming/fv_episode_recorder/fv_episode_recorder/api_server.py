@@ -21,6 +21,7 @@ from typing import Any, Optional
 from aiohttp import web
 
 from .active_lock import ActiveLock
+from .batch_runner import BatchConfig, BatchRunner
 from .bag_recorder import BagRecorder
 from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeMeta, EpisodeStore, new_episode_id, utc_now_iso
@@ -69,6 +70,7 @@ def build_app(
     app = web.Application(middlewares=[_cors_middleware])
     app["store"] = store
     app["mux_tracker"] = mux_tracker
+    app["batch_runner"] = BatchRunner()
     app["bag_recorder"] = bag_recorder
     app["camera_pool"] = camera_pool
     app["active_lock"] = active_lock
@@ -87,6 +89,10 @@ def build_app(
     app.router.add_get("/api/v1/episodes/{episode_id}/depth_preview/{camera}/{frame}", _depth_preview)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints", _episode_joints)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints.csv", _episode_joints_csv)
+    # Batch loop (LeRobot-style auto-cycle) so the operator clicks once for 100 runs.
+    app.router.add_post("/api/v1/episodes/batch_start", _batch_start)
+    app.router.add_get("/api/v1/episodes/batch_status", _batch_status)
+    app.router.add_post("/api/v1/episodes/batch_stop", _batch_stop)
     app.router.add_get("/api/v1/episodes/{episode_id}/download.tar", _episode_download_tar)
     app.router.add_get("/api/v1/disk/status", _disk_status)
 
@@ -884,6 +890,101 @@ async def _episode_file(request: web.Request) -> web.Response:
     if not path.exists() or not path.is_file():
         return web.json_response({"error": "not_found", "path": str(path.relative_to(ep_dir_resolved))}, status=404)
     return web.FileResponse(path)
+
+
+async def _batch_start(request: web.Request) -> web.Response:
+    """Kick off a LeRobot-style cycle: [setup_s → record_s] × count.
+
+    Body:
+        task_description: str (required)
+        profile: str (required)
+        count: int (required, >=1)
+        record_s: float (required, seconds per episode)
+        setup_s: float (default 5.0, scene-reset countdown before each ep)
+        tags: list[str] (optional)
+        outcome_on_timeout: str (default "success")
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    required = ["task_description", "profile", "count", "record_s"]
+    missing = [k for k in required if body.get(k) in (None, "", 0)]
+    if missing:
+        return web.json_response({"error": "missing_fields", "fields": missing}, status=400)
+    try:
+        cfg = BatchConfig(
+            task_description=str(body["task_description"]),
+            profile=str(body["profile"]),
+            count=max(1, int(body["count"])),
+            record_s=max(0.5, float(body["record_s"])),
+            setup_s=max(0.0, float(body.get("setup_s", 5.0))),
+            tags=list(body.get("tags") or []),
+            outcome_on_timeout=str(body.get("outcome_on_timeout", "success")),
+        )
+    except (TypeError, ValueError) as exc:
+        return web.json_response({"error": "invalid_request", "detail": str(exc)}, status=400)
+
+    runner: BatchRunner = request.app["batch_runner"]
+    if runner.is_running():
+        return web.json_response(
+            {"error": "batch_already_running", "current": runner.state.to_dict() if runner.state else None},
+            status=409,
+        )
+
+    # Run the existing start/stop handlers in-process — keeps a single
+    # code path (preflight, profile resolution, mux snapshot, lock).
+    # aiohttp doesn't have a public sub-request API; a tiny shim is
+    # enough since both handlers only use `request.json()`, `request.app`,
+    # and `request.match_info`.
+    async def _start(body: dict) -> dict:
+        class _Shim:
+            def __init__(self, parent, payload):
+                self.app = parent.app
+                self.match_info = {}
+                self._payload = payload
+            async def json(self):
+                return self._payload
+            @property
+            def query(self):
+                return {}
+        resp = await _start_episode(_Shim(request, body))  # type: ignore[arg-type]
+        if resp.status >= 400:
+            raise RuntimeError(f"start_episode HTTP {resp.status}: {resp.body.decode('utf-8', 'replace')[:200]}")
+        import json as _json
+        return _json.loads(resp.body)
+
+    async def _stop(ep_id: str, outcome: str) -> dict:
+        class _Shim:
+            def __init__(self, parent, ep, payload):
+                self.app = parent.app
+                self.match_info = {"episode_id": ep}
+                self._payload = payload
+            async def json(self):
+                return self._payload
+        resp = await _stop_episode(_Shim(request, ep_id, {"outcome": outcome}))  # type: ignore[arg-type]
+        if resp.status >= 400:
+            raise RuntimeError(f"stop_episode HTTP {resp.status}: {resp.body.decode('utf-8', 'replace')[:200]}")
+        import json as _json
+        return _json.loads(resp.body)
+
+    state = await runner.start(cfg, _start, _stop)
+    return web.json_response(state.to_dict(), status=202)
+
+
+async def _batch_status(request: web.Request) -> web.Response:
+    runner: BatchRunner = request.app["batch_runner"]
+    if runner.state is None:
+        return web.json_response({"phase": "idle"})
+    return web.json_response(runner.state.to_dict())
+
+
+async def _batch_stop(request: web.Request) -> web.Response:
+    runner: BatchRunner = request.app["batch_runner"]
+    if not runner.is_running():
+        return web.json_response({"error": "no_batch_running"}, status=404)
+    await runner.stop()
+    return web.json_response({"stopping": True, "state": runner.state.to_dict() if runner.state else None})
 
 
 async def _patch_episode(request: web.Request) -> web.Response:
