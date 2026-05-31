@@ -1593,8 +1593,8 @@
              existing sync handlers. -->
         <div class="flex gap-2 mb-3 overflow-x-auto shrink-0 pb-1">
           {#each playEpisode.cameras as cam (cam.name)}
-            {@const segments = cam.segments || [{ file: '0000.mp4' }]}
-            {@const isDepth = cam.kind === 'depth_png_seq'}
+            {@const segments = (cam.segments && cam.segments.length > 0) ? cam.segments : [{ file: '0000.mp4' }]}
+            {@const isDepth = (cam.kind || '').startsWith('depth')}
             {@const w = (cam as any).width || 640}
             {@const h = (cam as any).height || 480}
             <div class="shrink-0 flex flex-col rounded-md overflow-hidden border border-(--color-border) bg-(--color-bg-3)"
