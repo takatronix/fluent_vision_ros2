@@ -1256,6 +1256,8 @@
               {@const open = expandedBatches.has(row.batchId)}
               {@const successRate = s.count > 0 ? (s.success / s.count) * 100 : 0}
               {@const rateColor = successRate >= 90 ? 'text-emerald-400' : successRate >= 50 ? 'text-amber-400' : 'text-red-400'}
+              {@const allPinned = row.eps.every(x => x.pinned)}
+              {@const anyPinned = row.eps.some(x => x.pinned)}
               <tr class="group border-t border-(--color-border) hover:bg-(--color-accent-soft)/30 cursor-pointer transition-colors"
                   style="background: rgba(0,217,255,0.04);"
                   onclick={() => toggleBatch(row.batchId)}
@@ -1299,8 +1301,6 @@
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{fmtBytes(s.totalBytes)}</td>
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{s.totalMarkers}</td>
                 <td class="px-2 py-2.5 text-right whitespace-nowrap">
-                  {@const allPinned = row.eps.every(x => x.pinned)}
-                  {@const anyPinned = row.eps.some(x => x.pinned)}
                   <button
                     onclick={(e) => togglePinBatch(row.batchId, row.eps, e)}
                     class="{anyPinned ? 'opacity-100 text-amber-400' : 'opacity-0 group-hover:opacity-100 text-(--color-text-mute)'} hover:text-amber-400 transition p-1 rounded hover:bg-amber-500/10 mr-1"
