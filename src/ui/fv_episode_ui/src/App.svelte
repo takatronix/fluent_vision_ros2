@@ -718,6 +718,62 @@
   });
 
   let bulkDeleteProgress = $state<{ total: number; done: number; failed: number } | null>(null);
+  // ---- Retention (auto-maintenance) — operator policy + preview/run ----
+  type RetentionPolicy = {
+    enabled: boolean;
+    max_age_days: number | null;
+    max_episodes: number | null;
+    free_min_pct: number | null;
+    grace_period_s: number;
+    interval_s: number;
+  };
+  let retentionPolicy = $state<RetentionPolicy | null>(null);
+  let retentionPreview = $state<any>(null);
+  let retentionBusy = $state(false);
+
+  async function loadRetentionPolicy() {
+    try {
+      const r = await fetch(`${API}/retention/policy`);
+      if (r.ok) retentionPolicy = await r.json();
+    } catch {}
+  }
+  async function saveRetentionPolicy() {
+    if (!retentionPolicy) return;
+    retentionBusy = true;
+    try {
+      const r = await fetch(`${API}/retention/policy`, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(retentionPolicy),
+      });
+      if (r.ok) retentionPolicy = await r.json();
+    } finally { retentionBusy = false; }
+  }
+  async function previewRetention() {
+    if (!retentionPolicy) return;
+    retentionBusy = true;
+    try {
+      const r = await fetch(`${API}/retention/run?dry_run=true`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(retentionPolicy),
+      });
+      if (r.ok) retentionPreview = await r.json();
+    } finally { retentionBusy = false; }
+  }
+  async function runRetentionNow() {
+    if (!retentionPolicy) return;
+    if (!confirm('保存済みポリシーで今すぐ削除を実行します。grace_period_s 内の候補は次回 tick で実削除されます。')) return;
+    retentionBusy = true;
+    try {
+      const r = await fetch(`${API}/retention/run?dry_run=false`, {method: 'POST'});
+      if (r.ok) {
+        retentionPreview = await r.json();
+        await load();
+      }
+    } finally { retentionBusy = false; }
+  }
+
   async function deleteAllEpisodes() {
     const targets = episodes.filter(e => !e.pinned && e.state !== 'recording');
     if (targets.length === 0) {
@@ -801,7 +857,7 @@
         {#if pollIntervalS > 0}<span>{pollIntervalS}s 毎</span>{:else}<span>off</span>{/if}
       </div>
       <button
-        onclick={() => (settingsOpen = !settingsOpen)}
+        onclick={() => { settingsOpen = !settingsOpen; if (settingsOpen) loadRetentionPolicy(); }}
         class="flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg bg-(--color-bg-2) border border-(--color-border) text-(--color-text-dim) hover:text-(--color-accent) hover:border-(--color-accent-glow) transition"
         title="設定">
         <Settings class="size-4 {settingsOpen ? 'rotate-45' : ''} transition-transform" />
@@ -848,6 +904,79 @@
                 設定を初期化
               </button>
             </div>
+
+            <!-- Retention / 自動メンテ -->
+            {#if retentionPolicy}
+              <div class="border-t border-(--color-border) pt-3 mt-1 space-y-2">
+                <div class="text-(--color-text-dim) text-[11px] flex items-center justify-between">
+                  <span>🧹 自動メンテ (古い録画削除)</span>
+                  <label class="flex items-center gap-1 cursor-pointer">
+                    <input type="checkbox" bind:checked={retentionPolicy.enabled} class="accent-(--color-accent)" />
+                    <span class="text-[10px]">{retentionPolicy.enabled ? 'ON' : 'OFF'}</span>
+                  </label>
+                </div>
+                <div class="grid grid-cols-3 gap-1.5 text-[10px]" class:opacity-50={!retentionPolicy.enabled}>
+                  <label class="flex flex-col gap-0.5">
+                    <span class="text-(--color-text-mute)">日数</span>
+                    <input type="number" min="0" step="1"
+                           value={retentionPolicy.max_age_days ?? ''}
+                           oninput={(e) => { if (retentionPolicy) retentionPolicy.max_age_days = e.currentTarget.value ? parseInt(e.currentTarget.value) : null; }}
+                           placeholder="—" disabled={!retentionPolicy.enabled}
+                           class="w-full bg-(--color-bg-2) border border-(--color-border) rounded px-1.5 py-1 font-mono text-(--color-text)" />
+                  </label>
+                  <label class="flex flex-col gap-0.5">
+                    <span class="text-(--color-text-mute)">本数</span>
+                    <input type="number" min="0" step="10"
+                           value={retentionPolicy.max_episodes ?? ''}
+                           oninput={(e) => { if (retentionPolicy) retentionPolicy.max_episodes = e.currentTarget.value ? parseInt(e.currentTarget.value) : null; }}
+                           placeholder="—" disabled={!retentionPolicy.enabled}
+                           class="w-full bg-(--color-bg-2) border border-(--color-border) rounded px-1.5 py-1 font-mono text-(--color-text)" />
+                  </label>
+                  <label class="flex flex-col gap-0.5">
+                    <span class="text-(--color-text-mute)">空き %</span>
+                    <input type="number" min="0" max="100" step="1"
+                           value={retentionPolicy.free_min_pct ?? ''}
+                           oninput={(e) => { if (retentionPolicy) retentionPolicy.free_min_pct = e.currentTarget.value ? parseFloat(e.currentTarget.value) : null; }}
+                           placeholder="—" disabled={!retentionPolicy.enabled}
+                           class="w-full bg-(--color-bg-2) border border-(--color-border) rounded px-1.5 py-1 font-mono text-(--color-text)" />
+                  </label>
+                </div>
+                <div class="flex gap-1.5">
+                  <button onclick={saveRetentionPolicy} disabled={retentionBusy}
+                          class="flex-1 px-2 py-1 rounded bg-(--color-accent-soft) text-(--color-accent) border border-(--color-accent-glow) hover:brightness-125 transition text-[10px]">
+                    保存
+                  </button>
+                  <button onclick={previewRetention} disabled={retentionBusy || !retentionPolicy.enabled}
+                          class="flex-1 px-2 py-1 rounded bg-(--color-bg-2) border border-(--color-border) text-(--color-text-dim) hover:text-white transition text-[10px]">
+                    プレビュー
+                  </button>
+                  <button onclick={runRetentionNow} disabled={retentionBusy || !retentionPolicy.enabled}
+                          class="flex-1 px-2 py-1 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 transition text-[10px]">
+                    今すぐ実行
+                  </button>
+                </div>
+                {#if retentionPreview}
+                  {@const cands = retentionPreview.candidates || []}
+                  {@const deleted = retentionPreview.deleted || []}
+                  <div class="text-[10px] text-(--color-text-mute) bg-(--color-bg-3)/30 rounded p-2 space-y-0.5">
+                    <div>候補: <b class="text-(--color-text)">{cands.length}</b> 件 / 今回削除: <b class="text-amber-400">{deleted.length}</b> 件</div>
+                    {#if cands.length > 0}
+                      <div class="text-[9px] opacity-70 max-h-24 overflow-auto font-mono">
+                        {#each cands.slice(0, 10) as c}
+                          <div>· {c.task} ({c.reasons.join(',')}) {(c.size_bytes/1e6).toFixed(1)}MB</div>
+                        {/each}
+                        {#if cands.length > 10}<div>… 他 {cands.length - 10} 件</div>{/if}
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+                <div class="text-[9px] text-(--color-text-mute)">
+                  3 ルール union: 日数超 / 本数超 / 空き不足。pinned は保護。
+                  grace {retentionPolicy.grace_period_s}s → 候補→削除。
+                </div>
+              </div>
+            {/if}
+
             <div class="border-t border-red-500/30 pt-3 mt-1">
               <div class="text-[10px] text-red-400/70 mb-1.5">⚠ 危険ゾーン</div>
               <button onclick={() => { settingsOpen = false; deleteAllEpisodes(); }}
