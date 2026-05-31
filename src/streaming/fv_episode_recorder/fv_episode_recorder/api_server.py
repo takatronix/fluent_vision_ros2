@@ -130,6 +130,12 @@ async def _healthz(request: web.Request) -> web.Response:
             "fps_per_camera": camera_pool.frame_counts(),
             "active_markers": active_markers,
         }
+    # Include batch_runner state so the dashboard's WS recorder_status
+    # carries both episode + batch info — no second poll required, no race
+    # between WS recorder_status and the separate batch_status polling.
+    runner = request.app.get("batch_runner")
+    if runner is not None and runner.state is not None:
+        payload["batch"] = runner.state.to_dict()
     return web.json_response(payload)
 
 
