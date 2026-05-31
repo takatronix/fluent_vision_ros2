@@ -96,6 +96,10 @@ class BatchRunner:
         self._state: Optional[BatchState] = None
         self._task: Optional[asyncio.Task] = None
         self._stop_evt: Optional[asyncio.Event] = None
+        # Per-iteration control. retry = discard current ep + redo same index;
+        # skip = stop current ep with the configured outcome + advance to next.
+        self._retry_evt: Optional[asyncio.Event] = None
+        self._skip_evt: Optional[asyncio.Event] = None
 
     @property
     def state(self) -> Optional[BatchState]:
@@ -123,6 +127,8 @@ class BatchRunner:
             phase_duration_s=config.setup_s,
         )
         self._stop_evt = asyncio.Event()
+        self._retry_evt = asyncio.Event()
+        self._skip_evt = asyncio.Event()
         self._task = asyncio.create_task(self._run(start_fn, stop_fn))
         return self._state
 
@@ -134,38 +140,70 @@ class BatchRunner:
         self._stop_evt.set()
         return True
 
-    async def _sleep_or_abort(self, seconds: float) -> bool:
-        """Sleep `seconds`, return True if aborted."""
+    def retry(self) -> bool:
+        """Operator-triggered: this iteration was bad; discard the current
+        episode and redo the same index from the setup phase."""
+        if not self.is_running() or self._retry_evt is None:
+            return False
+        self._retry_evt.set()
+        return True
+
+    def skip(self) -> bool:
+        """Operator-triggered: this iteration finished early; finalize the
+        current episode with the configured outcome and advance to the next."""
+        if not self.is_running() or self._skip_evt is None:
+            return False
+        self._skip_evt.set()
+        return True
+
+    async def _wait(self, seconds: float) -> str:
+        """Wait `seconds` or until one of the control events fires. Returns
+        one of: 'timeout' (full duration elapsed), 'abort', 'retry', 'skip'."""
         if self._stop_evt is None:
             await asyncio.sleep(seconds)
-            return False
-        try:
-            await asyncio.wait_for(self._stop_evt.wait(), timeout=seconds)
-            return True
-        except asyncio.TimeoutError:
-            return False
+            return 'timeout'
+        sleep_t = asyncio.create_task(asyncio.sleep(seconds))
+        evts = {
+            'abort': asyncio.create_task(self._stop_evt.wait()),
+            'retry': asyncio.create_task(self._retry_evt.wait()) if self._retry_evt else None,
+            'skip':  asyncio.create_task(self._skip_evt.wait())  if self._skip_evt  else None,
+        }
+        waitset = {sleep_t} | {t for t in evts.values() if t is not None}
+        done, pending = await asyncio.wait(waitset, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        # Priority: abort > retry > skip > timeout.
+        if self._stop_evt.is_set():
+            return 'abort'
+        if self._retry_evt is not None and self._retry_evt.is_set():
+            self._retry_evt.clear()
+            return 'retry'
+        if self._skip_evt is not None and self._skip_evt.is_set():
+            self._skip_evt.clear()
+            return 'skip'
+        return 'timeout'
 
     async def _run(self, start_fn: StartEpisodeFn, stop_fn: StopEpisodeFn) -> None:
         assert self._state is not None
         state = self._state
         cfg = state.config
         try:
-            for i in range(1, cfg.count + 1):
+            i = 1
+            while i <= cfg.count:
                 state.current_index = i
                 # ---- setup countdown ----
                 state.phase = "setup"
                 state.phase_started_at = time.time()
                 state.phase_duration_s = cfg.setup_s
                 LOG.info("batch %s: ep %d/%d setup (%.1fs)", state.batch_id, i, cfg.count, cfg.setup_s)
-                if await self._sleep_or_abort(cfg.setup_s):
-                    state.phase = "aborted"
+                setup_action = await self._wait(cfg.setup_s)
+                if setup_action == 'abort':
+                    state.phase = 'aborted'
                     LOG.info("batch %s: aborted during setup at %d/%d", state.batch_id, i, cfg.count)
                     return
+                # retry / skip during setup just shorten or restart — both advance to recording
 
                 # ---- start episode ----
-                # Bake the sequence number into the task name so it appears
-                # everywhere (Episodes list / chip / play modal / search) —
-                # LeRobot-style episode_NNNN convention.
                 width = max(3, len(str(cfg.count)))
                 seq = f"{i:0{width}d}/{cfg.count}"
                 req_body = {
@@ -184,6 +222,7 @@ class BatchRunner:
                     state.failed += 1
                     state.last_error = f"start failed: {exc}"
                     LOG.warning("batch %s: ep %d start failed: %s", state.batch_id, i, exc)
+                    i += 1
                     continue
 
                 # ---- recording ----
@@ -192,25 +231,41 @@ class BatchRunner:
                 state.phase_duration_s = cfg.record_s
                 LOG.info("batch %s: ep %d/%d recording (%.1fs) id=%s",
                          state.batch_id, i, cfg.count, cfg.record_s, state.current_episode_id)
-                aborted = await self._sleep_or_abort(cfg.record_s)
+                rec_action = await self._wait(cfg.record_s)
 
-                # ---- stop episode ----
-                outcome = "discard" if aborted else cfg.outcome_on_timeout
+                # ---- decide outcome from action ----
+                if rec_action == 'abort':
+                    outcome = 'discard'
+                elif rec_action == 'retry':
+                    outcome = 'discard'
+                elif rec_action == 'skip':
+                    outcome = cfg.outcome_on_timeout   # treat as if record_s elapsed
+                else:  # 'timeout'
+                    outcome = cfg.outcome_on_timeout
+
                 try:
                     if state.current_episode_id:
                         await stop_fn(state.current_episode_id, outcome)
-                    if outcome != "discard":
+                    if outcome != 'discard':
                         state.succeeded += 1
+                    elif rec_action == 'retry':
+                        # retry doesn't count as failure — operator just bailing
+                        pass
                 except Exception as exc:
                     state.failed += 1
                     state.last_error = f"stop failed: {exc}"
                     LOG.warning("batch %s: ep %d stop failed: %s", state.batch_id, i, exc)
 
                 state.current_episode_id = None
-                if aborted:
-                    state.phase = "aborted"
+                if rec_action == 'abort':
+                    state.phase = 'aborted'
                     LOG.info("batch %s: aborted after %d/%d", state.batch_id, i, cfg.count)
                     return
+                if rec_action == 'retry':
+                    LOG.info("batch %s: retry requested at %d/%d", state.batch_id, i, cfg.count)
+                    continue  # same i, redo setup → record
+                # timeout or skip → advance
+                i += 1
 
             state.phase = "done"
             LOG.info("batch %s: done (succeeded=%d failed=%d)",
@@ -222,4 +277,6 @@ class BatchRunner:
         finally:
             state.finished_at = time.time()
             self._stop_evt = None
+            self._retry_evt = None
+            self._skip_evt = None
             self._task = None

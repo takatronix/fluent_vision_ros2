@@ -93,6 +93,8 @@ def build_app(
     app.router.add_post("/api/v1/episodes/batch_start", _batch_start)
     app.router.add_get("/api/v1/episodes/batch_status", _batch_status)
     app.router.add_post("/api/v1/episodes/batch_stop", _batch_stop)
+    app.router.add_post("/api/v1/episodes/batch_retry", _batch_retry)
+    app.router.add_post("/api/v1/episodes/batch_skip", _batch_skip)
     app.router.add_get("/api/v1/episodes/{episode_id}/download.tar", _episode_download_tar)
     app.router.add_get("/api/v1/disk/status", _disk_status)
 
@@ -991,6 +993,28 @@ async def _batch_stop(request: web.Request) -> web.Response:
         return web.json_response({"error": "no_batch_running"}, status=404)
     await runner.stop()
     return web.json_response({"stopping": True, "state": runner.state.to_dict() if runner.state else None})
+
+
+async def _batch_retry(request: web.Request) -> web.Response:
+    """Discard the current iteration's episode and redo the same index.
+    No-op if no batch is running."""
+    runner: BatchRunner = request.app["batch_runner"]
+    if not runner.is_running():
+        return web.json_response({"error": "no_batch_running"}, status=404)
+    if not runner.retry():
+        return web.json_response({"error": "retry_failed"}, status=500)
+    return web.json_response({"retrying": True, "state": runner.state.to_dict() if runner.state else None})
+
+
+async def _batch_skip(request: web.Request) -> web.Response:
+    """Finalize the current iteration's episode with the configured outcome
+    and advance to the next index immediately (don't wait for record_s)."""
+    runner: BatchRunner = request.app["batch_runner"]
+    if not runner.is_running():
+        return web.json_response({"error": "no_batch_running"}, status=404)
+    if not runner.skip():
+        return web.json_response({"error": "skip_failed"}, status=500)
+    return web.json_response({"skipping": True, "state": runner.state.to_dict() if runner.state else None})
 
 
 async def _patch_episode(request: web.Request) -> web.Response:
