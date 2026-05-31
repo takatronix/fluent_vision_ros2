@@ -799,6 +799,30 @@
     alert(`完了: ${removed} 件削除 / ${failed} 件失敗`);
   }
 
+  async function togglePinBatch(batchId: string, eps: Episode[], e: MouseEvent) {
+    e.stopPropagation();
+    // Decide direction: if any unpinned in the batch → pin all, else unpin all.
+    const anyUnpinned = eps.some(x => !x.pinned);
+    const next = anyUnpinned;
+    const label = (eps[0]?.task_description || '').replace(/\s+#\d+\/\d+$/, '');
+    if (!confirm(`バッチ ${eps.length} 本を ${next ? '📌 pin' : 'unpin'} します。\n\n  ${label}`)) return;
+    let done = 0, failed = 0;
+    for (const ep of eps) {
+      if (ep.pinned === next) { done++; continue; }
+      try {
+        const r = await fetch(`${API}/episodes/${ep.episode_id}`, {
+          method: 'PATCH',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({pinned: next}),
+        });
+        if (r.ok) done++; else failed++;
+      } catch { failed++; }
+    }
+    // Optimistic local update.
+    episodes = episodes.map(x => eps.some(e2 => e2.episode_id === x.episode_id) ? { ...x, pinned: next } : x);
+    if (failed > 0) alert(`pin 切替: ${done} 件成功 / ${failed} 件失敗`);
+  }
+
   async function deleteBatch(batchId: string, eps: Episode[], e: MouseEvent) {
     e.stopPropagation();
     const totalBytes = eps.reduce((s, x) => s + (x.size_bytes || 0), 0);
@@ -1226,6 +1250,14 @@
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{fmtBytes(s.totalBytes)}</td>
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{s.totalMarkers}</td>
                 <td class="px-2 py-2.5 text-right whitespace-nowrap">
+                  {@const allPinned = row.eps.every(x => x.pinned)}
+                  {@const anyPinned = row.eps.some(x => x.pinned)}
+                  <button
+                    onclick={(e) => togglePinBatch(row.batchId, row.eps, e)}
+                    class="{anyPinned ? 'opacity-100 text-amber-400' : 'opacity-0 group-hover:opacity-100 text-(--color-text-mute)'} hover:text-amber-400 transition p-1 rounded hover:bg-amber-500/10 mr-1"
+                    title={allPinned ? `バッチ全体 ${s.count} 件を unpin` : anyPinned ? `バッチを完全 pin (現状 ${row.eps.filter(x => x.pinned).length}/${s.count} pinned)` : `バッチ全体 ${s.count} 件を 📌 pin (retention 保護)`}>
+                    <Pin class="size-4" />
+                  </button>
                   <button
                     onclick={(e) => deleteBatch(row.batchId, row.eps, e)}
                     class="opacity-0 group-hover:opacity-100 text-(--color-text-mute) hover:text-red-400 transition p-1 rounded hover:bg-red-500/10"
