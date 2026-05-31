@@ -123,6 +123,11 @@ class EpisodeStore:
         self._lock = threading.Lock()
         self._active_episode: Optional[EpisodeMeta] = None
         self._active_dir: Optional[Path] = None
+        # sqlite cache built lazily — recorder_node calls ensure_consistent()
+        # on startup to detect drift + rebuild. Mutations below call upsert
+        # so the index stays in sync with on-disk meta.json.
+        from .episode_index import EpisodeIndex
+        self.index = EpisodeIndex(self.output_dir)
 
     # ---- active episode tracking (Phase 1 Step 1 — single active enforcement) ----
 
@@ -177,13 +182,12 @@ class EpisodeStore:
             self._active_dir = None
             return meta, ep_dir
 
-    # ---- list / get (Phase 1 Step 1 — filesystem walk; Phase 2 will use sqlite) ----
+    # ---- list / get ----
 
     def list_episodes(self, limit: int = 50) -> list[tuple[EpisodeMeta, int]]:
-        """Return (meta, size_bytes) tuples for episodes on disk, newest first.
-
-        size_bytes is computed by walking the episode dir. Phase 2 will move
-        this to a sqlite index since 500+ episodes walked per request gets slow."""
+        """Legacy filesystem-walk lister (kept for callers that don't need
+        pagination — e.g. retention planner). New code should use
+        `list_episodes_indexed()` for the sqlite-backed cursor pagination."""
         results: list[tuple[EpisodeMeta, int]] = []
         episodes_root = self.output_dir / "episodes"
         if not episodes_root.exists():
@@ -195,7 +199,6 @@ class EpisodeStore:
                 with meta_path.open() as f:
                     data = json.load(f)
                 meta = EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__})
-                # Aggregate size of the episode directory (bag + mp4 + sidecar + meta).
                 ep_dir = meta_path.parent
                 size = 0
                 try:
@@ -210,6 +213,24 @@ class EpisodeStore:
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
         return results
+
+    def list_episodes_indexed(
+        self,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+        profile: Optional[str] = None,
+        batch_id: Optional[str] = None,
+        pinned_only: bool = False,
+        env: Optional[str] = None,
+    ) -> tuple[list[dict], Optional[str], int]:
+        """sqlite-backed cursor pagination. Returns (rows, next_cursor, total).
+        Each row is a dict already shaped like EpisodeSummary so api_server
+        can pass it through with minimal massaging."""
+        rows, next_cursor = self.index.list(
+            limit=limit, cursor=cursor, profile=profile,
+            batch_id=batch_id, pinned_only=pinned_only, env=env,
+        )
+        return rows, next_cursor, self.index.total_count()
 
     def patch_episode_meta(self, episode_id: str, changes: dict) -> Optional[dict]:
         """Update a small allow-list of meta fields on disk (trim / task /
@@ -235,6 +256,8 @@ class EpisodeStore:
         with tmp.open("w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         tmp.replace(meta_path)
+        try: self.index.upsert(data, ep_dir)
+        except Exception: pass
         return data
 
     def add_finalized_marker(self, episode_id: str, marker: dict) -> Optional[dict]:
@@ -260,6 +283,8 @@ class EpisodeStore:
         with tmp.open("w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         tmp.replace(meta_path)
+        try: self.index.upsert(data, ep_dir)
+        except Exception: pass
         return marker
 
     def delete_finalized_marker(self, marker_id: str) -> bool:
@@ -281,6 +306,8 @@ class EpisodeStore:
                 with tmp.open("w") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 tmp.replace(meta_path)
+                try: self.index.upsert(data, meta_path.parent)
+                except Exception: pass
                 return True
         return False
 
@@ -315,6 +342,8 @@ class EpisodeStore:
                 with tmp.open("w") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                 tmp.replace(meta_path)
+                try: self.index.upsert(data, meta_path.parent)
+                except Exception: pass
                 return m
         return None
 
@@ -331,6 +360,8 @@ class EpisodeStore:
             raise RuntimeError("cannot delete the active recording episode")
         import shutil
         shutil.rmtree(ep_dir, ignore_errors=True)
+        try: self.index.delete(episode_id)
+        except Exception: pass
         return True
 
     def get_episode(self, episode_id: str) -> Optional[tuple[EpisodeMeta, Path]]:
@@ -374,6 +405,13 @@ class EpisodeStore:
     def _write_meta(self, ep_dir: Path, meta: EpisodeMeta) -> None:
         meta_path = ep_dir / "meta.json"
         tmp_path = meta_path.with_suffix(".json.tmp")
+        data = asdict(meta)
         with tmp_path.open("w") as f:
-            json.dump(asdict(meta), f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
         tmp_path.replace(meta_path)
+        # Mirror into the sqlite index so list queries don't have to FS-walk.
+        # Best-effort: a failure here doesn't block the meta.json write.
+        try:
+            self.index.upsert(data, ep_dir)
+        except Exception:
+            pass

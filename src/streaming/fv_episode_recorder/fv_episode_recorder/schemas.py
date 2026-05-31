@@ -79,3 +79,4 @@ class EpisodeSummary(BaseModel):
 class ListEpisodesResponse(BaseModel):
     episodes: list[EpisodeSummary]
     next_cursor: Optional[str] = None
+    total: int = 0

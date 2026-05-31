@@ -67,6 +67,12 @@ class FVEpisodeRecorderNode(Node):
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.store = EpisodeStore(self.output_dir)
+        # sqlite index: detect drift vs filesystem + rebuild if needed so
+        # episodes deleted via `rm -rf` while recorder was down are dropped.
+        try:
+            self.store.index.ensure_consistent()
+        except Exception as exc:
+            self.get_logger().warning(f"episode index consistency check failed: {exc}")
         self.bag_recorder = BagRecorder(max_bag_size_mb=1024)
         self.camera_pool = CameraWriterPool(node=self)
         self.active_lock = ActiveLock(self.output_dir)

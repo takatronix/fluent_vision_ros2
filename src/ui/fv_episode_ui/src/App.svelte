@@ -560,15 +560,26 @@
     return { label: '—', cls: 'bg-zinc-500/15 text-zinc-400 border border-zinc-500/30' };
   };
 
+  // Cursor pagination state. First load = fresh top-of-list, replaces
+  // `episodes`. loadMore = appends the next page if next_cursor is set.
+  let nextCursor = $state<string | null>(null);
+  let totalCount = $state<number>(0);
+  let loadingMore = $state(false);
+  const PAGE_SIZE = 50;
+
   async function load() {
     try {
+      const params = new URLSearchParams({ limit: String(PAGE_SIZE) });
+      if (activeProfile) params.set('profile', activeProfile);
       const [epRes, dkRes] = await Promise.all([
-        fetch(`${API}/episodes?limit=200`),
+        fetch(`${API}/episodes?${params}`),
         fetch(`${API}/disk/status`),
       ]);
       const epJson = await epRes.json();
       const dkJson = await dkRes.json();
       episodes = epJson.episodes || [];
+      nextCursor = epJson.next_cursor || null;
+      totalCount = epJson.total ?? episodes.length;
       disk = dkJson;
       error = null;
     } catch (e: any) {
@@ -577,6 +588,44 @@
       loading = false;
     }
   }
+
+  async function loadMore() {
+    if (loadingMore || !nextCursor) return;
+    loadingMore = true;
+    try {
+      const params = new URLSearchParams({ limit: String(PAGE_SIZE), cursor: nextCursor });
+      if (activeProfile) params.set('profile', activeProfile);
+      const r = await fetch(`${API}/episodes?${params}`);
+      const j = await r.json();
+      const newOnes: Episode[] = j.episodes || [];
+      // Dedup by episode_id in case the top-of-list poll and loadMore overlap.
+      const seen = new Set(episodes.map(e => e.episode_id));
+      episodes = [...episodes, ...newOnes.filter(e => !seen.has(e.episode_id))];
+      nextCursor = j.next_cursor || null;
+      totalCount = j.total ?? totalCount;
+    } catch (e: any) {
+      // Non-fatal — keep what we have, user can scroll-retry.
+      console.warn('loadMore failed', e);
+    } finally {
+      loadingMore = false;
+    }
+  }
+
+  // IntersectionObserver-driven infinite scroll. Sentinel <div> at the
+  // table foot is observed; when it enters the viewport we kick loadMore.
+  let scrollSentinel: HTMLDivElement | null = $state(null);
+  let scrollObserver: IntersectionObserver | null = null;
+  $effect(() => {
+    if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; }
+    if (!scrollSentinel) return;
+    scrollObserver = new IntersectionObserver((entries) => {
+      if (entries.some(e => e.isIntersecting) && nextCursor && !loadingMore) {
+        loadMore();
+      }
+    }, { rootMargin: '300px 0px' });
+    scrollObserver.observe(scrollSentinel);
+    return () => { if (scrollObserver) { scrollObserver.disconnect(); scrollObserver = null; } };
+  });
 
   // Disk-card derived thresholds. Pulled out of the markup because
   // Svelte 5 only allows {@const} as an immediate child of control-flow
@@ -1335,11 +1384,24 @@
           {/each}
         </tbody>
       </table>
+      <!-- Infinite-scroll sentinel — IntersectionObserver fires loadMore
+           when this enters the viewport (rootMargin 300px so it pre-loads). -->
+      {#if nextCursor}
+        <div bind:this={scrollSentinel} class="px-4 py-3 text-center text-[11px] text-(--color-text-mute)">
+          {#if loadingMore}
+            読み込み中…
+          {:else}
+            ↓ scroll でさらに読み込み
+          {/if}
+        </div>
+      {:else if episodes.length >= PAGE_SIZE}
+        <div class="px-4 py-3 text-center text-[10px] text-(--color-text-mute)">— 末尾 —</div>
+      {/if}
     </div>
   {/if}
 
   <footer class="mt-6 text-center text-[11px] text-(--color-text-mute)">
-    {filteredEpisodes.length} / {episodes.length} 件 · 5 秒毎自動更新 · fv_episode_ui v0.1.0
+    {filteredEpisodes.length} 表示 / {episodes.length} 読込 / 全{totalCount} 件 · {pollIntervalS > 0 ? `${pollIntervalS}s 毎自動更新` : '手動更新'} · fv_episode_ui v0.1.0
   </footer>
 </main>
 

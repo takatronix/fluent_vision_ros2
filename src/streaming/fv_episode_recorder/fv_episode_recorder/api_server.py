@@ -501,6 +501,15 @@ async def _stop_episode(request: web.Request) -> web.Response:
 
 
 async def _list_episodes(request: web.Request) -> web.Response:
+    """sqlite-indexed list with cursor pagination + filters.
+    Query params:
+      limit       (default 50, max 500)
+      cursor      pass back next_cursor from previous response
+      profile     filter by profile name
+      batch_id    filter by batch tag value
+      pinned_only "true" to filter
+      env         "sim" or "real"
+    """
     store: EpisodeStore = request.app["store"]
     try:
         limit = int(request.query.get("limit", "50"))
@@ -508,27 +517,40 @@ async def _list_episodes(request: web.Request) -> web.Response:
         limit = 50
     limit = max(1, min(limit, 500))
 
-    summaries: list[dict[str, Any]] = []
-    for meta, size in store.list_episodes(limit=limit):
-        summaries.append(EpisodeSummary(
-            episode_id=meta.episode_id,
-            state=meta.state,
-            task_description=meta.task_description,
-            profile=meta.profile,
-            robot_id=meta.robot_id,
-            started_at=meta.started_at,
-            stopped_at=meta.stopped_at,
-            duration_s=meta.duration_s,
-            outcome=meta.outcome,
-            pinned=meta.pinned,
-            size_bytes=size,
-            marker_count=len(meta.markers),
-            tags=meta.tags,
-            source=meta.source,
-            env="sim" if (meta.profile or "").endswith("_sim") else "real",
-            controller_label=_summarize_controller(meta.controller_at_end or meta.controller_at_start),
-        ).model_dump())
-    return web.json_response(ListEpisodesResponse(episodes=summaries).model_dump())
+    rows, next_cursor, total = store.list_episodes_indexed(
+        limit=limit,
+        cursor=request.query.get("cursor") or None,
+        profile=request.query.get("profile") or None,
+        batch_id=request.query.get("batch_id") or None,
+        pinned_only=(request.query.get("pinned_only", "").lower() == "true"),
+        env=request.query.get("env") or None,
+    )
+    summaries = [
+        EpisodeSummary(
+            episode_id=r["episode_id"],
+            state=r["state"],
+            task_description=r["task_description"],
+            profile=r["profile"],
+            robot_id=r.get("robot_id"),
+            started_at=r["started_at"],
+            stopped_at=r.get("stopped_at"),
+            duration_s=r.get("duration_s"),
+            outcome=r.get("outcome"),
+            pinned=bool(r.get("pinned")),
+            size_bytes=int(r.get("size_bytes") or 0),
+            marker_count=int(r.get("marker_count") or 0),
+            tags=r.get("tags") or [],
+            source=r.get("source") or "local",
+            env=r.get("env") or "real",
+            controller_label=r.get("controller_label"),
+        ).model_dump()
+        for r in rows
+    ]
+    return web.json_response({
+        "episodes": summaries,
+        "next_cursor": next_cursor,
+        "total": total,
+    })
 
 
 def _summarize_controller(snap: Optional[dict[str, Any]]) -> Optional[str]:
