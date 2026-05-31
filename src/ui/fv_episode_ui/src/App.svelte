@@ -923,7 +923,7 @@
     const simWarning = profile.endsWith('_sim')
       ? `${profile} (sim) で再走行します。`
       : `⚠ ${profile} は実機 profile の可能性があります。安全 gate 未実装 (Phase 3c) — ロボットがバッグの記録通りに動きます。本当に続けますか？`;
-    if (!confirm(`bag_play モード\n\n  ${simWarning}\n  速度: ${speed}x\n  duration: 全長\n\n他の teleop / mux source を停止しておくこと。`)) return;
+    if (!confirm(`リプレイ\n\n  ${simWarning}\n  速度: ${speed}x\n  duration: 全長\n\n再生中は teleop_mux が 'replay' source に切り替わり live teleop は遮断されます。終了時は 'stop' に戻るので live を再開するには明示的に source を選び直してください。`)) return;
     replayBusy = true;
     try {
       const r = await fetch(`${API}/episodes/${playEpisode.episode_id}/replay`, {
@@ -937,7 +937,7 @@
       }
       replayState = await r.json();
     } catch (e: any) {
-      alert('bag_play 開始失敗: ' + (e.message || e));
+      alert('リプレイ開始失敗: ' + (e.message || e));
     } finally { replayBusy = false; }
   }
   async function stopReplay() {
@@ -968,14 +968,14 @@
   async function startBagPlayRow(ep: Episode, e: MouseEvent, speed: number = 1.0) {
     e.stopPropagation();
     if (replayState?.running) {
-      alert('既に bag_play 実行中です (停止後に再試行)');
+      alert('既にリプレイ実行中です (停止後に再試行)');
       return;
     }
     const profile = ep.profile || '';
     const simWarning = profile.endsWith('_sim')
       ? `${profile} (sim) で再走行します。`
       : `⚠ ${profile} は実機 profile の可能性 — 安全 gate 未実装 (Phase 3c)。ロボットが記録通り動きます。`;
-    if (!confirm(`bag_play モード\n\n  ${ep.task_description || '(no task)'}\n  ${simWarning}\n  速度: ${speed}x\n\n他の teleop / mux source を停止しておくこと。`)) return;
+    if (!confirm(`リプレイ\n\n  ${ep.task_description || '(no task)'}\n  ${simWarning}\n  速度: ${speed}x\n\n再生中は teleop_mux が 'replay' source に切り替わり live teleop は遮断されます。終了時は 'stop' に戻るので live を再開するには明示的に source を選び直してください。`)) return;
     try {
       const r = await fetch(`${API}/episodes/${ep.episode_id}/replay`, {
         method: 'POST',
@@ -988,7 +988,7 @@
       }
       replayState = await r.json();
     } catch (err: any) {
-      alert('bag_play 開始失敗: ' + (err.message || err));
+      alert('リプレイ開始失敗: ' + (err.message || err));
     }
   }
 
@@ -1487,7 +1487,7 @@
                     onclick={(e) => startBagPlayRow(ep, e, 1.0)}
                     disabled={!!replayState?.running}
                     class="opacity-0 group-hover:opacity-100 text-(--color-text-mute) hover:text-amber-300 disabled:opacity-30 disabled:cursor-not-allowed transition p-1 rounded hover:bg-amber-500/10 mr-1"
-                    title="🎬 bag_play 1×で再走行 (sim 推奨 — safety gate 未実装)">
+                    title="🎬 リプレイ 1× (sim 推奨 — 実機 safety gate 未実装)">
                     🎬
                   </button>
                   <button
@@ -1566,12 +1566,12 @@
           {:else}
             <button onclick={() => startBagPlay(1.0)} disabled={replayBusy}
                     class="px-2 py-1 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300 hover:bg-amber-500/25 transition text-xs"
-                    title="ros2 bag play で記録 topic を再 publish → mujoco / 実機の subscriber が動作 (safety gate 未実装, sim 推奨)">
-              🎬 bag再走行
+                    title="録画した command 列を mux の replay source から再生 → mujoco / 実機が動作 (sim 推奨, 実機 safety gate 未実装)">
+              ▶ リプレイ
             </button>
             <select onchange={(e) => startBagPlay(parseFloat(e.currentTarget.value))} disabled={replayBusy}
                     class="text-[10px] bg-(--color-bg-2) border border-(--color-border) rounded px-1 py-1"
-                    title="速度を変えて bag_play 開始">
+                    title="速度を変えてリプレイ開始">
               <option value="" disabled selected>速度</option>
               <option value="0.5">0.5×</option>
               <option value="1.0">1.0×</option>
