@@ -1276,9 +1276,6 @@
                 <td class="px-4 py-2.5">
                   {#if isChild}<span class="inline-block w-4 text-(--color-text-mute) text-center">└</span>{/if}
                   <span class="inline-block px-2 py-0.5 rounded text-[11px] {b.cls}">{b.label}</span>
-                  {#if ep.pinned}
-                    <Pin class="inline size-3.5 ml-1 text-amber-400" />
-                  {/if}
                 </td>
                 <td class="px-4 py-2.5" style={isChild ? 'padding-left: 32px;' : ''}>
                   <div class="text-(--color-text) {isChild ? 'text-xs text-(--color-text-dim)' : 'font-medium'}">{ep.task_description}</div>
