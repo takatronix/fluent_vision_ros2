@@ -591,6 +591,10 @@
   const filteredEpisodes = $derived(
     episodes
       .filter(e => {
+        // Active recording lives in the header chip + disk card "録画中"
+        // section; surfacing it here too just adds noise (playback isn't
+        // possible until it finishes anyway).
+        if (e.state === 'recording') return false;
         if (activeProfile && e.profile !== activeProfile) return false;
         if (query.trim()) {
           const q = query.toLowerCase();
@@ -806,13 +810,15 @@
         <tbody>
           {#each filteredEpisodes as ep (ep.episode_id)}
             {@const b = outcomeBadge(ep.outcome)}
-            <tr class="group border-t border-(--color-border) hover:bg-(--color-bg-3)/40 transition-colors cursor-pointer"
-                onclick={() => openPlay(ep)}
-                title="クリックで再生">
+            {@const isRec = ep.state === 'recording'}
+            <tr class="group border-t border-(--color-border) hover:bg-(--color-bg-3)/40 transition-colors {isRec ? 'cursor-not-allowed' : 'cursor-pointer'}"
+                onclick={() => { if (!isRec) openPlay(ep); }}
+                title={isRec ? '録画中は再生できません (停止後に再生可能)' : 'クリックで再生'}>
               <td class="px-4 py-2.5">
-                <span class="inline-block px-2 py-0.5 rounded text-[11px] {b.cls}">{b.label}</span>
-                {#if ep.state === 'recording'}
-                  <span class="ml-1 inline-block px-2 py-0.5 rounded text-[11px] bg-red-500/20 text-red-400 border border-red-500/40" style="animation: rec-pulse 1.4s ease-in-out infinite">REC</span>
+                {#if isRec}
+                  <span class="inline-block px-2 py-0.5 rounded text-[11px] bg-red-500/20 text-red-400 border border-red-500/40" style="animation: rec-pulse 1.4s ease-in-out infinite">● 現在録画中</span>
+                {:else}
+                  <span class="inline-block px-2 py-0.5 rounded text-[11px] {b.cls}">{b.label}</span>
                 {/if}
                 {#if ep.pinned}
                   <Pin class="inline size-3.5 ml-1 text-amber-400" />
