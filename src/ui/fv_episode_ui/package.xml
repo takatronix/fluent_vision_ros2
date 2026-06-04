@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>fv_episode_ui</name>
+  <version>0.1.0</version>
+  <description>
+    Shared Svelte SPA for episode browsing (list, marker timeline, playback).
+    Built into dist/ by `npm run build` and ament-installed under
+    share/fv_episode_ui/web/ so dashboards (vlabor / aspa-navigation) can
+    serve it via a same-origin /static/fv_episode_ui/ route.
+  </description>
+  <maintainer email="takatronix@gmail.com">takatronix</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
