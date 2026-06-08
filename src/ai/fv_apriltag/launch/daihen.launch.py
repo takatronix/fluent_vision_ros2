@@ -1,6 +1,6 @@
 """Launch fv_apriltag for daihen_vc4l_teleop profile.
 
-Two detector instances (D405 arm_camera + C920 side_camera) plus the
+Two detector instances (D405 arm_camera + C920 top_camera) plus the
 cube estimator. Depth refine is only available on the D405 stream.
 """
 import os
@@ -43,7 +43,7 @@ def generate_launch_description():
         package='fv_apriltag',
         executable='apriltag_node',
         name='apriltag_node',
-        namespace='side_camera_apriltag',
+        namespace='top_camera_apriltag',
         output='screen',
         parameters=[{
             'family': 'tag36h11',
@@ -56,8 +56,8 @@ def generate_launch_description():
             'publish_tf': True,
         }],
         remappings=[
-            ('image', '/side_camera/image_raw'),
-            ('camera_info', '/side_camera/camera_info'),
+            ('image', '/top_camera/image_raw'),
+            ('camera_info', '/top_camera/camera_info'),
         ],
     )
 
