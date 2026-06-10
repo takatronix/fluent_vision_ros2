@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+/* fv_episode_ui — Dark + electric cyan theme (design doc §18.2.1)
+   Inspired by Tesla autopilot / SpaceX Dragon / Linear app.        */
+@theme {
+  --color-bg:           oklch(0.12 0.01 240);            /* deep navy */
+  --color-bg-2:         oklch(0.16 0.012 240);           /* card base */
+  --color-bg-3:         oklch(0.20 0.015 240);           /* hover     */
+  --color-border:       oklch(1 0 0 / 0.06);
+
+  --color-accent:       oklch(0.83 0.18 215);            /* electric cyan #00d9ff */
+  --color-accent-soft:  oklch(0.83 0.18 215 / 0.15);
+  --color-accent-glow:  oklch(0.83 0.18 215 / 0.35);
+
+  --color-danger:       oklch(0.65 0.24 25);
+  --color-success:      oklch(0.75 0.18 145);
+  --color-warning:      oklch(0.85 0.18 70);
+
+  --color-text:         oklch(0.95 0.005 240);
+  --color-text-dim:     oklch(0.65 0.01 240);
+  --color-text-mute:    oklch(0.45 0.01 240);
+
+  --radius-card:        16px;
+  --shadow-card:        0 8px 32px rgba(0, 0, 0, 0.4);
+
+  --font-sans:          "Inter Variable", "Inter", system-ui, sans-serif;
+  --font-mono:          "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+
+  --ease-quart:         cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11";
+}
+
+/* Subtle gradient + noise on the page background */
+body {
+  background-image:
+    linear-gradient(135deg, oklch(0.12 0.01 240), oklch(0.10 0.02 260)),
+    url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence baseFrequency='0.9' numOctaves='3'/></filter><rect width='180' height='180' filter='url(%23n)' opacity='0.04'/></svg>");
+  background-blend-mode: overlay;
+}
+
+/* Glass card utility */
+.card {
+  background: var(--color-bg-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  backdrop-filter: blur(16px);
+  box-shadow: var(--shadow-card);
+}
+
+/* Pulsing REC dot */
+@keyframes rec-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 68, 68, 0.7); }
+  50%      { box-shadow: 0 0 0 8px rgba(255, 68, 68, 0); }
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: oklch(1 0 0 / 0.08);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover { background: oklch(1 0 0 / 0.16); }
