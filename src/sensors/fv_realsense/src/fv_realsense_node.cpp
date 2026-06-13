@@ -1351,8 +1351,17 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
     // librealsense and prevents downstream tf2 future-extrapolation
     // failures.
     if (drift_resync_ms_ >= 0.0) {
-        const rclcpp::Duration drift = stamp - now;
-        const int64_t drift_ns = std::abs(drift.nanoseconds());
+        // Compare via nanoseconds() (plain int64 wall-clock counts) rather
+        // than rclcpp::Time/Duration operator- : `stamp` (from
+        // base_ros_stamp_), `now` (this->now()) and the throttle baseline
+        // can carry different clock sources (RCL_ROS_TIME vs
+        // RCL_SYSTEM_TIME). rclcpp::Time::operator-/< throw
+        // "can't subtract times with different time sources [1 != 2]"
+        // (std::runtime_error → SIGABRT) on a clock-type mismatch. That
+        // fired on the re-anchor path below (now - s_last_log) whenever the
+        // drift exceeded threshold — e.g. after a host clock jump on reboot —
+        // killing the D405 node. nanoseconds() never throws.
+        const int64_t drift_ns = std::abs(stamp.nanoseconds() - now.nanoseconds());
         const int64_t threshold_ns =
             static_cast<int64_t>(drift_resync_ms_ * 1e6);
         if (drift_ns > threshold_ns) {
@@ -1362,14 +1371,14 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
             last_device_ts_ms_ = device_ts_ms;
             last_ros_stamp_ = now;
             // Surface the event at most once per 10 s to avoid log spam.
-            static rclcpp::Time s_last_log{0, 0, RCL_SYSTEM_TIME};
-            if ((now - s_last_log).nanoseconds() > static_cast<int64_t>(1e10)) {
-                s_last_log = now;
+            static int64_t s_last_log_ns = 0;
+            if ((now.nanoseconds() - s_last_log_ns) > static_cast<int64_t>(1e10)) {
+                s_last_log_ns = now.nanoseconds();
                 RCLCPP_INFO(
                     this->get_logger(),
                     "device->ROS time mapping re-anchored "
                     "(drift was %.3f s; threshold %.3f s)",
-                    drift.seconds(), drift_resync_ms_ / 1000.0);
+                    static_cast<double>(drift_ns) / 1e9, drift_resync_ms_ / 1000.0);
             }
             return stamp;
         }
