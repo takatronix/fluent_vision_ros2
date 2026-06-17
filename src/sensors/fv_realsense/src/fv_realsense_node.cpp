@@ -1332,6 +1332,26 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
         return now;
     }
 
+    if (base_ros_stamp_.get_clock_type() != now.get_clock_type() ||
+        last_ros_stamp_.get_clock_type() != now.get_clock_type()) {
+        // The previous device->ROS baseline belongs to a different ROS clock
+        // epoch. Mixing clock types makes rclcpp::Time subtraction invalid and
+        // can publish timestamps with an undefined meaning, so fail the old
+        // mapping closed and start a new bounded mapping at this frame.
+        RCLCPP_WARN(
+            this->get_logger(),
+            "device->ROS time mapping re-anchored because ROS clock type changed "
+            "(base=%d last=%d now=%d)",
+            static_cast<int>(base_ros_stamp_.get_clock_type()),
+            static_cast<int>(last_ros_stamp_.get_clock_type()),
+            static_cast<int>(now.get_clock_type()));
+        base_device_ts_ms_ = device_ts_ms;
+        base_ros_stamp_ = now;
+        last_device_ts_ms_ = device_ts_ms;
+        last_ros_stamp_ = now;
+        return now;
+    }
+
     // Reset mapping if device timestamp jumps backwards significantly (device reset).
     if ((device_ts_ms + device_ts_reset_threshold_ms_) < last_device_ts_ms_) {
         base_device_ts_ms_ = device_ts_ms;
@@ -1351,25 +1371,28 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
     // librealsense and prevents downstream tf2 future-extrapolation
     // failures.
     if (drift_resync_ms_ >= 0.0) {
-        const rclcpp::Duration drift = stamp - now;
-        const int64_t drift_ns = std::abs(drift.nanoseconds());
+        const int64_t drift_ns = stamp.nanoseconds() - now.nanoseconds();
+        const int64_t abs_drift_ns = drift_ns < 0 ? -drift_ns : drift_ns;
         const int64_t threshold_ns =
             static_cast<int64_t>(drift_resync_ms_ * 1e6);
-        if (drift_ns > threshold_ns) {
+        if (abs_drift_ns > threshold_ns) {
             base_device_ts_ms_ = device_ts_ms;
             base_ros_stamp_ = now;
             stamp = now;
             last_device_ts_ms_ = device_ts_ms;
             last_ros_stamp_ = now;
             // Surface the event at most once per 10 s to avoid log spam.
-            static rclcpp::Time s_last_log{0, 0, RCL_SYSTEM_TIME};
-            if ((now - s_last_log).nanoseconds() > static_cast<int64_t>(1e10)) {
-                s_last_log = now;
+            static std::chrono::steady_clock::time_point s_last_log;
+            const auto log_now = std::chrono::steady_clock::now();
+            if (s_last_log.time_since_epoch().count() == 0 ||
+                log_now - s_last_log > std::chrono::seconds(10)) {
+                s_last_log = log_now;
                 RCLCPP_INFO(
                     this->get_logger(),
                     "device->ROS time mapping re-anchored "
                     "(drift was %.3f s; threshold %.3f s)",
-                    drift.seconds(), drift_resync_ms_ / 1000.0);
+                    static_cast<double>(drift_ns) / 1e9,
+                    drift_resync_ms_ / 1000.0);
             }
             return stamp;
         }
