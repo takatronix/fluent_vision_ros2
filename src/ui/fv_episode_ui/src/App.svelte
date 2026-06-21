@@ -1039,7 +1039,7 @@
   onDestroy(() => { if (pollTimer) clearInterval(pollTimer); });
 </script>
 
-<main class="min-h-screen p-6 max-w-[1400px] mx-auto">
+<main class="min-h-screen p-6">
   <!-- Header -->
   <header class="flex items-center justify-between mb-6">
     <div>
@@ -1544,7 +1544,7 @@
     onkeydown={(e) => { if (e.key === 'Escape') closePlay(); }}
     role="dialog"
     tabindex="-1">
-    <div class="card w-full max-w-6xl p-5 flex flex-col" style="max-height: 92vh;">
+    <div class="card w-full p-5 flex flex-col" style="max-height: 92vh;">
       <header class="flex items-start justify-between mb-3 shrink-0 gap-3">
         <div class="min-w-0 flex-1">
           <h2 class="text-lg font-semibold text-white truncate">{playEpisode.task_description}</h2>
