@@ -529,6 +529,78 @@
     return `${API}/episodes/${epId}/files/videos/${camera}/${segment}`;
   }
 
+  function triggerBlobDownload(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  // Download the CURRENT single frame of one camera as an image.
+  // Color cams: grab the <video>'s current frame onto a canvas → PNG. The
+  // api_server sends Access-Control-Allow-Origin:* and the <video> carries
+  // crossorigin="anonymous", so the canvas is NOT tainted and toBlob works.
+  // Depth cams: fetch the same turbo depth-preview JPG the pane is showing.
+  // Download the full mp4 clip of one (color) camera. Fetched as a blob so
+  // the cross-origin Content-Disposition / download attribute limitation
+  // doesn't apply (api_server sends Access-Control-Allow-Origin:*).
+  async function downloadCameraVideo(cam: any) {
+    if (!playEpisode) return;
+    const epId = playEpisode.episode_id;
+    const safe = String(cam.name).replace(/[^\w.-]+/g, '_');
+    const segs = (cam.segments && cam.segments.length > 0) ? cam.segments : [{ file: '0000.mp4' }];
+    try {
+      const resp = await fetch(videoUrl(epId, cam.name, segs[0].file));
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      triggerBlobDownload(await resp.blob(), `${epId}_${safe}.mp4`);
+    } catch (e) {
+      console.error('[downloadCameraVideo]', cam.name, e);
+      alert(`動画のダウンロードに失敗しました (${cam.name})\n${e instanceof Error ? e.message : e}`);
+    }
+  }
+
+  async function downloadCameraImage(cam: any) {
+    if (!playEpisode) return;
+    const epId = playEpisode.episode_id;
+    const safe = String(cam.name).replace(/[^\w.-]+/g, '_');
+    const isDepth = (cam.kind || '').startsWith('depth');
+    try {
+      if (isDepth) {
+        const fps = cam.fps_actual || 30;
+        const total = cam.frame_count || 0;
+        const fIdx = total > 0
+          ? Math.max(0, Math.min(total - 1, Math.floor(sharedTime * fps)))
+          : Math.max(0, Math.floor(sharedTime * fps));
+        const fStr = String(fIdx).padStart(6, '0');
+        const resp = await fetch(
+          `${API}/episodes/${epId}/depth_preview/${cam.name}/${fStr}.jpg?cmap=turbo&max=4000`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        triggerBlobDownload(await resp.blob(), `${epId}_${safe}_f${fIdx}.jpg`);
+      } else {
+        const v = videoEls[cam.name];
+        if (!v || !v.videoWidth) throw new Error('動画がまだ読み込まれていません');
+        const canvas = document.createElement('canvas');
+        canvas.width = v.videoWidth;
+        canvas.height = v.videoHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('canvas 2d context unavailable');
+        ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+        const blob = await new Promise<Blob | null>(
+          (res) => canvas.toBlob(res, 'image/png'));
+        if (!blob) throw new Error('toBlob returned null (tainted canvas?)');
+        const tStr = sharedTime.toFixed(2).replace('.', 'p');
+        triggerBlobDownload(blob, `${epId}_${safe}_t${tStr}s.png`);
+      }
+    } catch (e) {
+      console.error('[downloadCameraImage]', cam.name, e);
+      alert(`画像のダウンロードに失敗しました (${cam.name})\n${e instanceof Error ? e.message : e}`);
+    }
+  }
+
   const fmtBytes = (b: number | null | undefined) => {
     if (b == null) return '—';
     if (b >= 1e9) return (b/1e9).toFixed(2) + ' GB';
@@ -1599,11 +1671,29 @@
             {@const h = (cam as any).height || 480}
             <div class="shrink-0 flex flex-col rounded-md overflow-hidden border border-(--color-border) bg-(--color-bg-3)"
                  style="width: 280px;">
-              <div class="px-2 py-1 text-[11px] font-medium text-(--color-accent) bg-(--color-accent-soft) flex items-center justify-between">
-                <span>{cam.name}</span>
-                <span class="text-[9px] opacity-70 font-mono">
-                  {w}×{h}{#if isDepth} · depth · {cam.frame_count || 0}f{/if}
-                </span>
+              <div class="px-2 py-1 text-[11px] font-medium text-(--color-accent) bg-(--color-accent-soft) flex items-center justify-between gap-2">
+                <span class="truncate">{cam.name}</span>
+                <div class="flex items-center gap-1.5 shrink-0">
+                  <span class="text-[9px] opacity-70 font-mono">
+                    {w}×{h}{#if isDepth} · depth · {cam.frame_count || 0}f{/if}
+                  </span>
+                  <button
+                    onclick={() => downloadCameraImage(cam)}
+                    title={isDepth ? '現在フレームの深度プレビューをJPGで保存' : '現在フレームをPNGで保存'}
+                    aria-label="現在のフレームを画像でダウンロード"
+                    class="size-5 rounded flex items-center justify-center hover:bg-(--color-accent)/25 transition leading-none">
+                    🖼
+                  </button>
+                  {#if !isDepth}
+                    <button
+                      onclick={() => downloadCameraVideo(cam)}
+                      title="この映像 (mp4) をダウンロード"
+                      aria-label="この映像をダウンロード"
+                      class="size-5 -mr-0.5 rounded flex items-center justify-center hover:bg-(--color-accent)/25 transition leading-none">
+                      🎬
+                    </button>
+                  {/if}
+                </div>
               </div>
               {#if isDepth}
                 {@const fps = (cam as any).fps_actual || 30}
@@ -1639,6 +1729,7 @@
               {:else}
                 <video
                   preload="metadata"
+                  crossorigin="anonymous"
                   bind:this={videoEls[cam.name]}
                   onloadedmetadata={() => onVideoMetadata(cam.name)}
                   onplay={() => syncPlayFrom(cam.name)}

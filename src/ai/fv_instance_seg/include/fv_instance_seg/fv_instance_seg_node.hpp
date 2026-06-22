@@ -1,6 +1,7 @@
 #pragma once
 
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <fv_msgs/msg/detection_array.hpp>
 #include <opencv2/core.hpp>
@@ -42,6 +43,16 @@ class InstanceSegNode : public rclcpp::Node {
   void publishMask(const cv::Mat& mask_mono, const std_msgs::msg::Header& header);
   void publishDetections(const std::vector<TrackState>& tracks, const std_msgs::msg::Header& header);
   void updateTracking(const InferResult& res, const rclcpp::Time& stamp);
+  bool loadModel(const std::string& backend,
+                 const std::string& model_path,
+                 const std::string& device,
+                 const std::string& fallback_device,
+                 bool nms_class_agnostic,
+                 int max_detections,
+                 bool debug_shapes,
+                 int infer_timeout_ms);
+  rcl_interfaces::msg::SetParametersResult onParametersSet(
+      const std::vector<rclcpp::Parameter>& parameters);
 
   cv::Scalar nextColor();
   void updateStats(double inference_ms, double total_ms, std::size_t detection_count);
@@ -61,6 +72,8 @@ class InstanceSegNode : public rclcpp::Node {
   rclcpp::Publisher<fv_msgs::msg::DetectionArray>::SharedPtr fv_dets_pub_;
 
   std::unique_ptr<Inferencer> inferencer_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
+  std::mutex inferencer_mutex_;
 
   std::string backend_;
   std::string model_path_;
@@ -74,6 +87,7 @@ class InstanceSegNode : public rclcpp::Node {
   bool nms_class_agnostic_ = true;
   int max_detections_ = 100;
   bool debug_shapes_ = false;
+  int infer_timeout_ms_ = 0;
 
   std::vector<TrackState> tracks_;
   int next_track_id_ = 1;

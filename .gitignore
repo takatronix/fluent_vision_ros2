@@ -58,6 +58,10 @@ models/depth_anything_v3/*.safetensors
 models/depth_anything_v3/DA3-SMALL/
 models/depth_anything_v3/onnx-community-small/
 models/depth_anything_v3/DA3METRIC-LARGE.onnx
+# Training-source weights / per-export dups live under models/yolo/; the
+# runtime/engine-build copy is the committed models/onnx/*.onnx (cube precedent).
+models/yolo/*.pt
+models/yolo/*.onnx
 
 # TensorRT generated artifacts (GPU SM / TRT version specific binary;
 # rebuild per host from the committed .onnx via entrypoint trtexec).

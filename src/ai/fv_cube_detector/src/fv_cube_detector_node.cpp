@@ -30,12 +30,20 @@ static rclcpp::QoS make_qos(const std::string& reliability, int depth) {
 constexpr const char* FvCubeDetectorNode::CLASS_NAMES[];
 
 const cv::Scalar FvCubeDetectorNode::CLASS_COLORS[NUM_CLASSES] = {
-    cv::Scalar(255, 0, 0),     // blue
-    cv::Scalar(0, 200, 0),     // green
-    cv::Scalar(0, 0, 255),     // red
-    cv::Scalar(220, 220, 220), // white
-    cv::Scalar(0, 255, 255),   // yellow
-    cv::Scalar(128, 128, 128)  // unknown_cube
+    cv::Scalar(0, 0, 255),     // 0 red
+    cv::Scalar(0, 200, 0),     // 1 green
+    cv::Scalar(255, 0, 0),     // 2 blue
+    cv::Scalar(220, 220, 220), // 3 white
+    cv::Scalar(0, 255, 255),   // 4 digit_1 (yellow)
+    cv::Scalar(0, 165, 255),   // 5 digit_2 (orange)
+    cv::Scalar(255, 255, 0),   // 6 digit_3 (cyan)
+    cv::Scalar(255, 0, 255),   // 7 digit_4 (magenta)
+    cv::Scalar(147, 20, 255),  // 8 digit_5 (pink)
+    cv::Scalar(255, 128, 0),   // 9 digit_6 (azure)
+    cv::Scalar(0, 128, 255),   // 10 bowl (light orange)
+    cv::Scalar(64, 64, 64),    // 11 black_tray (dark gray)
+    cv::Scalar(180, 180, 0),   // 12 number_tray (teal)
+    cv::Scalar(60, 120, 180)   // 13 cardboard_box (brown)
 };
 
 FvCubeDetectorNode::FvCubeDetectorNode(const rclcpp::NodeOptions& options)
@@ -86,7 +94,7 @@ FvCubeDetectorNode::FvCubeDetectorNode(const rclcpp::NodeOptions& options)
   mask_pub_ = this->create_publisher<Image>("mask", qos);
   fv_dets_pub_ = this->create_publisher<DetectionArray>("detections", qos);
 
-  // Load model: TensorRT engine → ONNX Runtime (GPU) → ONNX Runtime (CPU)
+  // Load model: TensorRT engine -> ONNX Runtime (GPU) -> ONNX Runtime (CPU)
 #ifdef FV_HAS_TENSORRT
   if (use_gpu_ && !trt_engine_path.empty()) {
     std::ifstream test(trt_engine_path);

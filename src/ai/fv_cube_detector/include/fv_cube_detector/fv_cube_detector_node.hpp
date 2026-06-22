@@ -78,9 +78,12 @@ class FvCubeDetectorNode : public rclcpp::Node {
   bool use_gpu_;
   bool publish_overlay_;
 
-  static constexpr int NUM_CLASSES = 6;
+  static constexpr int NUM_CLASSES = 14;
+  // vlabor_perception model classes (order = model class indices 0..13).
   static constexpr const char* CLASS_NAMES[NUM_CLASSES] = {
-      "blue", "green", "red", "white", "yellow", "unknown_cube"};
+      "red", "green", "blue", "white",
+      "digit_1", "digit_2", "digit_3", "digit_4", "digit_5", "digit_6",
+      "bowl", "black_tray", "number_tray", "cardboard_box"};
 
   static const cv::Scalar CLASS_COLORS[NUM_CLASSES];
 

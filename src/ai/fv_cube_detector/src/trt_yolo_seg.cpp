@@ -69,9 +69,12 @@ bool TrtYoloSeg::load(const std::string& engine_path) {
       } else {
         // Outputs: det [1, C, N] or proto [1, 32, ph, pw]
         if (dims.nbDims == 3) {
-          // Detection output
+          // Detection output. Raw head: [4+nc+coeff, anchors] (det_c < det_n,
+          // e.g. 42 x 8400). End2end/NMS-free head: [num_det, 4+1+1+coeff]
+          // (det_c > det_n, e.g. 300 x 38).
           det_c_ = dims.d[1];
           det_n_ = dims.d[2];
+          is_end2end_ = (det_c_ > det_n_);
           num_classes_ = std::max(1, det_c_ - 4 - num_coeff_);
           size_t det_bytes = 1 * det_c_ * det_n_ * sizeof(float);
           h_det_.resize(det_c_ * det_n_);
@@ -198,46 +201,82 @@ bool TrtYoloSeg::infer(const cv::Mat& bgr, float conf_thres, float iou_thres, Se
   std::vector<float> scores;
   std::vector<int> classes;
   std::vector<std::vector<float>> coeffs;
-
-  for (int i = 0; i < N; ++i) {
-    float x = det[0 * N + i], y = det[1 * N + i];
-    float w = det[2 * N + i], h = det[3 * N + i];
-
-    int best_cls = 0;
-    float best_score = 0.f;
-    for (int c = 0; c < ncls; ++c) {
-      float s = det[(4 + c) * N + i];
-      if (s > best_score) { best_score = s; best_cls = c; }
-    }
-    if (best_score < conf_thres) continue;
-
-    float x1 = (x - w * 0.5f - info.pad_w) / info.scale;
-    float y1 = (y - h * 0.5f - info.pad_h) / info.scale;
-    float x2 = (x + w * 0.5f - info.pad_w) / info.scale;
-    float y2 = (y + h * 0.5f - info.pad_h) / info.scale;
-    x1 = std::clamp(x1, 0.f, static_cast<float>(bgr.cols - 1));
-    y1 = std::clamp(y1, 0.f, static_cast<float>(bgr.rows - 1));
-    x2 = std::clamp(x2, 0.f, static_cast<float>(bgr.cols - 1));
-    y2 = std::clamp(y2, 0.f, static_cast<float>(bgr.rows - 1));
-
-    cv::Rect2f r(x1, y1, std::max(0.f, x2 - x1), std::max(0.f, y2 - y1));
-    if (r.width <= 1 || r.height <= 1) continue;
-
-    boxes.push_back(r);
-    scores.push_back(best_score);
-    classes.push_back(best_cls);
-
-    std::vector<float> cv(P);
-    for (int k = 0; k < P; ++k) cv[k] = det[(4 + ncls + k) * N + i];
-    coeffs.emplace_back(std::move(cv));
-  }
-
-  // NMS
   std::vector<int> keep;
-  nms(boxes, scores, iou_thres, keep);
-  if (static_cast<int>(keep.size()) > max_det_) {
-    std::sort(keep.begin(), keep.end(), [&](int a, int b) { return scores[a] > scores[b]; });
-    keep.resize(max_det_);
+
+  if (is_end2end_) {
+    // End2end / NMS-free head: det is [num_det, attrs] row-major, with
+    // attrs = 4 (xyxy @ input scale) + 1 (score) + 1 (class) + P (mask).
+    // Already NMS'd and score-sorted by the model — no NMS done here.
+    const int num_det = det_c_;
+    const int attrs   = det_n_;
+    for (int d = 0; d < num_det; ++d) {
+      const float* row = det + static_cast<size_t>(d) * attrs;
+      float score = row[4];
+      if (score < conf_thres) continue;
+      int cls = static_cast<int>(std::lround(row[5]));
+
+      float x1 = (row[0] - info.pad_w) / info.scale;
+      float y1 = (row[1] - info.pad_h) / info.scale;
+      float x2 = (row[2] - info.pad_w) / info.scale;
+      float y2 = (row[3] - info.pad_h) / info.scale;
+      x1 = std::clamp(x1, 0.f, static_cast<float>(bgr.cols - 1));
+      y1 = std::clamp(y1, 0.f, static_cast<float>(bgr.rows - 1));
+      x2 = std::clamp(x2, 0.f, static_cast<float>(bgr.cols - 1));
+      y2 = std::clamp(y2, 0.f, static_cast<float>(bgr.rows - 1));
+
+      cv::Rect2f r(x1, y1, std::max(0.f, x2 - x1), std::max(0.f, y2 - y1));
+      if (r.width <= 1 || r.height <= 1) continue;
+
+      boxes.push_back(r);
+      scores.push_back(score);
+      classes.push_back(cls);
+
+      std::vector<float> cvf(P);
+      for (int k = 0; k < P; ++k) cvf[k] = row[6 + k];
+      coeffs.emplace_back(std::move(cvf));
+    }
+    for (int i = 0; i < static_cast<int>(boxes.size()); ++i) keep.push_back(i);
+    if (static_cast<int>(keep.size()) > max_det_) keep.resize(max_det_);
+  } else {
+    // Raw head [4+nc+coeff, anchors], channel-major. Decode + NMS.
+    for (int i = 0; i < N; ++i) {
+      float x = det[0 * N + i], y = det[1 * N + i];
+      float w = det[2 * N + i], h = det[3 * N + i];
+
+      int best_cls = 0;
+      float best_score = 0.f;
+      for (int c = 0; c < ncls; ++c) {
+        float s = det[(4 + c) * N + i];
+        if (s > best_score) { best_score = s; best_cls = c; }
+      }
+      if (best_score < conf_thres) continue;
+
+      float x1 = (x - w * 0.5f - info.pad_w) / info.scale;
+      float y1 = (y - h * 0.5f - info.pad_h) / info.scale;
+      float x2 = (x + w * 0.5f - info.pad_w) / info.scale;
+      float y2 = (y + h * 0.5f - info.pad_h) / info.scale;
+      x1 = std::clamp(x1, 0.f, static_cast<float>(bgr.cols - 1));
+      y1 = std::clamp(y1, 0.f, static_cast<float>(bgr.rows - 1));
+      x2 = std::clamp(x2, 0.f, static_cast<float>(bgr.cols - 1));
+      y2 = std::clamp(y2, 0.f, static_cast<float>(bgr.rows - 1));
+
+      cv::Rect2f r(x1, y1, std::max(0.f, x2 - x1), std::max(0.f, y2 - y1));
+      if (r.width <= 1 || r.height <= 1) continue;
+
+      boxes.push_back(r);
+      scores.push_back(best_score);
+      classes.push_back(best_cls);
+
+      std::vector<float> cvf(P);
+      for (int k = 0; k < P; ++k) cvf[k] = det[(4 + ncls + k) * N + i];
+      coeffs.emplace_back(std::move(cvf));
+    }
+
+    nms(boxes, scores, iou_thres, keep);
+    if (static_cast<int>(keep.size()) > max_det_) {
+      std::sort(keep.begin(), keep.end(), [&](int a, int b) { return scores[a] > scores[b]; });
+      keep.resize(max_det_);
+    }
   }
 
   // Decode masks

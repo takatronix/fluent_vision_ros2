@@ -17,7 +17,7 @@ class FoundationPoseAdapterNode(Node):
         self.declare_parameter("color_input_topic", "/d405_color/image_raw")
         self.declare_parameter("camera_info_input_topic", "/d405_color/camera_info")
         self.declare_parameter("depth_input_topic", "/d405_depth/image_rect_raw")
-        self.declare_parameter("mask_input_topic", "/d405_cube/mask")
+        self.declare_parameter("mask_input_topic", "/d405_perception/mask")
 
         self.declare_parameter("color_output_topic", "/rgb/image_rect_color")
         self.declare_parameter("camera_info_output_topic", "/rgb/camera_info")

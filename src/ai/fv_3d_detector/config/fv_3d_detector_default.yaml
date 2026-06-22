@@ -4,8 +4,8 @@ fv_3d_detector_node:
     mode: "depth"
 
     # Input topics
-    mask_topic: "/d405_cube/mask"               # Binary mask (MONO8, 0=bg, 255=fg)
-    detections_topic: "/d405_cube/detections"    # DetectionArray from fv_instance_seg
+    mask_topic: "/d405_perception/mask_id"            # Instance ID mask (MONO8, 0=bg)
+    detections_topic: "/d405_perception/detections"    # DetectionArray from fv_instance_seg
     depth_topic: "/d405_depth/filtered"          # Depth image (16UC1)
     color_topic: "/d405_color/image_raw"         # Color image (BGR8/RGB8)
     camera_info_topic: "/d405_depth/camera_info"

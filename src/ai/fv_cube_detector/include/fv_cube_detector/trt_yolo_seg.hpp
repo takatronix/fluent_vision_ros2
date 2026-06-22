@@ -55,6 +55,9 @@ class TrtYoloSeg {
 
   // Output dimensions from engine
   int det_c_ = 0, det_n_ = 0;
+  // true = end2end/NMS-free head: det output is [num_det, 4+1+1+coeff]
+  // (xyxy,score,class,mask) already NMS'd; false = raw [4+nc+coeff, anchors].
+  bool is_end2end_ = false;
 
   cudaStream_t stream_ = nullptr;
 };

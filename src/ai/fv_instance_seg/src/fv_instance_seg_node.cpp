@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cctype>
 #include <chrono>
 #include <thread>
 #include <cstdlib>
@@ -27,6 +28,40 @@ static rclcpp::QoS make_qos(const std::string& reliability, int depth) {
   return qos;
 }
 
+static std::string lower_path(const std::string& path) {
+  std::string lower = path;
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return lower;
+}
+
+static bool ends_with_any(const std::string& text, const std::vector<std::string>& suffixes) {
+  for (const auto& suffix : suffixes) {
+    if (text.size() >= suffix.size() &&
+        text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool is_tensorrt_model_path(const std::string& path) {
+  return ends_with_any(lower_path(path), {".engine", ".plan"});
+}
+
+static std::string infer_backend_for_model_path(const std::string& path,
+                                                const std::string& fallback) {
+  const auto lower = lower_path(path);
+  if (ends_with_any(lower, {".engine", ".plan"})) {
+    return "tensorrt";
+  }
+  if (ends_with_any(lower, {".onnx", ".xml"})) {
+    return "openvino";
+  }
+  return fallback;
+}
+
 InstanceSegNode::InstanceSegNode(const rclcpp::NodeOptions& options)
     : rclcpp::Node("instance_seg_node", options) {
   backend_ = this->declare_parameter<std::string>("backend", "openvino");
@@ -46,7 +81,7 @@ InstanceSegNode::InstanceSegNode(const rclcpp::NodeOptions& options)
   hold_frames_ = this->declare_parameter<int>("tracking.hold_frames", hold_frames_);
   drop_frames_ = this->declare_parameter<int>("tracking.drop_frames", drop_frames_);
   max_fps_ = this->declare_parameter<double>("max_fps", 0.0);
-  int infer_timeout_ms = this->declare_parameter<int>("infer.timeout_ms", 0);
+  infer_timeout_ms_ = this->declare_parameter<int>("infer.timeout_ms", 0);
   watchdog_stall_ms_ = this->declare_parameter<int>("watchdog.stall_ms", 0);
   watchdog_warn_ms_ = this->declare_parameter<int>("watchdog.warn_ms", watchdog_stall_ms_ > 0 ? std::min(500, watchdog_stall_ms_ / 2) : 0);
 
@@ -88,26 +123,12 @@ InstanceSegNode::InstanceSegNode(const rclcpp::NodeOptions& options)
     fv_dets_pub_ = this->create_publisher<DetectionArray>("~/detections", qos);
   }
 
-  inferencer_ = CreateInferencer(backend_);
-  if (inferencer_) {
-    inferencer_->set_timeout_ms(infer_timeout_ms);
-  }
-  if (inferencer_) inferencer_->configure(nms_class_agnostic_, max_detections_, debug_shapes_);
-  if (!model_path_.empty() && inferencer_) {
-    bool loaded = inferencer_->load(model_path_, device_);
-    if (!loaded && !fallback_device_.empty() && fallback_device_ != device_) {
-      RCLCPP_WARN(this->get_logger(), "Failed to load model on %s, retrying on %s", device_.c_str(), fallback_device_.c_str());
-      loaded = inferencer_->load(model_path_, fallback_device_);
-      if (loaded) {
-        device_ = fallback_device_;
-      }
-    }
-    if (!loaded) {
-      RCLCPP_WARN(this->get_logger(), "Failed to load model: %s on %s", model_path_.c_str(), device_.c_str());
-    } else {
-      RCLCPP_INFO(this->get_logger(), "Loaded model: %s on %s", model_path_.c_str(), device_.c_str());
-    }
-  }
+  (void)loadModel(backend_, model_path_, device_, fallback_device_,
+                  nms_class_agnostic_, max_detections_, debug_shapes_,
+                  infer_timeout_ms_);
+
+  parameter_callback_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&InstanceSegNode::onParametersSet, this, std::placeholders::_1));
 
   image_sub_ = this->create_subscription<Image>(
       input_image_topic_, qos, std::bind(&InstanceSegNode::imageCallback, this, std::placeholders::_1));
@@ -216,6 +237,275 @@ InstanceSegNode::~InstanceSegNode() {
   RCLCPP_INFO(this->get_logger(), "Overlay worker thread stopped");
 }
 
+bool InstanceSegNode::loadModel(const std::string& backend,
+                                const std::string& model_path,
+                                const std::string& device,
+                                const std::string& fallback_device,
+                                bool nms_class_agnostic,
+                                int max_detections,
+                                bool debug_shapes,
+                                int infer_timeout_ms) {
+  auto next_inferencer = CreateInferencer(backend);
+  if (!next_inferencer) {
+    RCLCPP_WARN(this->get_logger(), "Failed to create inferencer for backend: %s",
+                backend.c_str());
+    return false;
+  }
+
+  next_inferencer->set_timeout_ms(infer_timeout_ms);
+  next_inferencer->configure(nms_class_agnostic, max_detections, debug_shapes);
+
+  std::string loaded_device = device;
+  if (!model_path.empty()) {
+    bool loaded = next_inferencer->load(model_path, device);
+    if (!loaded && !fallback_device.empty() && fallback_device != device) {
+      RCLCPP_WARN(this->get_logger(), "Failed to load model on %s, retrying on %s",
+                  device.c_str(), fallback_device.c_str());
+      loaded = next_inferencer->load(model_path, fallback_device);
+      if (loaded) {
+        loaded_device = fallback_device;
+      }
+    }
+    if (!loaded) {
+      RCLCPP_WARN(this->get_logger(), "Failed to load model: %s on %s",
+                  model_path.c_str(), device.c_str());
+      return false;
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(inferencer_mutex_);
+    inferencer_ = std::move(next_inferencer);
+    backend_ = backend;
+    model_path_ = model_path;
+    device_ = loaded_device;
+    fallback_device_ = fallback_device;
+    nms_class_agnostic_ = nms_class_agnostic;
+    max_detections_ = max_detections;
+    debug_shapes_ = debug_shapes;
+    infer_timeout_ms_ = infer_timeout_ms;
+    tracks_.clear();
+    next_track_id_ = 1;
+    palette_index_ = 0;
+  }
+
+  if (model_path.empty()) {
+    RCLCPP_WARN(this->get_logger(), "No model_path specified");
+  } else {
+    RCLCPP_INFO(this->get_logger(), "Loaded model: %s on %s (backend=%s)",
+                model_path.c_str(), loaded_device.c_str(), backend.c_str());
+  }
+  return true;
+}
+
+rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
+    const std::vector<rclcpp::Parameter>& parameters) {
+  auto result = rcl_interfaces::msg::SetParametersResult();
+  result.successful = true;
+
+  auto as_double = [](const rclcpp::Parameter& param) -> double {
+    if (param.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) {
+      return static_cast<double>(param.as_int());
+    }
+    return param.as_double();
+  };
+  auto as_int = [](const rclcpp::Parameter& param) -> int {
+    if (param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+      return static_cast<int>(param.as_double());
+    }
+    return static_cast<int>(param.as_int());
+  };
+
+  std::string current_backend;
+  std::string current_model_path;
+  std::string current_device;
+  std::string current_fallback_device;
+  bool current_nms_class_agnostic = true;
+  int current_max_detections = 100;
+  bool current_debug_shapes = false;
+  int current_infer_timeout_ms = 0;
+
+  std::string next_backend;
+  std::string next_model_path;
+  std::string next_device;
+  std::string next_fallback_device;
+  double next_conf = 0.25;
+  double next_iou = 0.5;
+  double next_max_fps = 0.0;
+  double next_match_distance = 80.0;
+  int next_hold_frames = 3;
+  int next_drop_frames = 10;
+  bool next_nms_class_agnostic = true;
+  int next_max_detections = 100;
+  bool next_debug_shapes = false;
+  int next_infer_timeout_ms = 0;
+  bool model_path_changed = false;
+  bool backend_changed = false;
+  bool device_changed = false;
+
+  {
+    std::lock_guard<std::mutex> lock(inferencer_mutex_);
+    current_backend = backend_;
+    current_model_path = model_path_;
+    current_device = device_;
+    current_fallback_device = fallback_device_;
+    current_nms_class_agnostic = nms_class_agnostic_;
+    current_max_detections = max_detections_;
+    current_debug_shapes = debug_shapes_;
+    current_infer_timeout_ms = infer_timeout_ms_;
+
+    next_backend = backend_;
+    next_model_path = model_path_;
+    next_device = device_;
+    next_fallback_device = fallback_device_;
+    next_conf = conf_thres_;
+    next_iou = iou_thres_;
+    next_max_fps = max_fps_;
+    next_match_distance = match_distance_px_;
+    next_hold_frames = hold_frames_;
+    next_drop_frames = drop_frames_;
+    next_nms_class_agnostic = nms_class_agnostic_;
+    next_max_detections = max_detections_;
+    next_debug_shapes = debug_shapes_;
+    next_infer_timeout_ms = infer_timeout_ms_;
+  }
+
+  try {
+    for (const auto& param : parameters) {
+      const auto& name = param.get_name();
+      if (name == "backend") {
+        next_backend = param.as_string();
+        backend_changed = true;
+      } else if (name == "model_path") {
+        next_model_path = param.as_string();
+        model_path_changed = true;
+      } else if (name == "device") {
+        next_device = param.as_string();
+        device_changed = true;
+      } else if (name == "fallback_device") {
+        next_fallback_device = param.as_string();
+      } else if (name == "conf_thres") {
+        next_conf = as_double(param);
+      } else if (name == "iou_thres") {
+        next_iou = as_double(param);
+      } else if (name == "max_fps") {
+        next_max_fps = as_double(param);
+      } else if (name == "tracking.match_max_distance_px") {
+        next_match_distance = as_double(param);
+      } else if (name == "tracking.hold_frames") {
+        next_hold_frames = as_int(param);
+      } else if (name == "tracking.drop_frames") {
+        next_drop_frames = as_int(param);
+      } else if (name == "nms_class_agnostic") {
+        next_nms_class_agnostic = param.as_bool();
+      } else if (name == "max_detections") {
+        next_max_detections = as_int(param);
+      } else if (name == "debug_shapes") {
+        next_debug_shapes = param.as_bool();
+      } else if (name == "infer.timeout_ms") {
+        next_infer_timeout_ms = as_int(param);
+      }
+    }
+  } catch (const std::exception& e) {
+    result.successful = false;
+    result.reason = e.what();
+    return result;
+  }
+
+  if (model_path_changed && !backend_changed) {
+    next_backend = infer_backend_for_model_path(next_model_path, next_backend);
+  }
+  if (model_path_changed && !device_changed && is_tensorrt_model_path(next_model_path)) {
+    next_device = "GPU";
+  }
+
+  if (next_conf < 0.0 || next_conf > 1.0) {
+    result.successful = false;
+    result.reason = "conf_thres must be within [0.0, 1.0]";
+    return result;
+  }
+  if (next_iou < 0.0 || next_iou > 1.0) {
+    result.successful = false;
+    result.reason = "iou_thres must be within [0.0, 1.0]";
+    return result;
+  }
+  if (next_max_fps < 0.0) {
+    result.successful = false;
+    result.reason = "max_fps must be >= 0.0";
+    return result;
+  }
+  if (next_match_distance <= 0.0) {
+    result.successful = false;
+    result.reason = "tracking.match_max_distance_px must be > 0.0";
+    return result;
+  }
+  if (next_hold_frames < 0 || next_drop_frames < 0) {
+    result.successful = false;
+    result.reason = "tracking hold/drop frames must be >= 0";
+    return result;
+  }
+  if (next_max_detections <= 0) {
+    result.successful = false;
+    result.reason = "max_detections must be > 0";
+    return result;
+  }
+  if (next_infer_timeout_ms < 0) {
+    result.successful = false;
+    result.reason = "infer.timeout_ms must be >= 0";
+    return result;
+  }
+  if (next_drop_frames < next_hold_frames) {
+    next_drop_frames = next_hold_frames;
+  }
+
+  const bool reload_needed =
+      next_backend != current_backend ||
+      next_model_path != current_model_path ||
+      next_device != current_device ||
+      next_fallback_device != current_fallback_device;
+  const bool configure_changed =
+      next_nms_class_agnostic != current_nms_class_agnostic ||
+      next_max_detections != current_max_detections ||
+      next_debug_shapes != current_debug_shapes ||
+      next_infer_timeout_ms != current_infer_timeout_ms;
+
+  if (reload_needed &&
+      !loadModel(next_backend, next_model_path, next_device, next_fallback_device,
+                 next_nms_class_agnostic, next_max_detections, next_debug_shapes,
+                 next_infer_timeout_ms)) {
+    result.successful = false;
+    result.reason = "model reload failed";
+    return result;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(inferencer_mutex_);
+    conf_thres_ = next_conf;
+    iou_thres_ = next_iou;
+    max_fps_ = next_max_fps;
+    match_distance_px_ = next_match_distance;
+    hold_frames_ = next_hold_frames;
+    drop_frames_ = next_drop_frames;
+    if (!reload_needed) {
+      backend_ = next_backend;
+      model_path_ = next_model_path;
+      device_ = next_device;
+      fallback_device_ = next_fallback_device;
+      if (configure_changed && inferencer_) {
+        inferencer_->set_timeout_ms(next_infer_timeout_ms);
+        inferencer_->configure(next_nms_class_agnostic, next_max_detections,
+                               next_debug_shapes);
+      }
+      nms_class_agnostic_ = next_nms_class_agnostic;
+      max_detections_ = next_max_detections;
+      debug_shapes_ = next_debug_shapes;
+      infer_timeout_ms_ = next_infer_timeout_ms;
+    }
+  }
+
+  return result;
+}
+
 void InstanceSegNode::imageCallback(const Image::SharedPtr msg) {
   in_callback_.store(true, std::memory_order_relaxed);
   struct CallbackGuard {
@@ -240,9 +530,14 @@ void InstanceSegNode::imageCallback(const Image::SharedPtr msg) {
   auto callback_start = std::chrono::steady_clock::now();
 
   // FPS制限（フレームスキップ方式）
-  if (max_fps_ > 0.0) {
+  double max_fps = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(inferencer_mutex_);
+    max_fps = max_fps_;
+  }
+  if (max_fps > 0.0) {
     auto now = std::chrono::steady_clock::now();
-    double target_interval_ms = 1000.0 / max_fps_;
+    double target_interval_ms = 1000.0 / max_fps;
     double elapsed_ms = std::chrono::duration<double, std::milli>(now - last_publish_time_).count();
     if (elapsed_ms < target_interval_ms) {
       return;  // フレームスキップ（同期を保つため）
@@ -267,13 +562,23 @@ void InstanceSegNode::imageCallback(const Image::SharedPtr msg) {
   auto infer_start = std::chrono::steady_clock::now();
   InferResult res;
   stage_.store(3, std::memory_order_relaxed);  // infer
-  bool ok = inferencer_ && inferencer_->infer(cv_ptr->image, static_cast<float>(conf_thres_), static_cast<float>(iou_thres_), &res);
+  bool ok = false;
+  std::string backend_snapshot;
+  std::string device_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(inferencer_mutex_);
+    backend_snapshot = backend_;
+    device_snapshot = device_;
+    ok = inferencer_ && inferencer_->infer(
+        cv_ptr->image, static_cast<float>(conf_thres_),
+        static_cast<float>(iou_thres_), &res);
+  }
   auto infer_end = std::chrono::steady_clock::now();
 
   if (!ok) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                          "⚠️ infer() failed/timeout (backend=%s device=%s)",
-                         backend_.c_str(), device_.c_str());
+                         backend_snapshot.c_str(), device_snapshot.c_str());
     res = InferResult();
   }
   last_progress_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -288,21 +593,22 @@ void InstanceSegNode::imageCallback(const Image::SharedPtr msg) {
 
   auto tracking_start = std::chrono::steady_clock::now();
   stage_.store(4, std::memory_order_relaxed);  // tracking
-  updateTracking(res, stamp);
+  std::vector<TrackState> publish_tracks;
+  {
+    std::lock_guard<std::mutex> lock(inferencer_mutex_);
+    updateTracking(res, stamp);
+    publish_tracks.reserve(tracks_.size());
+    for (const auto& track : tracks_) {
+      bool keep = (track.active || track.misses <= hold_frames_) && !track.mask.empty();
+      if (keep) {
+        publish_tracks.push_back(track);
+      }
+    }
+  }
   auto tracking_end = std::chrono::steady_clock::now();
   double tracking_ms = std::chrono::duration<double, std::milli>(tracking_end - tracking_start).count();
   if (tracking_ms > 10.0) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "⚠️ updateTracking took %.1fms", tracking_ms);
-  }
-
-  // アクティブなトラックを先に抽出
-  std::vector<TrackState> publish_tracks;
-  publish_tracks.reserve(tracks_.size());
-  for (const auto& track : tracks_) {
-    bool keep = (track.active || track.misses <= hold_frames_) && !track.mask.empty();
-    if (keep) {
-      publish_tracks.push_back(track);
-    }
   }
 
   // 検出が0個の場合は空マスクをパブリッシュ（オーバーレイは後で描画）
@@ -592,14 +898,24 @@ void InstanceSegNode::drawStats(cv::Mat& image) {
     ++line;
   };
 
-  put(std::string("デバイス: ") + device_);
-  put(std::string("バックエンド: ") + backend_);
+  std::string device;
+  std::string backend;
+  std::string model_path;
+  {
+    std::lock_guard<std::mutex> lock(inferencer_mutex_);
+    device = device_;
+    backend = backend_;
+    model_path = model_path_;
+  }
+
+  put(std::string("デバイス: ") + device);
+  put(std::string("バックエンド: ") + backend);
   put(std::string("FPS: ") + std::to_string(static_cast<int>(stats_fps_)));
   put(std::string("推論: ") + std::to_string(static_cast<int>(stats_inference_ms_)) + "ms");
   put(std::string("総処理: ") + std::to_string(static_cast<int>(stats_total_ms_)) + "ms");
   put(std::string("セグメント: ") + std::to_string(stats_detection_count_));
-  if (!model_path_.empty()) {
-    put(std::string("モデル: ") + model_path_);
+  if (!model_path.empty()) {
+    put(std::string("モデル: ") + model_path);
   }
 }
 

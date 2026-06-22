@@ -25,7 +25,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image, JointState
 from std_msgs.msg import Bool, ColorRGBA, Float32MultiArray, String
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 
 try:
@@ -196,6 +196,9 @@ class FvPolicyRunnerNode(Node):
 
         self.declare_parameter("image_topics", [""])
         self.declare_parameter("image_names", [""])
+        # When no images are configured, fall back to the ALOHA 3-camera layout.
+        # Set False for state-only policies (no vision) so the runner stays image-free.
+        self.declare_parameter("default_aloha_cameras", True)
         self.declare_parameter("state_topic", "~/state/joint_states")
         self.declare_parameter("trigger_topic", "~/trigger/start")
         self.declare_parameter("stop_topic", "~/trigger/stop")
@@ -244,6 +247,14 @@ class FvPolicyRunnerNode(Node):
         self.declare_parameter("policy_gripper_joint_name", "gripper")
         self.declare_parameter("policy_gripper_state_value", 5.6)
         self.declare_parameter("policy_gripper_output_scale", 1.0)
+        # Live observation extras for state-based RL policies (off by default so
+        # joint/VLA policies are unaffected). send_joint_velocities adds qvel to the
+        # request; send_object_pose subscribes an external object pose (PoseStamped on
+        # object_pose_topic) and adds it — required by policies whose obs needs it.
+        self.declare_parameter("send_joint_velocities", False)
+        self.declare_parameter("send_object_pose", False)
+        self.declare_parameter("object_pose_topic", "")
+        self.declare_parameter("object_pose_max_age_sec", 0.5)
         self.declare_parameter("trajectory_fk_urdf_topic", "")
         self.declare_parameter("trajectory_fk_urdf_topic_timeout_sec", 3.0)
         self.declare_parameter("trajectory_fk_urdf_path", "")
@@ -251,11 +262,17 @@ class FvPolicyRunnerNode(Node):
         self.declare_parameter("trajectory_fk_tip_link", "gripper_tip")
         self.declare_parameter("trajectory_fk_joint_names", ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "gripper"])
 
+        self.default_aloha_cameras = bool(self.get_parameter("default_aloha_cameras").value)
         image_topics = [str(x).strip() for x in self.get_parameter("image_topics").value if str(x).strip()]
         image_names = [str(x).strip() for x in self.get_parameter("image_names").value if str(x).strip()]
-        if not image_topics:
+        # When no images are configured, default to the ALOHA 3-camera layout for
+        # back-compat — UNLESS default_aloha_cameras is False, which leaves the runner
+        # image-free for state-only policies (e.g. state-based RL: joint+object pose,
+        # no vision). Without this, a state-only policy would block on phantom camera
+        # slots that never receive frames.
+        if not image_topics and self.default_aloha_cameras:
             image_topics = ["~/image/cam_high", "~/image/cam_left_wrist", "~/image/cam_right_wrist"]
-        if not image_names:
+        if not image_names and self.default_aloha_cameras:
             image_names = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
         if len(image_topics) != len(image_names):
             raise ValueError("image_topics and image_names must have the same length")
@@ -295,6 +312,10 @@ class FvPolicyRunnerNode(Node):
         self.replenish_threshold_steps = max(1, int(self.get_parameter("replenish_threshold_steps").value))
         self.replace_action_queue_on_infer = bool(self.get_parameter("replace_action_queue_on_infer").value)
         self.observation_max_age_sec = max(0.01, float(self.get_parameter("observation_max_age_sec").value))
+        self.send_joint_velocities = bool(self.get_parameter("send_joint_velocities").value)
+        self.send_object_pose = bool(self.get_parameter("send_object_pose").value)
+        self.object_pose_topic = str(self.get_parameter("object_pose_topic").value).strip()
+        self.object_pose_max_age_sec = max(0.0, float(self.get_parameter("object_pose_max_age_sec").value))
         self.image_transport_encoding = str(self.get_parameter("image_transport_encoding").value)
         self.image_topics_are_compressed = bool(self.get_parameter("image_topics_are_compressed").value)
         self.image_codec = str(self.get_parameter("image_codec").value).strip().lower()
@@ -402,6 +423,23 @@ class FvPolicyRunnerNode(Node):
         self._stop_sub = self.create_subscription(Bool, self.stop_topic, self._on_stop, 10)
         self._policy_sub = self.create_subscription(String, self.policy_select_topic, self._on_policy_select, 10)
         self._prompt_sub = self.create_subscription(String, self.prompt_topic, self._on_prompt, 10)
+        # Optional external object pose (PoseStamped) for state-based RL policies whose
+        # observation includes an object pose (e.g. cube pick). Off unless a profile sets
+        # send_object_pose + object_pose_topic. The M1 sim bridge publishes the MuJoCo
+        # cube ground-truth here; M2 swaps in an fv_3d_detector bridge — same contract.
+        self._object_pose_sub = None
+        if self.send_object_pose and self.object_pose_topic:
+            self._object_pose_sub = self.create_subscription(
+                PoseStamped,
+                self.object_pose_topic,
+                self._on_object_pose,
+                QoSProfile(
+                    history=HistoryPolicy.KEEP_LAST,
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.VOLATILE,
+                ),
+            )
 
         self._action_pub = self.create_publisher(Float32MultiArray, self.action_topic, 10)
         self._joint_action_pub = self.create_publisher(JointState, self.joint_action_topic, 10)
@@ -411,6 +449,9 @@ class FvPolicyRunnerNode(Node):
         self._state_vector: Optional[np.ndarray] = None
         self._state_names: list[str] = []
         self._state_stamp_sec = 0.0
+        self._state_velocity: Optional[np.ndarray] = None
+        self._object_pose: Optional[np.ndarray] = None  # [x,y,z, qw,qx,qy,qz]
+        self._object_pose_stamp_sec = 0.0
 
         self._policy_id = self.default_policy_id
         self._prompt = self.default_prompt
@@ -509,6 +550,7 @@ class FvPolicyRunnerNode(Node):
         self._state_vector = None
         self._state_names = []
         self._state_stamp_sec = 0.0
+        self._state_velocity = None
         with self._lock:
             self._queue.clear()
 
@@ -665,6 +707,25 @@ class FvPolicyRunnerNode(Node):
             self._state_vector = np.asarray(msg.position, dtype=np.float32)
             self._state_names = list(msg.name)
             self._state_stamp_sec = _stamp_to_sec(msg.header.stamp)
+            # Velocities are paired with position/name; kept for policies that need
+            # them (send_joint_velocities). None when the publisher omits velocity.
+            self._state_velocity = (
+                np.asarray(msg.velocity, dtype=np.float32)
+                if len(msg.velocity) == len(msg.position)
+                else None
+            )
+
+    def _on_object_pose(self, msg: PoseStamped) -> None:
+        p = msg.pose.position
+        q = msg.pose.orientation
+        with self._lock:
+            # Store as [x,y,z, qw,qx,qy,qz] — serve/MuJoCo use wxyz, PoseStamped is
+            # xyzw. The publisher is expected to emit in the policy's base frame
+            # (M1 sim bridge / M2 fv_3d_detector bridge both republish in base_link).
+            self._object_pose = np.asarray(
+                [p.x, p.y, p.z, q.w, q.x, q.y, q.z], dtype=np.float32
+            )
+            self._object_pose_stamp_sec = _stamp_to_sec(msg.header.stamp)
 
     def _on_trigger(self, msg: Bool) -> None:
         # Treat any True as "start" rather than requiring a False→True
@@ -740,6 +801,28 @@ class FvPolicyRunnerNode(Node):
                 "images": images,
                 "joint_names": self._state_names,
             }
+            # Live observation extras for state-based RL policies. Velocities are
+            # best-effort (the backend warns + zero-fills if absent). object_pose is
+            # load-bearing for a pick, so a missing/stale pose fails closed (skip the
+            # tick) rather than feeding a stale target — no silent fallback.
+            if (
+                self.send_joint_velocities
+                and self._state_velocity is not None
+                and self._state_velocity.size == state_vector.size
+            ):
+                snapshot["joint_velocities"] = self._state_velocity.astype(float).tolist()
+            if self.send_object_pose:
+                if self._object_pose is None:
+                    self._last_error = "object_pose requested but not received yet"
+                    return None
+                age = now - self._object_pose_stamp_sec
+                if self.object_pose_max_age_sec > 0.0 and age > self.object_pose_max_age_sec:
+                    self._last_error = (
+                        f"object_pose stale ({age:.2f}s > {self.object_pose_max_age_sec}s); "
+                        "skipping inference"
+                    )
+                    return None
+                snapshot["object_pose"] = self._object_pose.astype(float).tolist()
             return snapshot
 
     def _policy_uses_degrees(self) -> bool:
