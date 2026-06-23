@@ -253,50 +253,60 @@ bool InstanceSegNode::loadModel(const std::string& backend,
                                 int max_detections,
                                 bool debug_shapes,
                                 int infer_timeout_ms) {
-  auto next_inferencer = CreateInferencer(backend);
-  if (!next_inferencer) {
-    RCLCPP_WARN(this->get_logger(), "Failed to create inferencer for backend: %s",
-                backend.c_str());
-    return false;
-  }
-
-  next_inferencer->set_timeout_ms(infer_timeout_ms);
-  next_inferencer->configure(nms_class_agnostic, max_detections, debug_shapes);
-
-  std::string loaded_device = device;
-  if (!model_path.empty()) {
-    bool loaded = next_inferencer->load(model_path, device);
-    if (!loaded && !fallback_device.empty() && fallback_device != device) {
-      RCLCPP_WARN(this->get_logger(), "Failed to load model on %s, retrying on %s",
-                  device.c_str(), fallback_device.c_str());
-      loaded = next_inferencer->load(model_path, fallback_device);
-      if (loaded) {
-        loaded_device = fallback_device;
-      }
-    }
-    if (!loaded) {
-      RCLCPP_WARN(this->get_logger(), "Failed to load model: %s on %s",
-                  model_path.c_str(), device.c_str());
-      return false;
-    }
-  }
-
+  // Snapshot the current good model so we can restore it if the new load fails.
+  std::string prev_model, prev_backend;
   {
     std::lock_guard<std::mutex> lock(inferencer_mutex_);
-    inferencer_ = std::move(next_inferencer);
-    backend_ = backend;
-    model_path_ = model_path;
+    prev_model = model_path_;
+    prev_backend = backend_;
+  }
+
+  // Build a fully-loaded inferencer for (mp, bk) WITHOUT touching inferencer_.
+  // Returns null on any failure. out_device receives the device actually used.
+  auto build = [&](const std::string& mp, const std::string& bk,
+                   std::string& out_device) {
+    auto inf = CreateInferencer(bk);
+    if (!inf) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to create inferencer for backend: %s",
+                   bk.c_str());
+      return inf;  // null
+    }
+    inf->set_timeout_ms(infer_timeout_ms);
+    inf->configure(nms_class_agnostic, max_detections, debug_shapes);
+    out_device = device;
+    if (!mp.empty()) {
+      bool loaded = inf->load(mp, device);
+      if (!loaded && !fallback_device.empty() && fallback_device != device) {
+        RCLCPP_WARN(this->get_logger(), "Failed to load model on %s, retrying on %s",
+                    device.c_str(), fallback_device.c_str());
+        loaded = inf->load(mp, fallback_device);
+        if (loaded) out_device = fallback_device;
+      }
+      if (!loaded) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to load model: %s on %s",
+                     mp.c_str(), device.c_str());
+        inf.reset();  // null -> caller treats as failure
+      }
+    }
+    return inf;
+  };
+
+  // Commit a freshly-built inferencer as the live one (under the lock).
+  auto commit = [&](auto inf, const std::string& mp, const std::string& bk,
+                    const std::string& used_device) {
+    std::lock_guard<std::mutex> lock(inferencer_mutex_);
+    inferencer_ = std::move(inf);
+    backend_ = bk;
+    model_path_ = mp;
     // Class labels travel with the model: load the `<model>.names` sidecar
     // (one class per line) that sits next to the model file, so switching
     // models re-loads the matching class names. The TRT .engine carries no
     // names metadata. Falls back to the class_names param when no sidecar.
-    {
-      auto sidecar_names = loadNamesSidecar(model_path);
-      if (!sidecar_names.empty()) {
-        class_names_ = std::move(sidecar_names);
-      }
+    auto sidecar_names = loadNamesSidecar(mp);
+    if (!sidecar_names.empty()) {
+      class_names_ = std::move(sidecar_names);
     }
-    device_ = loaded_device;
+    device_ = used_device;
     fallback_device_ = fallback_device;
     nms_class_agnostic_ = nms_class_agnostic;
     max_detections_ = max_detections;
@@ -305,16 +315,54 @@ bool InstanceSegNode::loadModel(const std::string& backend,
     tracks_.clear();
     next_track_id_ = 1;
     palette_index_ = 0;
+  };
+
+  // Tear down the previous inferencer FIRST so the new TensorRT context/stream
+  // is built on a clean CUDA state. Two coexisting TRT contexts plus an
+  // unsynchronized teardown corrupted the reloaded context (infer() then failed
+  // every frame after a runtime model switch). inferencer_ is briefly null here;
+  // imageCallback guards with `inferencer_ &&`. Because inferencer_ stays null
+  // throughout every build() below, two contexts never coexist.
+  {
+    std::lock_guard<std::mutex> lock(inferencer_mutex_);
+    inferencer_.reset();
   }
 
-  if (model_path.empty()) {
-    RCLCPP_WARN(this->get_logger(), "No model_path specified");
-  } else {
-    RCLCPP_INFO(this->get_logger(), "Loaded model: %s on %s (backend=%s, %zu classes)",
-                model_path.c_str(), loaded_device.c_str(), backend.c_str(),
-                class_names_.size());
+  std::string used_device;
+  auto next_inferencer = build(model_path, backend, used_device);
+  if (next_inferencer) {
+    commit(std::move(next_inferencer), model_path, backend, used_device);
+    if (model_path.empty()) {
+      RCLCPP_WARN(this->get_logger(), "No model_path specified");
+    } else {
+      RCLCPP_INFO(this->get_logger(), "Loaded model: %s on %s (backend=%s, %zu classes)",
+                  model_path.c_str(), used_device.c_str(), backend.c_str(),
+                  class_names_.size());
+    }
+    return true;
   }
-  return true;
+
+  // The requested model failed to load and the old inferencer is already gone,
+  // so perception is down. Try to restore the previous known-good model rather
+  // than leaving the node permanently blind (fail-closed recovery).
+  if (!prev_model.empty() && (prev_model != model_path || prev_backend != backend)) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "Model load failed for %s; restoring previous model %s",
+                 model_path.c_str(), prev_model.c_str());
+    std::string rec_device;
+    auto recovered = build(prev_model, prev_backend, rec_device);
+    if (recovered) {
+      commit(std::move(recovered), prev_model, prev_backend, rec_device);
+      RCLCPP_WARN(this->get_logger(),
+                  "Restored previous model %s after failed switch to %s",
+                  prev_model.c_str(), model_path.c_str());
+      return false;  // requested switch failed; perception alive on previous model
+    }
+  }
+
+  RCLCPP_ERROR(this->get_logger(),
+               "Model load failed and no inferencer is active — perception is DOWN");
+  return false;
 }
 
 std::vector<std::string> InstanceSegNode::loadNamesSidecar(
@@ -371,9 +419,15 @@ void InstanceSegNode::filterDetections(InferResult& res) const {
     if (min_aspect_ > 0.0 && aspect < min_aspect_) continue;
     if (max_aspect_ > 0.0 && aspect > max_aspect_) continue;
     if (min_mask_fill_ > 0.0 && i < res.masks.size() && !res.masks[i].empty()) {
-      const double total = static_cast<double>(res.masks[i].total());
-      const double fill =
-          total > 0.0 ? (static_cast<double>(cv::countNonZero(res.masks[i] > 0)) / total) : 0.0;
+      // The mask is full-frame; measure how much of the BOUNDING BOX it fills
+      // (compactness), not the whole image — otherwise the ratio scales with
+      // object-size-vs-frame and resolution, making the threshold meaningless.
+      const cv::Mat& m = res.masks[i];
+      const cv::Rect roi = b & cv::Rect(0, 0, m.cols, m.rows);  // clamp box to image
+      const double box_area = static_cast<double>(roi.area());
+      const double fill = (box_area > 0.0)
+          ? (static_cast<double>(cv::countNonZero(m(roi) > 0)) / box_area)
+          : 0.0;
       if (fill < min_mask_fill_) continue;
     }
     keep.push_back(i);
@@ -436,6 +490,11 @@ rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
   int next_max_detections = 100;
   bool next_debug_shapes = false;
   int next_infer_timeout_ms = 0;
+  double next_min_box_area = 0.0;
+  double next_max_box_area = 0.0;
+  double next_min_aspect = 0.0;
+  double next_max_aspect = 0.0;
+  double next_min_mask_fill = 0.0;
   bool model_path_changed = false;
   bool backend_changed = false;
   bool device_changed = false;
@@ -465,6 +524,11 @@ rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
     next_max_detections = max_detections_;
     next_debug_shapes = debug_shapes_;
     next_infer_timeout_ms = infer_timeout_ms_;
+    next_min_box_area = min_box_area_px_;
+    next_max_box_area = max_box_area_px_;
+    next_min_aspect = min_aspect_;
+    next_max_aspect = max_aspect_;
+    next_min_mask_fill = min_mask_fill_;
   }
 
   try {
@@ -501,6 +565,16 @@ rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
         next_debug_shapes = param.as_bool();
       } else if (name == "infer.timeout_ms") {
         next_infer_timeout_ms = as_int(param);
+      } else if (name == "min_box_area_px") {
+        next_min_box_area = as_double(param);
+      } else if (name == "max_box_area_px") {
+        next_max_box_area = as_double(param);
+      } else if (name == "min_aspect") {
+        next_min_aspect = as_double(param);
+      } else if (name == "max_aspect") {
+        next_max_aspect = as_double(param);
+      } else if (name == "min_mask_fill") {
+        next_min_mask_fill = as_double(param);
       }
     }
   } catch (const std::exception& e) {
@@ -583,6 +657,11 @@ rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
     match_distance_px_ = next_match_distance;
     hold_frames_ = next_hold_frames;
     drop_frames_ = next_drop_frames;
+    min_box_area_px_ = next_min_box_area;
+    max_box_area_px_ = next_max_box_area;
+    min_aspect_ = next_min_aspect;
+    max_aspect_ = next_max_aspect;
+    min_mask_fill_ = next_min_mask_fill;
     if (!reload_needed) {
       backend_ = next_backend;
       model_path_ = next_model_path;

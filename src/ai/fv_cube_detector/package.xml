@@ -2,7 +2,7 @@
 <package format="3">
   <name>fv_cube_detector</name>
   <version>0.1.0</version>
-  <description>Fluent Vision cube color segmentation node (ONNX Runtime, YOLO11-seg).</description>
+  <description>[DEPRECATED] Fluent Vision cube color segmentation node (ONNX Runtime, YOLO11-seg). Superseded by fv_instance_seg (unified multi-backend YOLO-seg node with end2end-head support, model-coupled class-name sidecars, and a settings UI). Kept for reference; do not use in new profiles.</description>
   <maintainer email="devnull@example.com">fluent-vision</maintainer>
   <license>Apache-2.0</license>
 

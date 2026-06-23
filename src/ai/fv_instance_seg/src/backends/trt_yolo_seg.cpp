@@ -31,6 +31,7 @@ TrtYoloSegInferencer::TrtYoloSegInferencer()
     : logger_(nvinfer1::ILogger::Severity::kWARNING) {}
 
 TrtYoloSegInferencer::~TrtYoloSegInferencer() {
+  cudaDeviceSynchronize();  // drain in-flight work before tearing down CUDA/TRT
   freeBuffers();
   context_.reset();
   engine_.reset();
@@ -87,6 +88,7 @@ void TrtYoloSegInferencer::configure(bool nms_class_agnostic, int max_detections
 }
 
 bool TrtYoloSegInferencer::load(const std::string& model_path, const std::string& /*device*/) {
+  cudaGetLastError();  // drop any sticky CUDA error inherited from a prior context
   freeBuffers();
   bindings_.clear();
   input_binding_ = -1;
@@ -714,6 +716,9 @@ bool TrtYoloSegInferencer::infer(const cv::Mat& bgr, float conf_thres, float iou
 }
 
 void TrtYoloSegInferencer::freeBuffers() {
+  if (stream_) {
+    cudaStreamSynchronize(stream_);  // let in-flight work finish before freeing
+  }
   for (void*& ptr : device_buffers_) {
     if (ptr) {
       cudaFree(ptr);
@@ -726,6 +731,7 @@ void TrtYoloSegInferencer::freeBuffers() {
     cudaStreamDestroy(stream_);
     stream_ = nullptr;
   }
+  cudaGetLastError();  // clear any latched error so it can't poison the next context
 }
 
 }  // namespace fv_instance_seg

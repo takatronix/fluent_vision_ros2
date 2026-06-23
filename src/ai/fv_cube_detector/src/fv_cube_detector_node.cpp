@@ -48,6 +48,10 @@ const cv::Scalar FvCubeDetectorNode::CLASS_COLORS[NUM_CLASSES] = {
 
 FvCubeDetectorNode::FvCubeDetectorNode(const rclcpp::NodeOptions& options)
     : rclcpp::Node("cube_detector_node", options) {
+  RCLCPP_WARN(this->get_logger(),
+              "fv_cube_detector is DEPRECATED — use fv_instance_seg (unified "
+              "multi-backend YOLO-seg node). This package is kept for "
+              "reference only.");
   model_path_ = this->declare_parameter<std::string>("model_path", "");
   auto trt_engine_path = this->declare_parameter<std::string>("trt_engine_path", "");
   input_image_topic_ = this->declare_parameter<std::string>(

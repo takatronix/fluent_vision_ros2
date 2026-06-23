@@ -98,7 +98,7 @@ class InstanceSegNode : public rclcpp::Node {
   double max_box_area_px_ = 0.0;
   double min_aspect_ = 0.0;     // w/h lower bound
   double max_aspect_ = 0.0;     // w/h upper bound
-  double min_mask_fill_ = 0.0;  // countNonZero(mask) / mask.total()
+  double min_mask_fill_ = 0.0;  // countNonZero(mask within bbox) / bbox.area()
   void filterDetections(InferResult& res) const;
   double conf_thres_;
   double iou_thres_;
