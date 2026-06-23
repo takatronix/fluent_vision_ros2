@@ -80,6 +80,26 @@ class InstanceSegNode : public rclcpp::Node {
   std::string device_;
   std::string fallback_device_;
   std::string input_image_topic_;
+  // Class index -> name. The TRT .engine carries no names metadata (the .onnx
+  // does, but trtexec drops it), so the operator supplies them via the
+  // `class_names` param (profile / settings UI). Empty -> label left blank.
+  std::vector<std::string> class_names_;
+  std::string labelForClass(int cls) const {
+    return (cls >= 0 && cls < static_cast<int>(class_names_.size()))
+               ? class_names_[cls]
+               : std::string();
+  }
+  // Read `<model_path stem>.names` (one class per line) next to the model.
+  // Empty vector when the sidecar is absent/empty (caller keeps its fallback).
+  std::vector<std::string> loadNamesSidecar(const std::string& model_path) const;
+  // Post-inference false-detection filter. All thresholds default to 0
+  // (disabled) so the filter is opt-in via params / the settings UI.
+  double min_box_area_px_ = 0.0;
+  double max_box_area_px_ = 0.0;
+  double min_aspect_ = 0.0;     // w/h lower bound
+  double max_aspect_ = 0.0;     // w/h upper bound
+  double min_mask_fill_ = 0.0;  // countNonZero(mask) / mask.total()
+  void filterDetections(InferResult& res) const;
   double conf_thres_;
   double iou_thres_;
   bool publish_detections_;

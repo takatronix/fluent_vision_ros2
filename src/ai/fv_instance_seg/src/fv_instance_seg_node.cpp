@@ -6,6 +6,7 @@
 #include <chrono>
 #include <thread>
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <condition_variable>
@@ -75,6 +76,13 @@ InstanceSegNode::InstanceSegNode(const rclcpp::NodeOptions& options)
   publish_overlay_ = this->declare_parameter<bool>("publish_overlay", true);
   nms_class_agnostic_ = this->declare_parameter<bool>("nms_class_agnostic", true);
   max_detections_ = this->declare_parameter<int>("max_detections", 100);
+  class_names_ = this->declare_parameter<std::vector<std::string>>(
+      "class_names", std::vector<std::string>{});
+  min_box_area_px_ = this->declare_parameter<double>("min_box_area_px", 0.0);
+  max_box_area_px_ = this->declare_parameter<double>("max_box_area_px", 0.0);
+  min_aspect_ = this->declare_parameter<double>("min_aspect", 0.0);
+  max_aspect_ = this->declare_parameter<double>("max_aspect", 0.0);
+  min_mask_fill_ = this->declare_parameter<double>("min_mask_fill", 0.0);
   debug_shapes_ = this->declare_parameter<bool>("debug_shapes", false);
 
   match_distance_px_ = this->declare_parameter<double>("tracking.match_max_distance_px", match_distance_px_);
@@ -278,6 +286,16 @@ bool InstanceSegNode::loadModel(const std::string& backend,
     inferencer_ = std::move(next_inferencer);
     backend_ = backend;
     model_path_ = model_path;
+    // Class labels travel with the model: load the `<model>.names` sidecar
+    // (one class per line) that sits next to the model file, so switching
+    // models re-loads the matching class names. The TRT .engine carries no
+    // names metadata. Falls back to the class_names param when no sidecar.
+    {
+      auto sidecar_names = loadNamesSidecar(model_path);
+      if (!sidecar_names.empty()) {
+        class_names_ = std::move(sidecar_names);
+      }
+    }
     device_ = loaded_device;
     fallback_device_ = fallback_device;
     nms_class_agnostic_ = nms_class_agnostic;
@@ -292,10 +310,89 @@ bool InstanceSegNode::loadModel(const std::string& backend,
   if (model_path.empty()) {
     RCLCPP_WARN(this->get_logger(), "No model_path specified");
   } else {
-    RCLCPP_INFO(this->get_logger(), "Loaded model: %s on %s (backend=%s)",
-                model_path.c_str(), loaded_device.c_str(), backend.c_str());
+    RCLCPP_INFO(this->get_logger(), "Loaded model: %s on %s (backend=%s, %zu classes)",
+                model_path.c_str(), loaded_device.c_str(), backend.c_str(),
+                class_names_.size());
   }
   return true;
+}
+
+std::vector<std::string> InstanceSegNode::loadNamesSidecar(
+    const std::string& model_path) const {
+  if (model_path.empty()) {
+    return {};
+  }
+  // Replace the model file extension with ".names" (keep dots in dir names).
+  std::string sidecar = model_path;
+  const auto slash = sidecar.find_last_of('/');
+  const auto dot = sidecar.find_last_of('.');
+  if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) {
+    sidecar.resize(dot);
+  }
+  sidecar += ".names";
+
+  std::ifstream f(sidecar);
+  if (!f.is_open()) {
+    return {};
+  }
+  std::vector<std::string> names;
+  std::string line;
+  while (std::getline(f, line)) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ' ||
+                             line.back() == '\t')) {
+      line.pop_back();
+    }
+    if (!line.empty()) {
+      names.push_back(line);
+    }
+  }
+  if (!names.empty()) {
+    RCLCPP_INFO(this->get_logger(), "Loaded %zu class names from %s",
+                names.size(), sidecar.c_str());
+  }
+  return names;
+}
+
+void InstanceSegNode::filterDetections(InferResult& res) const {
+  if (min_box_area_px_ <= 0.0 && max_box_area_px_ <= 0.0 &&
+      min_aspect_ <= 0.0 && max_aspect_ <= 0.0 && min_mask_fill_ <= 0.0) {
+    return;  // no filter configured
+  }
+  const std::size_t n = res.boxes.size();
+  std::vector<std::size_t> keep;
+  keep.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    const auto& b = res.boxes[i];
+    const double area = static_cast<double>(b.width) * static_cast<double>(b.height);
+    const double aspect =
+        (b.height > 0) ? (static_cast<double>(b.width) / static_cast<double>(b.height)) : 0.0;
+    if (min_box_area_px_ > 0.0 && area < min_box_area_px_) continue;
+    if (max_box_area_px_ > 0.0 && area > max_box_area_px_) continue;
+    if (min_aspect_ > 0.0 && aspect < min_aspect_) continue;
+    if (max_aspect_ > 0.0 && aspect > max_aspect_) continue;
+    if (min_mask_fill_ > 0.0 && i < res.masks.size() && !res.masks[i].empty()) {
+      const double total = static_cast<double>(res.masks[i].total());
+      const double fill =
+          total > 0.0 ? (static_cast<double>(cv::countNonZero(res.masks[i] > 0)) / total) : 0.0;
+      if (fill < min_mask_fill_) continue;
+    }
+    keep.push_back(i);
+  }
+  if (keep.size() == n) return;  // nothing filtered
+
+  InferResult out;
+  out.mask_proto_size = res.mask_proto_size;
+  out.boxes.reserve(keep.size());
+  out.classes.reserve(keep.size());
+  out.scores.reserve(keep.size());
+  out.masks.reserve(keep.size());
+  for (std::size_t idx : keep) {
+    out.boxes.push_back(res.boxes[idx]);
+    out.classes.push_back(res.classes[idx]);
+    out.scores.push_back(res.scores[idx]);
+    if (idx < res.masks.size()) out.masks.push_back(res.masks[idx]);
+  }
+  res = std::move(out);
 }
 
 rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
@@ -575,6 +672,11 @@ void InstanceSegNode::imageCallback(const Image::SharedPtr msg) {
   }
   auto infer_end = std::chrono::steady_clock::now();
 
+  // Drop false detections by box size / aspect / mask fill (opt-in via params).
+  if (ok) {
+    filterDetections(res);
+  }
+
   if (!ok) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                          "⚠️ infer() failed/timeout (backend=%s device=%s)",
@@ -727,7 +829,7 @@ void InstanceSegNode::publishDetections(const std::vector<TrackState>& tracks, c
     fv_det.id = track.id;
     fv_det.source_mask = FvDetection2D::SOURCE_INSTANCE;
     fv_det.class_id = track.cls;
-    fv_det.label = "";
+    fv_det.label = labelForClass(track.cls);
     fv_det.conf_fused = track.score;
     fv_det.conf_object = 0.0f;
     fv_det.conf_instance = track.score;
@@ -908,14 +1010,22 @@ void InstanceSegNode::drawStats(cv::Mat& image) {
     model_path = model_path_;
   }
 
-  put(std::string("デバイス: ") + device);
-  put(std::string("バックエンド: ") + backend);
+  // ASCII only: the overlay text is drawn with cv::putText (Hershey font),
+  // which has no glyphs for multibyte/Japanese and renders them as "????".
+  put(std::string("Device: ") + device);
+  put(std::string("Backend: ") + backend);
+  {
+    std::ostringstream cs;
+    cs << "Conf: " << std::fixed << std::setprecision(2) << conf_thres_
+       << "  IoU: " << std::fixed << std::setprecision(2) << iou_thres_;
+    put(cs.str());
+  }
   put(std::string("FPS: ") + std::to_string(static_cast<int>(stats_fps_)));
-  put(std::string("推論: ") + std::to_string(static_cast<int>(stats_inference_ms_)) + "ms");
-  put(std::string("総処理: ") + std::to_string(static_cast<int>(stats_total_ms_)) + "ms");
-  put(std::string("セグメント: ") + std::to_string(stats_detection_count_));
+  put(std::string("Infer: ") + std::to_string(static_cast<int>(stats_inference_ms_)) + "ms");
+  put(std::string("Total: ") + std::to_string(static_cast<int>(stats_total_ms_)) + "ms");
+  put(std::string("Detections: ") + std::to_string(stats_detection_count_));
   if (!model_path.empty()) {
-    put(std::string("モデル: ") + model_path);
+    put(std::string("Model: ") + model_path);
   }
 }
 
@@ -1034,6 +1144,8 @@ void InstanceSegNode::overlayWorker() {
           if (duration_sec < 0.0) duration_sec = 0.0;
 
           std::ostringstream label;
+          const std::string cls_name = labelForClass(track.cls);
+          if (!cls_name.empty()) label << cls_name << " ";
           label << "ID " << track.id
                 << " " << conf_pct << "%"
                 << " " << std::fixed << std::setprecision(1) << duration_sec << "s"

@@ -477,9 +477,6 @@ bool TrtYoloSegInferencer::infer(const cv::Mat& bgr, float conf_thres, float iou
   if (det_d1 <= 0 || det_d2 <= 0) {
     return false;
   }
-  const bool layout_cn = det_d1 < det_d2;  // [1,C,N]
-  const int det_c = layout_cn ? det_d1 : det_d2;
-  const int det_n = layout_cn ? det_d2 : det_d1;
 
   proto_c_ = proto_dims.d[1];
   proto_h_ = proto_dims.d[2];
@@ -488,17 +485,6 @@ bool TrtYoloSegInferencer::infer(const cv::Mat& bgr, float conf_thres, float iou
     return false;
   }
   num_coeff_ = proto_c_;
-  num_classes_ = std::max(1, det_c - 4 - num_coeff_);
-  if (det_c < 4 + num_classes_ + num_coeff_) {
-    return false;
-  }
-
-  auto det_at = [&](int c, int i) -> float {
-    if (layout_cn) {
-      return det_data[static_cast<std::size_t>(c) * det_n + i];
-    }
-    return det_data[static_cast<std::size_t>(i) * det_c + c];
-  };
 
   std::vector<cv::Rect2f> boxes;
   std::vector<float> scores;
@@ -509,63 +495,133 @@ bool TrtYoloSegInferencer::infer(const cv::Mat& bgr, float conf_thres, float iou
   classes.reserve(128);
   coeffs.reserve(128);
 
-  for (int i = 0; i < det_n; ++i) {
-    const float x = det_at(0, i);
-    const float y = det_at(1, i);
-    const float w = det_at(2, i);
-    const float h = det_at(3, i);
-
-    int cls_best = 0;
-    float cls_score = 0.0f;
-    for (int c = 0; c < num_classes_; ++c) {
-      const float s = det_at(4 + c, i);
-      if (s > cls_score) {
-        cls_score = s;
-        cls_best = c;
+  // Two YOLO-seg head layouts:
+  //   raw     [1, 4+nc+coeff, anchors]   (d1 < d2): per-class scores, needs NMS.
+  //   end2end [1, num_det, 4+1+1+coeff]  (d1 > d2): xyxy, score, class-index,
+  //           mask coeffs — already NMS'd + score-sorted by the model (the
+  //           NMS-free head, e.g. vlabor_perception). No NMS done here.
+  const bool is_end2end = (det_d1 > det_d2);
+  if (is_end2end) {
+    const int num_det = det_d1;
+    const int attrs = det_d2;
+    if (attrs < 6 + num_coeff_) {
+      return false;
+    }
+    num_classes_ = std::max(num_classes_, 1);  // class is an explicit index col
+    for (int d = 0; d < num_det; ++d) {
+      const float* row = det_data.data() + static_cast<std::size_t>(d) * attrs;
+      const float score = row[4];
+      if (score < conf_thres) {
+        continue;
       }
+      const int cls = static_cast<int>(std::lround(row[5]));
+
+      float x1 = row[0] - static_cast<float>(info.pad_w);
+      float y1 = row[1] - static_cast<float>(info.pad_h);
+      float x2 = row[2] - static_cast<float>(info.pad_w);
+      float y2 = row[3] - static_cast<float>(info.pad_h);
+      if (info.scale > 0.0f) {
+        x1 /= info.scale;
+        x2 /= info.scale;
+        y1 /= info.scale;
+        y2 /= info.scale;
+      }
+      x1 = std::clamp(x1, 0.0f, static_cast<float>(bgr.cols - 1));
+      y1 = std::clamp(y1, 0.0f, static_cast<float>(bgr.rows - 1));
+      x2 = std::clamp(x2, 0.0f, static_cast<float>(bgr.cols - 1));
+      y2 = std::clamp(y2, 0.0f, static_cast<float>(bgr.rows - 1));
+
+      cv::Rect2f rect(x1, y1, std::max(0.0f, x2 - x1), std::max(0.0f, y2 - y1));
+      if (rect.width <= 1.0f || rect.height <= 1.0f) {
+        continue;
+      }
+      boxes.push_back(rect);
+      scores.push_back(score);
+      classes.push_back(cls);
+      std::vector<float> coef(num_coeff_);
+      for (int k = 0; k < num_coeff_; ++k) {
+        coef[k] = row[6 + k];
+      }
+      coeffs.emplace_back(std::move(coef));
     }
-    if (cls_score < conf_thres) {
-      continue;
+  } else {
+    const bool layout_cn = det_d1 < det_d2;  // [1,C,N]
+    const int det_c = layout_cn ? det_d1 : det_d2;
+    const int det_n = layout_cn ? det_d2 : det_d1;
+    num_classes_ = std::max(1, det_c - 4 - num_coeff_);
+    if (det_c < 4 + num_classes_ + num_coeff_) {
+      return false;
     }
 
-    float x1 = x - w * 0.5f;
-    float y1 = y - h * 0.5f;
-    float x2 = x + w * 0.5f;
-    float y2 = y + h * 0.5f;
+    auto det_at = [&](int c, int i) -> float {
+      if (layout_cn) {
+        return det_data[static_cast<std::size_t>(c) * det_n + i];
+      }
+      return det_data[static_cast<std::size_t>(i) * det_c + c];
+    };
 
-    x1 -= static_cast<float>(info.pad_w);
-    x2 -= static_cast<float>(info.pad_w);
-    y1 -= static_cast<float>(info.pad_h);
-    y2 -= static_cast<float>(info.pad_h);
-    if (info.scale > 0.0f) {
-      x1 /= info.scale;
-      x2 /= info.scale;
-      y1 /= info.scale;
-      y2 /= info.scale;
+    for (int i = 0; i < det_n; ++i) {
+      const float x = det_at(0, i);
+      const float y = det_at(1, i);
+      const float w = det_at(2, i);
+      const float h = det_at(3, i);
+
+      int cls_best = 0;
+      float cls_score = 0.0f;
+      for (int c = 0; c < num_classes_; ++c) {
+        const float s = det_at(4 + c, i);
+        if (s > cls_score) {
+          cls_score = s;
+          cls_best = c;
+        }
+      }
+      if (cls_score < conf_thres) {
+        continue;
+      }
+
+      float x1 = x - w * 0.5f;
+      float y1 = y - h * 0.5f;
+      float x2 = x + w * 0.5f;
+      float y2 = y + h * 0.5f;
+
+      x1 -= static_cast<float>(info.pad_w);
+      x2 -= static_cast<float>(info.pad_w);
+      y1 -= static_cast<float>(info.pad_h);
+      y2 -= static_cast<float>(info.pad_h);
+      if (info.scale > 0.0f) {
+        x1 /= info.scale;
+        x2 /= info.scale;
+        y1 /= info.scale;
+        y2 /= info.scale;
+      }
+
+      x1 = std::clamp(x1, 0.0f, static_cast<float>(bgr.cols - 1));
+      y1 = std::clamp(y1, 0.0f, static_cast<float>(bgr.rows - 1));
+      x2 = std::clamp(x2, 0.0f, static_cast<float>(bgr.cols - 1));
+      y2 = std::clamp(y2, 0.0f, static_cast<float>(bgr.rows - 1));
+
+      cv::Rect2f rect(x1, y1, std::max(0.0f, x2 - x1), std::max(0.0f, y2 - y1));
+      if (rect.width <= 1.0f || rect.height <= 1.0f) {
+        continue;
+      }
+
+      boxes.push_back(rect);
+      scores.push_back(cls_score);
+      classes.push_back(cls_best);
+      std::vector<float> coef(num_coeff_);
+      for (int k = 0; k < num_coeff_; ++k) {
+        coef[k] = det_at(4 + num_classes_ + k, i);
+      }
+      coeffs.emplace_back(std::move(coef));
     }
-
-    x1 = std::clamp(x1, 0.0f, static_cast<float>(bgr.cols - 1));
-    y1 = std::clamp(y1, 0.0f, static_cast<float>(bgr.rows - 1));
-    x2 = std::clamp(x2, 0.0f, static_cast<float>(bgr.cols - 1));
-    y2 = std::clamp(y2, 0.0f, static_cast<float>(bgr.rows - 1));
-
-    cv::Rect2f rect(x1, y1, std::max(0.0f, x2 - x1), std::max(0.0f, y2 - y1));
-    if (rect.width <= 1.0f || rect.height <= 1.0f) {
-      continue;
-    }
-
-    boxes.push_back(rect);
-    scores.push_back(cls_score);
-    classes.push_back(cls_best);
-    std::vector<float> coef(num_coeff_);
-    for (int k = 0; k < num_coeff_; ++k) {
-      coef[k] = det_at(4 + num_classes_ + k, i);
-    }
-    coeffs.emplace_back(std::move(coef));
   }
 
   std::vector<int> keep;
-  if (nms_agnostic_) {
+  if (is_end2end) {
+    // NMS-free head: the model already de-duplicated + score-sorted; keep all.
+    keep.resize(boxes.size());
+    std::iota(keep.begin(), keep.end(), 0);
+  } else if (nms_agnostic_) {
     nms(boxes, scores, iou_thres, &keep);
   } else {
     std::unordered_map<int, std::vector<int>> by_class;
