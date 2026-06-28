@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <utility>
 #include <iomanip>
 #include <condition_variable>
 #include <fluent_lib/cv_bridge_compat.hpp>
@@ -61,6 +62,47 @@ static std::string infer_backend_for_model_path(const std::string& path,
     return "openvino";
   }
   return fallback;
+}
+
+// A 0-byte engine left behind by a killed/failed trtexec build must NOT be
+// treated as usable (it deserializes to nothing and blinds perception).
+static bool file_is_nonempty(const std::string& path) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  return f.is_open() && static_cast<std::streamoff>(f.tellg()) > 0;
+}
+
+// 「基本 TensorRT・動かない環境では ONNX」解決。 backend が TRT 寄り
+// (auto/tensorrt/trt/空) のとき、 portable な .onnx/.xml を host-local の
+// TensorRT engine (/ros2_ws/models/tensorrt/<stem>.engine) に差し替える ——
+// ただし engine が存在し かつ 非0バイトのときだけ。 engine が無い / 0バイト
+// (= TRT 非対応ホスト or ビルド失敗) なら .onnx のまま返して OpenVINO/ORT で
+// 走らせる。 明示 "openvino" は常に尊重 (operator が ONNX を強制)。 dashboard
+// の _resolve_runtime_model_path と挙動を一致させ launch 時と runtime 選択を揃える。
+static std::pair<std::string, std::string> resolve_trt_preferred(
+    const std::string& model_path, const std::string& backend) {
+  const std::string bk = lower_path(backend);
+  const bool prefer_trt =
+      bk.empty() || bk == "auto" || bk == "tensorrt" || bk == "trt";
+  if (!prefer_trt || model_path.empty()) {
+    return {model_path, backend};
+  }
+  const std::string lower = lower_path(model_path);
+  if (ends_with_any(lower, {".engine", ".plan"})) {
+    return {model_path, "tensorrt"};
+  }
+  if (ends_with_any(lower, {".onnx", ".xml"})) {
+    const auto slash = model_path.find_last_of('/');
+    const std::string base =
+        (slash == std::string::npos) ? model_path : model_path.substr(slash + 1);
+    const auto dot = base.find_last_of('.');
+    const std::string stem = (dot == std::string::npos) ? base : base.substr(0, dot);
+    const std::string engine = "/ros2_ws/models/tensorrt/" + stem + ".engine";
+    if (file_is_nonempty(engine)) {
+      return {engine, "tensorrt"};
+    }
+    return {model_path, "openvino"};
+  }
+  return {model_path, backend};
 }
 
 InstanceSegNode::InstanceSegNode(const rclcpp::NodeOptions& options)
@@ -329,14 +371,33 @@ bool InstanceSegNode::loadModel(const std::string& backend,
   }
 
   std::string used_device;
-  auto next_inferencer = build(model_path, backend, used_device);
+  // 基本 TensorRT・動かない環境では ONNX: redirect a portable .onnx to its
+  // host-local engine when one is usable, else keep the .onnx for OpenVINO/ORT.
+  auto resolved = resolve_trt_preferred(model_path, backend);
+  std::string eff_path = resolved.first;
+  std::string eff_backend = resolved.second;
+  auto next_inferencer = build(eff_path, eff_backend, used_device);
+
+  // Runtime fallback: an engine that exists but fails to deserialize (corrupt,
+  // built for another GPU SM / TRT version) must not blind perception — retry
+  // the portable ONNX via OpenVINO. Operator-agreed degradation, logged loud.
+  if (!next_inferencer && eff_backend == "tensorrt" && eff_path != model_path &&
+      !model_path.empty()) {
+    RCLCPP_WARN(this->get_logger(),
+                "TensorRT engine load failed (%s); falling back to ONNX/OpenVINO (%s)",
+                eff_path.c_str(), model_path.c_str());
+    eff_path = model_path;
+    eff_backend = "openvino";
+    next_inferencer = build(eff_path, eff_backend, used_device);
+  }
+
   if (next_inferencer) {
-    commit(std::move(next_inferencer), model_path, backend, used_device);
-    if (model_path.empty()) {
+    commit(std::move(next_inferencer), eff_path, eff_backend, used_device);
+    if (eff_path.empty()) {
       RCLCPP_WARN(this->get_logger(), "No model_path specified");
     } else {
       RCLCPP_INFO(this->get_logger(), "Loaded model: %s on %s (backend=%s, %zu classes)",
-                  model_path.c_str(), used_device.c_str(), backend.c_str(),
+                  eff_path.c_str(), used_device.c_str(), eff_backend.c_str(),
                   class_names_.size());
     }
     return true;
@@ -957,6 +1018,9 @@ void InstanceSegNode::updateTracking(const InferResult& res, const rclcpp::Time&
     TrackState* best = nullptr;
     double best_dist = match_distance_px_;
     for (auto& track : tracks_) {
+      if (track.active) {
+        continue;  // one detection must not overwrite another detection's track in the same frame
+      }
       double dist = cv::norm(track.center - center);
       if (dist <= best_dist) {
         best_dist = dist;
