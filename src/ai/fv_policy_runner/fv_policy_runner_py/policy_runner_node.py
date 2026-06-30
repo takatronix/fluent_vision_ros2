@@ -40,6 +40,10 @@ class ImageSlot:
     name: str
     topic: str
     image: Optional[np.ndarray] = None
+    # Original compressed frame, forwarded verbatim (no decode/re-encode) to
+    # match the DPEX inference_bridge passthrough.
+    raw: Optional[bytes] = None
+    raw_codec: str = "jpg"
     stamp_sec: float = 0.0
 
 
@@ -685,21 +689,19 @@ class FvPolicyRunnerNode(Node):
             slot.stamp_sec = stamp_sec
 
     def _on_compressed_image(self, slot: ImageSlot, msg: CompressedImage) -> None:
-        # Skip JPEG decode when idle (see _on_image).
+        # Skip work when idle (see _on_image).
         if not self._running:
             return
-        try:
-            data = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-            image_bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-            if image_bgr is None:
-                raise ValueError("cv2.imdecode returned None")
-            image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-            stamp_sec = _stamp_to_sec(msg.header.stamp)
-        except Exception as exc:
-            self.get_logger().warning(f"compressed image conversion failed topic={slot.topic} error={exc}")
-            return
+        # Forward the camera's original compressed frame verbatim, matching the
+        # DPEX inference_bridge passthrough. Decoding then re-encoding at JPEG q90
+        # double-compresses the image the policy grounds on; the gateway worker
+        # decodes "jpg"/"compressed" identically, so passthrough is exact parity.
+        fmt = str(msg.format or "").strip().lower()
+        codec = "png" if "png" in fmt else "jpg"
+        stamp_sec = _stamp_to_sec(msg.header.stamp)
         with self._lock:
-            slot.image = image
+            slot.raw = bytes(msg.data)
+            slot.raw_codec = codec
             slot.stamp_sec = stamp_sec
 
     def _on_state(self, msg: JointState) -> None:
@@ -772,6 +774,20 @@ class FvPolicyRunnerNode(Node):
             state_vector = self._ros_state_to_policy_state(self._state_vector, self._state_names)
             images = []
             for slot in self._image_slots:
+                # Compressed-source slots forward the original frame verbatim
+                # (no re-encode) to match the DPEX inference_bridge passthrough.
+                if slot.raw is not None:
+                    if now - slot.stamp_sec > self.observation_max_age_sec:
+                        self._last_error = f"image stale: {slot.name}"
+                        return None
+                    images.append(
+                        {
+                            "name": slot.name,
+                            "codec": slot.raw_codec,
+                            "data": base64.b64encode(slot.raw).decode("ascii"),
+                        }
+                    )
+                    continue
                 if slot.image is None:
                     self._last_error = f"image missing: {slot.name}"
                     return None
@@ -837,8 +853,17 @@ class FvPolicyRunnerNode(Node):
                 break
             if name in self.policy_angle_joint_names:
                 state[index] = math.degrees(float(state[index]))
-            elif self.policy_gripper_state_override and name == self.policy_gripper_joint_name:
-                state[index] = float(self.policy_gripper_state_value)
+            elif name == self.policy_gripper_joint_name:
+                if self.policy_gripper_state_override:
+                    state[index] = float(self.policy_gripper_state_value)
+                elif self.policy_gripper_output_scale not in (0.0, 1.0):
+                    # Gripper proprioception must be symmetric with the action
+                    # scale (DPEX inference_bridge uses one per-joint factor:
+                    # obs ×S, action ÷S). The arm reports the gripper in meters;
+                    # the policy was trained on dataset units (≈0–3.8). Without
+                    # this the model sees the gripper as ~always closed and emits
+                    # a narrow, oscillating grasp that never reaches the object.
+                    state[index] = float(state[index]) / self.policy_gripper_output_scale
         return state
 
     def _policy_action_to_ros_action(self, action: np.ndarray) -> np.ndarray:
