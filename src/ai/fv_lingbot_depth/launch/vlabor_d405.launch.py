@@ -1,30 +1,21 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    # No DeclareLaunchArgument here on purpose: generic names like
+    # `node_name` / `config_file` inherit values from the parent launch
+    # context when included by the vlabor profile launcher (observed:
+    # node_name resolved to "d405" and collided with the RealSense node).
     pkg_share = FindPackageShare("fv_lingbot_depth")
-    node_name_arg = DeclareLaunchArgument(
-        "node_name",
-        default_value="fv_lingbot_depth",
-        description="Node name",
-    )
-    config_file_arg = DeclareLaunchArgument(
-        "config_file",
-        default_value=PathJoinSubstitution([pkg_share, "config", "vlabor_d405.yaml"]),
-        description="Path to YAML config file",
-    )
-
     node = Node(
         package="fv_lingbot_depth",
         executable="fv_lingbot_depth_node",
-        name=LaunchConfiguration("node_name"),
+        name="fv_lingbot_depth",
         output="screen",
-        parameters=[LaunchConfiguration("config_file")],
+        parameters=[PathJoinSubstitution([pkg_share, "config", "vlabor_d405.yaml"])],
         emulate_tty=True,
     )
-
-    return LaunchDescription([node_name_arg, config_file_arg, node])
+    return LaunchDescription([node])

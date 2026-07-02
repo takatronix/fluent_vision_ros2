@@ -326,13 +326,16 @@ class FvLingbotDepthNode(Node):
             detail = exc.read().decode("utf-8", errors="replace").strip()
             if detail:
                 self.get_logger().error(
-                    f"worker request failed status={exc.code} detail={detail}"
+                    f"worker request failed status={exc.code} detail={detail}",
+                    throttle_duration_sec=5.0,
                 )
             else:
-                self.get_logger().error(f"worker request failed status={exc.code}")
+                self.get_logger().error(
+                    f"worker request failed status={exc.code}", throttle_duration_sec=5.0
+                )
             return None, None, None
         except Exception as exc:
-            self.get_logger().error(f"worker request failed: {exc}")
+            self.get_logger().error(f"worker request failed: {exc}", throttle_duration_sec=5.0)
             return None, None, None
 
         try:
