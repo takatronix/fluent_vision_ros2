@@ -17,6 +17,35 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _ensure_xformers_free_attention() -> None:
+    """Allow inference without xFormers (e.g. Jetson/ARM64).
+
+    The DINOv2-RGBD encoder feeds the transformer blocks a *list* of per-sample
+    token sequences; upstream NestedTensorBlock handles that path with xFormers
+    nested tensors and asserts otherwise. In eval mode the nested path is pure
+    ragged batching (block-diagonal attention mask), so running plain
+    Block.forward per element is mathematically identical — sequences never
+    attend across each other. The non-xFormers attention fallback already uses
+    PyTorch-native SDPA.
+    """
+    try:
+        import xformers  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
+    from mdm.model.dinov2_rgbd.layers.block import Block, NestedTensorBlock
+
+    def _forward_per_sample(self, x_or_x_list):
+        if isinstance(x_or_x_list, list):
+            return [Block.forward(self, x) for x in x_or_x_list]
+        return Block.forward(self, x_or_x_list)
+
+    NestedTensorBlock.forward = _forward_per_sample
+    print("xformers unavailable: patched NestedTensorBlock for per-sample attention", flush=True)
+
+
 class LingBotDepthWorker:
     def __init__(self) -> None:
         self.model_id = os.environ.get(
@@ -55,6 +84,8 @@ class LingBotDepthWorker:
             self._error = f"import failed: {exc}"
             return
 
+        _ensure_xformers_free_attention()
+
         try:
             if self.device_mode == "cuda":
                 device = "cuda"
@@ -81,7 +112,8 @@ class LingBotDepthWorker:
         use_fp16: bool,
         apply_mask: bool,
         resolution_level: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return_points: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         if self.ready:
             try:
                 return self._infer_model(
@@ -91,6 +123,7 @@ class LingBotDepthWorker:
                     use_fp16=use_fp16,
                     apply_mask=apply_mask,
                     resolution_level=resolution_level,
+                    return_points=return_points,
                 )
             except Exception as exc:
                 self._error = f"infer failed: {exc}"
@@ -101,7 +134,7 @@ class LingBotDepthWorker:
             raise RuntimeError(self._error or "worker not ready")
 
         mask = np.isfinite(depth_m) & (depth_m > 0.0)
-        points = self._depth_to_points(depth_m, intrinsics_norm, mask)
+        points = self._depth_to_points(depth_m, intrinsics_norm, mask) if return_points else None
         return depth_m.astype(np.float32), mask.astype(bool), points
 
     def _infer_model(
@@ -112,7 +145,8 @@ class LingBotDepthWorker:
         use_fp16: bool,
         apply_mask: bool,
         resolution_level: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return_points: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
         torch = self._torch
         if torch is None or self._model is None or self._device is None:
             raise RuntimeError("model is not loaded")
@@ -127,7 +161,7 @@ class LingBotDepthWorker:
             out = self._model.infer(
                 image_t,
                 depth_in=depth_t,
-                intrinsics=intr_t,
+                intrinsics=intr_t if return_points else None,
                 use_fp16=use_fp16,
                 apply_mask=apply_mask,
                 resolution_level=resolution_level,
@@ -143,6 +177,9 @@ class LingBotDepthWorker:
             mask_np = mask_out.detach().cpu().numpy().squeeze().astype(bool)
         else:
             mask_np = np.isfinite(depth_np) & (depth_np > 0.0)
+
+        if not return_points:
+            return depth_np, mask_np, None
 
         points_out = out.get("points")
         if points_out is not None:
@@ -209,6 +246,8 @@ class Handler(BaseHTTPRequestHandler):
             with np.load(io.BytesIO(body), allow_pickle=False) as payload:
                 color_bgr = payload["color_bgr"].astype(np.uint8, copy=False)
                 depth_m = payload["depth_m"].astype(np.float32, copy=False)
+                if "depth_scale" in payload:
+                    depth_m = depth_m * float(payload["depth_scale"].item())
                 intrinsics_norm = payload["intrinsics_norm"].astype(np.float32, copy=False)
                 use_fp16 = bool(payload["use_fp16"].item()) if "use_fp16" in payload else WORKER.use_fp16
                 apply_mask = bool(payload["apply_mask"].item()) if "apply_mask" in payload else WORKER.apply_mask
@@ -217,6 +256,8 @@ class Handler(BaseHTTPRequestHandler):
                     if "resolution_level" in payload
                     else WORKER.resolution_level
                 )
+                return_points = bool(payload["return_points"].item()) if "return_points" in payload else True
+                compress = bool(payload["compress"].item()) if "compress" in payload else True
         except Exception as exc:
             self.send_error(HTTPStatus.BAD_REQUEST, f"invalid request: {exc}")
             return
@@ -229,18 +270,26 @@ class Handler(BaseHTTPRequestHandler):
                 use_fp16=use_fp16,
                 apply_mask=apply_mask,
                 resolution_level=resolution_level,
+                return_points=return_points,
             )
         except Exception as exc:
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
             return
 
+        arrays = {
+            "depth": depth_out.astype(np.float32, copy=False),
+            "mask": mask_out.astype(np.uint8, copy=False),
+        }
+        if points_out is not None:
+            arrays["points"] = points_out.astype(np.float32, copy=False)
+
         resp = io.BytesIO()
-        np.savez_compressed(
-            resp,
-            depth=depth_out.astype(np.float32, copy=False),
-            mask=mask_out.astype(np.uint8, copy=False),
-            points=points_out.astype(np.float32, copy=False),
-        )
+        # Compression costs ~100ms+ per frame on Jetson; skip it for
+        # localhost transport unless the client asks for it.
+        if compress:
+            np.savez_compressed(resp, **arrays)
+        else:
+            np.savez(resp, **arrays)
         data = resp.getvalue()
 
         self.send_response(HTTPStatus.OK)

@@ -21,6 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Some base images (e.g. l4t/vlabor) ship python3 only
+RUN command -v python >/dev/null 2>&1 || ln -s "$(command -v python3)" /usr/local/bin/python
+
 RUN python -m pip install --upgrade --ignore-installed pip setuptools wheel && \
     python -m pip install "numpy<2" huggingface_hub ${EXTRA_PIP_PACKAGES}
 
@@ -54,6 +57,10 @@ ENV LISTEN_PORT=5540
 ENV FALLBACK_PASSTHROUGH=1
 
 EXPOSE 5540
+
+# Base images may carry their own ENTRYPOINT (e.g. the vlabor stack launcher);
+# this worker must only ever run the HTTP server.
+ENTRYPOINT []
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
   CMD python -c "import os, urllib.request; port=os.environ.get('LISTEN_PORT', '5540'); resp=urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=3); body=resp.read().decode('utf-8'); raise SystemExit(0 if resp.status == 200 and body else 1)"

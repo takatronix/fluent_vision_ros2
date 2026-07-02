@@ -10,7 +10,6 @@ import urllib.request
 import cv2
 import numpy as np
 import rclpy
-from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -18,10 +17,37 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 
 
+def _ensure_xformers_free_attention() -> None:
+    """Allow inference without xFormers (e.g. Jetson/ARM64).
+
+    The DINOv2-RGBD encoder feeds the transformer blocks a *list* of per-sample
+    token sequences; upstream NestedTensorBlock handles that path with xFormers
+    nested tensors and asserts otherwise. In eval mode the nested path is pure
+    ragged batching (block-diagonal attention mask), so running plain
+    Block.forward per element is mathematically identical — sequences never
+    attend across each other. The non-xFormers attention fallback already uses
+    PyTorch-native SDPA.
+    """
+    try:
+        import xformers  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
+    from mdm.model.dinov2_rgbd.layers.block import Block, NestedTensorBlock
+
+    def _forward_per_sample(self, x_or_x_list):
+        if isinstance(x_or_x_list, list):
+            return [Block.forward(self, x) for x in x_or_x_list]
+        return Block.forward(self, x_or_x_list)
+
+    NestedTensorBlock.forward = _forward_per_sample
+
+
 class FvLingbotDepthNode(Node):
     def __init__(self) -> None:
         super().__init__("fv_lingbot_depth")
-        self.bridge = CvBridge()
 
         # I/O
         self.declare_parameter("color_topic", "~/color/image_raw")
@@ -153,6 +179,8 @@ class FvLingbotDepthNode(Node):
             )
             return
 
+        _ensure_xformers_free_attention()
+
         try:
             if self.device_mode == "cuda":
                 device = "cuda"
@@ -180,7 +208,7 @@ class FvLingbotDepthNode(Node):
         start = time.perf_counter()
 
         try:
-            color_bgr = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding="bgr8")
+            color_bgr = self._color_to_bgr(color_msg)
             depth_m = self._depth_to_meters(depth_msg)
         except Exception as exc:
             self.get_logger().warning(f"Input conversion failed: {exc}")
@@ -200,14 +228,20 @@ class FvLingbotDepthNode(Node):
         if intr_norm is None:
             return
 
+        # PointCloud2 generation and transfer are expensive; only produce
+        # points when someone is actually listening.
+        want_points = self.points_pub.get_subscription_count() > 0
+
         if self.backend == "http":
-            refined_depth, mask, points = self._run_remote_model(color_bgr, depth_m, intr_norm)
+            refined_depth, mask, points = self._run_remote_model(
+                color_bgr, depth_m, intr_norm, want_points=want_points
+            )
             if refined_depth is None:
                 if not self.fallback_passthrough:
                     return
                 refined_depth = depth_m
                 mask = np.isfinite(refined_depth) & (refined_depth > 0.0)
-                points = self._depth_to_points(refined_depth, intr_norm, mask)
+                points = None
         elif self._model is not None:
             refined_depth, mask, points = self._run_model(color_bgr, depth_m, intr_norm)
             if refined_depth is None:
@@ -215,12 +249,15 @@ class FvLingbotDepthNode(Node):
                     return
                 refined_depth = depth_m
                 mask = np.isfinite(refined_depth) & (refined_depth > 0.0)
-                points = self._depth_to_points(refined_depth, intr_norm, mask)
+                points = None
         else:
             if not self.fallback_passthrough:
                 return
             refined_depth = depth_m
             mask = np.isfinite(refined_depth) & (refined_depth > 0.0)
+            points = None
+
+        if want_points and points is None:
             points = self._depth_to_points(refined_depth, intr_norm, mask)
 
         header = depth_msg.header
@@ -228,19 +265,18 @@ class FvLingbotDepthNode(Node):
             header.frame_id = self.frame_id_override
 
         depth_out = np.nan_to_num(refined_depth.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-        depth_image_msg = self.bridge.cv2_to_imgmsg(depth_out, encoding="32FC1")
-        depth_image_msg.header = header
+        depth_image_msg = self._to_image_msg(depth_out, "32FC1", header)
         self.depth_pub.publish(depth_image_msg)
 
         if mask is None:
             mask = np.isfinite(depth_out) & (depth_out > 0.0)
         mask_u8 = np.where(mask, 255, 0).astype(np.uint8)
-        mask_msg = self.bridge.cv2_to_imgmsg(mask_u8, encoding="mono8")
-        mask_msg.header = header
+        mask_msg = self._to_image_msg(mask_u8, "mono8", header)
         self.mask_pub.publish(mask_msg)
 
-        cloud_msg = self._to_pointcloud2(points, header)
-        self.points_pub.publish(cloud_msg)
+        if want_points:
+            cloud_msg = self._to_pointcloud2(points, header)
+            self.points_pub.publish(cloud_msg)
 
         self._frame_counter += 1
         proc_ms = (time.perf_counter() - start) * 1000.0
@@ -248,16 +284,23 @@ class FvLingbotDepthNode(Node):
         if self._frame_counter % self.log_every_n_frames == 0:
             avg = self._proc_ms_acc / float(self.log_every_n_frames)
             self._proc_ms_acc = 0.0
-            mode = "on" if self._model is not None else "fallback"
+            if self.backend == "http":
+                mode = "http"
+            elif self._model is not None:
+                mode = "direct"
+            else:
+                mode = "fallback"
             self.get_logger().info(
                 f"processed={self._frame_counter} avg_proc_ms={avg:.1f} model={mode}"
             )
 
     def _run_remote_model(
-        self, color_bgr: np.ndarray, depth_m: np.ndarray, intr_norm: np.ndarray
+        self, color_bgr: np.ndarray, depth_m: np.ndarray, intr_norm: np.ndarray, want_points: bool = True
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         payload = io.BytesIO()
-        np.savez_compressed(
+        # Uncompressed: zlib costs ~100ms+/frame on Jetson and the worker is
+        # local, so raw arrays are much faster end-to-end.
+        np.savez(
             payload,
             color_bgr=color_bgr.astype(np.uint8, copy=False),
             depth_m=depth_m.astype(np.float32, copy=False),
@@ -265,6 +308,8 @@ class FvLingbotDepthNode(Node):
             use_fp16=np.asarray(self.use_fp16, dtype=np.uint8),
             apply_mask=np.asarray(self.apply_mask, dtype=np.uint8),
             resolution_level=np.asarray(self.resolution_level, dtype=np.int32),
+            return_points=np.asarray(want_points, dtype=np.uint8),
+            compress=np.asarray(0, dtype=np.uint8),
         )
 
         req = urllib.request.Request(
@@ -303,26 +348,54 @@ class FvLingbotDepthNode(Node):
                 if "points" in result.files:
                     points_np = result["points"].astype(np.float32, copy=False)
 
-                if points_np is None and depth_np is not None:
-                    points_np = self._depth_to_points(depth_np, intr_norm, mask_np)
                 return depth_np, mask_np, points_np
         except Exception as exc:
             self.get_logger().error(f"invalid worker response: {exc}")
             return None, None, None
 
-    def _depth_to_meters(self, msg: Image) -> np.ndarray:
-        depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-        if depth is None:
-            raise RuntimeError("depth image is empty")
-        if depth.ndim != 2:
-            raise RuntimeError(f"unexpected depth shape: {depth.shape}")
+    # Manual Image<->numpy conversion: the vlabor backend container has no
+    # Python cv_bridge (C++ only), and the encodings involved are trivial.
+    def _color_to_bgr(self, msg: Image) -> np.ndarray:
+        encoding = msg.encoding.lower()
+        if encoding not in ("bgr8", "rgb8"):
+            raise RuntimeError(f"unsupported color encoding: {msg.encoding}")
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        expected = msg.height * msg.step
+        if buf.size < expected:
+            raise RuntimeError(f"color buffer too small: {buf.size} < {expected}")
+        img = buf[:expected].reshape(msg.height, msg.step // 3, 3)[:, : msg.width, :]
+        if encoding == "rgb8":
+            img = img[:, :, ::-1]
+        return np.ascontiguousarray(img)
 
-        if msg.encoding.lower() in ("16uc1", "mono16") or depth.dtype == np.uint16:
-            depth_m = depth.astype(np.float32) * self.depth_scale_16uc1
-        elif msg.encoding.lower() in ("32fc1",) or depth.dtype == np.float32:
-            depth_m = depth.astype(np.float32)
+    def _to_image_msg(self, arr: np.ndarray, encoding: str, header) -> Image:
+        msg = Image()
+        msg.header = header
+        msg.height = int(arr.shape[0])
+        msg.width = int(arr.shape[1])
+        msg.encoding = encoding
+        msg.is_bigendian = False
+        msg.step = int(arr.shape[1] * arr.itemsize)
+        msg.data = arr.tobytes()
+        return msg
+
+    def _depth_to_meters(self, msg: Image) -> np.ndarray:
+        encoding = msg.encoding.lower()
+        if encoding in ("16uc1", "mono16"):
+            depth = np.frombuffer(msg.data, dtype=np.uint16)
+            scale = self.depth_scale_16uc1
+        elif encoding == "32fc1":
+            depth = np.frombuffer(msg.data, dtype=np.float32)
+            scale = 1.0
         else:
-            depth_m = depth.astype(np.float32)
+            raise RuntimeError(f"unsupported depth encoding: {msg.encoding}")
+        row_elems = msg.step // depth.itemsize
+        expected = msg.height * row_elems
+        if depth.size < expected:
+            raise RuntimeError(f"depth buffer too small: {depth.size} < {expected}")
+        depth_m = (
+            depth[:expected].reshape(msg.height, row_elems)[:, : msg.width].astype(np.float32) * scale
+        )
         return np.nan_to_num(depth_m, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _normalized_intrinsics(self, info: CameraInfo, width: int, height: int) -> Optional[np.ndarray]:
@@ -380,9 +453,6 @@ class FvLingbotDepthNode(Node):
                 points_np = points_out.detach().float().cpu().numpy().squeeze().astype(np.float32)
             if mask_out is not None:
                 mask_np = mask_out.detach().cpu().numpy().squeeze().astype(bool)
-
-            if points_np is None and depth_np is not None:
-                points_np = self._depth_to_points(depth_np, intr_norm, mask_np)
 
             return depth_np, mask_np, points_np
         except Exception as exc:

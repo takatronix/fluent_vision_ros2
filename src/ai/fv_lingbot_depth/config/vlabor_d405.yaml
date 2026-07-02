@@ -1,0 +1,38 @@
+/**:
+  ros__parameters:
+    color_topic: "/d405_color/image_raw"
+    depth_topic: "/d405_depth/image_rect_raw"
+    camera_info_topic: "/d405_depth/camera_info"
+
+    refined_depth_topic: "/d405_depth_refined/image_rect_raw"
+    mask_topic: "/d405_depth_refined/mask"
+    pointcloud_topic: "/d405_depth_refined/points"
+    frame_id_override: ""
+
+    # LingBot deps live in the lingbot-depth-worker container, not in the
+    # vlabor backend env (torch is present but mdm/model weights are not).
+    backend: "http"
+    worker_endpoint: "http://127.0.0.1:5540/infer"
+    worker_timeout_sec: 5.0
+    model_id: "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
+    local_model_path: ""
+    device: "auto"
+    use_fp16: true
+    apply_mask: true
+    # Thor, PyTorch backend: L0 ≈ 100ms infer / ~300ms HTTP round trip.
+    # Raise towards 9 only if the extra detail is worth the latency.
+    resolution_level: 0
+    # No silent passthrough: when the worker is down the refined topics go
+    # quiet instead of republishing raw depth as if it were refined.
+    # Consumers keep reading the raw /d405_depth topics directly.
+    fallback_passthrough: false
+
+    depth_scale_16uc1: 0.001
+    min_depth_m: 0.05
+    max_depth_m: 3.0
+    point_stride: 2
+
+    sync_queue_size: 10
+    sync_slop_sec: 0.03
+    qos_reliability: "best_effort"
+    log_every_n_frames: 30
