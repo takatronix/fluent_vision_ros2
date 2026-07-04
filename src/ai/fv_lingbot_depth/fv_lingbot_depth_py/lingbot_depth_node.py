@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import rclpy
 from message_filters import ApproximateTimeSynchronizer, Subscriber
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -127,7 +128,14 @@ class FvLingbotDepthNode(Node):
 
         self.depth_pub = self.create_publisher(Image, self.refined_depth_topic, 10)
         self.mask_pub = self.create_publisher(Image, self.mask_topic, 10)
-        self.points_pub = self.create_publisher(PointCloud2, self.pointcloud_topic, 10)
+        # Empty pointcloud_topic disables the publisher entirely. Consumers
+        # build clouds from the refined depth image themselves; advertising
+        # an (on-demand, otherwise silent) topic here just confuses topic
+        # listings.
+        self.points_pub = (
+            self.create_publisher(PointCloud2, self.pointcloud_topic, 10)
+            if self.pointcloud_topic else None
+        )
 
         if self.backend not in ("direct", "http"):
             self.get_logger().warning(
@@ -161,12 +169,28 @@ class FvLingbotDepthNode(Node):
         self._frame_counter = 0
         self._proc_ms_acc = 0.0
 
+        # Runtime tuning: `ros2 param set` (or the dashboard quality button)
+        # can adjust the inference resolution without a node restart — the
+        # level is sent to the worker per request anyway.
+        self.add_on_set_parameters_callback(self._on_param_update)
+
         model_source = self.local_model_path if self.local_model_path else self.model_id
         self.get_logger().info(
             f"fv_lingbot_depth started color={self.color_topic} depth={self.depth_topic} "
             f"info={self.camera_info_topic} out_depth={self.refined_depth_topic} "
             f"out_points={self.pointcloud_topic} backend={self.backend} model={model_source}"
         )
+
+    def _on_param_update(self, params) -> SetParametersResult:
+        for p in params:
+            if p.name == "resolution_level":
+                try:
+                    self.resolution_level = max(0, min(9, int(p.value)))
+                except (TypeError, ValueError):
+                    return SetParametersResult(
+                        successful=False, reason="resolution_level must be an int 0..9")
+                self.get_logger().info(f"resolution_level -> {self.resolution_level}")
+        return SetParametersResult(successful=True)
 
     def _sensor_qos_profile(self) -> QoSProfile:
         reliable = self.qos_reliability == "reliable"
@@ -241,7 +265,10 @@ class FvLingbotDepthNode(Node):
 
         # PointCloud2 generation and transfer are expensive; only produce
         # points when someone is actually listening.
-        want_points = self.points_pub.get_subscription_count() > 0
+        want_points = (
+            self.points_pub is not None
+            and self.points_pub.get_subscription_count() > 0
+        )
 
         if self.backend == "http":
             refined_depth, mask, points = self._run_remote_model(

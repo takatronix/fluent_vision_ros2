@@ -6,7 +6,10 @@
 
     refined_depth_topic: "/d405_depth_refined/image_rect_raw"
     mask_topic: "/d405_depth_refined/mask"
-    pointcloud_topic: "/d405_depth_refined/points"
+    # Disabled: clouds are built from the refined depth by the pointcloud
+    # node / 3D detectors; an advertised-but-silent topic here only
+    # confuses topic listings and viewers.
+    pointcloud_topic: ""
     frame_id_override: ""
 
     # LingBot deps live in the lingbot-depth-worker container, not in the
@@ -19,15 +22,21 @@
     device: "auto"
     use_fp16: true
     apply_mask: true
-    # Thor, PyTorch backend: L0 ≈ 100ms infer / ~300ms HTTP round trip.
-    # Raise towards 9 only if the extra detail is worth the latency.
-    resolution_level: 0
+    # Thor, PyTorch backend: L0 ≈ 100ms infer (~3Hz end-to-end) but soft
+    # object edges (1200-token grid). L9 ≈ 370ms (~1.5Hz) with the
+    # sharpest edges the model can produce. Pick by use: cube-edge
+    # quality favours 9, update rate favours 0.
+    resolution_level: 9
     # No silent passthrough: when the worker is down the refined topics go
     # quiet instead of republishing raw depth as if it were refined.
     # Consumers keep reading the raw /d405_depth topics directly.
     fallback_passthrough: false
 
-    depth_scale_16uc1: 0.001
+    # D405 publishes 16UC1 in 0.1mm units (D405 default depth unit; the
+    # profile's depth_normals_depth_scale is 0.0001 for the same reason).
+    # This scale is used for input decode AND output encode, so refined
+    # output stays in the same 0.1mm units as the raw sensor stream.
+    depth_scale_16uc1: 0.0001
     # 16UC1 = same size/encoding as raw sensor depth (drop-in compatible;
     # 32FC1's 1.2MB fragmented messages starve BEST_EFFORT subscribers on
     # busy nodes like the dashboard).
