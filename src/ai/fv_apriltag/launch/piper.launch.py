@@ -20,6 +20,13 @@ def generate_launch_description():
         namespace='d405_apriltag',
         output='screen',
         parameters=[{
+            # OFF by default: tag detection on the 30fps color stream costs
+            # ~0.5 core and is only needed for cube-bundle calibration /
+            # AprilTag work. Toggle at runtime via
+            # `ros2 param set /d405_apriltag/apriltag_node enabled true`
+            # or the perception MCP set_apriltag_enabled - the node stays
+            # up, so switching on is instant.
+            'enabled': False,
             'family': 'tag36h11',
             'nthreads': 2,
             'quad_decimate': 2.0,

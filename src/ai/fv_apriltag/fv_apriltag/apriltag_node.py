@@ -83,6 +83,11 @@ class ApriltagNode(Node):
         self.declare_parameter('publish_annotated', True)
         self.declare_parameter('tag_frame_prefix', 'tag')
         self.declare_parameter('publish_tf', True)
+        # Runtime on/off gate (same pattern as fv_yoloe): while false the
+        # image callback returns before any decode/detection work, so the
+        # node costs nothing; re-enabling via `ros2 param set` (or the
+        # perception MCP) is instant.
+        self.declare_parameter('enabled', True)
         # Optional depth source for per-tag accurate distance overlay.
         # Empty string disables. Topic should be aligned to the color
         # image (e.g. /d405_depth/image_rect_raw paired with
@@ -104,6 +109,8 @@ class ApriltagNode(Node):
             'tag_frame_prefix'
         ).get_parameter_value().string_value
         self.publish_tf = bool(self.get_parameter('publish_tf').value)
+        self.enabled = bool(self.get_parameter('enabled').value)
+        self.add_on_set_parameters_callback(self._on_param_update)
 
         self._tag_sizes = self._parse_tag_sizes(
             self.get_parameter('tag_sizes').value
@@ -280,7 +287,21 @@ class ApriltagNode(Node):
             f'frame={msg.header.frame_id}'
         )
 
+    def _on_param_update(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name == 'enabled':
+                new_enabled = bool(p.value)
+                if new_enabled != self.enabled:
+                    self.enabled = new_enabled
+                    state = 'ENABLED' if new_enabled else \
+                        'DISABLED - detector idle, no CPU work'
+                    self.get_logger().info(f'AprilTag detection {state}')
+        return SetParametersResult(successful=True)
+
     def _on_image(self, msg: Image) -> None:
+        if not self.enabled:
+            return
         if self._cam_info is None or self._undistort_K is None:
             return
 
