@@ -45,6 +45,9 @@ class ImageSlot:
     raw: Optional[bytes] = None
     raw_codec: str = "jpg"
     stamp_sec: float = 0.0
+    # Transport decided at configuration time so the subscription can be
+    # torn down while idle and rebuilt identically on the next trigger.
+    compressed: bool = False
 
 
 @dataclass
@@ -212,6 +215,10 @@ class FvPolicyRunnerNode(Node):
         self.declare_parameter("joint_action_topic", "policy/joint_action")
         self.declare_parameter("status_topic", "policy/status")
         self.declare_parameter("trajectory_topic", "policy/trajectory_markers")
+        # Live per-policy trajectory control (dashboard / MCP): toggle drawing
+        # on/off and override the colour without a relaunch.
+        self.declare_parameter("trajectory_enable_topic", "~/trajectory/enable")
+        self.declare_parameter("trajectory_color_topic", "~/trajectory/color")
         self.declare_parameter("action_joint_names", [""])
         self.declare_parameter("profile_path", "")
         self.declare_parameter("profile_arm_namespace", "")
@@ -245,6 +252,9 @@ class FvPolicyRunnerNode(Node):
         self.declare_parameter("trajectory_label_height", 0.08)
         self.declare_parameter("trajectory_lifetime_sec", 2.0)
         self.declare_parameter("trajectory_refresh_interval_sec", 0.0)
+        # Operator-chosen trajectory colour (hex, e.g. "#00d9ff"). Empty → the
+        # positional palette (legacy behaviour). Stable per policy when set.
+        self.declare_parameter("trajectory_color", "")
         self.declare_parameter("policy_angle_unit", "rad")
         self.declare_parameter("policy_angle_joint_names", ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"])
         self.declare_parameter("policy_gripper_state_override", False)
@@ -294,6 +304,8 @@ class FvPolicyRunnerNode(Node):
         self.joint_action_topic = str(self.get_parameter("joint_action_topic").value)
         self.status_topic = str(self.get_parameter("status_topic").value)
         self.trajectory_topic = str(self.get_parameter("trajectory_topic").value)
+        self.trajectory_enable_topic = str(self.get_parameter("trajectory_enable_topic").value)
+        self.trajectory_color_topic = str(self.get_parameter("trajectory_color_topic").value)
         self.action_joint_names = [
             str(x).strip()
             for x in self.get_parameter("action_joint_names").value
@@ -326,6 +338,8 @@ class FvPolicyRunnerNode(Node):
         self.image_quality = max(1, min(100, int(self.get_parameter("image_quality").value)))
         self.auto_start = bool(self.get_parameter("auto_start").value)
         self.trajectory_publish = bool(self.get_parameter("trajectory_publish").value)
+        self._traj_color = self._parse_hex_color(
+            str(self.get_parameter("trajectory_color").value))
         self.trajectory_include_current_tip = bool(self.get_parameter("trajectory_include_current_tip").value)
         self.trajectory_anchor_to_current_tip = bool(self.get_parameter("trajectory_anchor_to_current_tip").value)
         self.trajectory_anchor_mode = str(self.get_parameter("trajectory_anchor_mode").value).strip().lower()
@@ -395,38 +409,35 @@ class FvPolicyRunnerNode(Node):
         )
         self._image_slots = [ImageSlot(name=name, topic=topic) for name, topic in zip(image_names, image_topics)]
         self._image_subs = []
+        self._sensor_qos = sensor_qos
         for slot in self._image_slots:
-            if self.image_topics_are_compressed or slot.topic.endswith("/compressed"):
-                self._image_subs.append(
-                    self.create_subscription(
-                        CompressedImage,
-                        slot.topic,
-                        lambda msg, current=slot: self._on_compressed_image(current, msg),
-                        sensor_qos,
-                    )
-                )
-            else:
-                self._image_subs.append(
-                    self.create_subscription(
-                        Image,
-                        slot.topic,
-                        lambda msg, current=slot: self._on_image(current, msg),
-                        sensor_qos,
-                    )
-                )
+            slot.compressed = bool(
+                self.image_topics_are_compressed
+                or slot.topic.endswith("/compressed"))
+        # Camera subscriptions exist only while running (idle backoff):
+        # rclpy deserialises every incoming frame BEFORE the callback can
+        # early-return, so an idle runner with live image subs still paid
+        # for ~900KB x 30Hz per camera - measured ~20% of a Thor core per
+        # runner, and every registered DPEX policy keeps one runner up.
+        # _on_trigger creates them; _on_stop tears them down.
+        if self.auto_start:
+            self._create_obs_subs()
 
         # state_topic may be empty when the profile defers wiring to
         # /load_profile. Skip the sub creation here and let the service
         # handler build it later.
-        if self.state_topic:
-            self._state_sub = self.create_subscription(
-                JointState, self.state_topic, self._on_state, sensor_qos)
-        else:
-            self._state_sub = None
+        # Deferred to _create_obs_subs (idle backoff) together with the
+        # camera subs - ~50Hz joint_states wakeups cost real CPU in rclpy
+        # even when the callback does almost nothing.
+        self._state_sub = None
         self._trigger_sub = self.create_subscription(Bool, self.trigger_topic, self._on_trigger, 10)
         self._stop_sub = self.create_subscription(Bool, self.stop_topic, self._on_stop, 10)
         self._policy_sub = self.create_subscription(String, self.policy_select_topic, self._on_policy_select, 10)
         self._prompt_sub = self.create_subscription(String, self.prompt_topic, self._on_prompt, 10)
+        self._traj_enable_sub = self.create_subscription(
+            Bool, self.trajectory_enable_topic, self._on_trajectory_enable, 10)
+        self._traj_color_sub = self.create_subscription(
+            String, self.trajectory_color_topic, self._on_trajectory_color, 10)
         # Optional external object pose (PoseStamped) for state-based RL policies whose
         # observation includes an object pose (e.g. cube pick). Off unless a profile sets
         # send_object_pose + object_pose_topic. The M1 sim bridge publishes the MuJoCo
@@ -494,6 +505,57 @@ class FvPolicyRunnerNode(Node):
     # Live profile reconfiguration
     # ------------------------------------------------------------------
 
+    def _create_obs_subs(self) -> None:
+        """(Re)create the observation subscriptions (cameras + joint
+        state) for the current configuration. Idempotent."""
+        if not self._image_subs:
+            for slot in self._image_slots:
+                if slot.compressed:
+                    self._image_subs.append(
+                        self.create_subscription(
+                            CompressedImage, slot.topic,
+                            lambda msg, current=slot: self._on_compressed_image(current, msg),
+                            self._sensor_qos,
+                        )
+                    )
+                else:
+                    self._image_subs.append(
+                        self.create_subscription(
+                            Image, slot.topic,
+                            lambda msg, current=slot: self._on_image(current, msg),
+                            self._sensor_qos,
+                        )
+                    )
+        if self._state_sub is None and self.state_topic:
+            self._state_sub = self.create_subscription(
+                JointState, self.state_topic, self._on_state, self._sensor_qos)
+
+    def _drop_obs_subs(self) -> None:
+        """Idle backoff: tear down camera + joint-state subscriptions and
+        clear the buffered observation (it would be stale by the next
+        trigger; the snapshot logic then waits for fresh data instead of
+        silently reusing old frames)."""
+        subs, self._image_subs = self._image_subs, []
+        for sub in subs:
+            try:
+                self.destroy_subscription(sub)
+            except Exception:
+                pass
+        for slot in self._image_slots:
+            slot.image = None
+            slot.raw = None
+            slot.stamp_sec = 0.0
+        if self._state_sub is not None:
+            try:
+                self.destroy_subscription(self._state_sub)
+            except Exception:
+                pass
+            self._state_sub = None
+        self._state_vector = None
+        self._state_names = []
+        self._state_stamp_sec = 0.0
+        self._state_velocity = None
+
     def _destroy_input_subscriptions(self) -> None:
         for sub in getattr(self, "_image_subs", []) or []:
             try:
@@ -526,27 +588,15 @@ class FvPolicyRunnerNode(Node):
             transport = (
                 image_transports[i].lower() if i < len(image_transports) and image_transports[i] else ""
             )
-            is_compressed = (
+            slot.compressed = (
                 transport == "compressed"
                 or (not transport and (self.image_topics_are_compressed or slot.topic.endswith("/compressed")))
             )
-            if is_compressed:
-                self._image_subs.append(
-                    self.create_subscription(
-                        CompressedImage, slot.topic,
-                        lambda msg, current=slot: self._on_compressed_image(current, msg),
-                        qos,
-                    )
-                )
-            else:
-                self._image_subs.append(
-                    self.create_subscription(
-                        Image, slot.topic,
-                        lambda msg, current=slot: self._on_image(current, msg),
-                        qos,
-                    )
-                )
-        if state_topic:
+        # Idle backoff: only subscribe while running; the next trigger
+        # creates the subs for these (possibly new) slots.
+        if self._running:
+            self._create_obs_subs()
+        elif state_topic:
             self._state_sub = self.create_subscription(
                 JointState, state_topic, self._on_state, qos)
         # Clear buffered state + action queue — they belong to the previous
@@ -607,6 +657,7 @@ class FvPolicyRunnerNode(Node):
                 topo_change = True
             if request.auto_start:
                 self._running = True
+                self._create_obs_subs()
             response.success = True
             response.current_endpoint = self.backend_endpoint
             response.current_model = self._policy_id
@@ -740,6 +791,7 @@ class FvPolicyRunnerNode(Node):
             was_running = self._running
             self._running = True
             self._queue.clear()
+        self._create_obs_subs()
         if not was_running:
             self._publish_status("trigger")
 
@@ -749,6 +801,7 @@ class FvPolicyRunnerNode(Node):
         with self._lock:
             self._running = False
             self._queue.clear()
+        self._drop_obs_subs()
         self._publish_status("stop")
 
     def _on_policy_select(self, msg: String) -> None:
@@ -764,6 +817,17 @@ class FvPolicyRunnerNode(Node):
         with self._lock:
             self._prompt = msg.data
         self._publish_status("prompt")
+
+    def _on_trajectory_enable(self, msg: Bool) -> None:
+        """Live on/off of the inferred-trajectory drawing (per policy)."""
+        self.trajectory_publish = bool(msg.data)
+        self._publish_status("trajectory_enable")
+
+    def _on_trajectory_color(self, msg: String) -> None:
+        """Live per-policy trajectory colour override (hex). Ignored if unparseable."""
+        color = self._parse_hex_color(msg.data)
+        if color is not None:
+            self._traj_color = color
 
     def _snapshot_observation(self) -> Optional[dict]:
         now = time.time()
@@ -1132,8 +1196,26 @@ class FvPolicyRunnerNode(Node):
         r, g, b, a = palette[index % len(palette)]
         return ColorRGBA(r=float(r), g=float(g), b=float(b), a=float(a))
 
+    @staticmethod
+    def _parse_hex_color(value: str) -> Optional[ColorRGBA]:
+        """Parse "#RRGGBB" / "RRGGBB" / "#RRGGBBAA" → ColorRGBA. None if invalid."""
+        s = (value or "").strip().lstrip("#")
+        if len(s) not in (6, 8):
+            return None
+        try:
+            r = int(s[0:2], 16) / 255.0
+            g = int(s[2:4], 16) / 255.0
+            b = int(s[4:6], 16) / 255.0
+            a = int(s[6:8], 16) / 255.0 if len(s) == 8 else 1.0
+        except ValueError:
+            return None
+        return ColorRGBA(r=float(r), g=float(g), b=float(b), a=float(a))
+
     def _marker_color(self, marker: Marker, index: int) -> ColorRGBA:
-        color = self._palette_color(index)
+        # Operator-chosen colour is stable per policy; fall back to the
+        # positional palette only when no colour is configured.
+        color = self._traj_color if self._traj_color is not None \
+            else self._palette_color(index)
         marker.color = color
         return color
 
