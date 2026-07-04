@@ -14,6 +14,8 @@
 #include <pcl/segmentation/extract_clusters.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <atomic>
 #include <mutex>
 #include <cmath>
 #include <algorithm>
@@ -72,6 +74,13 @@ public:
         this->declare_parameter<std::string>("mask_topic", "/d405_cube/mask");
         this->declare_parameter<std::string>("detections_topic", "/d405_cube/detections");
         this->declare_parameter<std::string>("depth_topic", "/d405_depth/filtered");
+        // Optional switchable secondary depth source (e.g. LingBot refined
+        // depth). Both stay subscribed; depth_source_topic
+        // (std_msgs/String, transient_local) selects the active one:
+        // "default"/"raw" = depth_topic, anything else = alt. The alt sub
+        // is RELIABLE: large fragmented Images starve BEST_EFFORT delivery.
+        this->declare_parameter<std::string>("alt_depth_topic", "");
+        this->declare_parameter<std::string>("depth_source_topic", "");
         this->declare_parameter<std::string>("color_topic", "/d405_color/image_raw");
         this->declare_parameter<std::string>("camera_info_topic", "/d405_depth/camera_info");
         this->declare_parameter<std::string>("output_topic", "~/objects_3d");
@@ -144,7 +153,31 @@ public:
             std::bind(&Detector3DNode::onCameraInfo, this, std::placeholders::_1));
         depth_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             depth_topic_, qos_be,
-            std::bind(&Detector3DNode::onDepth, this, std::placeholders::_1));
+            [this](const sensor_msgs::msg::Image::SharedPtr m) {
+                if (use_alt_depth_.load()) return;
+                onDepth(m);
+            });
+        if (!alt_depth_topic_.empty()) {
+            depth_alt_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+                alt_depth_topic_, rclcpp::QoS(1).reliable(),
+                [this](const sensor_msgs::msg::Image::SharedPtr m) {
+                    if (!use_alt_depth_.load()) return;
+                    onDepth(m);
+                });
+            if (!depth_source_topic_.empty()) {
+                depth_source_sub_ = this->create_subscription<std_msgs::msg::String>(
+                    depth_source_topic_,
+                    rclcpp::QoS(1).reliable().transient_local(),
+                    [this](std_msgs::msg::String::ConstSharedPtr m) {
+                        const bool alt = (m->data != "default" && m->data != "raw");
+                        if (alt != use_alt_depth_.load()) {
+                            use_alt_depth_.store(alt);
+                            RCLCPP_INFO(this->get_logger(), "depth source -> %s",
+                                        alt ? alt_depth_topic_.c_str() : depth_topic_.c_str());
+                        }
+                    });
+            }
+        }
         color_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
             color_topic_, qos_be,
             std::bind(&Detector3DNode::onColor, this, std::placeholders::_1));
@@ -176,6 +209,8 @@ private:
         mask_topic_        = this->get_parameter("mask_topic").as_string();
         det_topic_         = this->get_parameter("detections_topic").as_string();
         depth_topic_       = this->get_parameter("depth_topic").as_string();
+        alt_depth_topic_   = this->get_parameter("alt_depth_topic").as_string();
+        depth_source_topic_ = this->get_parameter("depth_source_topic").as_string();
         color_topic_       = this->get_parameter("color_topic").as_string();
         camera_info_topic_ = this->get_parameter("camera_info_topic").as_string();
         output_topic_      = this->get_parameter("output_topic").as_string();
@@ -837,6 +872,8 @@ private:
     }
 
     std::string mask_topic_, det_topic_, depth_topic_, color_topic_;
+    std::string alt_depth_topic_, depth_source_topic_;
+    std::atomic<bool> use_alt_depth_{false};
     std::string camera_info_topic_, output_topic_, marker_topic_;
     bool publish_markers_{true}, publish_overlay_{true};
     int min_points_{10};
@@ -874,6 +911,8 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr mask_sub_;
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr info_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_sub_, color_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr depth_alt_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr depth_source_sub_;
 
     rclcpp::Publisher<fv_msgs::msg::Object3DArray>::SharedPtr obj_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_out_pub_;
