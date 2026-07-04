@@ -49,3 +49,10 @@
     sync_slop_sec: 0.03
     qos_reliability: "best_effort"
     log_every_n_frames: 30
+
+    # Only run inference while the dashboard's depth tile actually selects
+    # the lingbot stream. Before this gate the worker refined every frame
+    # around the clock (~90-370ms GPU each) even with the tile on "raw" -
+    # the raw/lingbot toggle only switched what consumers read, so the GPU
+    # never got lighter. Model stays loaded; switching back is instant.
+    depth_source_topic: "/vlabor/d405_depth_source"

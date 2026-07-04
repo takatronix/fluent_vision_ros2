@@ -14,8 +14,9 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
+from std_msgs.msg import String
 
 
 def _ensure_xformers_free_attention() -> None:
@@ -87,6 +88,14 @@ class FvLingbotDepthNode(Node):
         self.declare_parameter("sync_slop_sec", 0.03)
         self.declare_parameter("qos_reliability", "best_effort")
 
+        # Consumer-side gate. When set (e.g. /vlabor/d405_depth_source),
+        # inference only runs while the latched selector picks the refined
+        # stream ("default"/"raw" = pause). The model stays loaded so
+        # switching back is instant; while paused the GPU does no work for
+        # this node. Empty = no gate (always-on, pre-gate behaviour) for
+        # deployments without the dashboard selector.
+        self.declare_parameter("depth_source_topic", "")
+
         # Logging
         self.declare_parameter("log_every_n_frames", 30)
 
@@ -123,6 +132,7 @@ class FvLingbotDepthNode(Node):
         self.sync_queue_size = int(self.get_parameter("sync_queue_size").value)
         self.sync_slop_sec = float(self.get_parameter("sync_slop_sec").value)
         self.qos_reliability = str(self.get_parameter("qos_reliability").value).strip().lower()
+        self.depth_source_topic = str(self.get_parameter("depth_source_topic").value).strip()
 
         self.log_every_n_frames = max(1, int(self.get_parameter("log_every_n_frames").value))
 
@@ -153,6 +163,25 @@ class FvLingbotDepthNode(Node):
             self.get_logger().info(
                 f"LingBot-Depth worker backend enabled endpoint={self.worker_endpoint}"
             )
+
+        # Gate state. With a selector topic configured, start PAUSED until
+        # the latched value arrives (the dashboard announces the current
+        # selection with transient_local, so a running system converges
+        # within one delivery; a missing publisher means nobody is
+        # consuming the refined stream anyway).
+        self._source_selected = self.depth_source_topic == ""
+        if self.depth_source_topic:
+            latched = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
+            self.create_subscription(
+                String, self.depth_source_topic, self._on_depth_source, latched)
+            self.get_logger().info(
+                f"inference gated by {self.depth_source_topic} "
+                "(paused until it selects the refined stream)")
 
         qos = self._sensor_qos_profile()
         self.color_sub = Subscriber(self, Image, self.color_topic, qos_profile=qos)
@@ -239,7 +268,20 @@ class FvLingbotDepthNode(Node):
             self._model_error = str(exc)
             self.get_logger().error(f"LingBot-Depth model load failed: {self._model_error}")
 
+    def _on_depth_source(self, msg: String) -> None:
+        selected = msg.data not in ("default", "raw")
+        if selected == self._source_selected:
+            return
+        self._source_selected = selected
+        if selected:
+            self.get_logger().info(f"inference resumed (source={msg.data})")
+        else:
+            self.get_logger().info(
+                f"inference paused (source={msg.data}) - model stays loaded, no GPU work")
+
     def _on_synced(self, color_msg: Image, depth_msg: Image, info_msg: CameraInfo) -> None:
+        if not self._source_selected:
+            return
         start = time.perf_counter()
 
         try:
