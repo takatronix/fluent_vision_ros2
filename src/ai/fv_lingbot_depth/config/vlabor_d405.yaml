@@ -28,6 +28,10 @@
     fallback_passthrough: false
 
     depth_scale_16uc1: 0.001
+    # 16UC1 = same size/encoding as raw sensor depth (drop-in compatible;
+    # 32FC1's 1.2MB fragmented messages starve BEST_EFFORT subscribers on
+    # busy nodes like the dashboard).
+    output_encoding: "16UC1"
     min_depth_m: 0.05
     max_depth_m: 3.0
     point_stride: 2

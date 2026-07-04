@@ -72,6 +72,11 @@ class FvLingbotDepthNode(Node):
 
         # Depth/point settings
         self.declare_parameter("depth_scale_16uc1", 0.001)
+        # 16UC1 (mm) keeps the refined stream the same size/encoding as the
+        # raw sensor depth. 32FC1 doubles the message to ~1.2MB, whose
+        # fragmented BEST_EFFORT samples starve on busy subscriber nodes
+        # (observed: the dashboard received ~0 of them).
+        self.declare_parameter("output_encoding", "16UC1")  # 16UC1|32FC1
         self.declare_parameter("min_depth_m", 0.05)
         self.declare_parameter("max_depth_m", 3.0)
         self.declare_parameter("point_stride", 2)
@@ -104,6 +109,12 @@ class FvLingbotDepthNode(Node):
         self.fallback_passthrough = bool(self.get_parameter("fallback_passthrough").value)
 
         self.depth_scale_16uc1 = float(self.get_parameter("depth_scale_16uc1").value)
+        self.output_encoding = str(self.get_parameter("output_encoding").value).strip().upper()
+        if self.output_encoding not in ("16UC1", "32FC1"):
+            self.get_logger().warning(
+                f"Unknown output_encoding='{self.output_encoding}', falling back to 16UC1"
+            )
+            self.output_encoding = "16UC1"
         self.min_depth_m = float(self.get_parameter("min_depth_m").value)
         self.max_depth_m = float(self.get_parameter("max_depth_m").value)
         self.point_stride = max(1, int(self.get_parameter("point_stride").value))
@@ -265,7 +276,11 @@ class FvLingbotDepthNode(Node):
             header.frame_id = self.frame_id_override
 
         depth_out = np.nan_to_num(refined_depth.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-        depth_image_msg = self._to_image_msg(depth_out, "32FC1", header)
+        if self.output_encoding == "16UC1":
+            depth_mm = np.clip(depth_out / self.depth_scale_16uc1, 0, 65535).astype(np.uint16)
+            depth_image_msg = self._to_image_msg(depth_mm, "16UC1", header)
+        else:
+            depth_image_msg = self._to_image_msg(depth_out, "32FC1", header)
         self.depth_pub.publish(depth_image_msg)
 
         if mask is None:
