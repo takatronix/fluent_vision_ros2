@@ -56,6 +56,11 @@ class FvYoloeNode(Node):
         self.declare_parameter("qos_reliability", "best_effort")
         self.declare_parameter("log_every_n_frames", 30)
         self.declare_parameter("jpeg_quality", 80)
+        # Runtime on/off gate (dashboard toggle). While false the image
+        # callback returns before decode, so the node does no GPU/CPU work
+        # at all; the model stays loaded and switching back on is instant.
+        # Same pattern as the fv_lingbot_depth depth-source gate.
+        self.declare_parameter("enabled", True)
 
         # Read params
         self.input_topic = str(self.get_parameter("input_image_topic").value)
@@ -77,6 +82,8 @@ class FvYoloeNode(Node):
         self.qos_reliability = str(self.get_parameter("qos_reliability").value).strip().lower()
         self.log_every_n_frames = max(1, int(self.get_parameter("log_every_n_frames").value))
         self.jpeg_quality = int(self.get_parameter("jpeg_quality").value)
+        self.enabled = bool(self.get_parameter("enabled").value)
+        self.add_on_set_parameters_callback(self._on_param_update)
 
         # Publishers (use sensor QoS = BEST_EFFORT for streaming topics)
         qos_pub = self._sensor_qos()
@@ -205,6 +212,15 @@ class FvYoloeNode(Node):
             new_prompt = ""
         self.get_logger().info(f"Prompt update: '{new_prompt}'")
         self._set_classes(new_prompt)
+        # Keep the text_prompt PARAM in sync so `ros2 param get` (and the
+        # perception MCP's get_yoloe_prompt) reflect the live prompt - it
+        # used to return the startup value forever after topic updates.
+        try:
+            from rclpy.parameter import Parameter as RclpyParameter
+            self.set_parameters([RclpyParameter(
+                "text_prompt", RclpyParameter.Type.STRING, new_prompt)])
+        except Exception as e:
+            self.get_logger().warning(f"text_prompt param sync failed: {e}")
 
     def _on_visual_prompt(self, msg: String) -> None:
         try:
@@ -377,7 +393,54 @@ class FvYoloeNode(Node):
         response.message = ",".join(self._current_classes)
         return response
 
+    def _on_param_update(self, params):
+        from rcl_interfaces.msg import SetParametersResult
+        for p in params:
+            if p.name == "enabled":
+                new_enabled = bool(p.value)
+                if new_enabled != self.enabled:
+                    self.enabled = new_enabled
+                    if new_enabled:
+                        self.get_logger().info("YOLOE inference ENABLED")
+                    else:
+                        self.get_logger().info(
+                            "YOLOE inference DISABLED - model stays loaded, no GPU/CPU work")
+            elif p.name == "conf_threshold":
+                v = float(p.value)
+                if not 0.0 <= v <= 1.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="conf_threshold must be within [0.0, 1.0]")
+                self.conf_threshold = v
+                self.get_logger().info(f"conf_threshold -> {v:.2f}")
+            elif p.name == "iou_threshold":
+                v = float(p.value)
+                if not 0.0 <= v <= 1.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="iou_threshold must be within [0.0, 1.0]")
+                self.iou_threshold = v
+                self.get_logger().info(f"iou_threshold -> {v:.2f}")
+            elif p.name == "processing_frequency":
+                v = float(p.value)
+                if v < 0.0:
+                    return SetParametersResult(
+                        successful=False,
+                        reason="processing_frequency must be >= 0 (0 = every frame)")
+                self.processing_frequency = v
+                self.get_logger().info(f"processing_frequency -> {v:.1f}Hz")
+            elif p.name == "text_prompt":
+                # `ros2 param set` path. _set_classes no-ops on an unchanged
+                # list, and this branch never re-sets the param, so the
+                # topic-side sync in _on_prompt cannot recurse through here.
+                v = str(p.value).strip()
+                self.get_logger().info(f"Prompt update via param: '{v}'")
+                self._set_classes(v)
+        return SetParametersResult(successful=True)
+
     def _on_image(self, msg: Image) -> None:
+        if not self.enabled:
+            return
         # Throttle
         if self.processing_frequency > 0:
             now = time.monotonic()
