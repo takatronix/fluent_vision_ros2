@@ -130,6 +130,7 @@ InstanceSegNode::InstanceSegNode(const rclcpp::NodeOptions& options)
   match_distance_px_ = this->declare_parameter<double>("tracking.match_max_distance_px", match_distance_px_);
   hold_frames_ = this->declare_parameter<int>("tracking.hold_frames", hold_frames_);
   drop_frames_ = this->declare_parameter<int>("tracking.drop_frames", drop_frames_);
+  track_enter_conf_ = this->declare_parameter<double>("tracking.enter_conf", track_enter_conf_);
   max_fps_ = this->declare_parameter<double>("max_fps", 0.0);
   infer_timeout_ms_ = this->declare_parameter<int>("infer.timeout_ms", 0);
   watchdog_stall_ms_ = this->declare_parameter<int>("watchdog.stall_ms", 0);
@@ -547,6 +548,7 @@ rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
   double next_match_distance = 80.0;
   int next_hold_frames = 3;
   int next_drop_frames = 10;
+  double next_enter_conf = 0.0;
   bool next_nms_class_agnostic = true;
   int next_max_detections = 100;
   bool next_debug_shapes = false;
@@ -581,6 +583,7 @@ rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
     next_match_distance = match_distance_px_;
     next_hold_frames = hold_frames_;
     next_drop_frames = drop_frames_;
+    next_enter_conf = track_enter_conf_;
     next_nms_class_agnostic = nms_class_agnostic_;
     next_max_detections = max_detections_;
     next_debug_shapes = debug_shapes_;
@@ -618,6 +621,8 @@ rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
         next_hold_frames = as_int(param);
       } else if (name == "tracking.drop_frames") {
         next_drop_frames = as_int(param);
+      } else if (name == "tracking.enter_conf") {
+        next_enter_conf = as_double(param);
       } else if (name == "nms_class_agnostic") {
         next_nms_class_agnostic = param.as_bool();
       } else if (name == "max_detections") {
@@ -676,6 +681,11 @@ rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
     result.reason = "tracking hold/drop frames must be >= 0";
     return result;
   }
+  if (next_enter_conf < 0.0 || next_enter_conf > 1.0) {
+    result.successful = false;
+    result.reason = "tracking.enter_conf must be within [0.0, 1.0]";
+    return result;
+  }
   if (next_max_detections <= 0) {
     result.successful = false;
     result.reason = "max_detections must be > 0";
@@ -718,6 +728,7 @@ rcl_interfaces::msg::SetParametersResult InstanceSegNode::onParametersSet(
     match_distance_px_ = next_match_distance;
     hold_frames_ = next_hold_frames;
     drop_frames_ = next_drop_frames;
+    track_enter_conf_ = next_enter_conf;
     min_box_area_px_ = next_min_box_area;
     max_box_area_px_ = next_max_box_area;
     min_aspect_ = next_min_aspect;
@@ -902,8 +913,12 @@ void InstanceSegNode::imageCallback(const Image::SharedPtr msg) {
   reusable_combined_mask_.setTo(0);
   reusable_id_mask_.setTo(0);
 
-  // publish_tracksのmaskを「フル解像度」に揃えて再利用（overlay側の二重resizeを削減）
+  // publish_tracksのmaskを「フル解像度」に揃えて再利用（overlay側の二重resizeを削減）。
+  // MONO8 ~/mask_id には per-frame slot (1..255, 0は背景に予約) を割り当て、
+  // 同じ値を Detection2D.mask_instance_id に載せる（安定 track ID は Detection2D.id 側）。
+  uint8_t next_slot = 0;
   for (auto& track : publish_tracks) {
+    track.publish_slot_id = 0;
     if (track.mask.empty()) {
       continue;
     }
@@ -913,9 +928,15 @@ void InstanceSegNode::imageCallback(const Image::SharedPtr msg) {
       track.mask = resized;
     }
     reusable_combined_mask_ |= track.mask;
-    unsigned char vid = static_cast<unsigned char>(track.id & 0xFF);
-    if (vid == 0) vid = 255; // 0は背景に予約
-    reusable_id_mask_.setTo(cv::Scalar(vid), track.mask);
+    if (next_slot == 255) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "more than 255 active tracks in one frame; extra tracks will not be reachable from MONO8 mask_id consumers");
+      continue;
+    }
+    next_slot += 1;
+    track.publish_slot_id = next_slot;
+    reusable_id_mask_.setTo(cv::Scalar(next_slot), track.mask);
   }
 
   publishMask(reusable_combined_mask_, msg->header);
@@ -982,7 +1003,9 @@ void InstanceSegNode::publishDetections(const std::vector<TrackState>& tracks, c
     fv_det.bbox_max.y = static_cast<float>(track.bbox.y + track.bbox.height);
     fv_det.bbox_max.z = 0.0f;
 
-    fv_det.mask_instance_id = static_cast<uint32_t>(track.id);
+    // 安定IDは Detection2D.id（上の fv_det.id）。mask_instance_id は MONO8
+    // ~/mask_id への per-frame key なので publish_slot_id を載せる。
+    fv_det.mask_instance_id = static_cast<uint32_t>(track.publish_slot_id);
     fv_det.mask_semantic_id = 0;
     fv_det.depth_hint_m = 0.0f;
     fv_det.observed_at = header.stamp;
@@ -1039,6 +1062,14 @@ void InstanceSegNode::updateTracking(const InferResult& res, const rclcpp::Time&
       best->last_seen = stamp;
       best->age_frames += 1;
     } else {
+      // Hysteresis entry gate: only a confident detection may start a
+      // new track. Existing tracks were refreshed above at any score
+      // >= conf_thres, so borderline objects stay once acquired but
+      // sub-threshold noise can no longer strobe one-frame boxes.
+      const float score = res.scores.size() > i ? res.scores[i] : 0.f;
+      if (score < static_cast<float>(track_enter_conf_)) {
+        continue;
+      }
       TrackState track;
       track.id = next_track_id_++;
       track.bbox = rect;

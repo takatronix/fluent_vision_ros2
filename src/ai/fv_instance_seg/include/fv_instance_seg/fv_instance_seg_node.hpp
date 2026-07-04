@@ -25,6 +25,10 @@ class InstanceSegNode : public rclcpp::Node {
  private:
   struct TrackState {
     int id = 0;
+    // Per-frame slot in the published ~/mask_id MONO8 image.
+    // Detection2D.mask_instance_id must carry this same value.
+    // Stable tracking ID stays in TrackState::id.
+    uint8_t publish_slot_id = 0;
     cv::Rect bbox;
     cv::Mat mask;
     float score = 0.f;
@@ -114,6 +118,14 @@ class InstanceSegNode : public rclcpp::Node {
   int hold_frames_ = 3;
   int drop_frames_ = 10;
   double match_distance_px_ = 80.0;
+  // Hysteresis: a detection may only CREATE a track at >= this score;
+  // matching an existing track works all the way down to conf_thres.
+  // 0.0 disables (every detection can start a track, pre-hysteresis
+  // behaviour). Profiles run conf_thres very low on purpose (0.01-0.06)
+  // so held objects survive confidence dips - without an entry gate
+  // that same low floor let every noise blob birth a track and the
+  // overlay flickered with one-frame boxes.
+  double track_enter_conf_ = 0.0;
   std::vector<cv::Scalar> palette_;
   std::size_t palette_index_ = 0;
 

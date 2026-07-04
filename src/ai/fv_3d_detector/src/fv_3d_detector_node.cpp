@@ -375,6 +375,13 @@ private:
             int y_max = std::min(static_cast<int>(mask_h) - 1, static_cast<int>(det.bbox_max.y));
             if (x_min >= x_max || y_min >= y_max) continue;
             const uint32_t mask_instance_id = det.mask_instance_id;
+            if (mask_instance_id > 255) {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 5000,
+                    "Detection2D.mask_instance_id=%u cannot match MONO8 mask topic %s; producer must publish a per-frame 1..255 mask slot, with stable track id in Detection2D.id",
+                    mask_instance_id, mask_topic_.c_str());
+                continue;
+            }
 
             CloudPtr sub(new Cloud);
             sub->points.reserve(static_cast<size_t>((x_max - x_min) * (y_max - y_min) / 4));
