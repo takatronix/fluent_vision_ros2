@@ -418,8 +418,14 @@ private:
     geometry_msgs::msg::TransformStamped transform;
     if (!target_frame_.empty() && msg.header.frame_id != target_frame_) {
       try {
+        // Allow a short wait for TF to catch up to the sensor stamp: the
+        // wrist-camera TF often lags the cloud by a few ms, and dropping
+        // the frame on every near-miss makes the streamed cloud stutter.
+        // 80ms stays well under the 5Hz cloud interval. The lookup is
+        // still exact-stamp - no fallback to latest.
         transform = tf_buffer_.lookupTransform(
-          target_frame_, msg.header.frame_id, rclcpp::Time(msg.header.stamp));
+          target_frame_, msg.header.frame_id, rclcpp::Time(msg.header.stamp),
+          rclcpp::Duration::from_seconds(0.08));
         do_transform = true;
       } catch (const tf2::TransformException & ex) {
         RCLCPP_WARN_THROTTLE(

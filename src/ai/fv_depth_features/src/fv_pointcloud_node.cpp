@@ -183,7 +183,10 @@ private:
         }
         // Rate limiter: honor publish_hz_ by dropping depth frames that arrive
         // faster than the configured interval. Keeps octomap / foxglove_bridge
-        // from being saturated by a high-rate cloud.
+        // from being saturated by a high-rate cloud. last_publish_time_ is
+        // updated only when a cloud is actually published, so a frame that
+        // passes this gate but bails out later (stale color, no intrinsics,
+        // zero points) does not burn the slot and stretch the output gap.
         if (publish_hz_ > 0.0) {
             const auto now = this->get_clock()->now();
             const double min_interval_s = 1.0 / publish_hz_;
@@ -191,7 +194,6 @@ private:
                 const double since_last = (now - last_publish_time_).seconds();
                 if (since_last < min_interval_s) return;
             }
-            last_publish_time_ = now;
         }
 
         double fx, fy, cx, cy;
@@ -351,6 +353,9 @@ private:
         cloud.data.resize(data_size);
         std::memcpy(cloud.data.data(), points.data(), data_size);
 
+        if (publish_hz_ > 0.0) {
+            last_publish_time_ = this->get_clock()->now();
+        }
         pub_cloud_->publish(cloud);
     }
 
