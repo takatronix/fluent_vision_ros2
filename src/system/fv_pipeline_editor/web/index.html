@@ -610,6 +610,102 @@ body {
 .log-badge.error { background: #3d0a0a; color: #ff5252; }
 .log-badge.save { background: #2a2a0a; color: #ffa726; }
 
+/* --- Model section (edit panel) --- */
+#modelSection { display: none; }
+#modelSection .model-row {
+  display: flex;
+  gap: 4px;
+}
+#modelSection .model-row select { flex: 1; min-width: 0; }
+#modelSection .model-row button {
+  padding: 4px 8px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+}
+#btnCloudModels {
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+#btnCloudModels:hover { border-color: var(--accent); }
+
+/* --- Cloud model overlay (ml-hub) --- */
+#cloudOverlay {
+  display: none;
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 210;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 40px;
+}
+#cloudOverlay.open { display: flex; }
+#cloudPanel {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 640px;
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 16px;
+}
+#cloudPanel h3 { font-size: 14px; margin-bottom: 4px; color: var(--accent); }
+#cloudHubUrl { font-size: 11px; color: var(--text2); font-weight: normal; }
+#cloudStatus {
+  font-size: 12px;
+  color: var(--text2);
+  margin: 8px 0;
+  min-height: 16px;
+}
+.cloud-model {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.cloud-model .cm-name { font-size: 13px; font-weight: bold; }
+.cloud-model .cm-meta {
+  font-size: 11px;
+  color: var(--text2);
+  margin: 4px 0 8px;
+}
+.cloud-model .cm-formats { display: flex; gap: 6px; }
+.cloud-model .cm-formats button {
+  padding: 4px 10px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+.cloud-model .cm-formats button:hover { border-color: var(--accent); }
+.cloud-model .cm-formats button:disabled { opacity: 0.5; cursor: default; }
+#cloudPanel .btn-row {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+#cloudPanel .btn-row button {
+  padding: 6px 12px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  cursor: pointer;
+}
+
 /* --- Toast --- */
 #toast {
   display: none;
@@ -670,6 +766,14 @@ body {
   <input id="editNamespace" type="text">
   <label>Parameters (JSON)</label>
   <textarea id="editParams"></textarea>
+  <div id="modelSection">
+    <label>Model</label>
+    <div class="model-row">
+      <select id="modelSelect"></select>
+      <button id="btnModelRefresh" title="Rescan local models">&#8635;</button>
+    </div>
+    <button id="btnCloudModels">&#9729; Download from ml-hub</button>
+  </div>
   <div class="btn-row">
     <button class="primary" id="btnEditApply">Apply</button>
     <button id="btnEditLaunch">Start</button>
@@ -716,6 +820,19 @@ body {
         <button id="btnDockerLogs">Logs</button>
         <button id="btnDockerRemove">Remove</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Cloud model overlay (ml-hub) -->
+<div id="cloudOverlay">
+  <div id="cloudPanel">
+    <h3>ml-hub Model Library <span id="cloudHubUrl"></span></h3>
+    <div id="cloudStatus"></div>
+    <div id="cloudContent"></div>
+    <div class="btn-row">
+      <button id="btnCloudReload">Reload</button>
+      <button id="btnCloudClose">Close</button>
     </div>
   </div>
 </div>
@@ -1137,6 +1254,41 @@ function handleWSMessage(msg) {
         addLog('info', 'status', `[${msg.container_id}] logs\n${msg.logs || ''}`);
       } else {
         addLog('error', 'status', `[${msg.container_id}] log fetch failed: ${msg.message || ''}`);
+      }
+      break;
+
+    case 'local_models':
+      localModels = msg.models || [];
+      localModelsDir = msg.models_dir || '';
+      populateModelSelect();
+      break;
+
+    case 'cloud_models':
+      renderCloudModels(msg);
+      break;
+
+    case 'download_progress': {
+      const pct = msg.total ? Math.round(msg.received * 100 / msg.total) : null;
+      const mb = (msg.received / (1 << 20)).toFixed(1);
+      document.getElementById('cloudStatus').textContent =
+        `Downloading... ${pct != null ? pct + '% (' + mb + ' MB)' : mb + ' MB'}`;
+      break;
+    }
+
+    case 'download_model_result':
+      cloudDownloading = false;
+      setCloudButtonsDisabled(false);
+      if (msg.success) {
+        document.getElementById('cloudStatus').textContent = `Saved: ${msg.name}`;
+        addLog('success', 'ws', `Model downloaded: ${msg.path}`);
+        toast(`Model downloaded: ${msg.name}`);
+        applyModelSelection(msg.path);
+        wsSend({ type: 'list_local_models' });
+      } else {
+        document.getElementById('cloudStatus').textContent =
+          `Failed: ${msg.message || ''}`;
+        addLog('error', 'error', `Model download failed: ${msg.message || ''}`);
+        toast('Model download failed', true);
       }
       break;
 
@@ -2567,6 +2719,8 @@ function openEditPanel(node) {
   // Disable launch/stop for topic sources
   document.getElementById('btnEditLaunch').disabled = node._externalSource;
   document.getElementById('btnEditStop').disabled = node._externalSource;
+
+  updateModelSection(node);
 }
 
 function closeEditPanel() {
@@ -2635,6 +2789,183 @@ function deleteSelectedNode() {
   buildGraph();
   markDirty();
 }
+
+// ---------------------------------------------------------------------------
+// Model selection + ml-hub cloud download
+// ---------------------------------------------------------------------------
+const MODEL_PARAM_KEYS = ['model.model_path', 'model_path', 'model.path', 'model_name'];
+let modelParamKey = null;
+let localModels = [];
+let localModelsDir = '';
+let cloudDownloading = false;
+
+function hasNestedParam(params, path) {
+  let obj = params;
+  for (const p of path.split('.')) {
+    if (obj == null || typeof obj !== 'object' || !(p in obj)) return false;
+    obj = obj[p];
+  }
+  return true;
+}
+
+function findModelParamKey(params) {
+  for (const k of MODEL_PARAM_KEYS) {
+    if (hasNestedParam(params, k)) return k;
+  }
+  return null;
+}
+
+function updateModelSection(node) {
+  const section = document.getElementById('modelSection');
+  modelParamKey = (node && !node._isTopicSource)
+    ? findModelParamKey(node.parameters) : null;
+  if (!modelParamKey) {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = 'block';
+  populateModelSelect();
+  wsSend({ type: 'list_local_models' });
+}
+
+function fmtModelSize(bytes) {
+  if (bytes == null) return '?';
+  if (bytes >= 1 << 30) return (bytes / (1 << 30)).toFixed(1) + ' GB';
+  if (bytes >= 1 << 20) return (bytes / (1 << 20)).toFixed(1) + ' MB';
+  return Math.round(bytes / 1024) + ' KB';
+}
+
+function populateModelSelect() {
+  if (!selectedNode || !modelParamKey) return;
+  const sel = document.getElementById('modelSelect');
+  const current = getNestedParam(selectedNode.parameters, modelParamKey);
+  sel.innerHTML = '';
+  const head = document.createElement('option');
+  head.value = '';
+  head.textContent = current ? `(current: ${current})` : '-- select model --';
+  sel.appendChild(head);
+  for (const m of localModels) {
+    const opt = document.createElement('option');
+    opt.value = m.path;
+    opt.textContent = `${m.name} [${m.format}, ${fmtModelSize(m.size)}]`;
+    if (m.path === current) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+function applyModelSelection(path) {
+  if (!selectedNode || !modelParamKey || !path) return;
+  setNestedParam(selectedNode.parameters, modelParamKey, path);
+  const pn = pipelineNodes.find(p => p.id === selectedNode.id);
+  if (pn) setNestedParam(pn.parameters, modelParamKey, path);
+  document.getElementById('editParams').value =
+    JSON.stringify(selectedNode.parameters, null, 2);
+  populateModelSelect();
+  markDirty();
+  addLog('info', 'ws', `Model set: ${modelParamKey} = ${path}`);
+}
+
+function openCloudPanel() {
+  document.getElementById('cloudOverlay').classList.add('open');
+  document.getElementById('cloudStatus').textContent = 'Loading...';
+  wsSend({ type: 'list_cloud_models' });
+}
+
+function closeCloudPanel() {
+  document.getElementById('cloudOverlay').classList.remove('open');
+}
+
+function setCloudButtonsDisabled(disabled) {
+  for (const b of document.querySelectorAll('.cloud-model .cm-formats button')) {
+    b.disabled = disabled;
+  }
+}
+
+function renderCloudModels(msg) {
+  const content = document.getElementById('cloudContent');
+  const status = document.getElementById('cloudStatus');
+  document.getElementById('cloudHubUrl').textContent = msg.hub_url || '';
+  content.innerHTML = '';
+  if (!msg.success) {
+    status.textContent = msg.message || 'Failed to reach ml-hub';
+    return;
+  }
+  const models = msg.models || [];
+  status.textContent = models.length
+    ? `${models.length} release(s)` : 'No releases in library';
+  for (const m of models) {
+    const card = document.createElement('div');
+    card.className = 'cloud-model';
+
+    const name = document.createElement('div');
+    name.className = 'cm-name';
+    name.textContent = m.display_name || m.release_id;
+
+    const meta = document.createElement('div');
+    meta.className = 'cm-meta';
+    const bits = [];
+    if (m.task) bits.push(m.task);
+    if (m.imgsz) bits.push(`imgsz ${m.imgsz}`);
+    if (m.metrics && m.metrics.mAP50 != null) {
+      bits.push(`mAP50 ${Number(m.metrics.mAP50).toFixed(3)}`);
+    }
+    if (m.classes && m.classes.length) bits.push(`${m.classes.length} classes`);
+    if (m.status) bits.push(m.status);
+    meta.textContent = bits.join(' · ');
+    if (m.classes && m.classes.length) meta.title = m.classes.join(', ');
+
+    const fmts = document.createElement('div');
+    fmts.className = 'cm-formats';
+    const fmtKeys = Object.keys(m.formats || {});
+    if (!fmtKeys.length) {
+      const none = document.createElement('span');
+      none.className = 'cm-meta';
+      none.textContent = 'no artifacts';
+      fmts.appendChild(none);
+    }
+    for (const fmt of fmtKeys) {
+      const btn = document.createElement('button');
+      const size = m.formats[fmt] ? m.formats[fmt].size_bytes : null;
+      btn.textContent = `⬇ ${fmt.toUpperCase()}` +
+        (size ? ` (${fmtModelSize(size)})` : '');
+      btn.onclick = () => startCloudDownload(m, fmt);
+      fmts.appendChild(btn);
+    }
+
+    card.appendChild(name);
+    card.appendChild(meta);
+    card.appendChild(fmts);
+    content.appendChild(card);
+  }
+}
+
+function startCloudDownload(model, fmt) {
+  if (cloudDownloading) {
+    toast('Another download is in progress', true);
+    return;
+  }
+  cloudDownloading = true;
+  setCloudButtonsDisabled(true);
+  document.getElementById('cloudStatus').textContent =
+    `Downloading ${model.display_name} (${fmt})...`;
+  addLog('info', 'ws', `Model download started: ${model.display_name} [${fmt}]`);
+  wsSend({ type: 'download_model', release_id: model.release_id, format: fmt });
+}
+
+document.getElementById('modelSelect').onchange = (e) => {
+  if (e.target.value) applyModelSelection(e.target.value);
+};
+document.getElementById('btnModelRefresh').onclick = () =>
+  wsSend({ type: 'list_local_models' });
+document.getElementById('btnCloudModels').onclick = openCloudPanel;
+document.getElementById('btnCloudClose').onclick = closeCloudPanel;
+document.getElementById('btnCloudReload').onclick = () => {
+  document.getElementById('cloudStatus').textContent = 'Loading...';
+  wsSend({ type: 'list_cloud_models' });
+};
+document.getElementById('cloudOverlay').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('cloudOverlay')) closeCloudPanel();
+});
 
 // ---------------------------------------------------------------------------
 // Toolbar actions
@@ -2811,6 +3142,7 @@ document.addEventListener('keydown', (e) => {
     hidePalette();
     closeEditPanel();
     closeDockerPanel();
+    closeCloudPanel();
     wiring = null;
     render();
   }

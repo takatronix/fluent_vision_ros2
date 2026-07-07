@@ -25,6 +25,7 @@ nodes:
       output_image_topic: ""
       output_detections_topic: ""
       model:
+        model_path: ""
         device: "auto"
         confidence_threshold: 0.5
       processing_frequency: 10.0
