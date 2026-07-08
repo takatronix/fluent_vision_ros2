@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -146,6 +147,8 @@ class CameraWriter:
         if self._stopped:
             return
         with self._lock:
+            if self._stopped:
+                return
             recv_ns = time.time_ns()
             # decode jpeg/png compressed bytes
             arr = np.frombuffer(msg.data, dtype=np.uint8)
@@ -192,6 +195,10 @@ class CameraWriter:
             self._first_frame_received = True
 
     def stop(self) -> dict:
+        self.stop_recording()
+        return self.finalize()
+
+    def stop_recording(self) -> None:
         with self._lock:
             self._stopped = True
             if self._sub is not None and self._node is not None:
@@ -205,6 +212,10 @@ class CameraWriter:
                     self._ffmpeg.stdin.close()
                 except Exception:
                     pass
+
+    def finalize(self) -> dict:
+        with self._lock:
+            if self._ffmpeg is not None:
                 try:
                     self._ffmpeg.wait(timeout=15)
                 except subprocess.TimeoutExpired:
@@ -283,6 +294,8 @@ class DepthCameraWriter:
         if self._stopped:
             return
         with self._lock:
+            if self._stopped:
+                return
             recv_ns = time.time_ns()
             self._encoding_seen = msg.encoding
             # Depth conventions: 16UC1 (mm, RealSense) or mono16 (also 16-bit).
@@ -325,6 +338,10 @@ class DepthCameraWriter:
             self._last_recv_ns = recv_ns
 
     def stop(self) -> dict:
+        self.stop_recording()
+        return self.finalize()
+
+    def stop_recording(self) -> None:
         with self._lock:
             self._stopped = True
             if self._sub is not None and self._node is not None:
@@ -333,6 +350,9 @@ class DepthCameraWriter:
                 except Exception:
                     pass
                 self._sub = None
+
+    def finalize(self) -> dict:
+        with self._lock:
             self._sidecar.close()
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
@@ -363,6 +383,41 @@ class DepthCameraWriter:
             "segments": [],  # PNG sequence — listed via /files/ if needed
             "total_png_bytes": total_bytes,
         }
+
+
+@dataclass
+class DetachedCameraWriterPool:
+    writers: list[CameraWriter | DepthCameraWriter]
+    depth_placeholders: list[dict]
+
+    def frame_counts(self) -> dict[str, int]:
+        counts = {writer.name: writer.frame_count for writer in self.writers}
+        for placeholder in self.depth_placeholders:
+            name = placeholder.get("name")
+            if name:
+                counts[str(name)] = int(placeholder.get("frame_count") or 0)
+        return counts
+
+    def finalize(self, depth_frame_counts: dict[str, int]) -> tuple[list[dict], list[str]]:
+        summaries: list[dict] = []
+        errors: list[str] = []
+        for writer in self.writers:
+            try:
+                summaries.append(writer.finalize())
+            except Exception as exc:
+                LOG.exception("camera writer finalize failed: %s", writer.name)
+                errors.append(f"{writer.name}: {exc}")
+                try:
+                    summary = writer.summary()
+                    summary["error"] = str(exc)
+                    summaries.append(summary)
+                except Exception:
+                    pass
+        for placeholder in self.depth_placeholders:
+            name = placeholder.get("name")
+            if name in depth_frame_counts:
+                placeholder["frame_count"] = int(depth_frame_counts[name])
+        return summaries + list(self.depth_placeholders), errors
 
 
 class CameraWriterPool:
@@ -426,15 +481,20 @@ class CameraWriterPool:
             if name in counts:
                 ph["frame_count"] = int(counts[name])
 
-    def stop_all(self) -> list[dict]:
-        summaries = []
-        for name, writer in list(self._writers.items()):
-            summaries.append(writer.stop())
+    def detach_all(self) -> DetachedCameraWriterPool:
+        writers = list(self._writers.values())
+        placeholders = list(self._depth_placeholders)
+        for writer in writers:
+            writer.stop_recording()
         self._writers.clear()
-        # Re-emit depth placeholders so meta.cameras keeps them.
-        out = summaries + list(self._depth_placeholders)
         self._depth_placeholders = []
-        return out
+        return DetachedCameraWriterPool(writers=writers, depth_placeholders=placeholders)
+
+    def stop_all(self) -> list[dict]:
+        summaries, errors = self.detach_all().finalize({})
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        return summaries
 
     def is_active(self) -> bool:
         return bool(self._writers)

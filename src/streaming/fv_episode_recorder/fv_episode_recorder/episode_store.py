@@ -157,11 +157,26 @@ class EpisodeStore:
 
     def stop_active(self, outcome: str) -> tuple[EpisodeMeta, Path]:
         """Finalize active episode. Returns (meta, dir)."""
+        meta, ep_dir = self.begin_finalizing_active(outcome)
+        with self._lock:
+            if outcome == "discard":
+                meta.state = "discarded"
+            elif outcome == "abort":
+                meta.state = "failed"
+            else:
+                meta.state = "finished"
+            self._write_meta(ep_dir, meta)
+        return meta, ep_dir
+
+    def begin_finalizing_active(self, outcome: str) -> tuple[EpisodeMeta, Path]:
+        """Stop accepting samples for the active episode and release the active slot."""
         with self._lock:
             if self._active_episode is None:
                 raise RuntimeError("no active episode")
             meta = self._active_episode
             ep_dir = self._active_dir
+            if ep_dir is None:
+                raise RuntimeError("active episode directory is missing")
             meta.stopped_at = utc_now_iso()
             meta.outcome = outcome
             started = datetime.strptime(
@@ -173,10 +188,8 @@ class EpisodeStore:
             meta.duration_s = (stopped - started).total_seconds()
             if outcome == "discard":
                 meta.state = "discarded"
-            elif outcome == "abort":
-                meta.state = "failed"
             else:
-                meta.state = "finished"
+                meta.state = "finalizing"
             self._write_meta(ep_dir, meta)
             self._active_episode = None
             self._active_dir = None

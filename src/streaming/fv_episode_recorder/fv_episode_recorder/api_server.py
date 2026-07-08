@@ -12,6 +12,7 @@ Other endpoints (markers, replay, export, disk, retention) land in later steps.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
 from dataclasses import asdict
@@ -23,8 +24,8 @@ from aiohttp import web
 from .active_lock import ActiveLock
 from .batch_runner import BatchConfig, BatchRunner
 from .replay_runner import ReplayRunner
-from .bag_recorder import BagRecorder
-from .camera_writer import CameraWriterPool
+from .bag_recorder import BagRecorder, DetachedBagRecording
+from .camera_writer import CameraWriterPool, DetachedCameraWriterPool
 from .episode_store import EpisodeMeta, EpisodeStore, new_episode_id, utc_now_iso
 from .marker_manager import MarkerManager
 from .preflight import run_preflight
@@ -468,19 +469,11 @@ async def _stop_episode(request: web.Request) -> web.Response:
             status=409,
         )
 
-    # Step 2: stop bag recorder first so metadata.yaml is flushed before meta write
+    # Step 2: detach all active episode resources. The slow flush/finalize
+    # happens in the background; this request only stops new samples.
     bag_recorder: BagRecorder = request.app["bag_recorder"]
-    bag_summary: dict = {"size_bytes": 0, "split_count": 0}
-    if bag_recorder.active:
-        bag_summary = bag_recorder.stop(timeout_s=10.0)
-    elif req.outcome == "discard":
-        bag_recorder.abort()
+    detached_bag = bag_recorder.detach_for_finalize()
 
-    # Step 2b: stop depth republishers AFTER bag (so any in-flight compressed
-    # frames make it into the bag's final flush). The republisher pool
-    # returns per-camera frame counts which we hand to camera_pool so the
-    # depth placeholder summaries carry a real frame_count (without this
-    # the play modal shows '0 frames' even though the bag has them).
     depth_pool = request.app.get("depth_pool")
     depth_frame_counts: dict[str, int] = {}
     if depth_pool is not None:
@@ -489,67 +482,151 @@ async def _stop_episode(request: web.Request) -> web.Response:
         except Exception as exc:
             LOG.warning("depth republisher stop failed: %s", exc)
     camera_pool: CameraWriterPool = request.app["camera_pool"]
-    if depth_frame_counts:
-        try:
-            camera_pool.apply_depth_frame_counts(depth_frame_counts)
-        except Exception as exc:
-            LOG.warning("depth frame_count apply failed: %s", exc)
-
-    # Step 3: stop camera writers, gather frame_count summaries. Called
-    # unconditionally because depth_bag placeholders also need to flush —
-    # a depth-only episode has no mp4 writers so is_active() is False but
-    # the placeholders must still come out for the play modal.
-    camera_summaries: list[dict] = camera_pool.stop_all()
-    frame_count_per_camera: dict[str, int] = {}
-    video_size_bytes = 0
-    for cs in camera_summaries:
-        frame_count_per_camera[cs["name"]] = cs["frame_count"]
-        for seg in cs.get("segments", []):
-            video_size_bytes += int(seg.get("size_bytes", 0))
+    detached_cameras = camera_pool.detach_all()
+    frame_count_per_camera = detached_cameras.frame_counts()
 
     # Flush markers (Phase 2) from in-memory manager into meta.json
     mm: MarkerManager = request.app["marker_manager"]
     pending_markers = mm.flush(episode_id)
 
-    meta, ep_dir = store.stop_active(req.outcome)
-    # Update meta with bag size + split_count + camera summaries + markers
-    meta.bag_split_count = int(bag_summary.get("split_count", 0))
-    if camera_summaries:
-        meta.cameras = camera_summaries
-    if pending_markers:
-        meta.markers = pending_markers
-    # Snapshot mux state at stop — used by the UI to tell operator-after-
-    # the-fact whether THIS run was VLA (with which controller) or teleop.
     mux_tracker = request.app.get("mux_tracker")
-    if mux_tracker is not None:
-        meta.controller_at_end = mux_tracker.snapshot()
-    store._write_meta(ep_dir, meta)  # noqa: SLF001 — local helper, store is single owner
+    controller_at_end = mux_tracker.snapshot() if mux_tracker is not None else None
+    meta, ep_dir = store.begin_finalizing_active(req.outcome)
 
-    # If discard, blow away the dir entirely
-    if req.outcome == "discard":
-        shutil.rmtree(ep_dir, ignore_errors=True)
-        LOG.info("episode discarded and dir removed: %s", episode_id)
-
-    # Step 6: release active lock
+    # Step 6: release active lock now; the episode is no longer recording.
     active_lock: Optional[ActiveLock] = request.app.get("active_lock")
     if active_lock is not None:
-        active_lock.release()
+        try:
+            active_lock.release()
+        except Exception as exc:
+            LOG.warning("active lock release failed after stop detach: %s", exc)
+
+    asyncio.create_task(
+        _finalize_stopped_episode(
+            store=store,
+            meta=meta,
+            ep_dir=ep_dir,
+            outcome=req.outcome,
+            detached_bag=detached_bag,
+            detached_cameras=detached_cameras,
+            depth_frame_counts=depth_frame_counts,
+            pending_markers=pending_markers,
+            controller_at_end=controller_at_end,
+        ),
+        name=f"fv-episode-finalize-{episode_id}",
+    )
 
     resp = StopEpisodeResponse(
         episode_id=meta.episode_id,
         state=meta.state,
         duration_s=meta.duration_s or 0.0,
         frame_count_per_camera=frame_count_per_camera,
-        bag_size_bytes=int(bag_summary.get("size_bytes", 0)),
-        video_size_bytes=video_size_bytes,
+        bag_size_bytes=0,
+        video_size_bytes=0,
         manifest_pending=True,
     )
     LOG.info(
-        "episode stopped: %s outcome=%s duration=%.1fs bag=%d video=%d frames=%s",
-        episode_id, req.outcome, resp.duration_s,
-        resp.bag_size_bytes, resp.video_size_bytes, frame_count_per_camera,
+        "episode stop accepted: %s outcome=%s duration=%.1fs frames=%s",
+        episode_id, req.outcome, resp.duration_s, frame_count_per_camera,
     )
-    return web.json_response(resp.model_dump(), status=200)
+    return web.json_response(resp.model_dump(), status=202)
+
+
+async def _finalize_stopped_episode(
+    *,
+    store: EpisodeStore,
+    meta: EpisodeMeta,
+    ep_dir: Path,
+    outcome: str,
+    detached_bag: DetachedBagRecording,
+    detached_cameras: DetachedCameraWriterPool,
+    depth_frame_counts: dict[str, int],
+    pending_markers: list[dict],
+    controller_at_end: dict | None,
+) -> None:
+    try:
+        await asyncio.to_thread(
+            _finalize_stopped_episode_sync,
+            store,
+            meta,
+            ep_dir,
+            outcome,
+            detached_bag,
+            detached_cameras,
+            depth_frame_counts,
+            pending_markers,
+            controller_at_end,
+        )
+    except Exception:
+        LOG.exception("episode finalizer crashed: %s", meta.episode_id)
+
+
+def _finalize_stopped_episode_sync(
+    store: EpisodeStore,
+    meta: EpisodeMeta,
+    ep_dir: Path,
+    outcome: str,
+    detached_bag: DetachedBagRecording,
+    detached_cameras: DetachedCameraWriterPool,
+    depth_frame_counts: dict[str, int],
+    pending_markers: list[dict],
+    controller_at_end: dict | None,
+) -> None:
+    errors: list[str] = []
+    try:
+        bag_summary = detached_bag.wait(timeout_s=10.0)
+    except Exception as exc:
+        LOG.exception("bag finalize failed: %s", meta.episode_id)
+        bag_summary = {"size_bytes": 0, "split_count": 0}
+        errors.append(f"bag: {exc}")
+    try:
+        camera_summaries, camera_errors = detached_cameras.finalize(depth_frame_counts)
+        errors.extend(camera_errors)
+    except Exception as exc:
+        LOG.exception("camera finalize failed: %s", meta.episode_id)
+        camera_summaries = []
+        errors.append(f"camera: {exc}")
+
+    video_size_bytes = 0
+    for camera_summary in camera_summaries:
+        for segment in camera_summary.get("segments", []):
+            video_size_bytes += int(segment.get("size_bytes", 0))
+
+    latest = store.get_episode(meta.episode_id)
+    if latest is not None:
+        meta = latest[0]
+    meta.bag_split_count = int(bag_summary.get("split_count", 0))
+    if camera_summaries:
+        meta.cameras = camera_summaries
+    if pending_markers:
+        meta.markers = pending_markers
+    if controller_at_end is not None:
+        meta.controller_at_end = controller_at_end
+    if errors:
+        meta.stale_input_events = [
+            *getattr(meta, "stale_input_events", []),
+            *[{"kind": "finalize_error", "detail": error} for error in errors],
+        ]
+
+    if outcome == "discard":
+        shutil.rmtree(ep_dir, ignore_errors=True)
+        try:
+            store.index.delete(meta.episode_id)
+        except Exception:
+            pass
+        LOG.info("episode discarded and dir removed: %s", meta.episode_id)
+        return
+
+    if outcome == "abort" or errors:
+        meta.state = "failed"
+    else:
+        meta.state = "finished"
+    store._write_meta(ep_dir, meta)  # noqa: SLF001 — local helper, store is single owner
+    LOG.info(
+        "episode finalized: %s outcome=%s state=%s duration=%.1fs bag=%d video=%d errors=%d",
+        meta.episode_id, outcome, meta.state, meta.duration_s or 0.0,
+        int(bag_summary.get("size_bytes", 0)), video_size_bytes, len(errors),
+    )
 
 
 async def _list_episodes(request: web.Request) -> web.Response:

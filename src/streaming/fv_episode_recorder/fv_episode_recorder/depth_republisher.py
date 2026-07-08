@@ -136,8 +136,9 @@ class DepthRepublisherPool:
         camera_pool can write it into the depth placeholder summary).
         Without this the play modal sees frame_count=0 and renders the
         '0 frames' empty-state even though the bag has the frames."""
+        pubs = self.detach_all()
         counts: dict[str, int] = {}
-        for r in self._pubs:
+        for r in pubs:
             try:
                 counts[r.name] = int(getattr(r, "_frame_count", 0))
             except Exception:
@@ -146,5 +147,9 @@ class DepthRepublisherPool:
                 r.stop()
             except Exception as exc:
                 LOG.warning("republisher stop failed for %s: %s", r.raw_topic, exc)
-        self._pubs = []
         return counts
+
+    def detach_all(self) -> list[_DepthRepublisher]:
+        pubs = list(self._pubs)
+        self._pubs = []
+        return pubs

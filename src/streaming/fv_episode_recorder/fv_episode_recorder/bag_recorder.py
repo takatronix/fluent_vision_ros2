@@ -17,10 +17,48 @@ import shutil
 import signal
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 LOG = logging.getLogger("fv_episode_recorder.bag")
+
+
+def _summary(bag_dir: Optional[Path], topics: list[str]) -> dict:
+    if bag_dir is None or not bag_dir.exists():
+        return {"bag_dir": None, "size_bytes": 0, "split_count": 0}
+    size = 0
+    splits = 0
+    for p in bag_dir.rglob("*.db3"):
+        size += p.stat().st_size
+        splits += 1
+    for p in bag_dir.iterdir():
+        if p.is_file() and not p.name.endswith(".db3"):
+            size += p.stat().st_size
+    return {"bag_dir": str(bag_dir), "size_bytes": size, "split_count": splits, "topics": topics}
+
+
+@dataclass
+class DetachedBagRecording:
+    proc: Optional[subprocess.Popen[bytes]]
+    bag_dir: Optional[Path]
+    topics: list[str]
+
+    def wait(self, timeout_s: float = 10.0) -> dict:
+        if self.proc is None or self.proc.poll() is not None:
+            return _summary(self.bag_dir, self.topics)
+        try:
+            self.proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            LOG.warning("bag recorder did not exit on SIGINT within %.1fs, sending SIGTERM", timeout_s)
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                LOG.error("bag recorder still alive, SIGKILL")
+                self.proc.kill()
+                self.proc.wait(timeout=3.0)
+        return _summary(self.bag_dir, self.topics)
 
 
 class BagRecorder:
@@ -79,47 +117,27 @@ class BagRecorder:
 
         Returns summary dict with bag_dir / size_bytes / split_count.
         """
-        if not self.active:
-            return self._summary()
+        return self.detach_for_finalize().wait(timeout_s)
 
-        assert self._proc is not None
-        # Send SIGINT to the whole process group so rosbag2 flushes metadata.
-        try:
-            if hasattr(os, "killpg"):
-                os.killpg(os.getpgid(self._proc.pid), signal.SIGINT)
-            else:
-                self._proc.send_signal(signal.SIGINT)
-        except ProcessLookupError:
-            pass
-
-        try:
-            self._proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            LOG.warning("bag recorder did not exit on SIGINT within %.1fs, sending SIGTERM", timeout_s)
-            self._proc.terminate()
+    def detach_for_finalize(self) -> DetachedBagRecording:
+        proc = self._proc
+        bag_dir = self._bag_dir
+        topics = list(self._topics)
+        if proc is not None and proc.poll() is None:
             try:
-                self._proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                LOG.error("bag recorder still alive, SIGKILL")
-                self._proc.kill()
-                self._proc.wait(timeout=3.0)
-
-        return self._summary()
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                else:
+                    proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        self._proc = None
+        self._bag_dir = None
+        self._topics = []
+        return DetachedBagRecording(proc=proc, bag_dir=bag_dir, topics=topics)
 
     def _summary(self) -> dict:
-        bag_dir = self._bag_dir
-        if bag_dir is None or not bag_dir.exists():
-            return {"bag_dir": None, "size_bytes": 0, "split_count": 0}
-        size = 0
-        splits = 0
-        for p in bag_dir.rglob("*.db3"):
-            size += p.stat().st_size
-            splits += 1
-        # also include metadata.yaml etc
-        for p in bag_dir.iterdir():
-            if p.is_file() and not p.name.endswith(".db3"):
-                size += p.stat().st_size
-        return {"bag_dir": str(bag_dir), "size_bytes": size, "split_count": splits, "topics": self._topics}
+        return _summary(self._bag_dir, self._topics)
 
     def abort(self) -> None:
         """Kill without waiting — for crash recovery / discard paths."""
