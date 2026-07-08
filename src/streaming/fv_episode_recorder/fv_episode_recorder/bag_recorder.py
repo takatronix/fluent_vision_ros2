@@ -15,7 +15,6 @@ import logging
 import os
 import shutil
 import signal
-import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass
@@ -136,29 +135,6 @@ class BagRecorder:
         self._bag_dir = None
         self._topics = []
         return DetachedBagRecording(proc=proc, bag_dir=bag_dir, topics=topics)
-
-    def topic_counts(self, topics: set[str]) -> dict[str, int]:
-        counts = {topic: 0 for topic in topics}
-        if not topics or self._bag_dir is None or not self._bag_dir.exists():
-            return counts
-        for db_path in sorted(self._bag_dir.rglob("*.db3")):
-            try:
-                uri = f"file:{db_path}?mode=ro"
-                with sqlite3.connect(uri, uri=True, timeout=0.05) as con:
-                    rows = con.execute(
-                        """
-                        select topics.name, count(messages.id)
-                        from topics
-                        left join messages on messages.topic_id = topics.id
-                        group by topics.name
-                        """
-                    ).fetchall()
-            except sqlite3.Error:
-                continue
-            for name, count in rows:
-                if name in counts:
-                    counts[str(name)] += int(count)
-        return counts
 
     def _summary(self) -> dict:
         return _summary(self._bag_dir, self._topics)

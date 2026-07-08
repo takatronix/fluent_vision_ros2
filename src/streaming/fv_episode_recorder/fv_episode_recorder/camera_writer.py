@@ -103,7 +103,6 @@ class CameraWriter:
         output_dir: Path,
         fps: int = 30,
         node: Optional[Node] = None,
-        record_immediately: bool = True,
     ):
         self.name = name
         self.topic = topic
@@ -124,9 +123,6 @@ class CameraWriter:
         self._last_recv_ns = 0
         self._lock = threading.Lock()
         self._sub = None
-        self._recording_enabled = threading.Event()
-        if record_immediately:
-            self._recording_enabled.set()
         self._first_frame_received = False
         self.frame_count = 0
         self.width = 0
@@ -154,9 +150,6 @@ class CameraWriter:
             if self._stopped:
                 return
             recv_ns = time.time_ns()
-            self._first_frame_received = True
-            if not self._recording_enabled.is_set():
-                return
             # decode jpeg/png compressed bytes
             arr = np.frombuffer(msg.data, dtype=np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -199,14 +192,7 @@ class CameraWriter:
             self._segment_local += 1
             self.frame_count += 1
             self._last_recv_ns = recv_ns
-
-    def enable_recording(self) -> None:
-        if not self._recording_enabled.is_set():
-            self._start_wall_ns = time.time_ns()
-        self._recording_enabled.set()
-
-    def has_observed_frame(self) -> bool:
-        return self._first_frame_received
+            self._first_frame_received = True
 
     def stop(self) -> dict:
         self.stop_recording()
@@ -284,9 +270,6 @@ class DepthCameraWriter:
         self._sidecar = FramesSidecar(self.output_dir / "frames.parquet")
         self._sub = None
         self._lock = threading.Lock()
-        self._recording_enabled = threading.Event()
-        self._recording_enabled.set()
-        self._first_frame_received = False
         self._frame_index = 0
         self._last_recv_ns = 0
         self._start_wall_ns = 0
@@ -314,9 +297,6 @@ class DepthCameraWriter:
             if self._stopped:
                 return
             recv_ns = time.time_ns()
-            self._first_frame_received = True
-            if not self._recording_enabled.is_set():
-                return
             self._encoding_seen = msg.encoding
             # Depth conventions: 16UC1 (mm, RealSense) or mono16 (also 16-bit).
             # 32FC1 (m, float) is converted to mm so we get a fixed-range PNG.
@@ -356,14 +336,6 @@ class DepthCameraWriter:
             self._frame_index += 1
             self.frame_count += 1
             self._last_recv_ns = recv_ns
-
-    def enable_recording(self) -> None:
-        if not self._recording_enabled.is_set():
-            self._start_wall_ns = time.time_ns()
-        self._recording_enabled.set()
-
-    def has_observed_frame(self) -> bool:
-        return self._first_frame_received
 
     def stop(self) -> dict:
         self.stop_recording()
@@ -493,21 +465,10 @@ class CameraWriterPool:
             cam_dir = videos_root / name
             writer = CameraWriter(
                 name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
-                record_immediately=bool(cam.get("record_immediately", True)),
             )
             writer.start()
             self._writers[name] = writer
         return [w.summary() for w in self._writers.values()] + self._depth_placeholders
-
-    def observed_frame_counts(self) -> dict[str, int]:
-        return {
-            name: 1 if writer.has_observed_frame() else 0
-            for name, writer in self._writers.items()
-        }
-
-    def enable_recording(self) -> None:
-        for writer in self._writers.values():
-            writer.enable_recording()
 
     def apply_depth_frame_counts(self, counts: dict[str, int]) -> None:
         """Patch the depth_bag placeholder summaries with the frame counts
