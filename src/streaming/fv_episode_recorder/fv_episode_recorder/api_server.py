@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -39,6 +39,15 @@ from .schemas import (
 )
 
 LOG = logging.getLogger("fv_episode_recorder.api")
+_READY_TIMEOUT_S = 2.0
+_READY_POLL_S = 0.02
+
+
+@dataclass(frozen=True)
+class RecordingReady:
+    ready_at: str
+    bag_topics: dict[str, int]
+    cameras: dict[str, int]
 
 
 @web.middleware
@@ -162,6 +171,125 @@ async def _healthz(request: web.Request) -> web.Response:
     if replay is not None and replay.state is not None:
         payload["replay"] = replay.state.to_dict()
     return web.json_response(payload)
+
+
+def _mux_source(snapshot) -> str | None:
+    if not isinstance(snapshot, dict):
+        return None
+    for value in snapshot.values():
+        if not isinstance(value, dict):
+            continue
+        source = value.get("source")
+        if isinstance(source, str) and source and source != "stop":
+            return source
+    return None
+
+
+def _topic_from_spec(spec) -> str | None:
+    if isinstance(spec, dict):
+        topic = spec.get("topic")
+        return topic if isinstance(topic, str) and topic else None
+    if isinstance(spec, str) and spec:
+        return spec
+    return None
+
+
+def _required_ready_topics(profile_dict, recorded_topics_meta: list[dict], controller_at_start) -> set[str]:
+    topics = {
+        str(entry["topic"])
+        for entry in recorded_topics_meta
+        if isinstance(entry, dict)
+        and entry.get("role") == "mux"
+        and isinstance(entry.get("topic"), str)
+    }
+    source = _mux_source(controller_at_start)
+    lerobot = profile_dict.get("lerobot") if isinstance(profile_dict, dict) else None
+    if not isinstance(lerobot, dict):
+        return topics
+    for stream in lerobot.get("arm_streams") or []:
+        if not isinstance(stream, dict):
+            continue
+        rx = stream.get("rx")
+        if not isinstance(rx, dict):
+            continue
+        state_topic = _topic_from_spec(rx.get("joint_state"))
+        if state_topic is not None:
+            topics.add(state_topic)
+        command = rx.get("joint_command")
+        if isinstance(command, dict):
+            action_topic = _topic_from_spec(command.get(source)) if source else None
+            if action_topic is None:
+                action_topic = _topic_from_spec(command)
+            if action_topic is not None:
+                topics.add(action_topic)
+    return topics
+
+
+async def _wait_recording_ready(
+    *,
+    bag_recorder: BagRecorder,
+    camera_pool: CameraWriterPool,
+    bag_topics: set[str],
+) -> RecordingReady:
+    deadline = asyncio.get_running_loop().time() + _READY_TIMEOUT_S
+    last_bag_counts: dict[str, int] = {}
+    last_camera_counts: dict[str, int] = {}
+    while True:
+        bag_status = bag_recorder.ready_status(bag_topics)
+        last_bag_counts = bag_status.counts
+        last_camera_counts = camera_pool.observed_frame_counts()
+        missing_bag = [topic for topic, count in last_bag_counts.items() if count <= 0]
+        missing_cameras = [name for name, count in last_camera_counts.items() if count <= 0]
+        if bag_status.ready and not missing_cameras:
+            return RecordingReady(
+                ready_at=bag_status.ready_at or utc_now_iso(),
+                bag_topics=last_bag_counts,
+                cameras=last_camera_counts,
+            )
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(
+                "recording ready timeout: "
+                f"missing_bag={missing_bag} missing_cameras={missing_cameras} "
+                f"bag_counts={last_bag_counts} camera_counts={last_camera_counts}"
+            )
+        await asyncio.sleep(_READY_POLL_S)
+
+
+def _fail_start_episode(
+    *,
+    store: EpisodeStore,
+    bag_recorder: BagRecorder,
+    camera_pool: CameraWriterPool,
+    depth_pool,
+    active_lock,
+    code: str,
+    detail: str,
+) -> None:
+    try:
+        bag_recorder.detach_for_finalize().wait(timeout_s=1.0)
+    except Exception:
+        LOG.exception("bag cleanup failed after start failure")
+    if depth_pool is not None:
+        try:
+            depth_pool.stop_all()
+        except Exception:
+            LOG.exception("depth cleanup failed after start failure")
+    try:
+        camera_pool.detach_all().finalize({})
+    except Exception:
+        LOG.exception("camera cleanup failed after start failure")
+    if active_lock is not None:
+        try:
+            active_lock.release()
+        except Exception:
+            LOG.exception("active lock cleanup failed after start failure")
+    try:
+        meta, ep_dir = store.begin_finalizing_active("abort")
+        meta.state = "failed"
+        meta.stale_input_events.append({"code": code, "detail": detail})
+        store._write_meta(ep_dir, meta)  # noqa: SLF001
+    except Exception:
+        LOG.exception("episode metadata cleanup failed after start failure")
 
 
 # ---------- Marker handlers ----------
@@ -362,6 +490,7 @@ async def _start_episode(request: web.Request) -> web.Response:
     # having to decode the bag.
     mux_tracker = request.app.get("mux_tracker")
     controller_at_start = mux_tracker.snapshot() if mux_tracker is not None else None
+    ready_topics = _required_ready_topics(profile_dict, recorded_topics_meta, controller_at_start)
 
     meta = EpisodeMeta(
         episode_id=ep_id,
@@ -415,14 +544,41 @@ async def _start_episode(request: web.Request) -> web.Response:
     bag_started = False
     if req.record_bag and bag_topics:
         if not BagRecorder.available():
-            LOG.warning("ros2 not available, skipping bag record")
+            detail = "ros2 is not available"
+            LOG.warning("bag recorder unavailable: %s", detail)
+            _fail_start_episode(
+                store=store,
+                bag_recorder=bag_recorder,
+                camera_pool=request.app["camera_pool"],
+                depth_pool=depth_pool,
+                active_lock=active_lock,
+                code="bag_recorder_unavailable",
+                detail=detail,
+            )
+            return web.json_response(
+                {"error": "bag_recorder_unavailable", "detail": detail},
+                status=503,
+            )
         else:
             try:
-                bag_recorder.start(ep_dir / "bag", bag_topics)
+                bag_recorder.start(ep_dir / "bag", bag_topics, ready_topics=ready_topics)
                 bag_started = True
             except Exception as exc:
                 LOG.error("bag recorder start failed: %s", exc)
-                # Don't fail the whole episode; record meta and continue.
+                detail = str(exc)
+                _fail_start_episode(
+                    store=store,
+                    bag_recorder=bag_recorder,
+                    camera_pool=request.app["camera_pool"],
+                    depth_pool=depth_pool,
+                    active_lock=active_lock,
+                    code="bag_recorder_start_failed",
+                    detail=detail,
+                )
+                return web.json_response(
+                    {"error": "bag_recorder_start_failed", "detail": detail},
+                    status=500,
+                )
 
     # Step 3+4: start camera writers (resolved from override or profile).
     # kind=depth entries are skipped here — they're bagged via the
@@ -431,20 +587,71 @@ async def _start_episode(request: web.Request) -> web.Response:
     cameras_started: list[dict] = []
     if cameras_resolved:
         try:
-            cameras_started = camera_pool.start_all(ep_dir, cameras_resolved, fps=req.fps)
+            warmup_cameras = [
+                {**camera, "record_immediately": False}
+                for camera in cameras_resolved
+            ]
+            cameras_started = camera_pool.start_all(ep_dir, warmup_cameras, fps=req.fps)
             meta.cameras = cameras_started
             store._write_meta(ep_dir, meta)  # noqa: SLF001
         except Exception as exc:
             LOG.error("camera_pool start failed: %s", exc)
+            detail = str(exc)
+            _fail_start_episode(
+                store=store,
+                bag_recorder=bag_recorder,
+                camera_pool=camera_pool,
+                depth_pool=depth_pool,
+                active_lock=active_lock,
+                code="camera_writer_start_failed",
+                detail=detail,
+            )
+            return web.json_response(
+                {"error": "camera_writer_start_failed", "detail": detail},
+                status=500,
+            )
+
+    try:
+        recording_ready = await _wait_recording_ready(
+            bag_recorder=bag_recorder,
+            camera_pool=camera_pool,
+            bag_topics=ready_topics,
+        )
+    except RuntimeError as exc:
+        detail = str(exc)
+        LOG.warning("episode recording ready failed: %s", detail)
+        _fail_start_episode(
+            store=store,
+            bag_recorder=bag_recorder,
+            camera_pool=camera_pool,
+            depth_pool=depth_pool,
+            active_lock=active_lock,
+            code="recording_ready_timeout",
+            detail=detail,
+        )
+        return web.json_response(
+            {"error": "recording_ready_timeout", "detail": detail},
+            status=503,
+        )
+
+    recording_ready_payload = asdict(recording_ready)
+    meta.started_at = recording_ready.ready_at
+    meta.quality_metrics = {
+        **(meta.quality_metrics or {}),
+        "recording_ready": recording_ready_payload,
+    }
+    camera_pool.enable_recording()
+    store._write_meta(ep_dir, meta)  # noqa: SLF001
 
     resp = StartEpisodeResponse(
         episode_id=ep_id,
-        started_at=started_at,
+        started_at=meta.started_at,
         bag_path=str((ep_dir / "bag").resolve()),
         meta_path=str((ep_dir / "meta.json").resolve()),
         recorded_topics_resolved=meta.recorded_topics,
         preflight={**preflight, "bag_started": bag_started,
-                   "cameras_started": [c["name"] for c in cameras_started]},
+                   "cameras_started": [c["name"] for c in cameras_started],
+                   "recording_ready": recording_ready_payload},
     )
     LOG.info("episode started: %s task=%s profile=%s bag_topics=%d bag_started=%s",
              ep_id, req.task_description, req.profile, len(bag_topics), bag_started)

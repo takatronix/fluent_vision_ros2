@@ -44,7 +44,9 @@ sys.modules.setdefault("sensor_msgs", _sensor_msgs)
 sys.modules.setdefault("sensor_msgs.msg", _sensor_msgs_msg)
 sys.modules.setdefault("ulid", _ulid)
 
-from fv_episode_recorder.api_server import _stop_episode
+import fv_episode_recorder.api_server as api_server
+from fv_episode_recorder.api_server import _start_episode, _stop_episode
+from fv_episode_recorder.bag_recorder import BagReadyStatus
 from fv_episode_recorder.episode_store import EpisodeMeta, EpisodeStore, utc_now_iso
 
 
@@ -109,6 +111,128 @@ class _Request:
         return {"outcome": "success"}
 
 
+class _StartRequest:
+    def __init__(self, store: EpisodeStore, bag_recorder, camera_pool) -> None:
+        self.match_info = {}
+        self.app = {
+            "store": store,
+            "bag_recorder": bag_recorder,
+            "camera_pool": camera_pool,
+            "depth_pool": None,
+            "marker_manager": _MarkerManager(),
+            "mux_tracker": _MuxTracker(),
+            "active_lock": None,
+            "get_profile": lambda _name: _profile(),
+        }
+
+    async def json(self) -> dict:
+        return {
+            "task_description": "pick",
+            "profile": "piper_single",
+            "tags": ["dpex:record"],
+            "expected_duration_s": 60,
+        }
+
+
+class _MuxTracker:
+    def snapshot(self) -> dict:
+        return {
+            "/follower_arm/teleop_mux/status": {
+                "source": "vr",
+            }
+        }
+
+
+class _ReadyBagRecorder:
+    def __init__(self) -> None:
+        self.started = False
+        self.polls = 0
+        self.ready_topics: set[str] = set()
+
+    def start(self, bag_dir: Path, topics: list[str], ready_topics: set[str] | None = None) -> None:
+        self.started = True
+        self.ready_topics = set(ready_topics or set())
+
+    def ready_status(self, required_topics: set[str]) -> BagReadyStatus:
+        self.polls += 1
+        counts = {topic: 1 if self.polls >= 2 else 0 for topic in required_topics}
+        return BagReadyStatus(
+            ready=all(count > 0 for count in counts.values()),
+            ready_at="2026-07-08T00:00:00.000000Z" if self.polls >= 2 else None,
+            counts=counts,
+        )
+
+    def detach_for_finalize(self) -> _DetachedBag:
+        return _DetachedBag()
+
+
+class _ReadyCameraPool:
+    def __init__(self) -> None:
+        self.polls = 0
+        self.enabled = False
+        self.started_cameras: list[dict] = []
+
+    def start_all(self, episode_dir: Path, cameras: list[dict], fps: int = 30) -> list[dict]:
+        self.started_cameras = cameras
+        return [{"name": "top_camera", "frame_count": 0, "segments": []}]
+
+    def observed_frame_counts(self) -> dict[str, int]:
+        self.polls += 1
+        return {"top_camera": 1 if self.polls >= 2 else 0}
+
+    def enable_recording(self) -> None:
+        self.enabled = True
+
+    def detach_all(self) -> _DetachedCameras:
+        return _DetachedCameras()
+
+
+def _profile() -> dict:
+    return {
+        "episode_recorder": {
+            "record_topics_override": [
+                {
+                    "topic": "/follower_arm/joint_states_single",
+                    "role": "state",
+                    "stamp_source": "message_header",
+                },
+                {
+                    "topic": "/follower_arm/joint_ctrl",
+                    "role": "command",
+                    "stamp_source": "rosbag_recv",
+                },
+                {
+                    "topic": "/follower_arm/teleop_mux/status",
+                    "role": "mux",
+                    "stamp_source": "rosbag_recv",
+                },
+            ],
+            "cameras": [
+                {
+                    "name": "top_camera",
+                    "topic": "/top_camera/image_raw/compressed",
+                }
+            ],
+        },
+        "lerobot": {
+            "arm_streams": [
+                {
+                    "key": "follower",
+                    "namespace": "follower_arm",
+                    "joints": ["joint1"],
+                    "rx": {
+                        "joint_state": {"topic": "/follower_arm/joint_states_single"},
+                        "joint_command": {
+                            "topic": "/follower_arm/joint_cmd",
+                            "vr": {"topic": "/follower_arm/joint_ctrl"},
+                        },
+                    },
+                }
+            ]
+        },
+    }
+
+
 def _meta(episode_id: str) -> EpisodeMeta:
     return EpisodeMeta(
         episode_id=episode_id,
@@ -141,5 +265,39 @@ def test_stop_detaches_active_episode_before_finalize(tmp_path: Path) -> None:
         assert first[0].tags == ["dpex:record", "user:red"]
         assert store.active is not None
         assert store.active.episode_id == "ep-2"
+
+    asyncio.run(run())
+
+
+def test_start_waits_for_bag_writer_and_camera_before_enabling_camera(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        monkeypatch.setattr(api_server.BagRecorder, "available", staticmethod(lambda: True))
+        store = EpisodeStore(tmp_path)
+        bag_recorder = _ReadyBagRecorder()
+        camera_pool = _ReadyCameraPool()
+
+        response = await _start_episode(_StartRequest(store, bag_recorder, camera_pool))
+        payload = json.loads(response.body.decode("utf-8"))
+
+        assert response.status == 201
+        assert bag_recorder.started
+        assert bag_recorder.polls >= 2
+        assert bag_recorder.ready_topics == {
+            "/follower_arm/joint_states_single",
+            "/follower_arm/joint_ctrl",
+            "/follower_arm/teleop_mux/status",
+        }
+        assert camera_pool.polls >= 2
+        assert camera_pool.enabled
+        assert camera_pool.started_cameras[0]["record_immediately"] is False
+        assert payload["preflight"]["recording_ready"]["bag_topics"] == {
+            "/follower_arm/joint_states_single": 1,
+            "/follower_arm/joint_ctrl": 1,
+            "/follower_arm/teleop_mux/status": 1,
+        }
+        assert payload["started_at"] == "2026-07-08T00:00:00.000000Z"
 
     asyncio.run(run())
