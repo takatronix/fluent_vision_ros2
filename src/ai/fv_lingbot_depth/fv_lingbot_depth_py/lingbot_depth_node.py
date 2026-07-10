@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import io
+import json
+import threading
 import time
 from typing import Optional, Tuple
 import urllib.error
@@ -12,11 +14,13 @@ import numpy as np
 import rclpy
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rcl_interfaces.msg import SetParametersResult
-from rclpy.executors import ExternalShutdownException
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 
 def _ensure_xformers_free_attention() -> None:
@@ -96,6 +100,21 @@ class FvLingbotDepthNode(Node):
         # deployments without the dashboard selector.
         self.declare_parameter("depth_source_topic", "")
 
+        # On-demand capture (~/capture, std_srvs/Trigger): while PAUSED,
+        # one service call refines exactly the next synced frame at
+        # capture_resolution_level (default = max quality) and re-pauses.
+        # This is the "robot stops -> take one clean cloud" path; continuous
+        # streaming stays as-is via the source selector.
+        self.declare_parameter("capture_resolution_level", 9)
+        self.declare_parameter("capture_timeout_sec", 10.0)
+
+        # Cameras that publish no camera_info topic (the D555 serves its
+        # streams straight from its on-board DDS server) can supply
+        # [fx, fy, cx, cy] in depth-pixel units here; the info subscriber is
+        # then dropped and the sync runs on color+depth only. All-zero =
+        # disabled (camera_info required, original behaviour).
+        self.declare_parameter("static_intrinsics", [0.0, 0.0, 0.0, 0.0])
+
         # Logging
         self.declare_parameter("log_every_n_frames", 30)
 
@@ -133,6 +152,17 @@ class FvLingbotDepthNode(Node):
         self.sync_slop_sec = float(self.get_parameter("sync_slop_sec").value)
         self.qos_reliability = str(self.get_parameter("qos_reliability").value).strip().lower()
         self.depth_source_topic = str(self.get_parameter("depth_source_topic").value).strip()
+        self.capture_resolution_level = max(0, min(9, int(
+            self.get_parameter("capture_resolution_level").value)))
+        self.capture_timeout_sec = float(
+            self.get_parameter("capture_timeout_sec").value)
+        intr_vals = [float(v) for v in self.get_parameter("static_intrinsics").value]
+        self._static_intr: Optional[Tuple[float, float, float, float]] = None
+        if any(v != 0.0 for v in intr_vals):
+            if len(intr_vals) != 4 or intr_vals[0] <= 0.0 or intr_vals[1] <= 0.0:
+                raise ValueError(
+                    f"static_intrinsics must be [fx, fy, cx, cy] with fx,fy > 0, got {intr_vals}")
+            self._static_intr = tuple(intr_vals)
 
         self.log_every_n_frames = max(1, int(self.get_parameter("log_every_n_frames").value))
 
@@ -186,14 +216,38 @@ class FvLingbotDepthNode(Node):
         qos = self._sensor_qos_profile()
         self.color_sub = Subscriber(self, Image, self.color_topic, qos_profile=qos)
         self.depth_sub = Subscriber(self, Image, self.depth_topic, qos_profile=qos)
-        self.info_sub = Subscriber(self, CameraInfo, self.camera_info_topic, qos_profile=qos)
-        self.sync = ApproximateTimeSynchronizer(
-            [self.color_sub, self.depth_sub, self.info_sub],
-            queue_size=self.sync_queue_size,
-            slop=self.sync_slop_sec,
-            allow_headerless=False,
-        )
-        self.sync.registerCallback(self._on_synced)
+        if self._static_intr is not None:
+            # No camera_info stream: sync color+depth only, intrinsics come
+            # from the static_intrinsics parameter.
+            self.info_sub = None
+            self.sync = ApproximateTimeSynchronizer(
+                [self.color_sub, self.depth_sub],
+                queue_size=self.sync_queue_size,
+                slop=self.sync_slop_sec,
+                allow_headerless=False,
+            )
+            self.sync.registerCallback(self._on_synced_static_intr)
+        else:
+            self.info_sub = Subscriber(
+                self, CameraInfo, self.camera_info_topic, qos_profile=qos)
+            self.sync = ApproximateTimeSynchronizer(
+                [self.color_sub, self.depth_sub, self.info_sub],
+                queue_size=self.sync_queue_size,
+                slop=self.sync_slop_sec,
+                allow_headerless=False,
+            )
+            self.sync.registerCallback(self._on_synced)
+
+        # On-demand capture: its own callback group so the (blocking) service
+        # handler can wait while the sync callback runs on the default group
+        # (needs the MultiThreadedExecutor in main()).
+        self._capture_lock = threading.Lock()
+        self._capture_pending = 0
+        self._capture_event = threading.Event()
+        self._capture_result: dict = {}
+        self._capture_srv = self.create_service(
+            Trigger, "~/capture", self._on_capture,
+            callback_group=MutuallyExclusiveCallbackGroup())
 
         self._frame_counter = 0
         self._proc_ms_acc = 0.0
@@ -279,9 +333,48 @@ class FvLingbotDepthNode(Node):
             self.get_logger().info(
                 f"inference paused (source={msg.data}) - model stays loaded, no GPU work")
 
-    def _on_synced(self, color_msg: Image, depth_msg: Image, info_msg: CameraInfo) -> None:
+    def _on_capture(self, request: Trigger.Request,
+                    response: Trigger.Response) -> Trigger.Response:
+        """One-shot refine: process the next synced frame, then re-pause.
+
+        Runs at capture_resolution_level (max quality by default) regardless
+        of the streaming resolution_level. While the continuous mode is
+        active the refined stream is already live, so the call just reports
+        that. No passthrough: if the worker/model fails, the call times out
+        rather than returning raw depth dressed up as refined.
+        """
+        if self._source_selected:
+            response.success = True
+            response.message = json.dumps(
+                {"note": "continuous mode active; refined stream already live"})
+            return response
+        with self._capture_lock:
+            if self._capture_pending <= 0:
+                self._capture_event.clear()
+                self._capture_pending = 1
+        if self._capture_event.wait(self.capture_timeout_sec):
+            response.success = True
+            response.message = json.dumps(self._capture_result)
+        else:
+            with self._capture_lock:
+                self._capture_pending = 0
+            response.success = False
+            response.message = (
+                f"timeout after {self.capture_timeout_sec:.1f}s "
+                "(no synced frame, or worker/model failure -- check the log)")
+        return response
+
+    def _on_synced_static_intr(self, color_msg: Image, depth_msg: Image) -> None:
+        self._on_synced(color_msg, depth_msg, None)
+
+    def _on_synced(self, color_msg: Image, depth_msg: Image,
+                   info_msg: Optional[CameraInfo]) -> None:
+        capture = False
         if not self._source_selected:
-            return
+            with self._capture_lock:
+                if self._capture_pending <= 0:
+                    return
+                capture = True
         start = time.perf_counter()
 
         try:
@@ -301,7 +394,12 @@ class FvLingbotDepthNode(Node):
                 interpolation=cv2.INTER_LINEAR,
             )
 
-        intr_norm = self._normalized_intrinsics(info_msg, depth_m.shape[1], depth_m.shape[0])
+        if info_msg is not None:
+            intr_norm = self._normalized_intrinsics(
+                info_msg, depth_m.shape[1], depth_m.shape[0])
+        else:
+            intr_norm = self._static_intrinsics_norm(
+                depth_m.shape[1], depth_m.shape[0])
         if intr_norm is None:
             return
 
@@ -312,26 +410,34 @@ class FvLingbotDepthNode(Node):
             and self.points_pub.get_subscription_count() > 0
         )
 
+        # Captures never fall back to passthrough: raw depth dressed up as
+        # refined would defeat the point of the capture. The pending flag
+        # stays set so the next frame retries until the service times out.
+        level = self.capture_resolution_level if capture else self.resolution_level
+        allow_passthrough = self.fallback_passthrough and not capture
+
         if self.backend == "http":
             refined_depth, mask, points = self._run_remote_model(
-                color_bgr, depth_m, intr_norm, want_points=want_points
+                color_bgr, depth_m, intr_norm, want_points=want_points,
+                resolution_level=level,
             )
             if refined_depth is None:
-                if not self.fallback_passthrough:
+                if not allow_passthrough:
                     return
                 refined_depth = depth_m
                 mask = np.isfinite(refined_depth) & (refined_depth > 0.0)
                 points = None
         elif self._model is not None:
-            refined_depth, mask, points = self._run_model(color_bgr, depth_m, intr_norm)
+            refined_depth, mask, points = self._run_model(
+                color_bgr, depth_m, intr_norm, resolution_level=level)
             if refined_depth is None:
-                if not self.fallback_passthrough:
+                if not allow_passthrough:
                     return
                 refined_depth = depth_m
                 mask = np.isfinite(refined_depth) & (refined_depth > 0.0)
                 points = None
         else:
-            if not self.fallback_passthrough:
+            if not allow_passthrough:
                 return
             refined_depth = depth_m
             mask = np.isfinite(refined_depth) & (refined_depth > 0.0)
@@ -364,6 +470,19 @@ class FvLingbotDepthNode(Node):
 
         self._frame_counter += 1
         proc_ms = (time.perf_counter() - start) * 1000.0
+        if capture:
+            stamp = float(header.stamp.sec) + float(header.stamp.nanosec) * 1e-9
+            with self._capture_lock:
+                self._capture_pending = 0
+                self._capture_result = {
+                    "stamp": stamp,
+                    "frame_id": header.frame_id,
+                    "proc_ms": round(proc_ms, 1),
+                    "resolution_level": level,
+                }
+            self._capture_event.set()
+            self.get_logger().info(
+                f"capture done stamp={stamp:.3f} proc_ms={proc_ms:.0f} level={level}")
         self._proc_ms_acc += proc_ms
         if self._frame_counter % self.log_every_n_frames == 0:
             avg = self._proc_ms_acc / float(self.log_every_n_frames)
@@ -379,8 +498,11 @@ class FvLingbotDepthNode(Node):
             )
 
     def _run_remote_model(
-        self, color_bgr: np.ndarray, depth_m: np.ndarray, intr_norm: np.ndarray, want_points: bool = True
+        self, color_bgr: np.ndarray, depth_m: np.ndarray, intr_norm: np.ndarray,
+        want_points: bool = True, resolution_level: Optional[int] = None,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        if resolution_level is None:
+            resolution_level = self.resolution_level
         payload = io.BytesIO()
         # Uncompressed: zlib costs ~100ms+/frame on Jetson and the worker is
         # local, so raw arrays are much faster end-to-end.
@@ -391,7 +513,7 @@ class FvLingbotDepthNode(Node):
             intrinsics_norm=intr_norm.astype(np.float32, copy=False),
             use_fp16=np.asarray(self.use_fp16, dtype=np.uint8),
             apply_mask=np.asarray(self.apply_mask, dtype=np.uint8),
-            resolution_level=np.asarray(self.resolution_level, dtype=np.int32),
+            resolution_level=np.asarray(resolution_level, dtype=np.int32),
             return_points=np.asarray(want_points, dtype=np.uint8),
             compress=np.asarray(0, dtype=np.uint8),
         )
@@ -444,12 +566,17 @@ class FvLingbotDepthNode(Node):
     # Python cv_bridge (C++ only), and the encodings involved are trivial.
     def _color_to_bgr(self, msg: Image) -> np.ndarray:
         encoding = msg.encoding.lower()
-        if encoding not in ("bgr8", "rgb8"):
-            raise RuntimeError(f"unsupported color encoding: {msg.encoding}")
         buf = np.frombuffer(msg.data, dtype=np.uint8)
         expected = msg.height * msg.step
         if buf.size < expected:
             raise RuntimeError(f"color buffer too small: {buf.size} < {expected}")
+        if encoding in ("yuv422_yuy2", "yuyv"):
+            # The D555 streams its color natively as YUY2.
+            rows = buf[:expected].reshape(msg.height, msg.step)
+            pix = rows[:, : msg.width * 2].reshape(msg.height, msg.width, 2)
+            return cv2.cvtColor(pix, cv2.COLOR_YUV2BGR_YUY2)
+        if encoding not in ("bgr8", "rgb8"):
+            raise RuntimeError(f"unsupported color encoding: {msg.encoding}")
         img = buf[:expected].reshape(msg.height, msg.step // 3, 3)[:, : msg.width, :]
         if encoding == "rgb8":
             img = img[:, :, ::-1]
@@ -502,11 +629,25 @@ class FvLingbotDepthNode(Node):
         out[1, 2] = cy / float(height)
         return out
 
+    def _static_intrinsics_norm(self, width: int, height: int) -> Optional[np.ndarray]:
+        if self._static_intr is None:
+            return None
+        fx, fy, cx, cy = self._static_intr
+        out = np.eye(3, dtype=np.float32)
+        out[0, 0] = fx / float(width)
+        out[1, 1] = fy / float(height)
+        out[0, 2] = cx / float(width)
+        out[1, 2] = cy / float(height)
+        return out
+
     def _run_model(
-        self, color_bgr: np.ndarray, depth_m: np.ndarray, intr_norm: np.ndarray
+        self, color_bgr: np.ndarray, depth_m: np.ndarray, intr_norm: np.ndarray,
+        resolution_level: Optional[int] = None,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         if self._model is None or self._torch is None:
             return None, None, None
+        if resolution_level is None:
+            resolution_level = self.resolution_level
 
         try:
             torch = self._torch
@@ -524,7 +665,7 @@ class FvLingbotDepthNode(Node):
                     intrinsics=intr_t,
                     use_fp16=self.use_fp16,
                     apply_mask=self.apply_mask,
-                    resolution_level=self.resolution_level,
+                    resolution_level=resolution_level,
                 )
 
             depth_out = out.get("depth", None)
@@ -613,11 +754,16 @@ class FvLingbotDepthNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = FvLingbotDepthNode()
+    # Two threads: the blocking ~/capture handler (own callback group) waits
+    # while the sync callback processes the frame on the default group.
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
