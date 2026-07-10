@@ -36,7 +36,13 @@ def generate_launch_description():
         output='screen',
         parameters=[config_file],
         # Force separate process to avoid device conflicts
-        emulate_tty=True
+        emulate_tty=True,
+        # The node exits on purpose (watchdog stall / camera missing at
+        # boot) and relies on this respawn as its recovery path — an
+        # in-process librealsense reset corrupts the heap, so a fresh
+        # process is the only reliable reset.
+        respawn=True,
+        respawn_delay=3.0,
     )
     
     return LaunchDescription([

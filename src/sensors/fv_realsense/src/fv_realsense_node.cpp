@@ -21,6 +21,8 @@
 #include <rclcpp/qos.hpp>
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 /**
@@ -50,8 +52,11 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
         // ===== Step 2: RealSenseの初期化（shared_from_thisより前） =====
         RCLCPP_INFO(this->get_logger(), "📷 Step 2: Initializing RealSense...");
         if (!initializeRealSense()) {
-            RCLCPP_ERROR(this->get_logger(), "❌ Failed to initialize RealSense");
-            return;
+            // Fail closed: a node without a camera used to stay alive as a
+            // silent zombie (topics never appear, watchdog never runs).
+            // Exit instead so the launch respawn keeps retrying until the
+            // camera enumerates.
+            exitForSupervisedRestart("RealSense initialization failed (camera not enumerated?)");
         }
         
         // ===== Step 3: パブリッシャーの初期化（RealSenseの後） =====
@@ -697,89 +702,23 @@ bool FVDepthCameraNode::startSensors() {
     return true;
 }
 
-bool FVDepthCameraNode::deepResetAndRestart() {
-    // Step 1: tear down sensors against the (now-likely-invalid) device.
-    // stopSensors() already swallows rs2::error internally so it's safe
-    // to call after USB unplug.
-    stopSensors();
-
-    // Step 1b: explicitly drop EVERY cached rs2 handle that still
-    // references the about-to-be-destroyed context. Anything left
-    // referencing the old context (sensor, device, stream_profile,
-    // frame, queued frame items) will be freed against an arena that
-    // no longer exists once ctx_.reset() runs, producing
-    // "free(): corrupted unsorted chunks" on the *next* deep reset
-    // (the first one looks fine because the dangling pointers
-    // haven't been touched yet).
-    try { color_sensor_ = rs2::sensor(); } catch (...) {}
-    try { depth_sensor_ = rs2::sensor(); } catch (...) {}
-    try { device_ = rs2::device(); } catch (...) {}
-    try { color_profile_ = rs2::stream_profile(); } catch (...) {}
-    try { depth_profile_ = rs2::stream_profile(); } catch (...) {}
-    {
-        std::lock_guard<std::mutex> lk(latest_frame_mutex_);
-        try { latest_color_frame_ = rs2::frame(); } catch (...) {}
-        try { latest_depth_frame_ = rs2::frame(); } catch (...) {}
-    }
-    {
-        std::lock_guard<std::mutex> lk(sync_mutex_);
-        // FrameItem holds rs2::frame; clear queues to drop refs.
-        color_queue_.clear();
-        depth_queue_.clear();
-    }
-
-    // Step 2: drop the old rs2::context. rs2::device handles cached
-    // inside it survive USB enumeration but point at the pre-unplug
-    // device path; that's exactly the "No such device" the cheap
-    // stop+start watchdog kept hitting.
-    try {
-        ctx_.reset();
-    } catch (...) {}
-
-    // Step 3: recreate context + re-enumerate. selectCamera() walks
-    // ctx_->query_devices() and reassigns device_ to a fresh handle.
-    // We retry up to ~3s because USB re-enumeration after plug-in is
-    // not instantaneous on Tegra.
-    constexpr int kMaxAttempts = 6;
-    constexpr int kAttemptDelayMs = 500;
-    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
-        try {
-            ctx_ = std::make_unique<rs2::context>();
-            if (selectCamera()) {
-                if (startSensors()) {
-                    RCLCPP_INFO(this->get_logger(),
-                                "✅ Deep reset succeeded on attempt %d/%d",
-                                attempt, kMaxAttempts);
-                    return true;
-                }
-                RCLCPP_WARN(this->get_logger(),
-                            "Deep reset attempt %d/%d: startSensors failed",
-                            attempt, kMaxAttempts);
-            } else {
-                RCLCPP_WARN(this->get_logger(),
-                            "Deep reset attempt %d/%d: no device enumerated",
-                            attempt, kMaxAttempts);
-            }
-        } catch (const rs2::error &e) {
-            RCLCPP_WARN(this->get_logger(),
-                        "Deep reset attempt %d/%d: %s",
-                        attempt, kMaxAttempts, e.what());
-        } catch (const std::exception &e) {
-            RCLCPP_WARN(this->get_logger(),
-                        "Deep reset attempt %d/%d: %s",
-                        attempt, kMaxAttempts, e.what());
-        }
-        if (attempt < kMaxAttempts) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kAttemptDelayMs));
-        }
-    }
-    RCLCPP_ERROR(this->get_logger(),
-                 "❌ Deep reset exhausted %d attempts; sensor stays down "
-                 "until next watchdog cycle (operator may need to "
-                 "verify USB cable / power).",
-                 kMaxAttempts);
-    return false;
+void FVDepthCameraNode::exitForSupervisedRestart(const std::string& reason) {
+    // In-process recovery (the former deepResetAndRestart) is not safe:
+    // when the USB device is wedged, sensor.stop()/close() can fail and
+    // leave librealsense driver threads alive, and destroying the
+    // rs2::context afterwards corrupts the heap — observed repeatedly as
+    // "free(): corrupted unsorted chunks" → SIGABRT, killing the node
+    // with no recovery at all. Even when such a reset "succeeds", the
+    // heap can no longer be trusted. The only reliable reset is a fresh
+    // process, so exit immediately — no destructors, no rs2 teardown
+    // (the kernel releases the USB fds) — and let the launch respawn
+    // reopen the camera cleanly.
+    RCLCPP_FATAL(this->get_logger(),
+                 "🔁 %s — exiting so the launch respawn can restart the node cleanly",
+                 reason.c_str());
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(3);
 }
 
 void FVDepthCameraNode::stopSensors() {
@@ -876,10 +815,9 @@ bool FVDepthCameraNode::selectCamera()
 
     // Crash guard: every branch below dereferences `devices` (most
     // notoriously the auto branch's `devices[0]`, which segfaults on
-    // an empty vector). This used to be reachable only at boot when
-    // ros2 launch already verified a device existed; the watchdog
-    // deep-reset now calls selectCamera() while the USB might still
-    // be unplugged, so we have to fail closed before any indexing.
+    // an empty vector). After a respawn the node can come up while the
+    // USB device is still re-enumerating, so fail closed before any
+    // indexing; the caller exits and the respawn retries.
     if (devices.empty()) {
         RCLCPP_WARN(this->get_logger(),
                     "🔍 selectCamera(): no RealSense devices enumerated; "
@@ -1161,13 +1099,8 @@ void FVDepthCameraNode::processingLoop()
                                 warned = true;
                             }
                             if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
-                                RCLCPP_ERROR(this->get_logger(), "🔁 Deep reset after %ldms color stall (mode=1)", (long)stall_ms);
-                                deepResetAndRestart();
-                                last_color_recv_ns_.store(
-                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                        std::chrono::steady_clock::now().time_since_epoch()).count(),
-                                    std::memory_order_relaxed);
-                                warned = false;
+                                exitForSupervisedRestart(
+                                    std::to_string((long)stall_ms) + "ms color stall (mode=1)");
                             }
                         }
                         break;
@@ -1244,13 +1177,8 @@ void FVDepthCameraNode::processingLoop()
                                 warned = true;
                             }
                             if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
-                                RCLCPP_ERROR(this->get_logger(), "🔁 Deep reset after %ldms color stall (mode=2)", (long)stall_ms);
-                                deepResetAndRestart();
-                                last_color_recv_ns_.store(
-                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                        std::chrono::steady_clock::now().time_since_epoch()).count(),
-                                    std::memory_order_relaxed);
-                                warned = false;
+                                exitForSupervisedRestart(
+                                    std::to_string((long)stall_ms) + "ms color stall (mode=2)");
                             }
                         }
                         break;

@@ -272,11 +272,11 @@ private:
     bool selectCamera();
     bool startSensors();
     void stopSensors();
-    // Watchdog recovery: stopSensors + drop rs2::context + recreate +
-    // selectCamera + startSensors. Needed after USB unplug, because
-    // the old rs2::device handle stays invalid even when the kernel
-    // re-enumerates the device. Returns true on success.
-    bool deepResetAndRestart();
+    // Watchdog recovery: log, flush, and _Exit(3) so the launch respawn
+    // restarts the node in a fresh process. In-process rs2 teardown after
+    // a USB stall corrupts the heap (see implementation comment), so a
+    // process restart is the only reliable reset. Never returns.
+    [[noreturn]] void exitForSupervisedRestart(const std::string& reason);
     void onColorFrame(const rs2::frame& frame);
     void onDepthFrame(const rs2::frame& frame);
     void initializePublishers();
