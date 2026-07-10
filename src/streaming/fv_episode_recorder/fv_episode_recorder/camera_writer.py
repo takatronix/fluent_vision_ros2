@@ -2,13 +2,12 @@
 
 Phase 1 Step 3 minimum:
   - CompressedImage subscriber (BEST_EFFORT, qos_profile_sensor_data)
-  - cv2.VideoWriter with mp4v fourcc (CPU encode, swap to h264_nvenc later)
+  - ffmpeg H.264 encode, then packet remux so mp4 PTS follows ros_stamp_ns
   - 1 mp4 file per camera (segment rotation lands in Step 3.5)
   - FramesSidecar populates frames.parquet
 
 Future steps:
   - segment rotation (10 min default)
-  - h264_nvenc (Tegra hw encode)
   - sensor_msgs/Image (uncompressed) support
   - cameras_downscale for untagged pool (Phase 2.5 always_on)
 """
@@ -21,9 +20,11 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
+import av
 import cv2
 import numpy as np
 import rclpy
@@ -34,6 +35,7 @@ from sensor_msgs.msg import CompressedImage, Image
 from .frames_sidecar import FramesSidecar
 
 LOG = logging.getLogger("fv_episode_recorder.camera")
+VIDEO_TIME_BASE = Fraction(1, 90_000)
 
 
 def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> tuple[subprocess.Popen, str] | None:
@@ -58,6 +60,7 @@ def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> 
             "-i", "pipe:0",
             "-c:v", codec,
             *extra,
+            "-bf", "0",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             str(out_path),
@@ -93,6 +96,74 @@ def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> 
     return None
 
 
+def _timestamp_ticks(stamp_ns: int, first_stamp_ns: int) -> int:
+    elapsed_ns = stamp_ns - first_stamp_ns
+    if elapsed_ns < 0:
+        raise RuntimeError("camera frame timestamps are not monotonic")
+    return round(elapsed_ns * VIDEO_TIME_BASE.denominator / 1_000_000_000)
+
+
+def _remux_mp4_with_ros_timestamps(path: Path, frame_stamps_ns: list[int]) -> None:
+    if not frame_stamps_ns:
+        return
+    tmp_path = path.with_name(f".{path.stem}.vfr{path.suffix}")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    first_stamp_ns = frame_stamps_ns[0]
+    previous_pts = -1
+    packet_count = 0
+    input_container = av.open(str(path), mode="r")
+    output_container = av.open(str(tmp_path), mode="w")
+    try:
+        try:
+            input_stream = input_container.streams.video[0]
+            output_stream = output_container.add_stream_from_template(input_stream)
+            output_stream.time_base = VIDEO_TIME_BASE
+            for packet in input_container.demux(input_stream):
+                if packet.dts is None:
+                    continue
+                if packet_count >= len(frame_stamps_ns):
+                    raise RuntimeError(
+                        f"video packet count exceeds frames sidecar rows: {packet_count + 1}/{len(frame_stamps_ns)}"
+                    )
+                source_duration = packet.duration
+                source_time_base = packet.time_base
+                pts = _timestamp_ticks(frame_stamps_ns[packet_count], first_stamp_ns)
+                if pts <= previous_pts:
+                    raise RuntimeError("camera frame timestamps are not strictly increasing")
+                packet.pts = pts
+                packet.dts = pts
+                packet.time_base = VIDEO_TIME_BASE
+                packet.stream = output_stream
+                if packet_count + 1 < len(frame_stamps_ns):
+                    next_pts = _timestamp_ticks(frame_stamps_ns[packet_count + 1], first_stamp_ns)
+                    packet.duration = max(1, next_pts - pts)
+                elif packet_count > 0:
+                    packet.duration = max(1, pts - previous_pts)
+                else:
+                    if source_duration is None or source_duration <= 0 or source_time_base is None:
+                        raise RuntimeError("single-frame video packet has no duration")
+                    packet.duration = max(
+                        1,
+                        round(source_duration * source_time_base / VIDEO_TIME_BASE),
+                    )
+                output_container.mux(packet)
+                previous_pts = pts
+                packet_count += 1
+            if packet_count != len(frame_stamps_ns):
+                raise RuntimeError(
+                    f"video packet count mismatch: {packet_count}/{len(frame_stamps_ns)}"
+                )
+        finally:
+            input_container.close()
+            output_container.close()
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    tmp_path.replace(path)
+
+
 class CameraWriter:
     """One worker per camera: subscribes, encodes, writes mp4 + sidecar."""
 
@@ -122,6 +193,7 @@ class CameraWriter:
         self._frame_index = 0
         self._segment_local = 0
         self._last_recv_ns = 0
+        self._frame_stamps_ns: list[int] = []
         self._lock = threading.Lock()
         self._sub = None
         self._recording_enabled = threading.Event()
@@ -154,9 +226,11 @@ class CameraWriter:
             if self._stopped:
                 return
             recv_ns = time.time_ns()
-            self._first_frame_received = True
-            if not self._recording_enabled.is_set():
+            ros_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+            if ros_stamp_ns <= 0:
+                LOG.warning("[%s] ROS header stamp is missing, skipping frame", self.name)
                 return
+            self._first_frame_received = True
             # decode jpeg/png compressed bytes
             arr = np.frombuffer(msg.data, dtype=np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -174,6 +248,8 @@ class CameraWriter:
                 self.height = h
                 LOG.info("[%s] first frame %dx%d → %s (%s)",
                          self.name, w, h, self._segment_file, self._codec_in_use)
+            if not self._recording_enabled.is_set():
+                return
 
             try:
                 self._ffmpeg.stdin.write(img.tobytes())
@@ -181,10 +257,6 @@ class CameraWriter:
                 LOG.warning("[%s] ffmpeg pipe write failed: %s", self.name, exc)
                 return
 
-            ros_stamp_ns = (
-                msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-                if msg.header.stamp.sec or msg.header.stamp.nanosec else recv_ns
-            )
             self._sidecar.append({
                 "frame_index": self._frame_index,
                 "segment_file": self._segment_file.name,
@@ -195,6 +267,7 @@ class CameraWriter:
                 "dropped_before": 0,  # naive (Phase 1.5 fills with seq gap detection)
                 "keyframe": True,  # mp4v: every frame is intra-coded; refine later
             })
+            self._frame_stamps_ns.append(ros_stamp_ns)
             self._frame_index += 1
             self._segment_local += 1
             self.frame_count += 1
@@ -229,24 +302,58 @@ class CameraWriter:
 
     def finalize(self) -> dict:
         with self._lock:
+            ffmpeg_error: str | None = None
             if self._ffmpeg is not None:
                 try:
-                    self._ffmpeg.wait(timeout=15)
+                    returncode = self._ffmpeg.wait(timeout=15)
                 except subprocess.TimeoutExpired:
                     LOG.warning("[%s] ffmpeg flush timeout, killing", self.name)
                     self._ffmpeg.kill()
-                    self._ffmpeg.wait(timeout=3)
+                    returncode = self._ffmpeg.wait(timeout=3)
+                if returncode != 0:
+                    ffmpeg_error = f"ffmpeg exited with code {returncode}"
                 self._ffmpeg = None
-            self._sidecar.close()
+            sidecar_rows = self._sidecar.close()
+            if ffmpeg_error is not None:
+                raise RuntimeError(ffmpeg_error)
+            if self.frame_count > 0:
+                if sidecar_rows != self.frame_count:
+                    raise RuntimeError(
+                        f"frames sidecar row count mismatch: {sidecar_rows}/{self.frame_count}"
+                    )
+                _remux_mp4_with_ros_timestamps(self._segment_file, self._frame_stamps_ns)
+                self._validate_video_readable()
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
         return self.summary()
+
+    def _validate_video_readable(self) -> None:
+        if not self._segment_file.exists() or self._segment_file.stat().st_size <= 0:
+            raise RuntimeError(f"video file missing or empty: {self._segment_file}")
+        cap = cv2.VideoCapture(str(self._segment_file))
+        try:
+            if not cap.isOpened():
+                raise RuntimeError(f"video cannot be opened: {self._segment_file}")
+            ok, _frame = cap.read()
+            if not ok:
+                raise RuntimeError(f"video frame 0 cannot be read: {self._segment_file}")
+            if self.frame_count > 1:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, self.frame_count - 1)
+                ok, _frame = cap.read()
+                if not ok:
+                    raise RuntimeError(
+                        f"video final frame {self.frame_count - 1} cannot be read: {self._segment_file}"
+                    )
+        finally:
+            cap.release()
 
     def summary(self) -> dict:
         size_bytes = self._segment_file.stat().st_size if self._segment_file.exists() else 0
         return {
             "name": self.name,
             "topic": self.topic,
+            "video_timing_mode": "ros_header_stamp_to_pts",
+            "video_pts_origin_ros_ns": self._frame_stamps_ns[0] if self._frame_stamps_ns else None,
             "width": self.width,
             "height": self.height,
             "fps_nominal": self.fps_nominal,
@@ -311,6 +418,10 @@ class DepthCameraWriter:
             if self._stopped:
                 return
             recv_ns = time.time_ns()
+            ros_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+            if ros_stamp_ns <= 0:
+                LOG.warning("[%s] ROS header stamp is missing, skipping depth frame", self.name)
+                return
             self._encoding_seen = msg.encoding
             # Depth conventions: 16UC1 (mm, RealSense) or mono16 (also 16-bit).
             # 32FC1 (m, float) is converted to mm so we get a fixed-range PNG.
@@ -333,10 +444,6 @@ class DepthCameraWriter:
                 return
             self.width = msg.width
             self.height = msg.height
-            ros_stamp_ns = (
-                msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-                if msg.header.stamp.sec or msg.header.stamp.nanosec else recv_ns
-            )
             self._sidecar.append({
                 "frame_index": self._frame_index,
                 "segment_file": png_path.name,

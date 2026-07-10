@@ -255,6 +255,22 @@ async def _wait_recording_ready(
         await asyncio.sleep(_READY_POLL_S)
 
 
+async def _wait_first_recorded_frames(camera_pool: CameraWriterPool) -> dict[str, int]:
+    deadline = asyncio.get_running_loop().time() + _READY_TIMEOUT_S
+    last_counts: dict[str, int] = {}
+    while True:
+        last_counts = camera_pool.frame_counts()
+        missing_cameras = [name for name, count in last_counts.items() if count <= 0]
+        if not missing_cameras:
+            return last_counts
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError(
+                "first recorded frame timeout: "
+                f"missing_cameras={missing_cameras} frame_counts={last_counts}"
+            )
+        await asyncio.sleep(_READY_POLL_S)
+
+
 def _fail_start_episode(
     *,
     store: EpisodeStore,
@@ -640,7 +656,32 @@ async def _start_episode(request: web.Request) -> web.Response:
         **(meta.quality_metrics or {}),
         "recording_ready": recording_ready_payload,
     }
+    store._write_meta(ep_dir, meta)  # noqa: SLF001
     camera_pool.enable_recording()
+
+    try:
+        first_recorded_frames = await _wait_first_recorded_frames(camera_pool)
+    except RuntimeError as exc:
+        detail = str(exc)
+        LOG.warning("episode first recorded frame failed: %s", detail)
+        _fail_start_episode(
+            store=store,
+            bag_recorder=bag_recorder,
+            camera_pool=camera_pool,
+            depth_pool=depth_pool,
+            active_lock=active_lock,
+            code="first_recorded_frame_timeout",
+            detail=detail,
+        )
+        return web.json_response(
+            {"error": "first_recorded_frame_timeout", "detail": detail},
+            status=503,
+        )
+
+    meta.quality_metrics = {
+        **(meta.quality_metrics or {}),
+        "first_recorded_frames": first_recorded_frames,
+    }
     store._write_meta(ep_dir, meta)  # noqa: SLF001
 
     resp = StartEpisodeResponse(
@@ -651,7 +692,8 @@ async def _start_episode(request: web.Request) -> web.Response:
         recorded_topics_resolved=meta.recorded_topics,
         preflight={**preflight, "bag_started": bag_started,
                    "cameras_started": [c["name"] for c in cameras_started],
-                   "recording_ready": recording_ready_payload},
+                   "recording_ready": recording_ready_payload,
+                   "first_recorded_frames": first_recorded_frames},
     )
     LOG.info("episode started: %s task=%s profile=%s bag_topics=%d bag_started=%s",
              ep_id, req.task_description, req.profile, len(bag_topics), bag_started)
@@ -793,6 +835,11 @@ def _finalize_stopped_episode_sync(
         LOG.exception("camera finalize failed: %s", meta.episode_id)
         camera_summaries = []
         errors.append(f"camera: {exc}")
+    for camera_summary in camera_summaries:
+        kind = str(camera_summary.get("kind") or "color").lower()
+        if not kind.startswith("depth") and int(camera_summary.get("frame_count") or 0) <= 0:
+            name = camera_summary.get("name") or "<unknown>"
+            errors.append(f"camera {name}: no recorded frames")
 
     video_size_bytes = 0
     for camera_summary in camera_summaries:
@@ -1673,8 +1720,8 @@ async def _retention_get_policy(request: web.Request) -> web.Response:
 
 
 async def _retention_put_policy(request: web.Request) -> web.Response:
-    """Save an operator override policy. Pass {"enabled": false} or DELETE to
-    clear and fall back to the profile default."""
+    """Save an operator override policy. Pass {"clear": true} to fall back
+    to the profile default."""
     runner = request.app.get("retention_runner")
     if runner is None:
         return web.json_response({"enabled": False, "error": "retention_runner_not_wired"}, status=503)
@@ -1683,7 +1730,7 @@ async def _retention_put_policy(request: web.Request) -> web.Response:
     except Exception:
         body = {}
     from .retention import RetentionPolicy
-    if not body or body.get("clear"):
+    if body.get("clear"):
         runner.clear_override()
     else:
         runner.set_policy(RetentionPolicy.from_dict(body))

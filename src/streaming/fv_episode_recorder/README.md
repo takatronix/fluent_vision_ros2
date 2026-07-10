@@ -31,4 +31,4 @@ curl http://localhost:8083/api/v1/episodes
 
 ## Design
 
-See `vlabor_ros2/docs/調整中/20260531_VLAbor_エピソード保存再生機能_設計書.md`.
+- [FV EpisodeからLeRobot Datasetへの変換仕様](../fv_lerobot_exporter/docs/lerobot_dataset_export.md)

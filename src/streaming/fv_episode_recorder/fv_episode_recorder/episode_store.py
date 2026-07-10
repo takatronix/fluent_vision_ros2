@@ -7,7 +7,9 @@ sqlite index / FTS / tags table are Phase 2.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -24,6 +26,13 @@ SCHEMA_VERSION = 1
 _FORBIDDEN_FS_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 _WHITESPACE = re.compile(r'\s+')
 _MULTI_UNDERSCORE = re.compile(r'_+')
+
+
+def _prepare_shared_directory(path: Path, shared_gid: int) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chown(path, -1, shared_gid)
+    mode = stat.S_IMODE(path.stat().st_mode)
+    path.chmod(mode | stat.S_ISGID | stat.S_IRWXG)
 
 
 def utc_now_iso() -> str:
@@ -120,6 +129,9 @@ class EpisodeStore:
 
     def __init__(self, output_dir: str | Path):
         self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.shared_gid = self.output_dir.stat().st_gid
+        _prepare_shared_directory(self.output_dir / "episodes", self.shared_gid)
         self._lock = threading.Lock()
         self._active_episode: Optional[EpisodeMeta] = None
         self._active_dir: Optional[Path] = None
@@ -147,9 +159,9 @@ class EpisodeStore:
                     f"another episode already active: {self._active_episode.episode_id}"
                 )
             ep_dir = self._episode_dir(meta)
-            ep_dir.mkdir(parents=True, exist_ok=True)
-            (ep_dir / "bag").mkdir(exist_ok=True)
-            (ep_dir / "videos").mkdir(exist_ok=True)
+            _prepare_shared_directory(ep_dir, self.shared_gid)
+            _prepare_shared_directory(ep_dir / "bag", self.shared_gid)
+            _prepare_shared_directory(ep_dir / "videos", self.shared_gid)
             self._active_episode = meta
             self._active_dir = ep_dir
             self._write_meta(ep_dir, meta)

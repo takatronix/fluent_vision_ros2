@@ -184,6 +184,9 @@ class FVEpisodeRecorderNode(Node):
 
 
 def main(args=None):
+    # Child writers inherit this umask, so setgid episode directories produce
+    # group-writable files without changing the rest of the VLAbor container.
+    os.umask(0o002)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

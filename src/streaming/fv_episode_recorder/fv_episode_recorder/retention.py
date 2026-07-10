@@ -309,6 +309,11 @@ class RetentionRunner:
                         "reasons": c.reasons,
                         "size_bytes": c.size_bytes,
                     })
+                    try:
+                        self.store.index.delete(c.meta.episode_id)
+                    except Exception as exc:
+                        LOG.warning("retention: index delete failed for %s: %s",
+                                    c.meta.episode_id, exc)
                     del self._scheduled[c.meta.episode_id]
                     LOG.info("retention: deleted %s (%s, %d bytes) reasons=%s",
                              c.meta.episode_id, c.meta.task_description,
