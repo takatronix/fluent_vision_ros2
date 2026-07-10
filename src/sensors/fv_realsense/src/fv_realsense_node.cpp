@@ -1057,6 +1057,12 @@ void FVDepthCameraNode::processingLoop()
     int depth_pub_count = 0;
     auto last_log_time = std::chrono::steady_clock::now();
     bool warned = false;
+    bool warned_depth = false;
+    // Baseline for the depth watchdog when no depth frame has arrived at
+    // all (e.g. the sensor opened color-only after a respawn).
+    const int64_t loop_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count();
     
     while (running_ && rclcpp::ok()) {
         try {
@@ -1157,6 +1163,33 @@ void FVDepthCameraNode::processingLoop()
                             depth_item = std::move(depth_queue_.back());
                             depth_queue_.clear();
                             got_depth = true;
+                        }
+                    }
+
+                    // Depth-only stall watchdog. The color-keyed check below
+                    // never runs while color frames keep arriving, so a depth
+                    // stream dying alone (observed in production as a partial
+                    // USB failure: color stayed at 30Hz, depth silent for
+                    // 45min) previously went undetected forever. Same
+                    // exit+respawn recovery, same thresholds.
+                    if (got_depth) {
+                        warned_depth = false;
+                    } else if (got_color && stream_config_.depth_enabled && stall_restart_ms_ > 0) {
+                        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now().time_since_epoch())
+                                                   .count();
+                        const int64_t last_d_ns = last_depth_recv_ns_.load(std::memory_order_relaxed);
+                        const int64_t base_ns = (last_d_ns > 0) ? last_d_ns : loop_start_ns;
+                        const int64_t d_stall_ms = (now_ns - base_ns) / 1000000;
+                        if (stall_warn_ms_ > 0 && d_stall_ms >= stall_warn_ms_ && !warned_depth) {
+                            RCLCPP_WARN(this->get_logger(),
+                                        "⚠️ No depth frames for %ldms while color continues (mode=2)",
+                                        (long)d_stall_ms);
+                            warned_depth = true;
+                        }
+                        if (d_stall_ms >= stall_restart_ms_) {
+                            exitForSupervisedRestart(
+                                std::to_string((long)d_stall_ms) + "ms depth stall (mode=2, color still alive)");
                         }
                     }
 
