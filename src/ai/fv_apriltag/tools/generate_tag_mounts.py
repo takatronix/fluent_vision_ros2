@@ -233,6 +233,58 @@ def generate_peg_two_piece(paper_mm: float, stake_mm: float,
           f' — both fit a 180mm bed straight')
 
 
+def generate_flat_plate_3mf(tag_id: int, tag_mm: float, out_3mf: Path,
+                            label: str = 'CALIB') -> None:
+    """Face-DOWN two-colour tag plate (calibration grade).
+
+    The tag face sits at z=0 and prints ON THE BED: black and white
+    share the same first layers, so the finished face has ZERO step
+    (the raised-pillar plates put black 1 mm proud — a parallax error
+    at oblique views that matters for hand-eye calibration). Because
+    the face is viewed from BELOW after flipping the part, the cell
+    pattern is MIRRORED in the model; a decode check on the projected
+    bed face must pass before trusting the output. The back carries a
+    FLUSH inset label (black letters level with the white back — no
+    bumps, the plate lies flat). tag_mm × tag_mm × 3 mm: drops into
+    the same pockets as the paper cutouts."""
+    from generate_cube_assets import (fetch_tag_array, _render_text_mask,
+                                      _mask_to_rects, write_cube_plates_3mf)
+    pattern = fetch_tag_array(tag_id)          # 10×10, 0=black
+    cell = tag_mm / 10.0
+    pat_t, body_t, txt_t = 1.0, 3.0, 0.4
+    black: List[Tri] = []
+    white: List[Tri] = []
+    for r in range(10):
+        for c in range(10):
+            x0 = (9 - c) * cell                # mirror X for face-down
+            y0 = (9 - r) * cell
+            dst = black if pattern[r, c] == 0 else white
+            dst += _box_triangles(x0, y0, 0.0,
+                                  x0 + cell, y0 + cell, pat_t)
+    white += _box_triangles(0, 0, pat_t, tag_mm, tag_mm, body_t - txt_t)
+    # back label band (flush inset): black text rects + white complement
+    band_h = 10.0
+    band_y0 = (tag_mm - band_h) / 2.0
+    mask = _render_text_mask([label], tag_mm - 4.0, band_h)
+    ppm = mask.shape[1] / (tag_mm - 4.0)
+    z0, z1 = body_t - txt_t, body_t
+    white += _box_triangles(0, 0, z0, tag_mm, band_y0, z1)
+    white += _box_triangles(0, band_y0 + band_h, z0, tag_mm, tag_mm, z1)
+    white += _box_triangles(0, band_y0, z0, 2.0, band_y0 + band_h, z1)
+    white += _box_triangles(tag_mm - 2.0, band_y0, z0,
+                            tag_mm, band_y0 + band_h, z1)
+    for inverted, dst in ((False, black), (True, white)):
+        for c0, r0, c1, r1 in _mask_to_rects(mask, inverted=inverted):
+            dst += _box_triangles(
+                2.0 + c0 / ppm, band_y0 + band_h - r1 / ppm, z0,
+                2.0 + c1 / ppm, band_y0 + band_h - r0 / ppm, z1)
+    write_cube_plates_3mf(out_3mf, [('flat', tag_id, white, black, [])],
+                          cube_label=f'flat_id{tag_id:03d}',
+                          plate_size_mm=tag_mm)
+    print(f'flat plate: {out_3mf}  {tag_mm}x{tag_mm}x{body_t}mm '
+          f'(face-down 2-colour, {len(black)}+{len(white)} tris)')
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out-dir', required=True)
@@ -245,6 +297,10 @@ def main() -> int:
                         'peg for a Bambu A1 mini (180mm bed): small '
                         'pegs fit straight, large pegs on the diagonal '
                         '(~250mm max)')
+    p.add_argument('--flat-plate-id', type=int, default=None,
+                   help='also emit a face-down two-colour plate 3MF '
+                        'for this tag id (calibration grade, zero-step '
+                        'face)')
     args = p.parse_args()
     out = Path(args.out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -262,6 +318,10 @@ def main() -> int:
                 s, stake,
                 out / f'tag_peg_paper{int(s)}_tag{tag}_plate.stl',
                 out / f'tag_peg_paper{int(s)}_tag{tag}_stake.stl')
+    if args.flat_plate_id is not None:
+        generate_flat_plate_3mf(
+            args.flat_plate_id, 50.0,
+            out / f'tag_plate_flat_id{args.flat_plate_id:03d}_50mm.3mf')
     return 0
 
 
