@@ -31,20 +31,23 @@ cameras:
     camera_frame:     d405_optical_frame
 
 cubes:
+  # "cube60" labels are historical (printed 60mm bodies retired
+  # 2026-07-12): tags are now pasted directly onto the REAL 50mm cubes.
+  # Names kept for topic/viewer wiring compatibility.
   cube60_a:
-    size: 0.060
+    size: 0.050
     tag_size: 0.040  # BLACK border edge. Prints render the 10x10 block (incl. its built-in white ring) at 50mm -> black = 40mm
     origin: bottom_center
     faces: {top: 1, front: 2, right: 3, back: 4, left: 5, bottom: 6}
 
   cube60_b:
-    size: 0.060
+    size: 0.050
     tag_size: 0.040  # BLACK border edge. Prints render the 10x10 block (incl. its built-in white ring) at 50mm -> black = 40mm
     origin: bottom_center
     faces: {top: 7, front: 8, right: 9, back: 10, left: 11, bottom: 12}
 
   cube60_c:
-    size: 0.060
+    size: 0.050
     tag_size: 0.040  # BLACK border edge. Prints render the 10x10 block (incl. its built-in white ring) at 50mm -> black = 40mm
     origin: bottom_center
     faces: {top: 13, front: 14, right: 15, back: 16, left: 17, bottom: 18}

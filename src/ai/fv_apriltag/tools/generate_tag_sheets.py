@@ -24,11 +24,13 @@ from generate_cube_assets import fetch_tag_array, _font_for_box  # noqa: E402
 
 DPI = 300.0
 A4_MM = (210.0, 297.0)
-# Cut slack only: the tag36h11 artwork already CONTAINS its required
-# white quiet ring (1 cell = tag_mm/10 per side), so the cut box only
-# needs scissor slack beyond the artwork edge. Mount pockets must be
-# sized to paper = tag_mm + 2*MARGIN_MM.
-MARGIN_MM = 2.0
+# The tag36h11 artwork already CONTAINS its required white quiet ring
+# (1 cell = tag_mm/10 per side), so the cut line sits ON the artwork
+# edge: a "50 mm tag" cutout really measures 50 mm overall (black
+# square = 40 mm). The white mounts' pocket rim supplies extra quiet
+# zone; only when pasting directly onto a DARK surface leave extra
+# white beyond the line. Mount pockets = tag_mm + 2*MARGIN_MM.
+MARGIN_MM = 0.0
 CUT_GRAY = 185         # light gray cut line — visible, not distracting
 CUT_W_MM = 0.35
 
@@ -86,12 +88,42 @@ def make_sheet(entries: List[Tuple[int, str]], tag_mm: float,
           f'{cols}col)')
 
 
+FACE_NAMES = ('top', 'front', 'right', 'back', 'left', 'bottom')
+CUBE_BASE_IDS = {'60A': 1, '60B': 7, '60C': 13,
+                 '100A': 21, '100B': 27, '100C': 33}
+
+
+def cube_entries(*cubes: str) -> List[Tuple[int, str]]:
+    """Face tags of the given cubes (id layout per cube_kit MANIFEST:
+    ids run top,front,right,back,left,bottom from the cube's base id).
+    All cube faces use 50 mm tags regardless of cube size."""
+    out: List[Tuple[int, str]] = []
+    for cube in cubes:
+        base = CUBE_BASE_IDS[cube]
+        out += [(base + i, f'{cube} {f.upper()}')
+                for i, f in enumerate(FACE_NAMES)]
+    return out
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out-dir', required=True)
+    p.add_argument('--cube-kit-out', default=None,
+                   help='also generate the cube-face sheets here '
+                        '(2 cubes = 12 faces per A4)')
     args = p.parse_args()
     out = Path(args.out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
+
+    if args.cube_kit_out:
+        ck = Path(args.cube_kit_out).expanduser()
+        ck.mkdir(parents=True, exist_ok=True)
+        make_sheet(cube_entries('60A', '60B'), 50.0,
+                   ck / 'sheet_cube60_ab_id01-12_50mm')
+        make_sheet(cube_entries('60C', '100A'), 50.0,
+                   ck / 'sheet_cube60c_100a_id13-26_50mm')
+        make_sheet(cube_entries('100B', '100C'), 50.0,
+                   ck / 'sheet_cube100_bc_id27-38_50mm')
 
     # Calibration spares: 12× ID 0 (paper tags wear; recut, re-paste).
     make_sheet([(0, 'CALIB')] * 12, 50.0,

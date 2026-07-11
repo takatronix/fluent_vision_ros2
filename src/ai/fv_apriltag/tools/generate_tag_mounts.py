@@ -236,9 +236,10 @@ def generate_peg_two_piece(paper_mm: float, stake_mm: float,
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out-dir', required=True)
-    p.add_argument('--paper-sizes', default='54,104',
-                   help='comma list of paper sizes [mm] '
-                        '(tag artwork + cut slack, see sheet generator)')
+    p.add_argument('--paper-sizes', default='50,100',
+                   help='comma list of paper sizes [mm] = the tag '
+                        'nominal size (cut line sits on the artwork '
+                        'edge, see sheet generator)')
     p.add_argument('--stake-mm', type=float, default=None,
                    help='stake length override [mm]. Default sizes the '
                         'peg for a Bambu A1 mini (180mm bed): small '
@@ -248,7 +249,7 @@ def main() -> int:
     out = Path(args.out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     for s in [float(v) for v in args.paper_sizes.split(',')]:
-        tag = int(round(s / 1.08 / 10) * 10)  # nominal block ≈ paper − slack
+        tag = int(s)          # paper == nominal (cut on the artwork edge)
         stake = args.stake_mm if args.stake_mm is not None else (
             70.0 if s <= 80 else 80.0)
         generate_stand(s, out / f'tag_stand_paper{int(s)}_tag{tag}.stl')
