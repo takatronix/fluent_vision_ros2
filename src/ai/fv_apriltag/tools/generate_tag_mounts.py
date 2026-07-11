@@ -168,20 +168,99 @@ def generate_peg(paper_mm: float, stake_mm: float, out: Path) -> None:
           f'tip {tip:.0f}mm  total {total:.0f}mm')
 
 
+def generate_peg_two_piece(paper_mm: float, stake_mm: float,
+                           out_plate: Path, out_stake: Path) -> None:
+    """Two-piece peg for LARGE tags on small printers (Bambu A1 mini,
+    180 mm bed): a 104 mm-paper plate is too wide to fit any one-piece
+    peg even diagonally (width + length > bed diagonal). The stake
+    slides into a downward-open socket on the plate back (friction
+    fit; add a drop of glue for the field).
+
+    Plate part prints POCKET-FACE-DOWN so the socket rails can grow
+    upward; the 0.6 mm pocket outline sits in layer 1 (paper hides
+    the floor finish)."""
+    pocket = paper_mm + POCKET_CLEARANCE_MM
+    plate = pocket + 2 * BORDER_MM
+    cx = plate / 2.0
+    ch_w, ch_d = 24.8, 6.5          # socket channel: width / rail height
+    ch_len = 70.0
+    tris: List[Tri] = []
+    # pocket-down plate: rim strips z 0..0.6 + solid slab above
+    bx = (plate - pocket) / 2.0
+    tris += _box_triangles(0, 0, 0, plate, bx, POCKET_DEPTH_MM)
+    tris += _box_triangles(0, plate - bx, 0, plate, plate, POCKET_DEPTH_MM)
+    tris += _box_triangles(0, bx, 0, bx, plate - bx, POCKET_DEPTH_MM)
+    tris += _box_triangles(plate - bx, bx, 0, plate, plate - bx,
+                           POCKET_DEPTH_MM)
+    tris += _box_triangles(0, 0, POCKET_DEPTH_MM, plate, plate, PLATE_T_MM)
+    # socket rails + cover + end stop (back side, opening at y=0)
+    z0, z1 = PLATE_T_MM, PLATE_T_MM + ch_d
+    z2 = z1 + 3.0
+    tris += _box_triangles(cx - ch_w / 2 - 6, 0, z0,
+                           cx - ch_w / 2, ch_len, z1)
+    tris += _box_triangles(cx + ch_w / 2, 0, z0,
+                           cx + ch_w / 2 + 6, ch_len, z1)
+    tris += _box_triangles(cx - ch_w / 2 - 6, 0, z1,
+                           cx + ch_w / 2 + 6, ch_len, z2)
+    tris += _box_triangles(cx - ch_w / 2, ch_len, z0,
+                           cx + ch_w / 2, ch_len + 6, z2)
+    write_stl_ascii(tris, out_plate,
+                    name=f'fv_tag_peg2_plate_{int(paper_mm)}')
+    # stake part: tongue + body + tip (prints flat)
+    t_w, t_t, t_len = ch_w - 0.8, ch_d - 0.5, ch_len - 4.0
+    body_w, body_t = 22.0, 12.0
+    s: List[Tri] = []
+    sx = body_w / 2.0
+    s += _box_triangles(sx - t_w / 2, 0, 0, sx + t_w / 2, t_len, t_t)
+    s += _box_triangles(0, t_len, 0, body_w, t_len + stake_mm, body_t)
+    tip = 28.0
+    y0 = t_len + stake_mm
+    s += [
+        _tri((0, y0, 0), (body_w, y0, 0), (sx, y0 + tip, 0)),
+        _tri((0, y0, body_t), (sx, y0 + tip, body_t), (body_w, y0, body_t)),
+        _tri((0, y0, 0), (sx, y0 + tip, 0), (0, y0, body_t)),
+        _tri((0, y0, body_t), (sx, y0 + tip, 0), (sx, y0 + tip, body_t)),
+        _tri((body_w, y0, 0), (body_w, y0, body_t), (sx, y0 + tip, 0)),
+        _tri((body_w, y0, body_t), (sx, y0 + tip, body_t),
+             (sx, y0 + tip, 0)),
+        _tri((0, y0, 0), (0, y0, body_t), (body_w, y0, 0)),
+        _tri((body_w, y0, 0), (0, y0, body_t), (body_w, y0, body_t)),
+    ]
+    write_stl_ascii(s, out_stake,
+                    name=f'fv_tag_peg2_stake_{int(paper_mm)}')
+    print(f'peg 2-piece: plate {plate:.1f}x{plate + 0:.1f}mm '
+          f'(+socket back {z2:.1f}mm) / stake {t_len + stake_mm + tip:.0f}mm'
+          f' — both fit a 180mm bed straight')
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out-dir', required=True)
-    p.add_argument('--paper-sizes', default='60,110',
-                   help='comma list of paper sizes [mm] (tag+margins)')
-    p.add_argument('--stake-mm', type=float, default=150.0)
+    p.add_argument('--paper-sizes', default='54,104',
+                   help='comma list of paper sizes [mm] '
+                        '(tag artwork + cut slack, see sheet generator)')
+    p.add_argument('--stake-mm', type=float, default=None,
+                   help='stake length override [mm]. Default sizes the '
+                        'peg for a Bambu A1 mini (180mm bed): small '
+                        'pegs fit straight, large pegs on the diagonal '
+                        '(~250mm max)')
     args = p.parse_args()
     out = Path(args.out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     for s in [float(v) for v in args.paper_sizes.split(',')]:
-        tag = int(s - 10)
+        tag = int(round(s / 1.08 / 10) * 10)  # nominal block ≈ paper − slack
+        stake = args.stake_mm if args.stake_mm is not None else (
+            70.0 if s <= 80 else 80.0)
         generate_stand(s, out / f'tag_stand_paper{int(s)}_tag{tag}.stl')
-        generate_peg(s, args.stake_mm,
-                     out / f'tag_peg_paper{int(s)}_tag{tag}.stl')
+        if s <= 80:
+            generate_peg(s, stake,
+                         out / f'tag_peg_paper{int(s)}_tag{tag}.stl')
+        else:
+            # one-piece would exceed a 180 mm bed even diagonally
+            generate_peg_two_piece(
+                s, stake,
+                out / f'tag_peg_paper{int(s)}_tag{tag}_plate.stl',
+                out / f'tag_peg_paper{int(s)}_tag{tag}_stake.stl')
     return 0
 
 

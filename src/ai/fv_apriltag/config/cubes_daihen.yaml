@@ -38,36 +38,36 @@ cameras:
 cubes:
   cube60_a:
     size: 0.060
-    tag_size: 0.050
+    tag_size: 0.040  # BLACK border edge. Prints render the 10x10 block (incl. its built-in white ring) at 50mm -> black = 40mm
     origin: bottom_center
     faces: {top: 1, front: 2, right: 3, back: 4, left: 5, bottom: 6}
 
   cube60_b:
     size: 0.060
-    tag_size: 0.050
+    tag_size: 0.040  # BLACK border edge. Prints render the 10x10 block (incl. its built-in white ring) at 50mm -> black = 40mm
     origin: bottom_center
     faces: {top: 7, front: 8, right: 9, back: 10, left: 11, bottom: 12}
 
   cube60_c:
     size: 0.060
-    tag_size: 0.050
+    tag_size: 0.040  # BLACK border edge. Prints render the 10x10 block (incl. its built-in white ring) at 50mm -> black = 40mm
     origin: bottom_center
     faces: {top: 13, front: 14, right: 15, back: 16, left: 17, bottom: 18}
 
   cube100_a:
     size: 0.100
-    tag_size: 0.050
+    tag_size: 0.040  # BLACK border edge. Prints render the 10x10 block (incl. its built-in white ring) at 50mm -> black = 40mm
     origin: bottom_center
     faces: {top: 21, front: 22, right: 23, back: 24, left: 25, bottom: 26}
 
   cube100_b:
     size: 0.100
-    tag_size: 0.050
+    tag_size: 0.040  # BLACK border edge. Prints render the 10x10 block (incl. its built-in white ring) at 50mm -> black = 40mm
     origin: bottom_center
     faces: {top: 27, front: 28, right: 29, back: 30, left: 31, bottom: 32}
 
   cube100_c:
     size: 0.100
-    tag_size: 0.050
+    tag_size: 0.040  # BLACK border edge. Prints render the 10x10 block (incl. its built-in white ring) at 50mm -> black = 40mm
     origin: bottom_center
     faces: {top: 33, front: 34, right: 35, back: 36, left: 37, bottom: 38}

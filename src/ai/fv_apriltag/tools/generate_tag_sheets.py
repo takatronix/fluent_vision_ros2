@@ -24,7 +24,11 @@ from generate_cube_assets import fetch_tag_array, _font_for_box  # noqa: E402
 
 DPI = 300.0
 A4_MM = (210.0, 297.0)
-MARGIN_MM = 5.0        # white quiet zone per side inside the cut box
+# Cut slack only: the tag36h11 artwork already CONTAINS its required
+# white quiet ring (1 cell = tag_mm/10 per side), so the cut box only
+# needs scissor slack beyond the artwork edge. Mount pockets must be
+# sized to paper = tag_mm + 2*MARGIN_MM.
+MARGIN_MM = 2.0
 CUT_GRAY = 185         # light gray cut line — visible, not distracting
 CUT_W_MM = 0.35
 
