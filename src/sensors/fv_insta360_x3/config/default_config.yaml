@@ -1,0 +1,77 @@
+fv_insta360_x3:
+  ros__parameters:
+    device:
+      path: "/dev/v4l/by-id/usb-Amba_Insta360_X3-video-index0"
+      fallback_path: "/dev/video8"
+      reconnect_delay_ms: 1000
+      read_fail_reopen_threshold: 30
+
+    camera:
+      width: 1280
+      height: 720
+      fps: 30
+      pixel_format: "MJPG"
+      rotate_180: false
+
+    streams:
+      raw_enabled: true
+      compressed_enabled: true
+      camera_info_enabled: true
+
+    topics:
+      image_raw: "/x3/image_raw"
+      image_raw_compressed: "/x3/image_raw/compressed"
+      camera_info: "/x3/camera_info"
+
+    camera_info:
+      frame_id: "x3_camera_optical_frame"
+      compressed_quality: 85
+      fx: -1.0
+      fy: -1.0
+      cx: -1.0
+      cy: -1.0
+      distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+fv_insta360_x3_stitcher:
+  ros__parameters:
+    input_topic: "/x3/image_raw"
+    input_layout: "top_bottom"
+
+    calibration:
+      lens_fov_deg: 190.0
+      front_lens: "top"
+      front:
+        center_x: 0.5
+        center_y: 0.25
+        radius_x: 0.5
+        radius_y: 0.25
+        yaw_deg: 0.0
+        roll_deg: 0.0
+      rear:
+        center_x: 0.5
+        center_y: 0.75
+        radius_x: 0.5
+        radius_y: 0.25
+        yaw_deg: 180.0
+        roll_deg: 0.0
+
+    equirectangular:
+      enabled: true
+      topic: "/x3/equirectangular/image_raw"
+      compressed_topic: "/x3/equirectangular/image_raw/compressed"
+      width: 1280
+      height: 640
+
+    view:
+      enabled: true
+      image_topic: "/x3/view/image_raw"
+      compressed_topic: "/x3/view/image_raw/compressed"
+      camera_info_topic: "/x3/view/camera_info"
+      frame_id: "x3_view_optical_frame"
+      width: 640
+      height: 480
+      yaw_deg: 0.0
+      pitch_deg: 0.0
+      roll_deg: 0.0
+      fov_deg: 90.0
+      compressed_quality: 85

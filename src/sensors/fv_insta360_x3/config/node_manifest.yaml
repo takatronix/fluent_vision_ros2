@@ -1,0 +1,72 @@
+# node_manifest.yaml - fv_insta360_x3
+# Dedicated Insta360 X3 UVC camera node.
+
+nodes:
+  - key: fv_insta360_x3
+    package: fv_insta360_x3
+    exec: fv_insta360_x3_node
+    category: sensor
+    label: "Insta360 X3"
+
+    inputs: []
+
+    outputs:
+      - param: topics.image_raw
+        type: image
+        label: image
+      - param: topics.image_raw_compressed
+        type: image
+        label: compressed
+      - param: topics.camera_info
+        type: camera_info
+        label: camera_info
+
+    default_parameters:
+      device:
+        path: "/dev/v4l/by-id/usb-Amba_Insta360_X3-video-index0"
+        fallback_path: "/dev/video8"
+      camera:
+        width: 1280
+        height: 720
+        fps: 30
+        pixel_format: "MJPG"
+      topics:
+        image_raw: "/x3/image_raw"
+        image_raw_compressed: "/x3/image_raw/compressed"
+        camera_info: "/x3/camera_info"
+
+  - key: fv_insta360_x3_stitcher
+    package: fv_insta360_x3
+    exec: fv_insta360_x3_stitcher_node
+    category: transform
+    label: "Insta360 X3 Stitcher"
+
+    inputs:
+      - param: input_topic
+        type: image
+        label: raw
+
+    outputs:
+      - param: equirectangular.topic
+        type: image
+        label: equirectangular
+      - param: equirectangular.compressed_topic
+        type: image
+        label: equirectangular_compressed
+      - param: view.image_topic
+        type: image
+        label: view
+      - param: view.compressed_topic
+        type: image
+        label: view_compressed
+      - param: view.camera_info_topic
+        type: camera_info
+        label: view_camera_info
+
+    default_parameters:
+      input_topic: "/x3/image_raw"
+      view:
+        yaw_deg: 0.0
+        pitch_deg: 0.0
+        roll_deg: 0.0
+        fov_deg: 90.0
