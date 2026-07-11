@@ -1,0 +1,26 @@
+# fv_apriltag tag ID registry — tag36h11 (587 ids).
+# Single source of truth for ID allocation. Update HERE first;
+# printed assets, mount pairing and downstream configs follow this file.
+# Print sizes: tag_mm is the black-border edge; paper = tag_mm + 5mm
+# margin per side (cut along the margin edge).
+family: tag36h11
+allocations:
+  - { ids: [0, 0],     class: handeye_calibration, tag_mm: 50,
+      note: "hand-eye calibration plate (see cube_kit)" }
+  - { ids: [1, 18],    class: cube60_faces,  tag_mm: 50,
+      note: "cube_kit cube60_a..c faces (cubes_piper.yaml)" }
+  - { ids: [19, 20],   class: reserved_buffer }
+  - { ids: [21, 38],   class: cube100_faces, tag_mm: 50,
+      note: "cube_kit cube100_a..c faces" }
+  - { ids: [40, 44],   class: calib_board_aux, tag_mm: 30,
+      note: "multi-tag calibration board (future)" }
+  - { ids: [50, 50],   class: keep_out,  label: "KEEP OUT",  tag_mm: 100,
+      note: "field zone marker: do not enter" }
+  - { ids: [51, 51],   class: stop,      label: "STOP",      tag_mm: 100 }
+  - { ids: [52, 52],   class: slow,      label: "SLOW",      tag_mm: 100 }
+  - { ids: [60, 60],   class: home_dock, label: "HOME",      tag_mm: 100 }
+  - { ids: [61, 61],   class: row_start, label: "ROW START", tag_mm: 100 }
+  - { ids: [62, 62],   class: row_end,   label: "ROW END",   tag_mm: 100 }
+  - { ids: [100, 149], class: mother_stem_no_harvest,
+      label: "MOTHER STEM - NO HARVEST", tag_mm: 50,
+      note: "unique per stem; close-range peg mount" }
