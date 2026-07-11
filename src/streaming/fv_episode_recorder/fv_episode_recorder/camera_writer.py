@@ -103,7 +103,11 @@ def _timestamp_ticks(stamp_ns: int, first_stamp_ns: int) -> int:
     return round(elapsed_ns * VIDEO_TIME_BASE.denominator / 1_000_000_000)
 
 
-def _remux_mp4_with_ros_timestamps(path: Path, frame_stamps_ns: list[int]) -> None:
+def _remux_mp4_with_ros_timestamps(
+    path: Path,
+    frame_stamps_ns: list[int],
+    frame_pts: list[int] | None = None,
+) -> None:
     if not frame_stamps_ns:
         return
     tmp_path = path.with_name(f".{path.stem}.vfr{path.suffix}")
@@ -111,6 +115,13 @@ def _remux_mp4_with_ros_timestamps(path: Path, frame_stamps_ns: list[int]) -> No
         tmp_path.unlink()
 
     first_stamp_ns = frame_stamps_ns[0]
+    expected_pts = frame_pts or [
+        _timestamp_ticks(stamp_ns, first_stamp_ns) for stamp_ns in frame_stamps_ns
+    ]
+    if len(expected_pts) != len(frame_stamps_ns):
+        raise RuntimeError(
+            f"video PTS count mismatch: {len(expected_pts)}/{len(frame_stamps_ns)}"
+        )
     previous_pts = -1
     packet_count = 0
     input_container = av.open(str(path), mode="r")
@@ -120,6 +131,12 @@ def _remux_mp4_with_ros_timestamps(path: Path, frame_stamps_ns: list[int]) -> No
             input_stream = input_container.streams.video[0]
             output_stream = output_container.add_stream_from_template(input_stream)
             output_stream.time_base = VIDEO_TIME_BASE
+            output_container.start_encoding()
+            if output_stream.time_base != VIDEO_TIME_BASE:
+                raise RuntimeError(
+                    "video muxer changed the requested time base: "
+                    f"{output_stream.time_base} != {VIDEO_TIME_BASE}"
+                )
             for packet in input_container.demux(input_stream):
                 if packet.dts is None:
                     continue
@@ -129,7 +146,7 @@ def _remux_mp4_with_ros_timestamps(path: Path, frame_stamps_ns: list[int]) -> No
                     )
                 source_duration = packet.duration
                 source_time_base = packet.time_base
-                pts = _timestamp_ticks(frame_stamps_ns[packet_count], first_stamp_ns)
+                pts = expected_pts[packet_count]
                 if pts <= previous_pts:
                     raise RuntimeError("camera frame timestamps are not strictly increasing")
                 packet.pts = pts
@@ -137,7 +154,7 @@ def _remux_mp4_with_ros_timestamps(path: Path, frame_stamps_ns: list[int]) -> No
                 packet.time_base = VIDEO_TIME_BASE
                 packet.stream = output_stream
                 if packet_count + 1 < len(frame_stamps_ns):
-                    next_pts = _timestamp_ticks(frame_stamps_ns[packet_count + 1], first_stamp_ns)
+                    next_pts = expected_pts[packet_count + 1]
                     packet.duration = max(1, next_pts - pts)
                 elif packet_count > 0:
                     packet.duration = max(1, pts - previous_pts)
@@ -149,6 +166,10 @@ def _remux_mp4_with_ros_timestamps(path: Path, frame_stamps_ns: list[int]) -> No
                         round(source_duration * source_time_base / VIDEO_TIME_BASE),
                     )
                 output_container.mux(packet)
+                if packet.pts != pts or packet.time_base != VIDEO_TIME_BASE:
+                    raise RuntimeError(
+                        "video muxer changed packet PTS before write completion"
+                    )
                 previous_pts = pts
                 packet_count += 1
             if packet_count != len(frame_stamps_ns):
@@ -194,12 +215,13 @@ class CameraWriter:
         self._segment_local = 0
         self._last_recv_ns = 0
         self._frame_stamps_ns: list[int] = []
+        self._frame_pts: list[int] = []
         self._lock = threading.Lock()
         self._sub = None
         self._recording_enabled = threading.Event()
         if record_immediately:
             self._recording_enabled.set()
-        self._first_frame_received = False
+        self._first_observed_ros_ns = 0
         self.frame_count = 0
         self.width = 0
         self.height = 0
@@ -230,7 +252,6 @@ class CameraWriter:
             if ros_stamp_ns <= 0:
                 LOG.warning("[%s] ROS header stamp is missing, skipping frame", self.name)
                 return
-            self._first_frame_received = True
             # decode jpeg/png compressed bytes
             arr = np.frombuffer(msg.data, dtype=np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -248,6 +269,8 @@ class CameraWriter:
                 self.height = h
                 LOG.info("[%s] first frame %dx%d → %s (%s)",
                          self.name, w, h, self._segment_file, self._codec_in_use)
+            if self._first_observed_ros_ns == 0:
+                self._first_observed_ros_ns = ros_stamp_ns
             if not self._recording_enabled.is_set():
                 return
 
@@ -257,10 +280,18 @@ class CameraWriter:
                 LOG.warning("[%s] ffmpeg pipe write failed: %s", self.name, exc)
                 return
 
+            video_pts_origin_ros_ns = (
+                self._frame_stamps_ns[0] if self._frame_stamps_ns else ros_stamp_ns
+            )
+            video_pts = _timestamp_ticks(
+                ros_stamp_ns,
+                video_pts_origin_ros_ns,
+            )
             self._sidecar.append({
                 "frame_index": self._frame_index,
                 "segment_file": self._segment_file.name,
                 "segment_local_frame": self._segment_local,
+                "video_pts": video_pts,
                 "ros_stamp_ns": ros_stamp_ns,
                 "recv_stamp_ns": recv_ns,
                 "source_seq": -1,
@@ -268,6 +299,7 @@ class CameraWriter:
                 "keyframe": True,  # mp4v: every frame is intra-coded; refine later
             })
             self._frame_stamps_ns.append(ros_stamp_ns)
+            self._frame_pts.append(video_pts)
             self._frame_index += 1
             self._segment_local += 1
             self.frame_count += 1
@@ -279,7 +311,13 @@ class CameraWriter:
         self._recording_enabled.set()
 
     def has_observed_frame(self) -> bool:
-        return self._first_frame_received
+        return self._first_observed_ros_ns > 0
+
+    def first_observed_ros_ns(self) -> int:
+        return self._first_observed_ros_ns
+
+    def last_recorded_ros_ns(self) -> int:
+        return self._frame_stamps_ns[-1] if self._frame_stamps_ns else 0
 
     def stop(self) -> dict:
         self.stop_recording()
@@ -321,7 +359,11 @@ class CameraWriter:
                     raise RuntimeError(
                         f"frames sidecar row count mismatch: {sidecar_rows}/{self.frame_count}"
                     )
-                _remux_mp4_with_ros_timestamps(self._segment_file, self._frame_stamps_ns)
+                _remux_mp4_with_ros_timestamps(
+                    self._segment_file,
+                    self._frame_stamps_ns,
+                    self._frame_pts,
+                )
                 self._validate_video_readable()
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
@@ -354,6 +396,8 @@ class CameraWriter:
             "topic": self.topic,
             "video_timing_mode": "ros_header_stamp_to_pts",
             "video_pts_origin_ros_ns": self._frame_stamps_ns[0] if self._frame_stamps_ns else None,
+            "video_time_base_num": VIDEO_TIME_BASE.numerator,
+            "video_time_base_den": VIDEO_TIME_BASE.denominator,
             "width": self.width,
             "height": self.height,
             "fps_nominal": self.fps_nominal,
@@ -448,6 +492,7 @@ class DepthCameraWriter:
                 "frame_index": self._frame_index,
                 "segment_file": png_path.name,
                 "segment_local_frame": self._frame_index,
+                "video_pts": None,
                 "ros_stamp_ns": ros_stamp_ns,
                 "recv_stamp_ns": recv_ns,
                 "source_seq": -1,
@@ -597,6 +642,24 @@ class CameraWriterPool:
             name: 1 if writer.has_observed_frame() else 0
             for name, writer in self._writers.items()
         }
+
+    def observed_frame_stamps_ns(self) -> dict[str, int]:
+        return {
+            name: writer.first_observed_ros_ns()
+            for name, writer in self._writers.items()
+        }
+
+    def recorded_frame_stamps_ns(self) -> dict[str, int]:
+        return {
+            name: writer.last_recorded_ros_ns()
+            for name, writer in self._writers.items()
+        }
+
+    def ros_now_ns(self) -> int:
+        now_ns = int(self._node.get_clock().now().nanoseconds)
+        if now_ns <= 0:
+            raise RuntimeError("recorder ROS clock did not return a positive timestamp")
+        return now_ns
 
     def enable_recording(self) -> None:
         for writer in self._writers.values():

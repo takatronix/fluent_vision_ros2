@@ -6,9 +6,16 @@ Phase 1 Step 1 — minimal start/stop/list/get only. Other endpoints land later.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _normalize_tags(tags: list[str]) -> list[str]:
+    normalized = [tag.strip() for tag in tags]
+    if any(not tag or len(tag) > 64 for tag in normalized):
+        raise ValueError("tags must contain 1 to 64 characters")
+    return list(dict.fromkeys(normalized))
 
 
 # ---------- Episode lifecycle ----------
@@ -28,14 +35,29 @@ class StartEpisodeRequest(BaseModel):
     fps: int = Field(default=30, ge=1, le=120)
     record_bag: bool = True
 
-
 class StartEpisodeResponse(BaseModel):
     episode_id: str
     started_at: str
+    timeline_start_ros_ns: int = Field(..., gt=0)
     bag_path: str
     meta_path: str
     recorded_topics_resolved: list[dict[str, Any]] = Field(default_factory=list)
     preflight: dict[str, Any] = Field(default_factory=dict)
+
+
+class RecordingReadyTimeoutResponse(BaseModel):
+    error: Literal["recording_ready_timeout"] = "recording_ready_timeout"
+    code: Literal["recording_ready_timeout"] = "recording_ready_timeout"
+    message: str = "recording inputs did not become ready before timeout"
+    bag_ready: bool
+    missing_bag: list[str]
+    missing_cameras: list[str]
+    bag_counts: dict[str, int]
+    camera_counts: dict[str, int]
+    first_bag_timestamp_ns: dict[str, int]
+    first_camera_stamp_ros_ns: dict[str, int]
+    bag_timestamp_source: str
+    timeout_s: float = Field(..., gt=0)
 
 
 class StopEpisodeRequest(BaseModel):
@@ -46,10 +68,25 @@ class StopEpisodeResponse(BaseModel):
     episode_id: str
     state: str
     duration_s: float
+    timeline_end_ros_ns: int = Field(..., gt=0)
     frame_count_per_camera: dict[str, int] = Field(default_factory=dict)
     bag_size_bytes: int = 0
     video_size_bytes: int = 0
     manifest_pending: bool = True
+
+
+class AddEpisodeTagsRequest(BaseModel):
+    tags: list[str] = Field(..., min_length=1, max_length=32)
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, tags: list[str]) -> list[str]:
+        return _normalize_tags(tags)
+
+
+class AddEpisodeTagsResponse(BaseModel):
+    episode_id: str
+    tags: list[str]
 
 
 # ---------- List / Get ----------

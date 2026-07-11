@@ -24,7 +24,6 @@ flowchart LR
         REQUEST["LerobotDatasetExportRequest"]
         PROFILE["解決済みprofile payload"]
         CORE["fv_lerobot_exporter<br/>検証、整列、dataset組立"]
-        PROGRESS["progress callback"]
     end
 
     TMP[("一時dataset<br/>.lerobot_exports/{id}")]
@@ -34,7 +33,6 @@ flowchart LR
     RAW --> CORE
     REQUEST --> CORE
     PROFILE --> CORE
-    CORE --> PROGRESS
     CORE --> TMP -->|"atomic rename"| DATASET
 ```
 
@@ -46,7 +44,7 @@ flowchart LR
 
 変換処理は、選択された複数のFV episodeから一つのLeRobot v3 datasetを生成する。
 
-変換時にcamera画像を再エンコードせず、収録時のROS timestampと動画PTSの対応を保持する。
+変換時にcamera画像を再エンコードせず、収録時に確定したROS timestamp、量子化後の動画PTS、MP4 packetの対応を保持する。
 
 必要な入力が欠けるepisodeを飛ばして成功扱いにせず、dataset全体の作成を失敗させる。
 
@@ -66,14 +64,12 @@ flowchart LR
 | --- | --- |
 | `dataset_id` | 出力先を一意に決める相対ID |
 | `dataset_name` | datasetの表示名 |
-| `episode_ids` | 一件以上の順序付きepisode ID列 |
+| `episode_ids` | 一件以上の重複しない順序付きepisode ID列 |
 | `fps` | LeRobot rowの基準FPS、1以上120以下 |
 | `max_alignment_error_s` | camera、state、actionの最大許容時刻差 |
 | `max_mux_status_age_s` | mux sourceを有効とみなす最大経過時間 |
 
-現行変換core単体は重複を検証しない。
-
-同じepisode IDを複数回指定した場合は、その出現順のまま複数episodeとして出力する。
+同じepisode IDを複数回指定したrequestは入力境界で拒否する。
 
 `max_alignment_error_s`は次の上限以下にする。
 
@@ -102,14 +98,17 @@ profileの`lerobot`セクションだけをLeRobot featureの意味と順序の�
 - `state == "finished"`
 - `outcome == "success"`
 - `started_at`が確定している
+- `timeline_start_ros_ns`と`timeline_end_ros_ns`が確定している
+- 両方の値が0より大きい
+- `timeline_start_ros_ns < timeline_end_ros_ns`である
 - 全episodeの`profile`名が一致する
 - `meta.json`、`bag/`、対象cameraのMP4、`frames.parquet`が存在する
 
-現行実装は`stopped_at`欠損を空文字列、`duration_s`欠損を0としてprovenanceへ出力する。
+`stopped_at`と`duration_s`は時刻整列に使わない補助的なsource provenanceである。
 
-`trim_start_s`と`trim_end_s`の意味は現行FV episode契約で確定していない。
+値が存在する場合はそのまま記録し、存在しない場合は`null`を記録する。
 
-現行変換coreは両fieldを参照しない。
+空文字列や0を生成して既知の値に見せない。
 
 episodeの概略構造は次のとおりである。
 
@@ -158,6 +157,30 @@ episodeに存在しない任意cameraは出力featureへ含めない。
 
 joint値は`profile.lerobot.arm_streams`の順、その中では`joints`の順で連結する。
 
+ROS `JointState.position`はwire値であり、そのままdataset値として保存しない。
+
+各jointのdataset単位は`joint_units`で指定する。
+
+`joint_units`を省略したjointは`degrees`として扱う。
+
+| `joint_units` | ROS wire値 | LeRobot dataset値 |
+| --- | --- | --- |
+| `degrees` | radian | `degrees(wire_value)` |
+| `percent` | 0以上1以下の比率 | `wire_value * 100` |
+
+```mermaid
+flowchart LR
+    SAMPLE["JointState.position<br/>ROS wire値"]
+    UNIT{"profileの<br/>joint_units"}
+    DEG["radianからdegreeへ変換"]
+    PCT["比率を100倍"]
+    DATASET["LeRobot rowの<br/>stateまたはaction"]
+
+    SAMPLE --> UNIT
+    UNIT -->|"degrees、または省略"| DEG --> DATASET
+    UNIT -->|"percent"| PCT --> DATASET
+```
+
 feature名は次の形式にする。
 
 ```text
@@ -170,26 +193,62 @@ feature名は次の形式にする。
 
 `action`はrow時刻で有効なmux sourceに対応するjoint command topicから生成する。
 
-source別topicがprofileにある場合は、`joint_command.leader`、`joint_command.vr`、`joint_command.ai`を使う。
+`leader`、`vr`、`ai`は、それぞれ`joint_command.leader`、`joint_command.vr`、`joint_command.ai`へ一対一に対応させる。
 
-source別topicがない場合は`joint_command.topic`を使う。
+有効なsourceに対応する明示topicがない場合は、base `joint_command.topic`へfallbackせず変換を失敗させる。
+
+`replay`と未知のsourceは変換対象外であり、別sourceのtopicへ読み替えない。
 
 PiPERのVR収録では`pos_cmd`と`gripper_cmd`を直接合成せず、PiPER内部IK後の`joint_ctrl`をactionとして使う。
 
 ## Camera動画時刻契約
 
-FV episode recorderは、camera frameのROS timestampをMP4 packetのPTS、DTS、durationへ反映する。
+FV episode recorderは、camera frameのROS timestampを`1/90000`秒単位の整数PTSへ量子化する。
 
-動画のtime baseは、そのcameraで最初に記録したROS timestampを0秒とする。
+**time base**は、PTSの整数1 tickが何秒を表すかを定める単位である。
+
+FV動画のtime baseは`1/90000`秒であり、camera metadataでは分子を`video_time_base_num`、分母を`video_time_base_den`へ保存する。
+
+**PTS origin**は、PTS 0に対応するROS絶対時刻である。
+
+FV動画のPTS originは最初に記録したcamera frameのROS timestampであり、`video_pts_origin_ros_ns`へ保存する。
+
+time baseはtickの単位を定め、PTS originは動画内相対時刻とROS絶対時刻の対応点を定めるため、両者は別の値である。
 
 camera metadataは次の値を持つ。
 
 ```json
 {
   "video_timing_mode": "ros_header_stamp_to_pts",
-  "video_pts_origin_ros_ns": 1234567890000000000
+  "video_pts_origin_ros_ns": 1234567890000000000,
+  "video_time_base_num": 1,
+  "video_time_base_den": 90000
 }
 ```
+
+各camera frameのPTSは次の式で求める。
+
+```text
+video_pts
+  = round((ros_stamp_ns - video_pts_origin_ros_ns) * 90000 / 1e9)
+
+video timestamp in seconds
+  = video_pts * video_time_base_num / video_time_base_den
+```
+
+`frames.parquet`は、各frameについて量子化後の整数`video_pts`と量子化前の`ros_stamp_ns`を持つ。
+
+```text
+frame_index
+segment_file
+segment_local_frame
+video_pts
+ros_stamp_ns
+recv_stamp_ns
+...
+```
+
+Recorderはsidecarへ保存した`video_pts`と同じ整数をMP4 packetのPTSへ書く。
 
 **PTS（Presentation Timestamp）**は、動画frameを表示する時刻である。
 
@@ -199,36 +258,75 @@ FV recorderはB-frameを無効にしているため、各packetのDTSをPTSと�
 
 ```mermaid
 flowchart LR
-    subgraph ROS["ROS header stamp"]
-        T0["t0"]
-        T1["t1"]
-        T2["t2"]
+    subgraph ROS["ROS絶対時刻"]
+        T0["frame 0<br/>ros_stamp_ns = R0"]
+        T1["frame 1<br/>ros_stamp_ns = R1"]
+        T2["frame 2<br/>ros_stamp_ns = R2"]
     end
 
-    subgraph MP4["MP4 packet timing"]
-        P0["packet 0<br/>PTS = 0<br/>DTS = 0<br/>duration = t1 - t0"]
-        P1["packet 1<br/>PTS = t1 - t0<br/>DTS = t1 - t0<br/>duration = t2 - t1"]
-        P2["packet 2<br/>PTS = t2 - t0<br/>DTS = t2 - t0"]
+    ORIGIN["PTS origin<br/>video_pts_origin_ros_ns = R0"]
+    QUANTIZE["1/90000秒単位へ量子化<br/>round((Rj - R0) × 90000 / 1e9)"]
+
+    subgraph SIDECAR["frames.parquet"]
+        S0["row 0<br/>video_pts = 0"]
+        S1["row 1<br/>video_pts = P1"]
+        S2["row 2<br/>video_pts = P2"]
     end
 
-    T0 -->|"origin"| P0
-    T1 --> P1
-    T2 --> P2
+    subgraph MP4["MP4 packet、time base = 1/90000"]
+        M0["packet 0<br/>PTS = DTS = 0"]
+        M1["packet 1<br/>PTS = DTS = P1"]
+        M2["packet 2<br/>PTS = DTS = P2"]
+    end
+
+    T0 --> ORIGIN --> QUANTIZE
+    T1 --> QUANTIZE
+    T2 --> QUANTIZE
+    QUANTIZE --> S0 --> M0
+    QUANTIZE --> S1 --> M1
+    QUANTIZE --> S2 --> M2
 ```
 
 **video timing mode**は、camera frameの時刻を動画packetのPTSへ写す規則を表す。
 
-`ros_header_stamp_to_pts`は、ROS messageの`header.stamp`を先頭frameからの相対時刻へ変換し、動画packetのPTSへ設定したことを表す。
+`ros_header_stamp_to_pts`は、ROS messageの`header.stamp`を先頭frameからの相対時刻へ変換し、`1/90000`秒単位へ量子化して動画packetのPTSへ設定したことを表す。
 
 変換coreは`video_timing_mode == "ros_header_stamp_to_pts"`を要求する。
+
+変換coreは`video_time_base_num == 1`かつ`video_time_base_den == 90000`を要求し、宣言値からPTS秒を計算する。
+
+現在のFV recorderが生成する宣言値は`1/90000`であり、変換coreはtime baseを推測しない。
 
 `frames.parquet`の先頭`ros_stamp_ns`は`video_pts_origin_ros_ns`と一致しなければならない。
 
 sidecar rowはROS timestampの狭義単調増加でなければならない。
 
-sidecarのrow順、`segment_file`、`segment_local_frame`はMP4 packetと一対一で対応しなければならない。
+sidecarの先頭`video_pts`は0でなければならず、後続`video_pts`は狭義単調増加でなければならない。
 
-古いraw episodeについてCFRを仮定したり、sidecarだけから動画PTSを再構成したりしない。
+このPTS契約に違反したepisodeは`camera_video_pts_invalid`として変換を失敗させる。
+
+```mermaid
+flowchart LR
+    SIDECAR["frames.parquetのvideo_pts列"]
+    FIRST{"先頭が0か"}
+    ORDER{"後続が狭義単調増加か"}
+    INDEX["PTS秒の時刻indexを構築"]
+    ERROR["camera_video_pts_invalid"]
+
+    SIDECAR --> FIRST
+    FIRST -->|"はい"| ORDER
+    FIRST -->|"いいえ"| ERROR
+    ORDER -->|"はい"| INDEX
+    ORDER -->|"いいえ"| ERROR
+```
+
+sidecarのrow順、`segment_file`、`segment_local_frame`、`video_pts`はMP4 packetと一対一で対応しなければならない。
+
+`ros_stamp_ns`は収録元時刻のprovenanceとorigin検証に使い、camera frameの最近傍整列には使わない。
+
+camera frameの最近傍整列では、MP4へ実際に書いた量子化後の`video_pts`だけを時刻indexに使う。
+
+古いraw episodeについてCFRを仮定したり、`ros_stamp_ns`から動画PTSを再構成したりしない。
 
 ## CFRとVFR
 
@@ -236,7 +334,7 @@ sidecarのrow順、`segment_file`、`segment_local_frame`はMP4 packetと一対�
 
 **VFR**は、隣接する動画frameのPTS間隔が変化する動画である。
 
-次の図は、不均一なROS timestampを30 FPSのCFRへ押し込んだ場合と、ROS timestamp由来のPTSを保持した場合を比較する。
+次の図は、不均一なROS timestampを30 FPSのCFRへ置き換えた場合と、ROS timestampを`1/90000`秒単位のPTSへ量子化した場合を比較する。
 
 ```mermaid
 flowchart TB
@@ -248,17 +346,17 @@ flowchart TB
         C0["PTS 0.0 ms"] -->|"33.3 ms"| C1["PTS 33.3 ms"] -->|"33.3 ms"| C2["PTS 66.7 ms"] -->|"33.3 ms"| C3["PTS 100.0 ms"]
     end
 
-    subgraph ROSPTS["ros_header_stamp_to_ptsで保存"]
-        V0["PTS 0 ms"] -->|"34 ms"| V1["PTS 34 ms"] -->|"39 ms"| V2["PTS 73 ms"] -->|"35 ms"| V3["PTS 108 ms"]
+    subgraph ROSPTS["ros_header_stamp_to_ptsで保存、time base = 1/90000"]
+        V0["PTS 0<br/>0 ms"] -->|"3060 tick"| V1["PTS 3060<br/>34 ms"] -->|"3510 tick"| V2["PTS 6570<br/>73 ms"] -->|"3150 tick"| V3["PTS 9720<br/>108 ms"]
     end
 
     INPUT -->|"固定間隔へ置換"| CFR
-    INPUT -->|"実際の間隔を保持"| ROSPTS
+    INPUT -->|"1/90000秒へ量子化"| ROSPTS
 ```
 
 `ros_header_stamp_to_pts`の出力が常にVFRになるわけではない。
 
-ROS timestampが等間隔ならPTSも等間隔になり、結果はCFRと同じ時刻配置になる。
+ROS timestampがtime base上で等間隔ならPTSも等間隔になり、結果はCFRと同じ時刻配置になる。
 
 したがって、契約名はVFRかCFRかではなく、PTSをどの時刻から生成したかを表す。
 
@@ -271,31 +369,29 @@ flowchart TD
 
     subgraph EACH["episodeごとの処理、最大8 worker"]
         CAMERA["3. profile topicからcameraを対応付け"]
-        GRID["4. primary camera範囲に固定FPS gridを生成"]
+        GRID["4. episode有効区間に固定FPS gridを生成"]
         BAG["5. 必要topicだけbagを1回走査"]
         MUX["6. 各grid時刻のmux sourceを解決"]
         ALIGN["7. state、action、全cameraを最近傍整列"]
-        WINDOW{"8. 未整列rowの位置"}
-        TRIM["先頭、末尾だけ除外"]
+        CARRY{"8. 直前値を<br/>引き継げるか"}
         ROWS["9. LeRobot rowを生成"]
         VIDEO["10. from_timestampと動画参照を生成"]
 
-        CAMERA --> GRID --> BAG --> MUX --> ALIGN --> WINDOW
-        WINDOW -->|"境界だけ"| TRIM --> ROWS --> VIDEO
+        CAMERA --> GRID --> BAG --> MUX --> ALIGN --> CARRY
+        CARRY -->|"整列済み、または許容範囲内"| ROWS --> VIDEO
     end
 
     FAIL["dataset全体を失敗<br/>一時rootを削除"]
     ASSEMBLE["全episodeをrequest順に集約"]
     WRITER["LeRobot公式writerで<br/>Parquet、metadata、statsを生成"]
     LINK["元MP4を再エンコードせずhardlink"]
-    VALIDATE["必須出力を検証"]
     FINAL["完成rootへatomic rename"]
 
     REQUEST --> EPISODES --> CAMERA
-    WINDOW -->|"内部欠損"| FAIL
+    CARRY -->|"先頭欠損、または上限超過"| FAIL
     REQUEST -.->|"契約違反"| FAIL
     EPISODES -.->|"入力欠損"| FAIL
-    VIDEO --> ASSEMBLE --> WRITER --> LINK --> VALIDATE --> FINAL
+    VIDEO --> ASSEMBLE --> WRITER --> LINK --> FINAL
 ```
 
 変換は、episode内の時刻整列を先に完了してから、dataset全体を一括で組み立てる。
@@ -329,36 +425,40 @@ profileのcamera、arm stream、joint、topic定義を型検証する。
 
 profile順にepisode cameraをtopicで対応付ける。
 
-一致したcameraごとにMP4、sidecar、解像度、video originを検証する。
+一致したcameraごとにMP4、sidecar、解像度、PTS origin、time base、`video_pts`列を検証する。
 
-先頭の一致cameraをprimary cameraとする。
+camera mappingにはprimary cameraを設けない。
 
-primary cameraは固定FPS gridの有効範囲を決めるために使い、各rowの画像payloadを直接決めるmasterにはしない。
+全camera、state、actionは独立した入力として同じ固定FPS gridへ整列する。
 
 ### 4. 固定FPS gridを作る
 
-primary cameraの先頭ROS timestampを`t_first`、末尾を`t_last`とする。
+episode metadataの`timeline_start_ros_ns`を`T0`、`timeline_end_ros_ns`を`T1`とする。
 
-gridのrow数`N`は次の式で決める。
-
-```text
-N = floor((t_last - t_first) * fps / 1e9) + 1
-```
+有効区間は`[T0, T1)`の半開区間である。
 
 gridの各絶対ROS timestampは次の式で決める。
 
 ```text
-t_i = t_first + round(i * 1e9 / fps)
-0 <= i < N
+t_i = T0 + round(i * 1e9 / fps)
+i = 0, 1, 2, ...
 ```
 
-source cameraの各frame timestampをそのままLeRobot rowにはしない。
+`t_i < T1`を満たす時刻だけをgridに含め、その件数をrow数`N`とする。
+
+camera timestampはgridの開始、終了、row数を決めない。
 
 ### 5. Bagを一回読む
 
 必要topicだけをrosbagから読み、topicごとの時刻昇順sample列を作る。
 
-必要topicは全arm streamのstate topic、base action topic、定義済みsource別action topic、mux status topicである。
+bag接続として静的に必須なのは、全arm streamのstate topicとmux status topicである。
+
+profileに定義されたsource別action topicはoptional読込対象とし、bag接続が存在するtopicだけを同じ一回の走査で読む。
+
+episodeで一度も選ばれなかったsourceのaction topicは、bag接続もsampleも要求しない。
+
+各gridでmuxが実際に選んだsourceのaction sampleが存在しない場合は、別sourceへfallbackせず整列を失敗させる。
 
 stateとaction topicは`JointState`、mux status topicはJSON文字列を持つ`std_msgs/String`でなければならない。
 
@@ -378,99 +478,149 @@ source eventが古すぎる場合、sourceが`stop`の場合、JSONからsource�
 
 ```mermaid
 flowchart TB
-    PRIMARY["Primary camera sidecar<br/>先頭t_first、末尾t_last"]
-    GRID["固定FPS grid<br/>t0, t1, t2, ..."]
+    INTERVAL["episode有効区間<br/>T0以上、T1未満"]
+    GRID["固定FPS row<br/>frame_index = i"]
+    ROSQUERY["ROS絶対時刻<br/>t_i = T0 + round(i × 1e9 / fps)"]
+    VIDEOQUERY["動画問い合わせ時刻<br/>q_i = from_timestamp + i / fps"]
 
-    CAMERA["各camera sidecar<br/>c0, c1, c2, ..."]
+    CAMERA["各camera sidecar<br/>p_j = video_pts_j × time base"]
     STATE["state samples<br/>s0, s1, s2, ..."]
     MUX["mux events<br/>sourceの時系列"]
     ACTION["source別action samples<br/>a0, a1, a2, ..."]
 
-    SEARCH["各t_iの直前、直後を二分探索"]
+    ROSSEARCH["t_iの直前、直後を二分探索"]
+    VIDEOSEARCH["q_iの直前、直後のPTSを二分探索"]
     LIMIT{"全入力が<br/>許容時刻差以内か"}
-    ROW["LeRobot row i<br/>state、action、camera参照"]
-    UNALIGNED["未整列row"]
+    SCALE["state、actionを<br/>joint_unitsでdataset単位へ変換"]
+    ROW["LeRobot row i<br/>state、action"]
+    CARRY{"同じstreamの直前値を<br/>引き継げるか"}
+    ERROR["episode_alignment_gap"]
 
-    PRIMARY -->|"範囲だけを決定"| GRID
-    GRID --> SEARCH
-    CAMERA --> SEARCH
-    STATE --> SEARCH
-    MUX -->|"action topicを選択"| ACTION --> SEARCH
-    SEARCH --> LIMIT
-    LIMIT -->|"はい"| ROW
-    LIMIT -->|"いいえ"| UNALIGNED
-    UNALIGNED -->|"先頭、末尾"| TRIM["除外可能"]
-    UNALIGNED -->|"有効区間の内部"| ERROR["episode_alignment_gap"]
+    INTERVAL -->|"周期だけで生成"| GRID
+    GRID --> ROSQUERY --> ROSSEARCH
+    GRID --> VIDEOQUERY --> VIDEOSEARCH
+    CAMERA --> VIDEOSEARCH
+    STATE --> ROSSEARCH
+    MUX -->|"action topicを選択"| ACTION --> ROSSEARCH
+    ROSSEARCH --> LIMIT
+    VIDEOSEARCH --> LIMIT
+    LIMIT -->|"はい"| SCALE --> ROW
+    LIMIT -->|"いいえ"| CARRY
+    CARRY -->|"3 grid frame以内かつ0.1秒以内"| SCALE
+    CARRY -->|"直前値なし、または上限超過"| ERROR
 ```
 
-primary cameraの各frameをLeRobot rowとして採用するわけではない。
+固定FPS gridはcameraと独立している。
 
-primary cameraは固定FPS gridの開始と終了だけを決め、全入力は各grid時刻へ個別に整列する。
+state、action、muxは各gridのROS絶対時刻`t_i`へ整列する。
+
+cameraは各gridの動画問い合わせ時刻`q_i`へ整列する。
+
+cameraごとの問い合わせ時刻は次の式で決める。
+
+```text
+q_i = from_timestamp + i / fps
+
+from_timestamp
+  = (timeline_start_ros_ns - video_pts_origin_ros_ns) / 1e9
+```
+
+camera側の候補時刻は、sidecarの整数`video_pts`をtime baseで秒へ変換した値である。
+
+```text
+p_j = video_pts_j * video_time_base_num / video_time_base_den
+```
+
+したがって、camera整列は`q_i`と`p_j`を比較し、量子化前の`ros_stamp_ns`とは比較しない。
 
 一つのgrid時刻に対する問い合わせは次の順序で進む。
 
 ```mermaid
 sequenceDiagram
-    participant G as 固定FPS grid t_i
+    participant G as 固定FPS row i
     participant M as mux timeline
     participant S as state samples
     participant A as source別action samples
-    participant C as camera sidecars
+    participant C as camera video_pts
 
-    G->>M: t_i以前で最新のsourceを取得
+    G->>M: ROS絶対時刻t_i以前で最新のsourceを取得
     M-->>G: leader、VR、AI
-    G->>S: t_iの直前と直後を検索
+    G->>S: ROS絶対時刻t_iの直前と直後を検索
     S-->>G: 最近傍state
-    G->>A: 選択sourceのtopicを検索
+    G->>A: ROS絶対時刻t_iで選択sourceのtopicを検索
     A-->>G: 最近傍action
-    G->>C: cameraごとに直前と直後を検索
-    C-->>G: 最近傍frame参照
-    Note over G,C: 全入力の時刻差が許容値以内ならrowを確定
+    G->>G: stateとactionをjoint_unitsでdataset単位へ変換
+    G->>C: 動画問い合わせ時刻q_iの直前と直後を検索
+    C-->>G: 最近傍video_ptsのframe参照
+    Note over G,C: 最近傍がなければ同じstreamの直前確定値だけを検討
 ```
 
-各sample列について`t_i`の直前と直後だけを候補にし、時刻差が小さいsampleを選ぶ。
+stateとactionは`t_i`の直前と直後だけを候補にし、時刻差が小さいsampleを選ぶ。
 
-時刻差が等しい場合、現行変換coreは直後sampleを選ぶ。
+cameraは`q_i`の直前と直後にある`p_j`だけを候補にし、時刻差が小さいframeを選ぶ。
+
+時刻差が等しい場合、stateとactionは直後sampleを選び、cameraはreaderと同じ直前frameを選ぶ。
+
+stateとactionはLeRobotの動画readerで再選択されないため、cameraだけreaderのtie規則と一致させる。
 
 選択sampleと`t_i`の差は`max_alignment_error_s`以下でなければならない。
 
 stateとactionはprofile指定joint順にvector化する。
 
-全cameraについてもsidecar timestampの最近傍が許容差内にあることを確認する。
+全cameraについても量子化後PTSの最近傍が許容差内にあることを確認する。
 
-camera問い合わせ時刻がsidecarの先頭より前、または末尾より後の場合は未整列とする。
+camera問い合わせ時刻がsidecarの先頭PTSより前、または末尾PTSより後の場合は最近傍なしとする。
 
-sample欠損または許容差超過のgrid rowは未整列rowとして記録する。
+最近傍sampleまたはframeがない場合は、同じstreamで直前に確定した値だけを引き継げる。
 
-未知のtopic型、joint名欠損、mux異常のような契約違反は未整列rowにせず、その時点で変換を失敗させる。
+引き継ぎは最大3 grid frameかつ最大`max_alignment_error_s`までとし、どちらか一方でも超えた場合は変換を失敗させる。
 
-### 8. 共通有効区間を確定する
+同じsource sampleまたはcamera frameが複数のgridで最近傍になった場合も引き継ぎとして数える。
+
+そのsourceを最初に採用したgrid indexを起点とし、同じsourceが再選択されても起点を更新しない。
+
+異なるsourceを選択した場合だけ起点を現在のgrid indexへ更新する。
+
+30 FPSでは3 grid frameが0.1秒に相当する。
+
+低いFPSでは0.1秒上限が先に適用される。
+
+先頭gridに直前値はないため、先頭欠損は変換を失敗させる。
+
+未来のsampleやframeを引き継ぎ値として使用しない。
+
+未知のtopic型、joint名欠損、mux異常のような契約違反は引き継ぎの対象にせず、その時点で変換を失敗させる。
+
+### 8. 欠損時の引き継ぎを判定する
 
 ```mermaid
 flowchart TB
-    subgraph BOUNDARY["境界だけが未整列"]
-        B0["未整列"] --- B1["未整列"] --- B2["整列済み"] --- B3["整列済み"] --- B4["整列済み"] --- B5["未整列"]
+    subgraph OK["許容される欠損"]
+        O0["確定値 A"] --- O1["Aを引き継ぐ"] --- O2["Aを引き継ぐ"] --- O3["Aを引き継ぐ"] --- O4["新しい確定値 B"]
     end
 
-    subgraph INTERIOR["有効区間の内部が未整列"]
-        G0["整列済み"] --- G1["整列済み"] --- G2["未整列"] --- G3["整列済み"]
+    subgraph LEADING["先頭欠損"]
+        L0["直前値なし"] --- L1["最初の確定値 A"]
     end
 
-    BOUNDARY -->|"両端を除外"| OK["3 rowで変換を継続"]
-    INTERIOR -->|"時間軸に穴が残る"| NG["episode_alignment_gap"]
+    subgraph LONG["上限を超える欠損"]
+        G0["確定値 A"] --- G1["carry 1"] --- G2["carry 2"] --- G3["carry 3"] --- G4["carry 4"]
+    end
+
+    OK --> CONTINUE["変換を継続"]
+    LEADING --> ERROR["episode_alignment_gap"]
+    LONG --> ERROR
 ```
 
-最初の整列済みrowより前と、最後の整列済みrowより後にある未整列rowは除外できる。
+引き継ぎはstreamごとに判定する。
 
-最初と最後の整列済みrowの間に未整列rowが一件でもある場合は`episode_alignment_gap`として変換を失敗させる。
+state、action、各cameraのどれか一つでも引き継げなければ、episode全体を`episode_alignment_gap`として失敗させる。
 
-全rowが未整列の場合は`episode_joint_alignment_empty`として変換を失敗させる。
-
-この規則により、欠損値、zero、前回値でrowを補完しない。
+mux sourceはこの引き継ぎの対象にせず、`max_mux_status_age_s`で鮮度を判定する。
 
 ### 9. Episode rowを作る
 
-trim後のrowを0から連番し直す。
+固定FPS gridのrowを0から連番する。
 
 episode内rowは次の値を持つ。
 
@@ -487,13 +637,13 @@ dataset組立時に`episode_index`、dataset全体の`index`、`task_index`を�
 
 ### 10. 動画参照を作る
 
-trim後の先頭絶対ROS timestampを`t_valid_first`とする。
+先頭絶対ROS timestampは`timeline_start_ros_ns`である。
 
 cameraごとの`from_timestamp`は次の式で求める。
 
 ```text
 from_timestamp
-  = (t_valid_first - video_pts_origin_ros_ns) / 1e9
+  = (timeline_start_ros_ns - video_pts_origin_ros_ns) / 1e9
 ```
 
 `from_timestamp`が負になる場合は変換を失敗させる。
@@ -508,6 +658,12 @@ to_timestamp = from_timestamp + episode row count / fps
 
 hardlink失敗時に物理copyへfallbackしない。
 
+finished/success episodeの動画とframes sidecarは、Recorder側が書き込みbitを除去した後にexport対象となる。
+
+Exporterは動画とsidecarのread-onlyを検証し、mutableな入力を自動chmodせずfail closedにする。
+
+Recorder起動時に、旧episodeのうちfinished/successのものだけに同じread-only契約を冪等に適用する。
+
 ## Dataset組立
 
 選択episode間でcamera feature集合とcamera解像度が一致しなければならない。
@@ -515,6 +671,10 @@ hardlink失敗時に物理copyへfallbackしない。
 LeRobot metadataとParquetはLeRobot公式のmetadata classとwriterを使って生成する。
 
 独自実装でLeRobot schemaを複製しない。
+
+各writerとhardlinkが例外なく完了した後、一時rootを完成rootへatomic renameする。
+
+生成直後に同じfileの存在を再走査するruntime検証は行わず、生成物の構造は自動テストで検証する。
 
 出力featureは`observation.state`、`action`、一致したcamera feature、LeRobot標準index列で構成する。
 
@@ -527,6 +687,18 @@ episode metadataはtask、length、data位置、video位置、`from_timestamp`�
 VFR動画の平均入力FPSとして解釈しない。
 
 `meta/info.json`へ`video_timestamp_tolerance_s`を書き、読込側と変換側で同じ許容差を使う。
+
+FV exporterは`meta/info.json`へ次の読込契約も書く。
+
+```json
+{
+  "video_query_timestamp_source": "frame_index_over_fps"
+}
+```
+
+この値は、動画問い合わせ時刻のepisode内成分を`frame_index / fps`から計算するdatasetであることを示す。
+
+他の値は受け入れず、未知の読込規則で動画frameを選ばない。
 
 statsは`observation.state`と`action`だけを対象に、min、max、mean、std、count、q01、q10、q50、q90、q99を計算する。
 
@@ -563,9 +735,7 @@ FV実装は`meta/fv_episode_export.json`へ保存する。
 
 全fileを一時rootへ生成する。
 
-必須metadata、data、statsと全hardlinkの生成成功を確認してからprovenanceを保存する。
-
-現行実装は、`info.json`、tasks、episodes、data、statsの必須5 fileが存在することを検証する。
+metadata、data、statsのwriterと全hardlinkが例外なく完了してからprovenanceを保存する。
 
 完成rootへ同一filesystem内のrenameで配置する。
 
@@ -582,52 +752,125 @@ FV実装は`meta/fv_episode_export.json`へ保存する。
 ## LeRobot読込契約
 
 ```mermaid
-flowchart LR
-    SOURCE["FV episode動画<br/>ROS timestamp由来PTS<br/>等間隔または不均一"]
-    CFRVIDEO["既存CFR dataset動画<br/>等間隔PTS"]
-    HARDLINK["dataset動画<br/>元MP4と同じinode"]
-    ROW["LeRobot row<br/>timestamp = frame_index / fps"]
-    OFFSET["episode metadata<br/>from_timestamp"]
-    QUERY["動画問い合わせ時刻<br/>from_timestamp + row timestamp"]
+flowchart TB
+    subgraph FVQUERY["FV exporterが作るdataset"]
+        FVMETA["meta/info.json<br/>video_query_timestamp_source<br/>= frame_index_over_fps"]
+        FVROW["LeRobot row<br/>整数frame_index"]
+        FVLOCAL["episode内問い合わせ時刻<br/>frame_index / fps、float64"]
+        FVMETA --> FVLOCAL
+        FVROW --> FVLOCAL
+    end
+
+    subgraph LEGACYQUERY["metadata keyを持たない既存dataset"]
+        LEGACYMETA["video_query_timestamp_sourceなし"]
+        LEGACYROW["LeRobot row<br/>保存済みtimestamp"]
+        LEGACYLOCAL["episode内問い合わせ時刻<br/>persisted timestamp"]
+        LEGACYMETA --> LEGACYLOCAL
+        LEGACYROW --> LEGACYLOCAL
+    end
+
+    OFFSET["episode metadata<br/>cameraごとのfrom_timestamp"]
+    QUERY["動画問い合わせ時刻<br/>from_timestamp + episode内問い合わせ時刻"]
+    FVLOCAL --> QUERY
+    LEGACYLOCAL --> QUERY
+    OFFSET --> QUERY
+
+    SOURCE["FV episode動画<br/>time base = 1/90000<br/>等間隔または不均一なPTS"]
+    CFRVIDEO["既存dataset動画<br/>等間隔PTSも読込可能"]
+    HARDLINK["FV dataset動画<br/>元MP4と同じinode"]
     DECODER["TorchCodec exact seek<br/>前後PTSから最近傍"]
     FRAME["rowに対応するcamera frame"]
 
     SOURCE -->|"再エンコードなし"| HARDLINK --> DECODER
     CFRVIDEO --> DECODER
-    ROW --> QUERY
-    OFFSET --> QUERY
     QUERY --> DECODER --> FRAME
 ```
 
-LeRobot rowに対応する動画問い合わせ時刻は次の値である。
+FV exporterが作るdatasetでは、LeRobot rowに対応する動画問い合わせ時刻を次の式で求める。
 
 ```text
-query timestamp = from_timestamp + row timestamp
+query_timestamp_i = from_timestamp + frame_index_i / fps
 ```
+
+FV exporterは`video_query_timestamp_source == "frame_index_over_fps"`を`meta/info.json`へ書く。
+
+このmetadataを持つdatasetだけは、動画readerが整数の`frame_index`とdatasetの`fps`からepisode内問い合わせ時刻をfloat64で再構成する。
+
+`timestamp`はLeRobot標準schemaではfloat32であり、長時間episodeでは量子化誤差がVFR frameの最近傍判定を変える可能性がある。
+
+そのため、FV datasetの動画問い合わせにはParquetのfloat32 `timestamp`を使わない。
+
+一方、`video_query_timestamp_source`を持たない既存datasetでは、従来どおりParquetに保存された`timestamp`をepisode内問い合わせ時刻に使う。
+
+既存datasetには`timestamp`と`frame_index / fps`が同じとは限らないものがあるため、metadataがないdatasetをFVの規則へ暗黙に切り替えない。
+
+`video_query_timestamp_source`が存在して値が`frame_index_over_fps`以外の場合は、未知の規則でframeを選ばず読込を失敗させる。
+
+Exporterとreaderが同じcamera frameを選ぶ関係は次の図で表せる。
+
+```mermaid
+flowchart LR
+    GRID["固定FPS row i"]
+    QUERY["q_i = from_timestamp + i / fps"]
+
+    subgraph EXPORT["export時"]
+        SIDECAR["frames.parquet<br/>video_pts_j"]
+        SIDECARTIME["p_j = video_pts_j × 1/90000"]
+        ALIGN["q_iの前後PTSから最近傍を選ぶ"]
+        SIDECAR --> SIDECARTIME --> ALIGN
+    end
+
+    subgraph READ["LeRobot読込時"]
+        MP4["hardlink済みMP4<br/>packet PTS_j"]
+        MP4TIME["p_j = PTS_j × 1/90000"]
+        DECODE["q_iの前後PTSから最近傍を返す"]
+        MP4 --> MP4TIME --> DECODE
+    end
+
+    GRID --> QUERY --> ALIGN
+    QUERY --> DECODE
+    MATCH["sidecar video_pts_j = MP4 PTS_j"]
+    SIDECAR --> MATCH
+    MP4 --> MATCH
+```
+
+exporterはsidecarから選んだcamera frame indexをLeRobot rowへ保存しない。
+
+exporterはsidecarの`video_pts`をtime baseで秒へ変換し、`query_timestamp_i`に最も近いframeを検証する。
+
+readerはMP4 packetのPTSを同じtime baseで秒へ変換し、同じ`query_timestamp_i`に最も近いframeを返す。
+
+Recorderがsidecarの`video_pts`とMP4 packetのPTSを同じ整数として確定するため、exporterとreaderの候補時刻列は一致する。
+
+したがって、exporterが検証したsource frameとreaderが返すframeは、等距離の場合を含めて一致する。
 
 TorchCodecは`seek_mode="exact"`を使う。
 
-VFR datasetのcamera読込はTorchCodec経路を必須にする。
+PyAV経路も、問い合わせ範囲のframeをPTSで列挙して最近傍を選ぶ。
 
-PyAV fallbackが同じPTS最近傍契約を実装していない限り、VFR datasetをPyAVへ暗黙にfallbackしない。
+利用可能な場合はTorchCodecを既定とし、利用できない環境では同じPTS最近傍契約を持つPyAVを使う。
 
 問い合わせ時刻を表示区間に含む直前frameと、その次のframeをPTSで比較し、近いframeを返す。
 
 距離が等しい場合は直前frameを返す。
 
+Exporterの時刻合わせも同じ規則で直前frameを選ぶため、完全な中点でもreaderと一致する。
+
 `average_fps * timestamp`からframe indexを推定しない。
 
 最近傍PTSとの差が`video_timestamp_tolerance_s`を超える場合は読込を失敗させる。
 
-既存のCFR LeRobot datasetも同じPTS最近傍経路で読む。
+既存のCFR LeRobot datasetも同じPTS最近傍decoderで読む。
 
 CFRはPTS間隔が一定な場合であり、VFRと分ける形式判定を持たない。
+
+metadataを持たない既存datasetでは、CFRかVFRかに関係なく保存済み`timestamp`を問い合わせに使う。
 
 既存datasetに`video_timestamp_tolerance_s`がない場合は`min(0.1, 3 / fps)`を使う。
 
 この既定値は動画PTS検索だけに使い、delta timestamp検証の既定値`1e-4`を緩めない。
 
-このCFR契約は作成済みLeRobot datasetの読込互換であり、`ros_header_stamp_to_pts`を宣言しない古いraw FV episodeの変換互換ではない。
+この読込契約は作成済みLeRobot datasetとの互換であり、`ros_header_stamp_to_pts`と明示的なPTSを持たない古いraw FV episodeの変換互換ではない。
 
 ## Package構成
 
@@ -637,7 +880,7 @@ CFRはPTS間隔が一定な場合であり、VFRと分ける形式判定を持�
 
 `fv_lerobot_exporter`は確定済みepisodeの検証、時刻整列、LeRobot dataset組立、atomic finalizeを所有する。
 
-`export_lerobot_dataset()`はrequest、profile payload、dataset root、任意のprogress callbackを受け取る。
+`export_lerobot_dataset()`はrequest、profile payload、dataset rootを受け取る。
 
 実行processとUIへの進捗表示は変換coreの外側で選択する。
 
@@ -655,9 +898,21 @@ episode変換はepisode単位でprocess並列化できる。
 
 現在の既定上限は8 workerで、設定可能範囲は1以上32以下である。
 
+alignment executorはprocess内で一つだけ生成し、同時に始まったdataset作成jobも同じworker poolを共有する。
+
+初期化はlockで直列化し、同時初回呼出しでも複数のworker poolを生成しない。
+
 workerは一つのepisodeについてbag読込、deserialize、時刻index構築、row整列を完結させる。
 
 workerの完了順に関係なく、出力episode順はrequestの`episode_ids`順を維持する。
+
+workerへの投入は同時実行上限までに制限し、全episodeを先行投入しない。
+
+episode変換、worker投入、結果回収のいずれかが失敗した場合は、未開始futureをcancelする。
+
+実行中futureの終了を待ってから、cleanup例外へ置き換えず元の失敗を返す。
+
+これにより、失敗したexportのworkerが後続exportとCPU、memory、disk I/Oを競合し続けることを防ぐ。
 
 dataset作成時の動画decode、frame seek、動画再エンコードを禁止する。
 
@@ -680,59 +935,45 @@ timestamp配列をrow検索ごとに再構築せず、episode内で再利用す�
 | 分類 | 代表的なerror code |
 | --- | --- |
 | Requestと出力先 | `invalid_dataset_id`, `dataset_exists`, `export_tmp_exists`, `export_workers_invalid` |
-| Episode | `episode_store_missing`, `episode_not_found`, `episode_meta_invalid`, `episode_not_finished`, `episode_not_success`, `profile_mismatch` |
-| Profile | `profile_invalid`, `camera_mapping_empty`, `mux_topic_not_configured`, `action_topic_not_configured` |
+| Episode | `episode_store_missing`, `episode_not_found`, `episode_id_ambiguous`, `episode_meta_invalid`, `episode_not_finished`, `episode_not_success`, `profile_mismatch` |
+| Profile | `profile_invalid`, `camera_mapping_empty`, `mux_topic_not_configured`, `action_topic_not_configured`, `action_source_unsupported` |
 | Bag | `bag_missing`, `bag_topic_missing`, `joint_topic_type_mismatch`, `mux_status_type_mismatch` |
 | Timestamp | `stamp_source_missing`, `message_header_stamp_missing`, `camera_timestamps_invalid` |
 | Mux | `mux_status_missing`, `mux_status_invalid`, `mux_status_before_frame_missing`, `mux_status_stale`, `mux_source_stop` |
 | Joint | `joint_names_missing`, `joint_position_missing`, `joint_name_mismatch`, `joint_vector_mismatch`, `samples_missing`, `sample_alignment_error` |
-| Camera | `camera_missing`, `camera_segments_unsupported`, `camera_video_timing_contract_missing`, `frames_sidecar_missing`, `camera_sidecar_empty`, `camera_sidecar_video_mismatch`, `camera_video_pts_origin_mismatch`, `camera_video_missing`, `camera_resolution_mismatch` |
-| Alignment | `camera_alignment_error`, `camera_frame_missing`, `episode_joint_alignment_empty`, `episode_alignment_gap` |
-| Output | `video_hardlink_failed`, `video_path_missing`, `lerobot_export_incomplete` |
+| Camera | `camera_missing`, `camera_segments_unsupported`, `camera_video_timing_contract_missing`, `camera_video_time_base_invalid`, `frames_sidecar_missing`, `frames_sidecar_mutable`, `camera_sidecar_empty`, `camera_sidecar_video_mismatch`, `camera_video_pts_origin_mismatch`, `camera_video_pts_invalid`, `camera_video_query_before_origin`, `camera_video_missing`, `video_source_mutable`, `camera_resolution_mismatch` |
+| Alignment | `camera_alignment_error`, `camera_frame_missing`, `episode_alignment_gap` |
+| Output | `video_hardlink_failed`, `video_path_missing` |
 
 例外を空dataset、欠損row、zero vector、推測値へ変換しない。
 
 ## 受け入れ基準
 
-1. 不規則なcamera timestampから指定FPSのrow gridが決定どおり生成される。
-2. state、action、全cameraが許容差内の最近傍sampleへ整列される。
-3. 先頭と末尾の未整列rowだけがtrimされ、内部欠損は失敗する。
-4. mux sourceに対応したaction topicとprofile joint順が守られる。
-5. dataset動画とsource動画のinodeが一致する。
-6. 出力をLeRobotDatasetで開き、先頭、中間、末尾rowのcameraを読める。
-7. VFRとCFRの両方でPTS最近傍frameが一致する。
-8. `video_timestamp_tolerance_s`がdataset分割、feature変更、結合後も維持される。
-9. 変換失敗後に完成rootが残らない。
-10. 同じ入力の並列実行でもepisode順とtask indexが変わらない。
+1. canonical episode有効区間から指定FPSのrow gridが決定どおり生成される。
+2. stateとactionはROS絶対時刻、全cameraは量子化後PTSを使って、許容差内の最近傍sampleへ整列される。
+3. 欠損は直前値を最大3 grid frameかつ0.1秒まで引き継ぎ、先頭欠損と上限超過は失敗する。
+4. mux sourceに対応する明示action topicだけを使い、選択sourceのsample欠損、未設定source、非対応sourceは失敗する。
+5. episodeで未使用のsource別action topicはbag接続がなくても変換できる。
+6. stateとactionをprofile joint順に並べ、`joint_units`どおりのdataset単位へ変換する。
+7. dataset動画とsource動画のinodeが一致する。
+8. 出力をLeRobotDatasetで開き、先頭、中間、末尾rowのcameraを読める。
+9. sidecarの`video_pts`とMP4 packetのPTSが`1/90000`秒のtime base上で一致する。
+10. FV datasetは`frame_index_over_fps`で、metadataを持たない既存datasetは保存済み`timestamp`で動画を問い合わせる。
+11. VFRとCFRの両方でPTS最近傍frameが一致する。
+12. `video_timestamp_tolerance_s`がdataset分割、feature変更、結合後も維持される。
+13. 変換失敗後に完成rootが残らない。
+14. 同じ入力の並列実行でもepisode順とtask indexが変わらない。
+15. worker投入、変換、結果回収のどこで失敗しても未完了futureが残らない。
+16. 同時初回呼出しでもalignment worker poolは一つだけ生成される。
 
 ## 既知の仕様課題
 
-現行変換coreの最近傍sample選択は、時刻差が等しい場合に直後sampleを選ぶ。
+profile snapshotとtrimの未決事項は`pending_episode_metadata_contract.md`へ分離する。
 
-TorchCodec読込経路は等距離時に直前frameを選ぶため、tie規則は別の正しさ変更で統一する必要がある。
-
-FV episode metadataは録画時のprofile snapshotを保持していない。
-
-録画時profile snapshotの固定をepisode metadata契約の残課題として扱う。
-
-現行変換coreは`trim_start_s`と`trim_end_s`を参照しない。
-
-trimの意味と拒否条件は別のepisode metadata契約で決定する。
-
-現行変換coreはepisode IDの重複を検証しない。
-
-重複を拒否するか維持するかは、公開core APIの別変更として決定する。
-
-現行変換coreは`stopped_at`と`duration_s`の欠損をprovenance上の空文字列と0へ変換する。
-
-必須metadata化は別のepisode metadata契約で決定する。
-
-現行LeRobot読込経路にはTorchCodecからPyAVへのfallbackがある。
-
-VFR datasetについて意味の異なるfallbackを無効にする必要がある。
+TorchCodecとPyAVの両経路がPTS最近傍を実装している。
 
 `robot_type="vlabor"`は、FV episodeがVLAbor robot収録を表す現行契約として継続する。
 
-現行exporterのfinalize検証は必須fileの存在確認が中心であり、全rowのcamera decodeと電源断耐性までは検証していない。
+現行exporterはfinalize前に全rowのcamera decodeと電源断耐性を検証しない。
 
 この保証範囲をatomic renameの保証と混同しない。

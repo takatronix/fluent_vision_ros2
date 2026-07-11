@@ -13,6 +13,7 @@ Other endpoints (markers, replay, export, disk, retention) land in later steps.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 from dataclasses import asdict, dataclass
@@ -20,23 +21,35 @@ from pathlib import Path
 from typing import Any, Optional
 
 from aiohttp import web
+import cv2
+import numpy as np
 
 from .active_lock import ActiveLock
 from .batch_runner import BatchConfig, BatchRunner
 from .replay_runner import ReplayRunner
-from .bag_recorder import BagRecorder, DetachedBagRecording
+from .bag_recorder import BAG_FINALIZE_TIMEOUT_S, BagRecorder, DetachedBagRecording
 from .camera_writer import CameraWriterPool, DetachedCameraWriterPool
-from .episode_store import EpisodeMeta, EpisodeStore, new_episode_id, utc_now_iso
+from .episode_store import (
+    EpisodeMeta,
+    EpisodeMetadataError,
+    EpisodeNotFoundError,
+    EpisodeStore,
+    new_episode_id,
+    utc_now_iso,
+)
 from .marker_manager import MarkerManager
 from .preflight import run_preflight
 from .schemas import (
+    AddEpisodeTagsRequest,
+    AddEpisodeTagsResponse,
     EpisodeSummary,
-    ListEpisodesResponse,
+    RecordingReadyTimeoutResponse,
     StartEpisodeRequest,
     StartEpisodeResponse,
     StopEpisodeRequest,
     StopEpisodeResponse,
 )
+from .topic_discovery import depth_bag_topic
 
 LOG = logging.getLogger("fv_episode_recorder.api")
 _READY_TIMEOUT_S = 2.0
@@ -45,9 +58,34 @@ _READY_POLL_S = 0.02
 
 @dataclass(frozen=True)
 class RecordingReady:
-    ready_at: str
+    timeline_start_ros_ns: int
+    bag_ready_at_ros_ns: int | None
+    bag_timestamp_source: str
+    first_bag_timestamp_ns: dict[str, int]
     bag_topics: dict[str, int]
     cameras: dict[str, int]
+    first_camera_stamp_ros_ns: dict[str, int]
+
+
+@dataclass(frozen=True)
+class FinalizeFailure:
+    code: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class RecordingCoverage:
+    bag_topics: dict[str, int]
+    latest_bag_timestamp_ros_ns: dict[str, int]
+    bag_alignment_tolerance_ns: int
+    frame_counts: dict[str, int]
+    last_frame_stamp_ros_ns: dict[str, int]
+
+
+class RecordingReadyTimeoutError(RuntimeError):
+    def __init__(self, response: RecordingReadyTimeoutResponse) -> None:
+        super().__init__(response.message)
+        self.response = response
 
 
 @web.middleware
@@ -59,7 +97,7 @@ async def _cors_middleware(request, handler):
             status=204,
             headers={
                 "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+                "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
                 "Access-Control-Allow-Headers": "Content-Type,Authorization",
                 "Access-Control-Max-Age": "86400",
             },
@@ -92,6 +130,8 @@ def build_app(
     app["active_lock"] = active_lock
     app["marker_manager"] = marker_manager or MarkerManager()
     app["get_profile"] = get_profile
+    app["finalizer_tasks"] = set()
+    app.on_cleanup.append(_await_finalizer_tasks)
 
     app.router.add_get("/api/v1/healthz", _healthz)
     app.router.add_post("/api/v1/episodes", _start_episode)
@@ -101,6 +141,7 @@ def build_app(
     app.router.add_get("/api/v1/episodes/{episode_id}", _get_episode)
     app.router.add_delete("/api/v1/episodes/{episode_id}", _delete_episode)
     app.router.add_patch("/api/v1/episodes/{episode_id}", _patch_episode)
+    app.router.add_post("/api/v1/episodes/{episode_id}/tags", _add_episode_tags)
     app.router.add_get("/api/v1/episodes/{episode_id}/files/{tail:.*}", _episode_file)
     app.router.add_get("/api/v1/episodes/{episode_id}/depth_preview/{camera}/{frame}", _depth_preview)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints", _episode_joints)
@@ -132,6 +173,12 @@ def build_app(
     app.router.add_delete("/api/v1/markers/{marker_id}", _delete_marker)
 
     return app
+
+
+async def _await_finalizer_tasks(app: web.Application) -> None:
+    tasks: set[asyncio.Task[None]] = app["finalizer_tasks"]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _healthz(request: web.Request) -> web.Response:
@@ -225,6 +272,78 @@ def _required_ready_topics(profile_dict, recorded_topics_meta: list[dict], contr
     return topics
 
 
+def _enabled_cameras(cameras: list[dict]) -> list[dict]:
+    enabled_cameras: list[dict] = []
+    for camera in cameras:
+        enabled = camera.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                f"camera {camera.get('name')!r} enabled must resolve to a boolean"
+            )
+        if enabled:
+            enabled_cameras.append(camera)
+    return enabled_cameras
+
+
+def _sync_depth_bag_topics(
+    cameras: list[dict],
+    recorded_topics: list[dict],
+    bag_topics: list[str],
+) -> set[str]:
+    required: set[str] = set()
+    required_in_camera_order: list[str] = []
+    known_topics = set(bag_topics)
+    for camera in cameras:
+        kind = camera.get("kind", "color")
+        if not isinstance(kind, str) or kind.lower() != "depth":
+            continue
+        raw_topic = camera.get("topic")
+        if not isinstance(raw_topic, str) or not raw_topic:
+            raise ValueError(
+                f"enabled depth camera {camera.get('name')!r} has no valid topic"
+            )
+        topic = depth_bag_topic(raw_topic)
+        if topic not in required:
+            required.add(topic)
+            required_in_camera_order.append(topic)
+
+    discovered_depth_topics: set[str] = set()
+    for entry in recorded_topics:
+        topic = entry.get("topic")
+        if entry.get("role") == "camera_depth_compressed" and isinstance(topic, str):
+            discovered_depth_topics.add(topic)
+    stale_depth_topics = discovered_depth_topics - required
+    if stale_depth_topics:
+        recorded_topics[:] = [
+            entry
+            for entry in recorded_topics
+            if not (
+                entry.get("role") == "camera_depth_compressed"
+                and entry.get("topic") in stale_depth_topics
+            )
+        ]
+        bag_topics[:] = [
+            topic for topic in bag_topics if topic not in stale_depth_topics
+        ]
+        known_topics.difference_update(stale_depth_topics)
+
+    for topic in required_in_camera_order:
+        if topic in known_topics:
+            continue
+        recorded_topics.append(
+            {
+                "topic": topic,
+                "role": "camera_depth_compressed",
+                "qos": "best_effort",
+                "stamp_source": "message_header",
+                "msg_type": "sensor_msgs/msg/CompressedImage",
+            }
+        )
+        bag_topics.append(topic)
+        known_topics.add(topic)
+    return required
+
+
 async def _wait_recording_ready(
     *,
     bag_recorder: BagRecorder,
@@ -234,39 +353,104 @@ async def _wait_recording_ready(
     deadline = asyncio.get_running_loop().time() + _READY_TIMEOUT_S
     last_bag_counts: dict[str, int] = {}
     last_camera_counts: dict[str, int] = {}
+    last_camera_stamps: dict[str, int] = {}
     while True:
         bag_status = bag_recorder.ready_status(bag_topics)
         last_bag_counts = bag_status.counts
         last_camera_counts = camera_pool.observed_frame_counts()
+        last_camera_stamps = camera_pool.observed_frame_stamps_ns()
         missing_bag = [topic for topic, count in last_bag_counts.items() if count <= 0]
         missing_cameras = [name for name, count in last_camera_counts.items() if count <= 0]
         if bag_status.ready and not missing_cameras:
-            return RecordingReady(
-                ready_at=bag_status.ready_at or utc_now_iso(),
-                bag_topics=last_bag_counts,
-                cameras=last_camera_counts,
-            )
+            evidence_stamps = [
+                *bag_status.first_bag_timestamp_ns.values(),
+                *last_camera_stamps.values(),
+            ]
+            positive_evidence_stamps = [stamp for stamp in evidence_stamps if stamp > 0]
+            if positive_evidence_stamps:
+                timeline_start_ros_ns = max(
+                    camera_pool.ros_now_ns(), *positive_evidence_stamps
+                )
+                return RecordingReady(
+                    timeline_start_ros_ns=timeline_start_ros_ns,
+                    bag_ready_at_ros_ns=bag_status.ready_at_ros_ns,
+                    bag_timestamp_source=bag_status.timestamp_source,
+                    first_bag_timestamp_ns=bag_status.first_bag_timestamp_ns,
+                    bag_topics=last_bag_counts,
+                    cameras=last_camera_counts,
+                    first_camera_stamp_ros_ns=last_camera_stamps,
+                )
         if asyncio.get_running_loop().time() >= deadline:
-            raise RuntimeError(
-                "recording ready timeout: "
-                f"missing_bag={missing_bag} missing_cameras={missing_cameras} "
-                f"bag_counts={last_bag_counts} camera_counts={last_camera_counts}"
+            raise RecordingReadyTimeoutError(
+                RecordingReadyTimeoutResponse(
+                    bag_ready=bag_status.ready,
+                    missing_bag=sorted(missing_bag),
+                    missing_cameras=sorted(missing_cameras),
+                    bag_counts=dict(sorted(last_bag_counts.items())),
+                    camera_counts=dict(sorted(last_camera_counts.items())),
+                    first_bag_timestamp_ns=dict(
+                        sorted(bag_status.first_bag_timestamp_ns.items())
+                    ),
+                    first_camera_stamp_ros_ns=dict(
+                        sorted(last_camera_stamps.items())
+                    ),
+                    bag_timestamp_source=bag_status.timestamp_source,
+                    timeout_s=_READY_TIMEOUT_S,
+                )
             )
         await asyncio.sleep(_READY_POLL_S)
 
 
-async def _wait_first_recorded_frames(camera_pool: CameraWriterPool) -> dict[str, int]:
+async def _wait_recording_coverage(
+    bag_recorder: BagRecorder,
+    camera_pool: CameraWriterPool,
+    bag_topics: set[str],
+    timeline_start_ros_ns: int,
+    fps: int,
+) -> RecordingCoverage:
     deadline = asyncio.get_running_loop().time() + _READY_TIMEOUT_S
+    bag_alignment_tolerance_ns = round(min(0.1, 3 / fps) * 1_000_000_000)
+    earliest_acceptable_bag_stamp_ns = (
+        timeline_start_ros_ns - bag_alignment_tolerance_ns
+    )
+    last_bag_counts: dict[str, int] = {}
+    last_bag_stamps: dict[str, int] = {}
     last_counts: dict[str, int] = {}
     while True:
+        bag_status = bag_recorder.ready_status(bag_topics)
+        last_bag_counts = bag_status.counts
+        last_bag_stamps = bag_status.latest_bag_timestamp_ns
         last_counts = camera_pool.frame_counts()
-        missing_cameras = [name for name, count in last_counts.items() if count <= 0]
-        if not missing_cameras:
-            return last_counts
+        last_stamps = camera_pool.recorded_frame_stamps_ns()
+        missing_bag = [
+            topic
+            for topic, count in last_bag_counts.items()
+            if count <= 0
+            or last_bag_stamps.get(topic, 0) < earliest_acceptable_bag_stamp_ns
+        ]
+        missing_cameras = [
+            name
+            for name, count in last_counts.items()
+            if count <= 0 or last_stamps.get(name, 0) < timeline_start_ros_ns
+        ]
+        if bag_status.ready and not missing_bag and not missing_cameras:
+            return RecordingCoverage(
+                bag_topics=last_bag_counts,
+                latest_bag_timestamp_ros_ns=last_bag_stamps,
+                bag_alignment_tolerance_ns=bag_alignment_tolerance_ns,
+                frame_counts=last_counts,
+                last_frame_stamp_ros_ns=last_stamps,
+            )
         if asyncio.get_running_loop().time() >= deadline:
             raise RuntimeError(
-                "first recorded frame timeout: "
-                f"missing_cameras={missing_cameras} frame_counts={last_counts}"
+                "recording coverage timeout: "
+                f"bag_ready={bag_status.ready} missing_bag={missing_bag} "
+                f"missing_cameras={missing_cameras} "
+                f"bag_counts={last_bag_counts} latest_bag_stamps={last_bag_stamps} "
+                f"earliest_acceptable_bag_stamp_ns={earliest_acceptable_bag_stamp_ns} "
+                f"frame_counts={last_counts} "
+                f"last_frame_stamps={last_stamps} "
+                f"timeline_start_ros_ns={timeline_start_ros_ns}"
             )
         await asyncio.sleep(_READY_POLL_S)
 
@@ -294,18 +478,26 @@ def _fail_start_episode(
         camera_pool.detach_all().finalize({})
     except Exception:
         LOG.exception("camera cleanup failed after start failure")
-    if active_lock is not None:
+    terminal_state_saved = False
+    try:
+        active = store.active
+        timeline_end_ros_ns = (
+            camera_pool.ros_now_ns()
+            if active is not None and active.timeline_start_ros_ns is not None
+            else None
+        )
+        meta, ep_dir = store.begin_finalizing_active("abort", timeline_end_ros_ns)
+        meta.state = "failed"
+        meta.stale_input_events.append({"code": code, "detail": detail})
+        store._write_meta(ep_dir, meta)  # noqa: SLF001
+        terminal_state_saved = True
+    except Exception:
+        LOG.exception("episode metadata cleanup failed after start failure")
+    if active_lock is not None and terminal_state_saved:
         try:
             active_lock.release()
         except Exception:
             LOG.exception("active lock cleanup failed after start failure")
-    try:
-        meta, ep_dir = store.begin_finalizing_active("abort")
-        meta.state = "failed"
-        meta.stale_input_events.append({"code": code, "detail": detail})
-        store._write_meta(ep_dir, meta)  # noqa: SLF001
-    except Exception:
-        LOG.exception("episode metadata cleanup failed after start failure")
 
 
 # ---------- Marker handlers ----------
@@ -455,6 +647,19 @@ async def _start_episode(request: web.Request) -> web.Response:
     from .topic_discovery import discover_cameras, discover_topics
     get_profile = request.app.get("get_profile")
     profile_dict = get_profile(req.profile) if callable(get_profile) else {}
+    has_request_override = (
+        req.record_topics_override is not None
+        or req.record_bag_topics is not None
+        or req.cameras_override is not None
+    )
+    if not profile_dict and not has_request_override:
+        return web.json_response(
+            {
+                "error": "profile_not_found",
+                "detail": f"recording profile not found: {req.profile}",
+            },
+            status=404,
+        )
 
     if req.record_topics_override:
         recorded_topics_meta = req.record_topics_override
@@ -483,6 +688,27 @@ async def _start_episode(request: web.Request) -> web.Response:
     else:
         cameras_resolved = []
 
+    try:
+        cameras_resolved = _enabled_cameras(cameras_resolved)
+        depth_ready_topics = _sync_depth_bag_topics(
+            cameras_resolved,
+            recorded_topics_meta,
+            bag_topics,
+        )
+    except ValueError as exc:
+        return web.json_response(
+            {"error": "invalid_camera_config", "detail": str(exc)},
+            status=400,
+        )
+    if depth_ready_topics and not req.record_bag:
+        return web.json_response(
+            {
+                "error": "invalid_camera_config",
+                "detail": "enabled depth cameras require record_bag=true",
+            },
+            status=400,
+        )
+
     # Step 5: disk preflight (refuse with 503 if not enough room).
     preflight_cfg = (req.model_dump().get("preflight") or {}) if hasattr(req, "model_dump") else {}
     preflight = run_preflight(
@@ -507,6 +733,7 @@ async def _start_episode(request: web.Request) -> web.Response:
     mux_tracker = request.app.get("mux_tracker")
     controller_at_start = mux_tracker.snapshot() if mux_tracker is not None else None
     ready_topics = _required_ready_topics(profile_dict, recorded_topics_meta, controller_at_start)
+    ready_topics.update(depth_ready_topics)
 
     meta = EpisodeMeta(
         episode_id=ep_id,
@@ -530,33 +757,59 @@ async def _start_episode(request: web.Request) -> web.Response:
     except RuntimeError as exc:
         return web.json_response({"error": "conflict", "detail": str(exc)}, status=409)
 
+    bag_recorder: BagRecorder = request.app["bag_recorder"]
+    camera_pool: CameraWriterPool = request.app["camera_pool"]
+    depth_pool = request.app.get("depth_pool")
+
     # Step 6: acquire active lock
     active_lock: Optional[ActiveLock] = request.app.get("active_lock")
     if active_lock is not None:
         try:
             active_lock.acquire(ep_id, ep_dir)
         except Exception as exc:
-            LOG.warning("active lock acquire failed: %s", exc)
+            detail = str(exc)
+            LOG.error("active lock acquire failed: %s", detail)
+            _fail_start_episode(
+                store=store,
+                bag_recorder=bag_recorder,
+                camera_pool=camera_pool,
+                depth_pool=depth_pool,
+                active_lock=active_lock,
+                code="active_lock_failed",
+                detail=detail,
+            )
+            return web.json_response(
+                {"error": "active_lock_failed", "detail": detail},
+                status=500,
+            )
 
     # Step 2a: start depth republishers BEFORE bag recorder so the compressed
     # topics have publishers before rosbag2 subscribes. Each depth camera
     # gets an in-process Image → CompressedImage relay (PNG-compressed,
     # lossless). Fail-loud: a republisher spawn failure aborts the episode.
-    depth_pool = request.app.get("depth_pool")
     depth_cams = [c for c in cameras_resolved
                   if isinstance(c, dict) and (c.get("kind") or "").lower() == "depth"]
     if depth_cams and depth_pool is not None:
         try:
             depth_pool.start_all(depth_cams)
         except Exception as exc:
-            LOG.error("depth republisher start failed: %s", exc)
+            detail = str(exc)
+            LOG.error("depth republisher start failed: %s", detail)
+            _fail_start_episode(
+                store=store,
+                bag_recorder=bag_recorder,
+                camera_pool=camera_pool,
+                depth_pool=depth_pool,
+                active_lock=active_lock,
+                code="depth_republisher_failed",
+                detail=detail,
+            )
             return web.json_response(
-                {"error": "depth_republisher_failed", "detail": str(exc)},
+                {"error": "depth_republisher_failed", "detail": detail},
                 status=500,
             )
 
     # Step 2: start bag recorder if topics provided and record_bag=true
-    bag_recorder: BagRecorder = request.app["bag_recorder"]
     bag_started = False
     if req.record_bag and bag_topics:
         if not BagRecorder.available():
@@ -599,13 +852,11 @@ async def _start_episode(request: web.Request) -> web.Response:
     # Step 3+4: start camera writers (resolved from override or profile).
     # kind=depth entries are skipped here — they're bagged via the
     # republisher, not written to disk as a separate mp4/png stream.
-    camera_pool: CameraWriterPool = request.app["camera_pool"]
     cameras_started: list[dict] = []
     if cameras_resolved:
         try:
             warmup_cameras = [
-                {**camera, "record_immediately": False}
-                for camera in cameras_resolved
+                {**camera, "record_immediately": True} for camera in cameras_resolved
             ]
             cameras_started = camera_pool.start_all(ep_dir, warmup_cameras, fps=req.fps)
             meta.cameras = cameras_started
@@ -633,7 +884,24 @@ async def _start_episode(request: web.Request) -> web.Response:
             camera_pool=camera_pool,
             bag_topics=ready_topics,
         )
-    except RuntimeError as exc:
+    except RecordingReadyTimeoutError as exc:
+        timeout_payload: dict = exc.response.model_dump(mode="json")
+        LOG.warning(
+            "episode recording ready timed out: missing_bag=%s missing_cameras=%s",
+            exc.response.missing_bag,
+            exc.response.missing_cameras,
+        )
+        _fail_start_episode(
+            store=store,
+            bag_recorder=bag_recorder,
+            camera_pool=camera_pool,
+            depth_pool=depth_pool,
+            active_lock=active_lock,
+            code=exc.response.code,
+            detail=exc.response.message,
+        )
+        return web.json_response(timeout_payload, status=503)
+    except Exception as exc:
         detail = str(exc)
         LOG.warning("episode recording ready failed: %s", detail)
         _fail_start_episode(
@@ -642,58 +910,105 @@ async def _start_episode(request: web.Request) -> web.Response:
             camera_pool=camera_pool,
             depth_pool=depth_pool,
             active_lock=active_lock,
-            code="recording_ready_timeout",
+            code="recording_ready_failed",
             detail=detail,
         )
         return web.json_response(
-            {"error": "recording_ready_timeout", "detail": detail},
-            status=503,
+            {"error": "recording_ready_failed", "detail": detail},
+            status=500,
         )
 
-    recording_ready_payload = asdict(recording_ready)
-    meta.started_at = recording_ready.ready_at
-    meta.quality_metrics = {
-        **(meta.quality_metrics or {}),
-        "recording_ready": recording_ready_payload,
-    }
-    store._write_meta(ep_dir, meta)  # noqa: SLF001
-    camera_pool.enable_recording()
-
     try:
-        first_recorded_frames = await _wait_first_recorded_frames(camera_pool)
-    except RuntimeError as exc:
+        recording_ready_payload = asdict(recording_ready)
+        meta.started_at = utc_now_iso()
+        meta.timeline_start_ros_ns = recording_ready.timeline_start_ros_ns
+        meta.quality_metrics = {
+            **(meta.quality_metrics or {}),
+            "recording_ready": recording_ready_payload,
+        }
+        store._write_meta(ep_dir, meta)  # noqa: SLF001
+        camera_pool.enable_recording()
+    except Exception as exc:
         detail = str(exc)
-        LOG.warning("episode first recorded frame failed: %s", detail)
+        LOG.exception("episode recording enable failed: %s", ep_id)
         _fail_start_episode(
             store=store,
             bag_recorder=bag_recorder,
             camera_pool=camera_pool,
             depth_pool=depth_pool,
             active_lock=active_lock,
-            code="first_recorded_frame_timeout",
+            code="recording_enable_failed",
             detail=detail,
         )
         return web.json_response(
-            {"error": "first_recorded_frame_timeout", "detail": detail},
+            {"error": "recording_enable_failed", "detail": detail},
+            status=500,
+        )
+
+    try:
+        recording_coverage = await _wait_recording_coverage(
+            bag_recorder,
+            camera_pool,
+            ready_topics,
+            recording_ready.timeline_start_ros_ns,
+            req.fps,
+        )
+    except Exception as exc:
+        detail = str(exc)
+        LOG.warning("episode recording coverage failed: %s", detail)
+        _fail_start_episode(
+            store=store,
+            bag_recorder=bag_recorder,
+            camera_pool=camera_pool,
+            depth_pool=depth_pool,
+            active_lock=active_lock,
+            code="recording_coverage_timeout",
+            detail=detail,
+        )
+        return web.json_response(
+            {"error": "recording_coverage_timeout", "detail": detail},
             status=503,
         )
 
+    start_response_preflight = {
+        **preflight,
+        "bag_started": bag_started,
+        "cameras_started": [c["name"] for c in cameras_started],
+        "recording_ready": recording_ready_payload,
+        "recording_coverage": asdict(recording_coverage),
+    }
     meta.quality_metrics = {
         **(meta.quality_metrics or {}),
-        "first_recorded_frames": first_recorded_frames,
+        "recording_coverage": asdict(recording_coverage),
+        "start_response_preflight": start_response_preflight,
     }
-    store._write_meta(ep_dir, meta)  # noqa: SLF001
+    try:
+        store._write_meta(ep_dir, meta)  # noqa: SLF001
+    except Exception as exc:
+        detail = str(exc)
+        LOG.exception("episode ready metadata commit failed: %s", ep_id)
+        _fail_start_episode(
+            store=store,
+            bag_recorder=bag_recorder,
+            camera_pool=camera_pool,
+            depth_pool=depth_pool,
+            active_lock=active_lock,
+            code="recording_ready_commit_failed",
+            detail=detail,
+        )
+        return web.json_response(
+            {"error": "recording_ready_commit_failed", "detail": detail},
+            status=500,
+        )
 
     resp = StartEpisodeResponse(
         episode_id=ep_id,
         started_at=meta.started_at,
+        timeline_start_ros_ns=meta.timeline_start_ros_ns,
         bag_path=str((ep_dir / "bag").resolve()),
         meta_path=str((ep_dir / "meta.json").resolve()),
         recorded_topics_resolved=meta.recorded_topics,
-        preflight={**preflight, "bag_started": bag_started,
-                   "cameras_started": [c["name"] for c in cameras_started],
-                   "recording_ready": recording_ready_payload,
-                   "first_recorded_frames": first_recorded_frames},
+        preflight=start_response_preflight,
     )
     LOG.info("episode started: %s task=%s profile=%s bag_topics=%d bag_started=%s",
              ep_id, req.task_description, req.profile, len(bag_topics), bag_started)
@@ -717,20 +1032,42 @@ async def _stop_episode(request: web.Request) -> web.Response:
              "detail": f"active is {store.active.episode_id}, requested {episode_id}"},
             status=409,
         )
+    camera_pool: CameraWriterPool = request.app["camera_pool"]
+    try:
+        timeline_end_ros_ns = camera_pool.ros_now_ns()
+    except RuntimeError as exc:
+        return web.json_response(
+            {"error": "timeline_clock_invalid", "detail": str(exc)},
+            status=500,
+        )
+    if (
+        store.active.timeline_start_ros_ns is None
+        or timeline_end_ros_ns <= store.active.timeline_start_ros_ns
+    ):
+        return web.json_response(
+            {
+                "error": "timeline_boundary_invalid",
+                "detail": "recording has no valid canonical ROS timeline interval",
+            },
+            status=500,
+        )
 
-    # Step 2: detach all active episode resources. The slow flush/finalize
-    # happens in the background; this request only stops new samples.
+    # Detach all active episode resources. The slow flush/finalize happens in
+    # the background; this request only stops new samples at timeline_end_ros_ns.
     bag_recorder: BagRecorder = request.app["bag_recorder"]
     detached_bag = bag_recorder.detach_for_finalize()
 
     depth_pool = request.app.get("depth_pool")
     depth_frame_counts: dict[str, int] = {}
+    initial_failures: list[FinalizeFailure] = []
     if depth_pool is not None:
         try:
             depth_frame_counts = depth_pool.stop_all() or {}
         except Exception as exc:
             LOG.warning("depth republisher stop failed: %s", exc)
-    camera_pool: CameraWriterPool = request.app["camera_pool"]
+            initial_failures.append(
+                FinalizeFailure(code="camera_write_error", detail=f"depth: {exc}")
+            )
     detached_cameras = camera_pool.detach_all()
     frame_count_per_camera = detached_cameras.frame_counts()
 
@@ -740,7 +1077,9 @@ async def _stop_episode(request: web.Request) -> web.Response:
 
     mux_tracker = request.app.get("mux_tracker")
     controller_at_end = mux_tracker.snapshot() if mux_tracker is not None else None
-    meta, ep_dir = store.begin_finalizing_active(req.outcome)
+    meta, ep_dir = store.begin_finalizing_active(req.outcome, timeline_end_ros_ns)
+    meta.stop_frame_count_per_camera = frame_count_per_camera
+    store._write_meta(ep_dir, meta)  # noqa: SLF001
 
     # Step 6: release active lock now; the episode is no longer recording.
     active_lock: Optional[ActiveLock] = request.app.get("active_lock")
@@ -750,7 +1089,7 @@ async def _stop_episode(request: web.Request) -> web.Response:
         except Exception as exc:
             LOG.warning("active lock release failed after stop detach: %s", exc)
 
-    asyncio.create_task(
+    finalizer_task = asyncio.create_task(
         _finalize_stopped_episode(
             store=store,
             meta=meta,
@@ -761,14 +1100,19 @@ async def _stop_episode(request: web.Request) -> web.Response:
             depth_frame_counts=depth_frame_counts,
             pending_markers=pending_markers,
             controller_at_end=controller_at_end,
+            initial_failures=initial_failures,
         ),
         name=f"fv-episode-finalize-{episode_id}",
     )
+    finalizer_tasks: set[asyncio.Task[None]] = request.app["finalizer_tasks"]
+    finalizer_tasks.add(finalizer_task)
+    finalizer_task.add_done_callback(finalizer_tasks.discard)
 
     resp = StopEpisodeResponse(
         episode_id=meta.episode_id,
         state=meta.state,
         duration_s=meta.duration_s or 0.0,
+        timeline_end_ros_ns=timeline_end_ros_ns,
         frame_count_per_camera=frame_count_per_camera,
         bag_size_bytes=0,
         video_size_bytes=0,
@@ -792,6 +1136,7 @@ async def _finalize_stopped_episode(
     depth_frame_counts: dict[str, int],
     pending_markers: list[dict],
     controller_at_end: dict | None,
+    initial_failures: list[FinalizeFailure],
 ) -> None:
     try:
         await asyncio.to_thread(
@@ -805,9 +1150,27 @@ async def _finalize_stopped_episode(
             depth_frame_counts,
             pending_markers,
             controller_at_end,
+            initial_failures,
         )
-    except Exception:
+    except asyncio.CancelledError:
+        _mark_finalize_failed(
+            store,
+            meta,
+            ep_dir,
+            FinalizeFailure(
+                code="finalizer_error",
+                detail="episode finalizer task was cancelled",
+            ),
+        )
+        raise
+    except Exception as exc:
         LOG.exception("episode finalizer crashed: %s", meta.episode_id)
+        _mark_finalize_failed(
+            store,
+            meta,
+            ep_dir,
+            FinalizeFailure(code="finalizer_error", detail=str(exc)),
+        )
 
 
 def _finalize_stopped_episode_sync(
@@ -820,26 +1183,38 @@ def _finalize_stopped_episode_sync(
     depth_frame_counts: dict[str, int],
     pending_markers: list[dict],
     controller_at_end: dict | None,
+    initial_failures: list[FinalizeFailure],
 ) -> None:
-    errors: list[str] = []
+    failures = list(initial_failures)
     try:
-        bag_summary = detached_bag.wait(timeout_s=10.0)
+        bag_summary = detached_bag.wait(timeout_s=BAG_FINALIZE_TIMEOUT_S)
     except Exception as exc:
         LOG.exception("bag finalize failed: %s", meta.episode_id)
         bag_summary = {"size_bytes": 0, "split_count": 0}
-        errors.append(f"bag: {exc}")
+        failures.append(FinalizeFailure(code="bag_write_error", detail=str(exc)))
     try:
         camera_summaries, camera_errors = detached_cameras.finalize(depth_frame_counts)
-        errors.extend(camera_errors)
+        failures.extend(
+            FinalizeFailure(code="camera_write_error", detail=error)
+            for error in camera_errors
+        )
     except Exception as exc:
         LOG.exception("camera finalize failed: %s", meta.episode_id)
         camera_summaries = []
-        errors.append(f"camera: {exc}")
+        failures.append(FinalizeFailure(code="camera_write_error", detail=str(exc)))
     for camera_summary in camera_summaries:
         kind = str(camera_summary.get("kind") or "color").lower()
-        if not kind.startswith("depth") and int(camera_summary.get("frame_count") or 0) <= 0:
+        if (
+            not kind.startswith("depth")
+            and int(camera_summary.get("frame_count") or 0) <= 0
+        ):
             name = camera_summary.get("name") or "<unknown>"
-            errors.append(f"camera {name}: no recorded frames")
+            failures.append(
+                FinalizeFailure(
+                    code="camera_write_error",
+                    detail=f"camera {name}: no recorded frames",
+                )
+            )
 
     video_size_bytes = 0
     for camera_summary in camera_summaries:
@@ -856,31 +1231,63 @@ def _finalize_stopped_episode_sync(
         meta.markers = pending_markers
     if controller_at_end is not None:
         meta.controller_at_end = controller_at_end
-    if errors:
+    if failures:
         meta.stale_input_events = [
             *getattr(meta, "stale_input_events", []),
-            *[{"kind": "finalize_error", "detail": error} for error in errors],
+            *[asdict(failure) for failure in failures],
         ]
 
     if outcome == "discard":
-        shutil.rmtree(ep_dir, ignore_errors=True)
-        try:
-            store.index.delete(meta.episode_id)
-        except Exception:
-            pass
+        if not store.delete_episode(meta.episode_id, force=True):
+            raise EpisodeNotFoundError(meta.episode_id)
         LOG.info("episode discarded and dir removed: %s", meta.episode_id)
         return
 
-    if outcome == "abort" or errors:
+    if outcome == "success" and not failures:
+        try:
+            store.make_episode_videos_read_only(ep_dir)
+        except Exception as exc:
+            failure = FinalizeFailure(code="video_immutability_error", detail=str(exc))
+            failures.append(failure)
+            meta.stale_input_events.append(asdict(failure))
+
+    if outcome == "abort" or failures:
         meta.state = "failed"
+        meta.outcome = "abort"
     else:
         meta.state = "finished"
-    store._write_meta(ep_dir, meta)  # noqa: SLF001 — local helper, store is single owner
+    meta = store.commit_episode_finalization(meta, ep_dir)
     LOG.info(
         "episode finalized: %s outcome=%s state=%s duration=%.1fs bag=%d video=%d errors=%d",
-        meta.episode_id, outcome, meta.state, meta.duration_s or 0.0,
-        int(bag_summary.get("size_bytes", 0)), video_size_bytes, len(errors),
+        meta.episode_id,
+        meta.outcome,
+        meta.state,
+        meta.duration_s or 0.0,
+        int(bag_summary.get("size_bytes", 0)),
+        video_size_bytes,
+        len(failures),
     )
+
+
+def _mark_finalize_failed(
+    store: EpisodeStore,
+    meta: EpisodeMeta,
+    ep_dir: Path,
+    failure: FinalizeFailure,
+) -> None:
+    latest = store.get_episode(meta.episode_id)
+    if latest is not None:
+        meta = latest[0]
+    meta.state = "failed"
+    meta.outcome = "abort"
+    meta.stale_input_events = [
+        *getattr(meta, "stale_input_events", []),
+        asdict(failure),
+    ]
+    try:
+        store.commit_episode_finalization(meta, ep_dir)
+    except Exception:
+        LOG.exception("failed to persist terminal finalizer state: %s", meta.episode_id)
 
 
 async def _list_episodes(request: web.Request) -> web.Response:
@@ -1032,7 +1439,6 @@ async def _disk_status(request: web.Request) -> web.Response:
     Returns: current usage, recent write rate, estimated "hours of recording
     left at current rate", episode count + total bytes.
     """
-    import time
     store: EpisodeStore = request.app["store"]
     output_dir = store.output_dir
     usage = shutil.disk_usage(output_dir)
@@ -1290,7 +1696,6 @@ async def _depth_preview(request: web.Request) -> web.Response:
     Legacy: if a per-frame PNG file exists at the old path (pre-2026-05-31
     recordings before the bag-integration switch), serve that instead.
     """
-    import cv2, asyncio, numpy as np
     store: EpisodeStore = request.app["store"]
     episode_id = request.match_info["episode_id"]
     camera = request.match_info["camera"]
@@ -1512,7 +1917,10 @@ async def _batch_start(request: web.Request) -> web.Response:
             @property
             def query(self):
                 return {}
-        resp = await _start_episode(_Shim(request, body))  # type: ignore[arg-type]
+
+        resp = await _start_episode(  # type: ignore[arg-type]
+            _Shim(request, body)
+        )
         if resp.status >= 400:
             raise RuntimeError(f"start_episode HTTP {resp.status}: {resp.body.decode('utf-8', 'replace')[:200]}")
         import json as _json
@@ -1526,7 +1934,10 @@ async def _batch_start(request: web.Request) -> web.Response:
                 self._payload = payload
             async def json(self):
                 return self._payload
-        resp = await _stop_episode(_Shim(request, ep_id, {"outcome": outcome}))  # type: ignore[arg-type]
+
+        resp = await _stop_episode(  # type: ignore[arg-type]
+            _Shim(request, ep_id, {"outcome": outcome})
+        )
         if resp.status >= 400:
             raise RuntimeError(f"stop_episode HTTP {resp.status}: {resp.body.decode('utf-8', 'replace')[:200]}")
         import json as _json
@@ -1752,6 +2163,31 @@ async def _patch_episode(request: web.Request) -> web.Response:
     return web.json_response(updated)
 
 
+async def _add_episode_tags(request: web.Request) -> web.Response:
+    """Atomically append tags without replacing tags written by another client."""
+    episode_id = request.match_info["episode_id"]
+    try:
+        body = AddEpisodeTagsRequest.model_validate(await request.json())
+    except Exception as exc:
+        return web.json_response(
+            {"error": "invalid_request", "detail": str(exc)},
+            status=400,
+        )
+    store: EpisodeStore = request.app["store"]
+    try:
+        tags = store.add_episode_tags(episode_id, body.tags)
+    except EpisodeNotFoundError:
+        return web.json_response({"error": "not_found"}, status=404)
+    except EpisodeMetadataError as exc:
+        LOG.exception("episode metadata unavailable while adding tags: %s", episode_id)
+        return web.json_response(
+            {"error": "episode_metadata_unavailable", "detail": str(exc)},
+            status=500,
+        )
+    response = AddEpisodeTagsResponse(episode_id=episode_id, tags=tags)
+    return web.json_response(response.model_dump())
+
+
 async def _delete_episode(request: web.Request) -> web.Response:
     """Hard-delete an episode directory. ?force=true bypasses the pin guard.
 
@@ -1763,6 +2199,11 @@ async def _delete_episode(request: web.Request) -> web.Response:
         removed = store.delete_episode(episode_id, force=force)
     except PermissionError as exc:
         return web.json_response({"error": "pinned", "detail": str(exc)}, status=409)
+    except EpisodeMetadataError as exc:
+        return web.json_response(
+            {"error": "episode_metadata_unavailable", "detail": str(exc)},
+            status=500,
+        )
     except RuntimeError as exc:
         return web.json_response({"error": "active", "detail": str(exc)}, status=409)
     if not removed:
@@ -1793,20 +2234,28 @@ async def _recover_episode(request: web.Request) -> web.Response:
 
     store: EpisodeStore = request.app["store"]
     active_lock: Optional[ActiveLock] = request.app.get("active_lock")
-    found = store.get_episode(episode_id)
-    if found is None:
-        return web.json_response({"error": "not_found"}, status=404)
-    meta, ep_dir = found
-
     if action == "discard":
-        shutil.rmtree(ep_dir, ignore_errors=True)
-        result = {"episode_id": episode_id, "state": "discarded", "files_removed": True}
+        if not store.delete_episode(episode_id, force=True):
+            return web.json_response({"error": "not_found"}, status=404)
+        result: dict = {
+            "episode_id": episode_id,
+            "state": "discarded",
+            "files_removed": True,
+        }
     else:  # finalize_aborted
-        meta.state = "failed"
-        meta.outcome = "abort"
-        if meta.stopped_at is None:
-            meta.stopped_at = utc_now_iso()
-        store._write_meta(ep_dir, meta)  # noqa: SLF001
+        try:
+            meta = store.mark_orphan_failed(episode_id)
+        except EpisodeNotFoundError:
+            return web.json_response({"error": "not_found"}, status=404)
+        except EpisodeMetadataError as exc:
+            return web.json_response(
+                {"error": "episode_metadata_unavailable", "detail": str(exc)},
+                status=500,
+            )
+        except RuntimeError as exc:
+            return web.json_response(
+                {"error": "invalid_episode_state", "detail": str(exc)}, status=409
+            )
         result = {"episode_id": episode_id, "state": meta.state, "outcome": meta.outcome}
 
     if active_lock is not None:

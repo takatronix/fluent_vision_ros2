@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -15,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rcutils/time.h>
 #include <rmw/rmw.h>
 #include <rosbag2_cpp/writer.hpp>
 #include <rosbag2_cpp/writers/sequential_writer.hpp>
@@ -82,13 +84,6 @@ Args parse_args(int argc, char ** argv)
   return args;
 }
 
-uint64_t unix_time_ns()
-{
-  const auto now = std::chrono::system_clock::now().time_since_epoch();
-  return static_cast<uint64_t>(
-    std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
-}
-
 class ReadyState
 {
 public:
@@ -97,28 +92,47 @@ public:
   {
     for (const auto & topic : required_topics_) {
       counts_[topic] = 0;
+      first_bag_timestamp_ns_[topic] = 0;
+      latest_bag_timestamp_ns_[topic] = 0;
     }
     ready_ = required_topics_.empty();
-    ready_at_unix_ns_ = ready_ ? unix_time_ns() : 0;
-    write_status(ready_, ready_at_unix_ns_);
+    write_status_locked();
   }
 
-  void mark_written(const std::string & topic)
+  void mark_written(const std::string & topic, rcutils_time_point_value_t bag_timestamp_ns)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto found = counts_.find(topic);
     if (found == counts_.end()) {
       return;
     }
+    if (bag_timestamp_ns <= 0) {
+      throw std::runtime_error(
+              "rosbag2 accepted a required message without a positive receive timestamp: " + topic);
+    }
+    if (found->second == 0) {
+      first_bag_timestamp_ns_[topic] = bag_timestamp_ns;
+    }
+    latest_bag_timestamp_ns_[topic] = std::max(
+      latest_bag_timestamp_ns_[topic], bag_timestamp_ns);
     found->second += 1;
-    const bool became_ready = !ready_ && all_required_seen();
-    if (became_ready) {
+    if (!ready_ && all_required_seen()) {
       ready_ = true;
-      ready_at_unix_ns_ = unix_time_ns();
+      ready_at_ros_ns_ = latest_first_bag_timestamp_ns();
     }
-    if (found->second == 1 || became_ready) {
-      write_status(ready_, ready_at_unix_ns_);
+    dirty_ = true;
+  }
+
+  void flush_status(bool force = false)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = std::chrono::steady_clock::now();
+    if (!dirty_ || (!force && now - last_status_write_ < std::chrono::milliseconds(50))) {
+      return;
     }
+    write_status_locked();
+    dirty_ = false;
+    last_status_write_ = now;
   }
 
 private:
@@ -133,13 +147,25 @@ private:
     return true;
   }
 
-  void write_status(bool ready, uint64_t ready_at_unix_ns) const
+  rcutils_time_point_value_t latest_first_bag_timestamp_ns() const
+  {
+    rcutils_time_point_value_t latest = 0;
+    for (const auto & entry : first_bag_timestamp_ns_) {
+      latest = std::max(latest, entry.second);
+    }
+    return latest;
+  }
+
+  void write_status_locked() const
   {
     std::filesystem::create_directories(ready_file_.parent_path());
     nlohmann::json body;
-    body["ready"] = ready;
-    body["ready_at_unix_ns"] = ready_at_unix_ns;
+    body["ready"] = ready_;
+    body["ready_at_ros_ns"] = ready_at_ros_ns_;
     body["bag_topics"] = counts_;
+    body["first_bag_timestamp_ns"] = first_bag_timestamp_ns_;
+    body["latest_bag_timestamp_ns"] = latest_bag_timestamp_ns_;
+    body["timestamp_source"] = "rosbag2_serialized_message_time_stamp";
     const auto tmp = ready_file_.string() + ".tmp";
     {
       std::ofstream out(tmp, std::ios::out | std::ios::trunc);
@@ -155,8 +181,13 @@ private:
   std::filesystem::path ready_file_;
   std::unordered_set<std::string> required_topics_;
   std::unordered_map<std::string, int64_t> counts_;
-  uint64_t ready_at_unix_ns_ = 0;
+  std::unordered_map<std::string, rcutils_time_point_value_t> first_bag_timestamp_ns_;
+  std::unordered_map<std::string, rcutils_time_point_value_t> latest_bag_timestamp_ns_;
+  rcutils_time_point_value_t ready_at_ros_ns_ = 0;
   bool ready_ = false;
+  bool dirty_ = false;
+  std::chrono::steady_clock::time_point last_status_write_ =
+    std::chrono::steady_clock::now();
   mutable std::mutex mutex_;
 };
 
@@ -170,7 +201,9 @@ public:
   void write(std::shared_ptr<rosbag2_storage::SerializedBagMessage> message) override
   {
     rosbag2_cpp::writers::SequentialWriter::write(message);
-    ready_state_->mark_written(message->topic_name);
+    // `time_stamp` is the receive timestamp rosbag2 stores for this serialized
+    // message. It is not a deserialized message-header timestamp.
+    ready_state_->mark_written(message->topic_name, message->time_stamp);
   }
 
 private:
@@ -222,9 +255,11 @@ int main(int argc, char ** argv)
     executor.add_node(recorder);
     while (rclcpp::ok() && !g_stop_requested.load()) {
       executor.spin_some(std::chrono::milliseconds(50));
+      ready_state->flush_status();
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     recorder->stop();
+    ready_state->flush_status(true);
     rclcpp::shutdown();
   } catch (const std::exception & exc) {
     std::cerr << "fv_counting_bag_recorder: " << exc.what() << "\n";

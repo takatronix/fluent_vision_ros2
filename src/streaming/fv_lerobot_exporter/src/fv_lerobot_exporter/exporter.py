@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import os
 import shutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import stat
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from multiprocessing import get_context, set_forkserver_preload
 from pathlib import Path
-from typing import Callable, Literal, Mapping, Self
+from threading import Lock
+from typing import Literal, Mapping, TypeVar
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -37,25 +39,22 @@ from pydantic import (
 )
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
+from typing_extensions import Self
 
-from .timing import max_video_timestamp_tolerance_s
+from .timing import (
+    MAX_VIDEO_TIMESTAMP_FRAME_DISTANCE,
+    max_video_timestamp_tolerance_s,
+)
 
 
 JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
+VIDEO_QUERY_TIMESTAMP_SOURCE_KEY = "video_query_timestamp_source"
+VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX = "frame_index_over_fps"
 StampSource = Literal["message_header", "rosbag_recv", "system"]
+JointUnit = Literal["degrees", "percent"]
 StatValue = list[float] | list[int] | list[list[list[float]]]
 LerobotDataValue = int | float | list[float]
 LerobotEpisodeValue = int | float | str | list[str]
-LerobotDatasetExportProgressPhase = Literal[
-    "preparing",
-    "aligning",
-    "writing_rows",
-    "writing_videos",
-    "writing_metadata",
-    "writing_stats",
-    "validating",
-    "finalizing",
-]
 
 
 class LerobotDatasetExportError(RuntimeError):
@@ -88,6 +87,13 @@ class LerobotDatasetExportRequest(BaseModel):
             raise ValueError("dataset_id must be a relative POSIX path")
         return value
 
+    @field_validator("episode_ids")
+    @classmethod
+    def validate_episode_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("episode_ids must not contain duplicates")
+        return value
+
     @model_validator(mode="after")
     def validate_alignment_error(self) -> Self:
         limit_s = max_video_timestamp_tolerance_s(self.fps)
@@ -108,36 +114,6 @@ class LerobotDatasetExportResponse(BaseModel):
     frame_count: int
     exported_at: str
     provenance_path: str
-
-
-class LerobotDatasetExportProgress(BaseModel):
-    phase: LerobotDatasetExportProgressPhase
-    progress_percent: float = Field(..., ge=0.0, le=100.0)
-    message: str = Field(..., min_length=1)
-    detail: str | None = None
-
-
-LerobotDatasetExportProgressReporter = Callable[[LerobotDatasetExportProgress], None]
-
-
-def _report_progress(
-    progress: LerobotDatasetExportProgressReporter | None,
-    *,
-    phase: LerobotDatasetExportProgressPhase,
-    progress_percent: float,
-    message: str,
-    detail: str | None = None,
-) -> None:
-    if progress is None:
-        return
-    progress(
-        LerobotDatasetExportProgress(
-            phase=phase,
-            progress_percent=progress_percent,
-            message=message,
-            detail=detail,
-        )
-    )
 
 
 def _export_worker_count(item_count: int) -> int:
@@ -161,13 +137,20 @@ def _export_worker_count(item_count: int) -> int:
     return min(item_count, max(1, min(os.cpu_count() or 4, 8)))
 
 
-@lru_cache(maxsize=1)
+_ALIGNMENT_EXECUTOR: ProcessPoolExecutor | None = None
+_ALIGNMENT_EXECUTOR_LOCK = Lock()
+
+
 def _alignment_executor() -> ProcessPoolExecutor:
-    set_forkserver_preload(["fv_lerobot_exporter.exporter"])
-    return ProcessPoolExecutor(
-        max_workers=_export_worker_count(32),
-        mp_context=get_context("forkserver"),
-    )
+    global _ALIGNMENT_EXECUTOR
+    with _ALIGNMENT_EXECUTOR_LOCK:
+        if _ALIGNMENT_EXECUTOR is None:
+            set_forkserver_preload(["fv_lerobot_exporter.exporter"])
+            _ALIGNMENT_EXECUTOR = ProcessPoolExecutor(
+                max_workers=_export_worker_count(32),
+                mp_context=get_context("forkserver"),
+            )
+        return _ALIGNMENT_EXECUTOR
 
 
 class TopicSpec(BaseModel):
@@ -181,18 +164,22 @@ class JointCommandSpec(TopicSpec):
     ai: TopicSpec | None = None
 
     def topic_for_source(self, source: str) -> str:
-        if source == "leader" and self.leader is not None:
-            return self.leader.topic
-        if source == "vr" and self.vr is not None:
-            return self.vr.topic
-        if source == "ai" and self.ai is not None:
-            return self.ai.topic
-        if self.topic:
-            return self.topic
-        raise LerobotDatasetExportError(
-            "action_topic_not_configured",
-            f"profile.lerobot has no action topic for mux source '{source}'",
-        )
+        source_topic = {
+            "leader": self.leader,
+            "vr": self.vr,
+            "ai": self.ai,
+        }.get(source)
+        if source not in {"leader", "vr", "ai"}:
+            raise LerobotDatasetExportError(
+                "action_source_unsupported",
+                f"mux source '{source}' is not supported for dataset export",
+            )
+        if source_topic is None:
+            raise LerobotDatasetExportError(
+                "action_topic_not_configured",
+                f"profile.lerobot has no explicit action topic for mux source '{source}'",
+            )
+        return source_topic.topic
 
 
 class ArmRxSpec(BaseModel):
@@ -205,14 +192,29 @@ class ArmStreamSpec(BaseModel):
     namespace: str | None = None
     side: str | None = None
     joints: list[str] = Field(..., min_length=1)
+    joint_units: dict[str, JointUnit] | None = None
     rx: ArmRxSpec
+
+    @model_validator(mode="after")
+    def validate_joint_units(self) -> Self:
+        if self.joint_units is None:
+            return self
+        unknown = set(self.joint_units) - set(self.joints)
+        if unknown:
+            raise ValueError(f"joint_units keys not in joints: {sorted(unknown)}")
+        return self
+
+    def unit_for(self, joint_name: str) -> JointUnit:
+        if self.joint_units is None:
+            return "degrees"
+        return self.joint_units.get(joint_name, "degrees")
 
 
 class CameraSpec(BaseModel):
     name: str
     topic: str
     source: str | None = None
-    enabled: bool | str | None = None
+    enabled: bool = Field(default=True, strict=True)
 
 
 class LerobotSpec(BaseModel):
@@ -240,6 +242,8 @@ class RecorderCameraMeta(BaseModel):
     height: int | None = None
     video_timing_mode: str | None = None
     video_pts_origin_ros_ns: int | None = None
+    video_time_base_num: int | None = Field(default=None, gt=0)
+    video_time_base_den: int | None = Field(default=None, gt=0)
     segments: list[RecorderCameraSegment] = Field(default_factory=list)
 
 
@@ -259,18 +263,29 @@ class SourceEpisodeMeta(BaseModel):
     profile: str = Field(..., min_length=1)
     started_at: str
     stopped_at: str | None = None
-    duration_s: float | None = None
+    duration_s: float | None = Field(default=None, ge=0.0)
+    timeline_start_ros_ns: int = Field(..., gt=0)
+    timeline_end_ros_ns: int = Field(..., gt=0)
     outcome: str | None = None
     tags: list[str] = Field(default_factory=list)
     cameras: list[RecorderCameraMeta] = Field(default_factory=list)
     recorded_topics: list[RecordedTopicMeta] = Field(default_factory=list)
     bag_path: str = "bag/"
 
+    @model_validator(mode="after")
+    def validate_timeline(self) -> Self:
+        if self.timeline_end_ros_ns <= self.timeline_start_ros_ns:
+            raise ValueError(
+                "timeline_end_ros_ns must be greater than timeline_start_ros_ns"
+            )
+        return self
+
 
 class FrameSidecarRow(BaseModel):
     frame_index: int
     segment_file: str
     segment_local_frame: int
+    video_pts: int = Field(..., ge=0)
     ros_stamp_ns: int
     recv_stamp_ns: int
     source_seq: int
@@ -293,8 +308,8 @@ class SourceEpisodeProvenance(BaseModel):
     episode_id: str
     task_description: str
     started_at: str
-    stopped_at: str
-    duration_s: float
+    stopped_at: str | None
+    duration_s: float | None
     source_tags: list[str]
 
 
@@ -321,7 +336,8 @@ class CameraExportMapping:
     width: int
     height: int
     source_video: Path
-    video_pts_origin_ros_ns: int
+    frame_pts_seconds: list[float]
+    from_timestamp_s: float
     sidecar_rows: list[FrameSidecarRow]
 
 
@@ -331,8 +347,8 @@ class EpisodeExportData:
     videos: dict[str, "VideoExportData"]
     task_description: str
     started_at: str
-    stopped_at: str
-    duration_s: float
+    stopped_at: str | None
+    duration_s: float | None
     source_tags: list[str]
 
 
@@ -365,7 +381,23 @@ class SourceEventIndex:
 @dataclass(frozen=True)
 class CameraFrameIndex:
     rows: list[FrameSidecarRow]
-    stamps: list[int]
+    pts_seconds: list[float]
+
+
+@dataclass(frozen=True)
+class AlignedJointSample:
+    sample: JointSample
+    origin_grid_index: int
+
+
+@dataclass(frozen=True)
+class AlignedCameraFrame:
+    frame: FrameSidecarRow
+    pts_s: float
+    origin_grid_index: int
+
+
+CarryValueT = TypeVar("CarryValueT", AlignedJointSample, AlignedCameraFrame)
 
 
 def export_lerobot_dataset(
@@ -373,15 +405,8 @@ def export_lerobot_dataset(
     request: LerobotDatasetExportRequest,
     profile_payload: Mapping[str, JsonValue],
     datasets_dir: Path,
-    progress: LerobotDatasetExportProgressReporter | None = None,
 ) -> LerobotDatasetExportResponse:
     root = datasets_dir.resolve()
-    _report_progress(
-        progress,
-        phase="preparing",
-        progress_percent=6.0,
-        message="エピソード候補を確認しています。",
-    )
     episodes = _load_episodes_for_export(root, request.episode_ids)
     profile_name = episodes[0].meta.profile
     if any(ep.meta.profile != profile_name for ep in episodes):
@@ -396,13 +421,6 @@ def export_lerobot_dataset(
             "profile_invalid",
             f"profile.lerobot export contract is invalid: {exc}",
         ) from exc
-    _report_progress(
-        progress,
-        phase="preparing",
-        progress_percent=8.0,
-        message="LeRobot変換設定を確認しています。",
-        detail=f"profile: {profile_name}",
-    )
     dataset_root = _safe_dataset_root(root, request.dataset_id)
     tmp_root = _safe_tmp_root(root, request.dataset_id)
     if dataset_root.exists():
@@ -421,7 +439,6 @@ def export_lerobot_dataset(
             fps=request.fps,
             max_alignment_error_s=request.max_alignment_error_s,
             max_mux_status_age_s=request.max_mux_status_age_s,
-            progress=progress,
         )
         _validate_video_feature_sets(episode_exports)
         _write_lerobot_v3(
@@ -432,22 +449,8 @@ def export_lerobot_dataset(
             video_timestamp_tolerance_s=request.max_alignment_error_s,
             profile=profile,
             episode_exports=episode_exports,
-            progress=progress,
         )
-        _report_progress(
-            progress,
-            phase="validating",
-            progress_percent=94.0,
-            message="LeRobotデータセットの必須ファイルを検証しています。",
-        )
-        _validate_lerobot_export_files(tmp_root)
         exported_at = _utc_now_iso()
-        _report_progress(
-            progress,
-            phase="finalizing",
-            progress_percent=95.0,
-            message="作成したデータセットを配置しています。",
-        )
         provenance = LerobotDatasetExportProvenance(
             dataset_id=request.dataset_id,
             dataset_name=request.dataset_name,
@@ -490,9 +493,53 @@ def export_lerobot_dataset(
 def _load_episodes_for_export(
     root: Path, episode_ids: list[str]
 ) -> list[EpisodeForExport]:
+    episodes_root = root / "episodes"
+    if not episodes_root.exists():
+        raise LerobotDatasetExportError(
+            "episode_store_missing", f"episode store missing: {episodes_root}"
+        )
+    requested_ids = set(episode_ids)
+    matches: dict[str, dict[Path, EpisodeForExport]] = {
+        episode_id: {} for episode_id in episode_ids
+    }
+    for meta_path in episodes_root.glob("*/*/*/meta.json"):
+        try:
+            raw_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise LerobotDatasetExportError(
+                "episode_meta_invalid",
+                f"episode meta is invalid: {meta_path}",
+            ) from exc
+        raw_episode_id = raw_meta.get("episode_id")
+        if raw_episode_id not in requested_ids:
+            continue
+        try:
+            meta = SourceEpisodeMeta.model_validate(raw_meta)
+        except ValidationError as exc:
+            raise LerobotDatasetExportError(
+                "episode_meta_invalid",
+                f"episode meta is invalid: {meta_path}",
+            ) from exc
+        episode_dir = meta_path.parent.resolve()
+        matches[meta.episode_id][episode_dir] = EpisodeForExport(
+            meta=meta,
+            episode_dir=episode_dir,
+        )
+
     episodes: list[EpisodeForExport] = []
     for episode_id in episode_ids:
-        episode = _find_episode(root, episode_id)
+        episode_matches = matches[episode_id]
+        if len(episode_matches) > 1:
+            raise LerobotDatasetExportError(
+                "episode_id_ambiguous",
+                f"episode_id {episode_id} maps to multiple directories: "
+                f"{sorted(str(path) for path in episode_matches)}",
+            )
+        if not episode_matches:
+            raise LerobotDatasetExportError(
+                "episode_not_found", f"episode not found: {episode_id}"
+            )
+        episode = next(iter(episode_matches.values()))
         if episode.meta.state != "finished":
             raise LerobotDatasetExportError(
                 "episode_not_finished",
@@ -514,7 +561,6 @@ def _convert_episodes(
     fps: int,
     max_alignment_error_s: float,
     max_mux_status_age_s: float,
-    progress: LerobotDatasetExportProgressReporter | None,
 ) -> list[EpisodeExportData]:
     episode_total = len(episodes)
     if episode_total == 1:
@@ -532,46 +578,59 @@ def _convert_episodes(
                 exc.code,
                 f"episode {episode.meta.episode_id}: {exc.detail}",
             ) from exc
-        _report_progress(
-            progress,
-            phase="aligning",
-            progress_percent=35.0,
-            message="エピソードのフレームと関節データを時刻合わせしています。",
-            detail=f"1/1: {len(converted_episode.rows)} frames",
-        )
         return [converted_episode]
 
     converted: list[EpisodeExportData | None] = [None] * episode_total
-    futures = {
-        _alignment_executor().submit(
+    executor = _alignment_executor()
+    futures: dict[Future[EpisodeExportData], tuple[int, EpisodeForExport]] = {}
+    next_episode_index = 0
+
+    def submit_next_episode() -> None:
+        nonlocal next_episode_index
+        if next_episode_index >= episode_total:
+            return
+        episode = episodes[next_episode_index]
+        future = executor.submit(
             _convert_episode,
             episode=episode,
             profile=profile,
             fps=fps,
             max_alignment_error_s=max_alignment_error_s,
             max_mux_status_age_s=max_mux_status_age_s,
-        ): (episode_index, episode)
-        for episode_index, episode in enumerate(episodes)
-    }
-    completed = 0
-    for future in as_completed(futures):
-        episode_index, episode = futures[future]
-        try:
-            converted_episode = future.result()
-        except LerobotDatasetExportError as exc:
-            raise LerobotDatasetExportError(
-                exc.code,
-                f"episode {episode.meta.episode_id}: {exc.detail}",
-            ) from exc
-        converted[episode_index] = converted_episode
-        completed += 1
-        _report_progress(
-            progress,
-            phase="aligning",
-            progress_percent=10.0 + (25.0 * (completed / episode_total)),
-            message="エピソードのフレームと関節データを時刻合わせしています。",
-            detail=f"{completed}/{episode_total}: {len(converted_episode.rows)} frames",
         )
+        futures[future] = (next_episode_index, episode)
+        next_episode_index += 1
+
+    def cancel_and_drain_outstanding() -> None:
+        if not futures:
+            return
+        for outstanding in futures:
+            outstanding.cancel()
+        wait(tuple(futures))
+
+    try:
+        for _ in range(_export_worker_count(episode_total)):
+            submit_next_episode()
+
+        while futures:
+            done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+            for future in done:
+                episode_index, episode = futures.pop(future)
+                try:
+                    converted_episode = future.result()
+                except LerobotDatasetExportError as exc:
+                    raise LerobotDatasetExportError(
+                        exc.code,
+                        f"episode {episode.meta.episode_id}: {exc.detail}",
+                    ) from exc
+                converted[episode_index] = converted_episode
+                submit_next_episode()
+    except BaseException as exc:
+        try:
+            cancel_and_drain_outstanding()
+        except BaseException as cleanup_exc:
+            raise exc from cleanup_exc
+        raise
 
     result: list[EpisodeExportData] = []
     for episode in converted:
@@ -579,31 +638,6 @@ def _convert_episodes(
             raise RuntimeError("episode conversion worker returned no result")
         result.append(episode)
     return result
-
-
-def _find_episode(root: Path, episode_id: str) -> EpisodeForExport:
-    episodes_root = root / "episodes"
-    if not episodes_root.exists():
-        raise LerobotDatasetExportError(
-            "episode_store_missing", f"episode store missing: {episodes_root}"
-        )
-    suffix = episode_id[-8:] if len(episode_id) >= 8 else episode_id
-    for pattern in (f"*/*/*{suffix}/meta.json", f"*/*/{episode_id}/meta.json"):
-        for meta_path in episodes_root.glob(pattern):
-            try:
-                meta = SourceEpisodeMeta.model_validate(
-                    json.loads(meta_path.read_text(encoding="utf-8"))
-                )
-            except (OSError, ValueError, ValidationError) as exc:
-                raise LerobotDatasetExportError(
-                    "episode_meta_invalid",
-                    f"episode meta is invalid: {meta_path}",
-                ) from exc
-            if meta.episode_id == episode_id:
-                return EpisodeForExport(meta=meta, episode_dir=meta_path.parent)
-    raise LerobotDatasetExportError(
-        "episode_not_found", f"episode not found: {episode_id}"
-    )
 
 
 def _safe_dataset_root(root: Path, dataset_id: str) -> Path:
@@ -633,23 +667,20 @@ def _convert_episode(
     max_mux_status_age_s: float,
 ) -> EpisodeExportData:
     camera_mappings = _resolve_camera_mappings(episode, profile)
-    primary_camera = camera_mappings[0]
-    primary_frame_stamps = [row.ros_stamp_ns for row in primary_camera.sidecar_rows]
-    if not primary_frame_stamps:
-        raise LerobotDatasetExportError(
-            "camera_sidecar_empty",
-            f"episode {episode.meta.episode_id} has no frames for {primary_camera.recorder_name}",
-        )
     frame_stamps = _fixed_fps_timeline(
-        first_stamp_ns=primary_frame_stamps[0],
-        last_stamp_ns=primary_frame_stamps[-1],
+        timeline_start_ros_ns=episode.meta.timeline_start_ros_ns,
+        timeline_end_ros_ns=episode.meta.timeline_end_ros_ns,
         fps=fps,
     )
 
     stamp_sources = _recorded_topic_stamp_sources(episode.meta)
-    bag_topics = _required_bag_topics(profile)
+    required_bag_topics = _required_bag_topics(profile)
+    optional_action_topics = _configured_action_bag_topics(profile)
     bag = _read_bag_topics(
-        episode.episode_dir / episode.meta.bag_path, bag_topics, stamp_sources
+        episode.episode_dir / episode.meta.bag_path,
+        required_bag_topics,
+        optional_action_topics,
+        stamp_sources,
     )
     if not bag.source_events:
         raise LerobotDatasetExportError(
@@ -670,149 +701,117 @@ def _convert_episode(
     camera_frames_by_feature = {
         mapping.feature_key: CameraFrameIndex(
             rows=mapping.sidecar_rows,
-            stamps=[row.ros_stamp_ns for row in mapping.sidecar_rows],
+            pts_seconds=mapping.frame_pts_seconds,
         )
         for mapping in camera_mappings
     }
 
     arm_streams = profile.lerobot.arm_streams
     state_names = _joint_feature_names(arm_streams)
-    aligned_rows: list[tuple[int, list[float], list[float]] | None] = []
-    alignment_errors: list[LerobotDatasetExportError | None] = []
-    for stamp_ns in frame_stamps:
+    last_state_samples: dict[str, AlignedJointSample] = {}
+    last_action_samples: dict[str, AlignedJointSample] = {}
+    last_camera_frames: dict[str, AlignedCameraFrame] = {}
+    rows: list[dict[str, LerobotDataValue]] = []
+    for grid_index, stamp_ns in enumerate(frame_stamps):
         source = _source_at(source_events, stamp_ns, max_mux_status_age_s)
-        try:
-            state = _combined_joint_values(
-                arm_streams=arm_streams,
-                samples_by_topic=joint_samples_by_topic,
-                stamp_ns=stamp_ns,
-                kind="state",
-                source=source,
-                max_alignment_error_s=max_alignment_error_s,
+        state = _combined_joint_values(
+            arm_streams=arm_streams,
+            samples_by_topic=joint_samples_by_topic,
+            stamp_ns=stamp_ns,
+            grid_index=grid_index,
+            kind="state",
+            source=source,
+            max_alignment_error_s=max_alignment_error_s,
+            last_samples_by_topic=last_state_samples,
+        )
+        action = _combined_joint_values(
+            arm_streams=arm_streams,
+            samples_by_topic=joint_samples_by_topic,
+            stamp_ns=stamp_ns,
+            grid_index=grid_index,
+            kind="action",
+            source=source,
+            max_alignment_error_s=max_alignment_error_s,
+            last_samples_by_topic=last_action_samples,
+        )
+        for mapping in camera_mappings:
+            _camera_frame_with_carry(
+                frame_index=camera_frames_by_feature[mapping.feature_key],
+                query_timestamp_s=mapping.from_timestamp_s + grid_index / fps,
+                grid_index=grid_index,
+                max_error_s=max_alignment_error_s,
+                feature_key=mapping.feature_key,
+                last_frames_by_feature=last_camera_frames,
             )
-            action = _combined_joint_values(
-                arm_streams=arm_streams,
-                samples_by_topic=joint_samples_by_topic,
-                stamp_ns=stamp_ns,
-                kind="action",
-                source=source,
-                max_alignment_error_s=max_alignment_error_s,
-            )
-            for mapping in camera_mappings:
-                _nearest_camera_frame(
-                    camera_frames_by_feature[mapping.feature_key],
-                    stamp_ns,
-                    max_alignment_error_s,
-                )
-        except LerobotDatasetExportError as exc:
-            # Camera recording can start/stop slightly outside joint streams.
-            # Trim only unaligned boundaries; an interior hole cannot be represented
-            # by LeRobot's fixed-fps row timestamps without changing time semantics.
-            if exc.code in {
-                "sample_alignment_error",
-                "sample_missing",
-                "samples_missing",
-                "camera_alignment_error",
-                "camera_frame_missing",
-            }:
-                aligned_rows.append(None)
-                alignment_errors.append(exc)
-                continue
-            raise
         if len(state) != len(state_names) or len(action) != len(state_names):
             raise LerobotDatasetExportError(
                 "joint_vector_mismatch",
                 f"episode {episode.meta.episode_id} produced invalid joint vector length",
             )
-        aligned_rows.append((stamp_ns, state, action))
-        alignment_errors.append(None)
-
-    valid_indices = [index for index, row in enumerate(aligned_rows) if row is not None]
-    if not valid_indices:
-        raise LerobotDatasetExportError(
-            "episode_joint_alignment_empty",
-            f"episode {episode.meta.episode_id} has no frames aligned to joint samples",
-        )
-    first_valid = valid_indices[0]
-    last_valid = valid_indices[-1]
-    for index in range(first_valid, last_valid + 1):
-        if aligned_rows[index] is None:
-            cause = alignment_errors[index]
-            detail = cause.detail if cause is not None else "unknown alignment error"
-            raise LerobotDatasetExportError(
-                "episode_alignment_gap",
-                f"fixed-fps timeline has an unaligned interior frame at index {index}: {detail}",
-            )
-
-    pending_rows = [
-        row for row in aligned_rows[first_valid : last_valid + 1] if row is not None
-    ]
-    first_output_stamp_ns = pending_rows[0][0]
-
-    rows: list[dict[str, LerobotDataValue]] = []
-    for output_frame_index, (_stamp_ns, state, action) in enumerate(pending_rows):
         rows.append(
             {
                 "observation.state": state,
                 "action": action,
-                "timestamp": output_frame_index / fps,
-                "frame_index": output_frame_index,
+                "timestamp": grid_index / fps,
+                "frame_index": grid_index,
             }
         )
 
     videos: dict[str, VideoExportData] = {}
     for mapping in camera_mappings:
-        from_timestamp_s = (
-            first_output_stamp_ns - mapping.video_pts_origin_ros_ns
-        ) / 1_000_000_000.0
-        if from_timestamp_s < 0:
-            raise LerobotDatasetExportError(
-                "camera_video_query_before_origin",
-                f"{mapping.feature_key} starts after the common aligned timeline",
-            )
         videos[mapping.feature_key] = VideoExportData(
             source_video=mapping.source_video,
             width=mapping.width,
             height=mapping.height,
-            from_timestamp_s=from_timestamp_s,
+            from_timestamp_s=mapping.from_timestamp_s,
         )
     return EpisodeExportData(
         rows=rows,
         videos=videos,
         task_description=episode.meta.task_description,
         started_at=episode.meta.started_at,
-        stopped_at=episode.meta.stopped_at or "",
-        duration_s=episode.meta.duration_s or 0.0,
+        stopped_at=episode.meta.stopped_at,
+        duration_s=episode.meta.duration_s,
         source_tags=episode.meta.tags,
     )
 
 
 def _fixed_fps_timeline(
-    *, first_stamp_ns: int, last_stamp_ns: int, fps: int
+    *, timeline_start_ros_ns: int, timeline_end_ros_ns: int, fps: int
 ) -> list[int]:
-    if last_stamp_ns < first_stamp_ns:
+    if timeline_end_ros_ns <= timeline_start_ros_ns:
         raise LerobotDatasetExportError(
-            "camera_timestamps_invalid", "primary camera timestamps are not monotonic"
+            "episode_timeline_invalid",
+            "timeline_end_ros_ns must be greater than timeline_start_ros_ns",
         )
-    frame_count = ((last_stamp_ns - first_stamp_ns) * fps) // 1_000_000_000 + 1
-    return [
-        first_stamp_ns + round(frame_index * 1_000_000_000 / fps)
-        for frame_index in range(frame_count)
-    ]
+    duration_ns = timeline_end_ros_ns - timeline_start_ros_ns
+    frame_count = (duration_ns * fps + 1_000_000_000 - 1) // 1_000_000_000
+    stamps: list[int] = []
+    for frame_index in range(frame_count):
+        stamp_ns = timeline_start_ros_ns + round(frame_index * 1_000_000_000 / fps)
+        if stamp_ns >= timeline_end_ros_ns:
+            break
+        stamps.append(stamp_ns)
+    return stamps
 
 
 def _required_bag_topics(profile: ProfileExportSpec) -> set[str]:
+    topics = {
+        stream.rx.joint_state.topic for stream in profile.lerobot.arm_streams
+    }
+    topics.add(_mux_status_topic(profile))
+    return topics
+
+
+def _configured_action_bag_topics(profile: ProfileExportSpec) -> set[str]:
     topics: set[str] = set()
     for stream in profile.lerobot.arm_streams:
-        topics.add(stream.rx.joint_state.topic)
-        topics.add(stream.rx.joint_command.topic)
         if stream.rx.joint_command.leader is not None:
             topics.add(stream.rx.joint_command.leader.topic)
         if stream.rx.joint_command.vr is not None:
             topics.add(stream.rx.joint_command.vr.topic)
         if stream.rx.joint_command.ai is not None:
             topics.add(stream.rx.joint_command.ai.topic)
-    topics.add(_mux_status_topic(profile))
     return topics
 
 
@@ -836,6 +835,7 @@ def _recorded_topic_stamp_sources(meta: SourceEpisodeMeta) -> dict[str, StampSou
 def _read_bag_topics(
     bag_dir: Path,
     required_topics: set[str],
+    optional_action_topics: set[str],
     stamp_sources: Mapping[str, StampSource],
 ) -> BagTopicData:
     if not bag_dir.exists():
@@ -848,10 +848,11 @@ def _read_bag_topics(
         type_by_topic = {
             connection.topic: connection.msgtype for connection in reader.connections
         }
+        read_topics = required_topics | optional_action_topics
         connections = [
             connection
             for connection in reader.connections
-            if connection.topic in required_topics
+            if connection.topic in read_topics
         ]
 
         missing = sorted(
@@ -866,7 +867,9 @@ def _read_bag_topics(
             topic for topic in required_topics if topic.endswith("/teleop_mux/status")
         )
         joint_samples: dict[str, list[JointSample]] = {
-            topic: [] for topic in required_topics if topic != mux_topic
+            topic: []
+            for topic in read_topics
+            if topic != mux_topic and topic in type_by_topic
         }
         source_events: list[SourceEvent] = []
 
@@ -997,9 +1000,11 @@ def _combined_joint_values(
     arm_streams: list[ArmStreamSpec],
     samples_by_topic: Mapping[str, JointSampleIndex],
     stamp_ns: int,
+    grid_index: int,
     kind: Literal["state", "action"],
     source: str,
     max_alignment_error_s: float,
+    last_samples_by_topic: dict[str, AlignedJointSample],
 ) -> list[float]:
     values: list[float] = []
     for stream in arm_streams:
@@ -1009,11 +1014,15 @@ def _combined_joint_values(
             else stream.rx.joint_command.topic_for_source(source)
         )
         sample_index = samples_by_topic.get(topic)
-        if sample_index is None or not sample_index.samples:
-            raise LerobotDatasetExportError(
-                "samples_missing", f"no {kind} samples for {topic}"
-            )
-        sample = _nearest_sample(sample_index, stamp_ns, max_alignment_error_s)
+        sample = _joint_sample_with_carry(
+            sample_index=sample_index,
+            stamp_ns=stamp_ns,
+            grid_index=grid_index,
+            max_error_s=max_alignment_error_s,
+            kind=kind,
+            topic=topic,
+            last_samples_by_topic=last_samples_by_topic,
+        )
         position_by_name = {
             name: sample.positions[index] for index, name in enumerate(sample.names)
         }
@@ -1025,8 +1034,67 @@ def _combined_joint_values(
                 "joint_name_mismatch",
                 f"{topic} is missing profile joints: {missing_joints}",
             )
-        values.extend(float(position_by_name[joint]) for joint in stream.joints)
+        for joint in stream.joints:
+            wire_value = float(position_by_name[joint])
+            values.append(
+                math.degrees(wire_value)
+                if stream.unit_for(joint) == "degrees"
+                else wire_value * 100.0
+            )
     return values
+
+
+def _joint_sample_with_carry(
+    *,
+    sample_index: JointSampleIndex | None,
+    stamp_ns: int,
+    grid_index: int,
+    max_error_s: float,
+    kind: Literal["state", "action"],
+    topic: str,
+    last_samples_by_topic: dict[str, AlignedJointSample],
+) -> JointSample:
+    previous = last_samples_by_topic.get(topic)
+    try:
+        if sample_index is None or not sample_index.samples:
+            raise LerobotDatasetExportError(
+                "samples_missing", f"no {kind} samples for {topic}"
+            )
+        sample = _nearest_sample(sample_index, stamp_ns, max_error_s)
+    except LerobotDatasetExportError as exc:
+        if exc.code not in {
+            "sample_alignment_error",
+            "sample_missing",
+            "samples_missing",
+        }:
+            raise
+        return _carry_previous_value(
+            previous=previous,
+            age_s=(
+                (stamp_ns - previous.sample.stamp_ns) / 1_000_000_000.0
+                if previous is not None
+                else None
+            ),
+            grid_index=grid_index,
+            max_error_s=max_error_s,
+            stream=f"{kind} topic {topic}",
+            cause=exc,
+            allow_future=False,
+        ).sample
+    if previous is not None and sample is previous.sample:
+        return _carry_previous_value(
+            previous=previous,
+            age_s=(stamp_ns - sample.stamp_ns) / 1_000_000_000.0,
+            grid_index=grid_index,
+            max_error_s=max_error_s,
+            stream=f"{kind} topic {topic}",
+            cause=None,
+            allow_future=True,
+        ).sample
+    last_samples_by_topic[topic] = AlignedJointSample(
+        sample=sample, origin_grid_index=grid_index
+    )
+    return sample
 
 
 def _nearest_sample(
@@ -1051,35 +1119,125 @@ def _nearest_sample(
 
 
 def _nearest_camera_frame(
-    frame_index: CameraFrameIndex, stamp_ns: int, max_error_s: float
-) -> FrameSidecarRow:
+    frame_index: CameraFrameIndex,
+    query_timestamp_s: float,
+    max_error_s: float,
+) -> tuple[FrameSidecarRow, float]:
     if not frame_index.rows:
         raise LerobotDatasetExportError(
             "camera_frame_missing", "no camera frame candidates"
         )
-    if stamp_ns < frame_index.stamps[0] or stamp_ns > frame_index.stamps[-1]:
-        raise LerobotDatasetExportError(
-            "camera_alignment_error",
-            "query timestamp is outside the camera video timestamp range",
-        )
-    index = bisect.bisect_left(frame_index.stamps, stamp_ns)
-    candidates: list[FrameSidecarRow] = []
-    if index < len(frame_index.rows):
-        candidates.append(frame_index.rows[index])
+    index = bisect.bisect_left(frame_index.pts_seconds, query_timestamp_s)
+    candidate_indices: list[int] = []
     if index > 0:
-        candidates.append(frame_index.rows[index - 1])
-    if not candidates:
+        candidate_indices.append(index - 1)
+    if index < len(frame_index.rows):
+        candidate_indices.append(index)
+    if not candidate_indices:
         raise LerobotDatasetExportError(
             "camera_frame_missing", "no camera frame candidates"
         )
-    nearest = min(candidates, key=lambda row: abs(row.ros_stamp_ns - stamp_ns))
-    error_s = abs(nearest.ros_stamp_ns - stamp_ns) / 1_000_000_000.0
+    nearest_index = min(
+        candidate_indices,
+        key=lambda candidate_index: abs(
+            frame_index.pts_seconds[candidate_index] - query_timestamp_s
+        ),
+    )
+    nearest = frame_index.rows[nearest_index]
+    nearest_pts_s = frame_index.pts_seconds[nearest_index]
+    error_s = abs(nearest_pts_s - query_timestamp_s)
     if error_s > max_error_s:
         raise LerobotDatasetExportError(
             "camera_alignment_error",
             f"nearest camera frame is {error_s:.3f}s away, max={max_error_s:.3f}s",
         )
-    return nearest
+    return nearest, nearest_pts_s
+
+
+def _camera_frame_with_carry(
+    *,
+    frame_index: CameraFrameIndex,
+    query_timestamp_s: float,
+    grid_index: int,
+    max_error_s: float,
+    feature_key: str,
+    last_frames_by_feature: dict[str, AlignedCameraFrame],
+) -> FrameSidecarRow:
+    previous = last_frames_by_feature.get(feature_key)
+    try:
+        frame, frame_pts_s = _nearest_camera_frame(
+            frame_index,
+            query_timestamp_s,
+            max_error_s,
+        )
+    except LerobotDatasetExportError as exc:
+        if exc.code not in {"camera_alignment_error", "camera_frame_missing"}:
+            raise
+        return _carry_previous_value(
+            previous=previous,
+            age_s=(
+                query_timestamp_s - previous.pts_s if previous is not None else None
+            ),
+            grid_index=grid_index,
+            max_error_s=max_error_s,
+            stream=f"camera {feature_key}",
+            cause=exc,
+            allow_future=False,
+        ).frame
+    if previous is not None and (
+        frame.frame_index == previous.frame.frame_index
+        and frame.ros_stamp_ns == previous.frame.ros_stamp_ns
+    ):
+        return _carry_previous_value(
+            previous=previous,
+            age_s=query_timestamp_s - frame_pts_s,
+            grid_index=grid_index,
+            max_error_s=max_error_s,
+            stream=f"camera {feature_key}",
+            cause=None,
+            allow_future=True,
+        ).frame
+    last_frames_by_feature[feature_key] = AlignedCameraFrame(
+        frame=frame,
+        pts_s=frame_pts_s,
+        origin_grid_index=grid_index,
+    )
+    return frame
+
+
+def _carry_previous_value(
+    *,
+    previous: CarryValueT | None,
+    age_s: float | None,
+    grid_index: int,
+    max_error_s: float,
+    stream: str,
+    cause: LerobotDatasetExportError | None,
+    allow_future: bool,
+) -> CarryValueT:
+    if previous is None or age_s is None:
+        detail = cause.detail if cause is not None else "no previously aligned value"
+        raise LerobotDatasetExportError(
+            "episode_alignment_gap",
+            f"{stream} is missing at the first grid frame: {detail}",
+        ) from cause
+    carry_frames = grid_index - previous.origin_grid_index
+    # Reuse is safe only while both agreed bounds hold. Fallback carry never
+    # adopts a future value; direct nearest selection may reuse one within tolerance.
+    if (
+        carry_frames > MAX_VIDEO_TIMESTAMP_FRAME_DISTANCE
+        or (age_s < 0.0 and not allow_future)
+        or abs(age_s) > max_error_s
+    ):
+        detail = f"; {cause.detail}" if cause is not None else ""
+        raise LerobotDatasetExportError(
+            "episode_alignment_gap",
+            f"{stream} cannot carry to grid frame {grid_index}: "
+            f"carry_frames={carry_frames} age={age_s:.3f}s "
+            f"max_frames={MAX_VIDEO_TIMESTAMP_FRAME_DISTANCE} "
+            f"max_age={max_error_s:.3f}s{detail}",
+        ) from cause
+    return previous
 
 
 def _resolve_camera_mappings(
@@ -1089,14 +1247,14 @@ def _resolve_camera_mappings(
     episode_camera_by_topic = {camera.topic: camera for camera in episode.meta.cameras}
     mappings: list[CameraExportMapping] = []
     for camera in profile.lerobot.cameras:
+        if not camera.enabled:
+            continue
         episode_camera = episode_camera_by_topic.get(camera.topic)
         if episode_camera is None:
-            if camera.enabled is True:
-                raise LerobotDatasetExportError(
-                    "camera_missing",
-                    f"required profile camera {camera.name} topic {camera.topic} missing from episode",
-                )
-            continue
+            raise LerobotDatasetExportError(
+                "camera_missing",
+                f"required profile camera {camera.name} topic {camera.topic} missing from episode",
+            )
         if len(episode_camera.segments) != 1:
             raise LerobotDatasetExportError(
                 "camera_segments_unsupported",
@@ -1105,10 +1263,20 @@ def _resolve_camera_mappings(
         if (
             episode_camera.video_timing_mode != "ros_header_stamp_to_pts"
             or not episode_camera.video_pts_origin_ros_ns
+            or episode_camera.video_time_base_num is None
+            or episode_camera.video_time_base_den is None
         ):
             raise LerobotDatasetExportError(
                 "camera_video_timing_contract_missing",
                 f"camera {episode_camera.name} does not declare ros_header_stamp_to_pts video timing",
+            )
+        if (
+            episode_camera.video_time_base_num != 1
+            or episode_camera.video_time_base_den != 90_000
+        ):
+            raise LerobotDatasetExportError(
+                "camera_video_time_base_invalid",
+                f"camera {episode_camera.name} video time base must be 1/90000",
             )
         segment = episode_camera.segments[0]
         source_video = (
@@ -1118,9 +1286,13 @@ def _resolve_camera_mappings(
             raise LerobotDatasetExportError(
                 "camera_video_missing", f"video missing: {source_video}"
             )
-        sidecar_rows = _read_sidecar_rows(
+        _require_read_only_source(source_video, "video_source_mutable")
+        sidecar_path = (
             episode.episode_dir / "videos" / episode_camera.name / "frames.parquet"
         )
+        if sidecar_path.exists():
+            _require_read_only_source(sidecar_path, "frames_sidecar_mutable")
+        sidecar_rows = _read_sidecar_rows(sidecar_path)
         if not sidecar_rows:
             raise LerobotDatasetExportError(
                 "camera_sidecar_empty",
@@ -1139,6 +1311,28 @@ def _resolve_camera_mappings(
                 "camera_video_pts_origin_mismatch",
                 f"camera {episode_camera.name} video origin does not match its first sidecar frame",
             )
+        frame_pts_seconds = [
+            row.video_pts
+            * episode_camera.video_time_base_num
+            / episode_camera.video_time_base_den
+            for row in sidecar_rows
+        ]
+        if frame_pts_seconds[0] != 0.0 or any(
+            right <= left
+            for left, right in zip(frame_pts_seconds, frame_pts_seconds[1:])
+        ):
+            raise LerobotDatasetExportError(
+                "camera_video_pts_invalid",
+                f"camera {episode_camera.name} video PTS must start at zero and increase strictly",
+            )
+        from_timestamp_s = (
+            episode.meta.timeline_start_ros_ns - episode_camera.video_pts_origin_ros_ns
+        ) / 1_000_000_000.0
+        if from_timestamp_s < 0:
+            raise LerobotDatasetExportError(
+                "camera_video_query_before_origin",
+                f"observation.images.{camera.name} starts after the canonical timeline",
+            )
         width = int(episode_camera.width or 0)
         height = int(episode_camera.height or 0)
         if width <= 0 or height <= 0:
@@ -1152,7 +1346,8 @@ def _resolve_camera_mappings(
                 width=width,
                 height=height,
                 source_video=source_video,
-                video_pts_origin_ros_ns=episode_camera.video_pts_origin_ros_ns,
+                frame_pts_seconds=frame_pts_seconds,
+                from_timestamp_s=from_timestamp_s,
                 sidecar_rows=sidecar_rows,
             )
         )
@@ -1197,6 +1392,7 @@ def _probe_video_size(path: Path) -> tuple[int, int]:
 
 
 def _hardlink_video(source: Path, destination: Path) -> None:
+    _require_read_only_source(source, "video_source_mutable")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.unlink(missing_ok=True)
     try:
@@ -1207,6 +1403,16 @@ def _hardlink_video(source: Path, destination: Path) -> None:
             "video_hardlink_failed",
             f"cannot hardlink immutable episode video {source} to {destination}: {exc}",
         ) from exc
+
+
+def _require_read_only_source(path: Path, error_code: str) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    write_bits = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+    if mode & write_bits:
+        raise LerobotDatasetExportError(
+            error_code,
+            f"finished episode source must be read-only before export: {path} mode={mode:o}",
+        )
 
 
 def _validate_video_feature_sets(episode_exports: list[EpisodeExportData]) -> None:
@@ -1242,14 +1448,7 @@ def _write_lerobot_v3(
     video_timestamp_tolerance_s: float,
     profile: ProfileExportSpec,
     episode_exports: list[EpisodeExportData],
-    progress: LerobotDatasetExportProgressReporter | None = None,
 ) -> None:
-    _report_progress(
-        progress,
-        phase="writing_rows",
-        progress_percent=38.0,
-        message="LeRobotのフレーム表を作成しています。",
-    )
     features = _features(profile, episode_exports)
     meta = LeRobotDatasetMetadata.create(
         repo_id=dataset_id,
@@ -1301,29 +1500,25 @@ def _write_lerobot_v3(
         root=meta.root,
         video_path_template=meta.video_path,
         episode_exports=episode_exports,
-        progress=progress,
     )
     for feature_key, video_paths in written_video_paths_by_feature.items():
         meta.info["features"][feature_key]["info"] = get_video_info(video_paths[0])
         meta.info["features"][feature_key]["info"]["video.fps"] = fps
     meta.info["dataset_name"] = dataset_name
     meta.info["video_timestamp_tolerance_s"] = video_timestamp_tolerance_s
+    meta.info[VIDEO_QUERY_TIMESTAMP_SOURCE_KEY] = (
+        VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX
+    )
     meta.info["repo_id"] = dataset_id
     meta.info["total_episodes"] = len(episode_exports)
     meta.info["total_frames"] = len(all_rows)
     meta.info["total_tasks"] = len(task_index_by_name)
     meta.info["splits"] = {"train": f"0:{len(episode_exports)}"}
-    _report_progress(
-        progress,
-        phase="writing_metadata",
-        progress_percent=88.0,
-        message="LeRobotメタデータを書き出しています。",
-    )
     write_info(meta.info, meta.root)
     _write_data_parquet(meta, all_rows)
     _write_episode_parquet(meta.root, episode_rows)
     _write_tasks_parquet(meta.root, task_index_by_name)
-    _write_stats(meta.root, all_rows, progress=progress)
+    _write_stats(meta.root, all_rows)
 
 
 def _features(
@@ -1361,7 +1556,6 @@ def _write_dataset_videos(
     root: Path,
     video_path_template: str | None,
     episode_exports: list[EpisodeExportData],
-    progress: LerobotDatasetExportProgressReporter | None = None,
 ) -> dict[str, list[Path]]:
     if video_path_template is None:
         raise LerobotDatasetExportError(
@@ -1371,8 +1565,6 @@ def _write_dataset_videos(
     written_by_feature: dict[str, list[Path]] = {
         feature_key: [] for feature_key in feature_keys
     }
-    total_videos = len(feature_keys) * len(episode_exports)
-    completed = 0
     for feature_key in feature_keys:
         for episode_index, episode_data in enumerate(episode_exports):
             video = episode_data.videos[feature_key]
@@ -1383,18 +1575,6 @@ def _write_dataset_videos(
             )
             _hardlink_video(video.source_video, destination)
             written_by_feature[feature_key].append(destination)
-            completed += 1
-            _report_progress(
-                progress,
-                phase="writing_videos",
-                progress_percent=40.0 + (45.0 * (completed / total_videos)),
-                message="録画動画をデータセットへ関連付けています。",
-                detail=(
-                    f"{completed}/{total_videos}: "
-                    f"{feature_key} "
-                    f"{episode_index + 1}/{len(episode_exports)}"
-                ),
-            )
     return written_by_feature
 
 
@@ -1407,22 +1587,6 @@ def _write_data_parquet(
     Dataset.from_list(
         rows, features=get_hf_features_from_features(meta.features)
     ).to_parquet(path)
-
-
-def _validate_lerobot_export_files(root: Path) -> None:
-    required = [
-        root / "meta" / "info.json",
-        root / "meta" / "tasks.parquet",
-        root / "meta" / "episodes" / "chunk-000" / "file-000.parquet",
-        root / "data" / "chunk-000" / "file-000.parquet",
-        root / "meta" / "stats.json",
-    ]
-    missing = [str(path) for path in required if not path.exists()]
-    if missing:
-        raise LerobotDatasetExportError(
-            "lerobot_export_incomplete",
-            f"LeRobot export did not produce required files: {missing}",
-        )
 
 
 def _write_episode_parquet(
@@ -1444,15 +1608,7 @@ def _write_tasks_parquet(root: Path, task_index_by_name: Mapping[str, int]) -> N
 def _write_stats(
     root: Path,
     rows: list[dict[str, LerobotDataValue]],
-    *,
-    progress: LerobotDatasetExportProgressReporter | None = None,
 ) -> None:
-    _report_progress(
-        progress,
-        phase="writing_stats",
-        progress_percent=90.0,
-        message="数値データの統計を計算しています。",
-    )
     numeric = {
         "observation.state": np.asarray(
             [row["observation.state"] for row in rows], dtype=np.float32

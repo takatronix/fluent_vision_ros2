@@ -68,12 +68,21 @@ class FVEpisodeRecorderNode(Node):
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.store = EpisodeStore(self.output_dir)
-        # sqlite index: detect drift vs filesystem + rebuild if needed so
-        # episodes deleted via `rm -rf` while recorder was down are dropped.
-        try:
-            self.store.index.ensure_consistent()
-        except Exception as exc:
-            self.get_logger().warning(f"episode index consistency check failed: {exc}")
+        # meta.json is authoritative; rebuild also repairs same-count state/tag
+        # drift after a crash between meta replacement and index upsert.
+        self.store.index.ensure_consistent()
+        recovered_finalizers = self.store.recover_finalizing_orphans()
+        if recovered_finalizers:
+            self.get_logger().warning(
+                "failed orphaned episode finalizers from previous process: "
+                + ", ".join(recovered_finalizers)
+            )
+        migrated_sources = self.store.migrate_finished_episode_sources_read_only()
+        if migrated_sources:
+            self.get_logger().info(
+                "made historical finished episode sources read-only: "
+                + ", ".join(migrated_sources)
+            )
         self.bag_recorder = BagRecorder(max_bag_size_mb=1024)
         self.camera_pool = CameraWriterPool(node=self)
         # Depth republisher: compresses raw 16UC1 → CompressedImage (png) so
@@ -99,25 +108,14 @@ class FVEpisodeRecorderNode(Node):
         orphan = self.active_lock.detect_orphan()
         if orphan and orphan.get("status") == "orphan":
             self._orphan_payload = orphan
+            episode_id = orphan.get("episode_id")
             self.get_logger().warning(
-                f"orphan episode detected: id={orphan.get('episode_id')} "
+                f"orphan episode detected: id={episode_id} "
                 f"dir={orphan.get('episode_dir')} — call POST /api/v1/episodes/{orphan.get('episode_id')}/recover"
             )
-            # Mark the meta as failed if the dir is still there
-            ep_dir = Path(orphan.get("episode_dir", ""))
-            meta_path = ep_dir / "meta.json"
-            if meta_path.exists():
+            if isinstance(episode_id, str) and episode_id:
                 try:
-                    import json
-                    with meta_path.open() as f:
-                        data = json.load(f)
-                    if data.get("state") in ("recording", "finalizing"):
-                        data["state"] = "failed"
-                        data["outcome"] = "abort"
-                        tmp = meta_path.with_suffix(".json.tmp")
-                        with tmp.open("w") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
-                        tmp.replace(meta_path)
+                    self.store.mark_orphan_failed(episode_id)
                 except Exception as exc:
                     self.get_logger().warning(f"orphan meta rewrite failed: {exc}")
             # The lock is left in place until operator calls /recover so the
@@ -126,6 +124,11 @@ class FVEpisodeRecorderNode(Node):
             self.get_logger().error("another recorder instance appears alive — exiting")
             import sys
             sys.exit(2)
+
+        self.get_logger().info(
+            f"fv_episode_recorder ready: output_dir={self.output_dir} "
+            f"profiles_dir={self.profiles_dir} api=http://{self.host}:{self.port}/api/v1"
+        )
 
     def get_profile(self, profile_name: str) -> dict:
         """Lazy-load + cache profile yaml."""
@@ -176,11 +179,6 @@ class FVEpisodeRecorderNode(Node):
             if Path(fallback).exists():
                 return fallback
         return "/vlabor/profiles"  # final fallback (may not exist)
-
-        self.get_logger().info(
-            f"fv_episode_recorder ready: output_dir={self.output_dir} "
-            f"profiles_dir={self.profiles_dir} api=http://{self.host}:{self.port}/api/v1"
-        )
 
 
 def main(args=None):

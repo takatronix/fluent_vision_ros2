@@ -15,11 +15,12 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 LOG = logging.getLogger("fv_episode_recorder.bag")
+BAG_FINALIZE_TIMEOUT_S = 10.0
+_BAG_TERMINATE_TIMEOUT_S = 3.0
 
 
 def _summary(bag_dir: Optional[Path], topics: list[str]) -> dict:
@@ -42,28 +43,47 @@ class DetachedBagRecording:
     bag_dir: Optional[Path]
     topics: list[str]
 
-    def wait(self, timeout_s: float = 10.0) -> dict:
-        if self.proc is None or self.proc.poll() is not None:
+    def wait(self, timeout_s: float = BAG_FINALIZE_TIMEOUT_S) -> dict:
+        if self.proc is None:
             return _summary(self.bag_dir, self.topics)
-        try:
-            self.proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            LOG.warning("bag recorder did not exit on SIGINT within %.1fs, sending SIGTERM", timeout_s)
-            self.proc.terminate()
+        timed_out = False
+        if self.proc.poll() is None:
             try:
-                self.proc.wait(timeout=3.0)
+                self.proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                LOG.error("bag recorder still alive, SIGKILL")
-                self.proc.kill()
-                self.proc.wait(timeout=3.0)
+                timed_out = True
+                LOG.warning("bag recorder did not exit on SIGINT within %.1fs, sending SIGTERM", timeout_s)
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=_BAG_TERMINATE_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    LOG.error("bag recorder still alive, SIGKILL")
+                    self.proc.kill()
+                    self.proc.wait(timeout=_BAG_TERMINATE_TIMEOUT_S)
+        if timed_out:
+            raise RuntimeError(
+                f"bag recorder finalize timed out after {timeout_s:.1f}s "
+                f"(returncode={self.proc.returncode})"
+            )
+        if self.proc.returncode not in (0, 130):
+            stderr = b""
+            if self.proc.stderr is not None:
+                stderr = self.proc.stderr.read() or b""
+            raise RuntimeError(
+                f"bag recorder exited with code {self.proc.returncode}: "
+                f"{stderr.decode('utf-8', errors='replace')[-1000:]}"
+            )
         return _summary(self.bag_dir, self.topics)
 
 
 @dataclass(frozen=True)
 class BagReadyStatus:
     ready: bool
-    ready_at: str | None
+    ready_at_ros_ns: int | None
     counts: dict[str, int]
+    first_bag_timestamp_ns: dict[str, int]
+    latest_bag_timestamp_ns: dict[str, int]
+    timestamp_source: str
 
 
 class BagRecorder:
@@ -124,7 +144,7 @@ class BagRecorder:
         self._ready_file = ready_file
         self._topics = topics
 
-    def stop(self, timeout_s: float = 10.0) -> dict:
+    def stop(self, timeout_s: float = BAG_FINALIZE_TIMEOUT_S) -> dict:
         """Stop the bag recorder gracefully (SIGINT) so metadata.yaml is finalized.
 
         Returns summary dict with bag_dir / size_bytes / split_count.
@@ -151,8 +171,17 @@ class BagRecorder:
 
     def ready_status(self, required_topics: set[str]) -> BagReadyStatus:
         counts = {topic: 0 for topic in required_topics}
+        first_bag_timestamp_ns = {topic: 0 for topic in required_topics}
+        latest_bag_timestamp_ns = {topic: 0 for topic in required_topics}
         if not required_topics:
-            return BagReadyStatus(ready=True, ready_at=_utcnow_iso(), counts=counts)
+            return BagReadyStatus(
+                ready=True,
+                ready_at_ros_ns=None,
+                counts=counts,
+                first_bag_timestamp_ns=first_bag_timestamp_ns,
+                latest_bag_timestamp_ns=latest_bag_timestamp_ns,
+                timestamp_source="rosbag2_serialized_message_time_stamp",
+            )
         if self._ready_file is not None and self._ready_file.exists():
             try:
                 raw = json.loads(self._ready_file.read_text(encoding="utf-8"))
@@ -164,20 +193,62 @@ class BagRecorder:
                     value = raw_counts.get(topic)
                     if isinstance(value, int):
                         counts[topic] = value
+            raw_first_timestamps = raw.get("first_bag_timestamp_ns")
+            if isinstance(raw_first_timestamps, dict):
+                for topic in required_topics:
+                    value = raw_first_timestamps.get(topic)
+                    if isinstance(value, int):
+                        first_bag_timestamp_ns[topic] = value
+            raw_latest_timestamps = raw.get("latest_bag_timestamp_ns")
+            if isinstance(raw_latest_timestamps, dict):
+                for topic in required_topics:
+                    value = raw_latest_timestamps.get(topic)
+                    if isinstance(value, int):
+                        latest_bag_timestamp_ns[topic] = value
             ready = bool(raw.get("ready")) and all(counts[topic] > 0 for topic in required_topics)
-            ready_at = _iso_from_unix_ns(raw.get("ready_at_unix_ns")) if ready else None
+            timestamp_source = raw.get("timestamp_source")
+            if timestamp_source != "rosbag2_serialized_message_time_stamp":
+                raise RuntimeError(
+                    f"bag ready status has invalid timestamp_source: {timestamp_source!r}"
+                )
+            ready_at_ros_ns = raw.get("ready_at_ros_ns") if ready else None
+            if ready and (
+                not isinstance(ready_at_ros_ns, int)
+                or ready_at_ros_ns <= 0
+                or any(first_bag_timestamp_ns[topic] <= 0 for topic in required_topics)
+                or any(latest_bag_timestamp_ns[topic] <= 0 for topic in required_topics)
+                or any(
+                    latest_bag_timestamp_ns[topic] < first_bag_timestamp_ns[topic]
+                    for topic in required_topics
+                )
+            ):
+                raise RuntimeError("bag ready status has invalid ROS timestamps")
             if not ready and self._proc is not None and self._proc.poll() is not None:
                 raise RuntimeError(
                     f"bag recorder exited before ready: rc={self._proc.returncode} "
                     f"stderr={self._stderr_tail()}"
                 )
-            return BagReadyStatus(ready=ready, ready_at=ready_at, counts=counts)
+            return BagReadyStatus(
+                ready=ready,
+                ready_at_ros_ns=ready_at_ros_ns,
+                counts=counts,
+                first_bag_timestamp_ns=first_bag_timestamp_ns,
+                latest_bag_timestamp_ns=latest_bag_timestamp_ns,
+                timestamp_source=timestamp_source,
+            )
         if self._proc is not None and self._proc.poll() is not None:
             raise RuntimeError(
                 f"bag recorder exited before ready: rc={self._proc.returncode} "
                 f"stderr={self._stderr_tail()}"
             )
-        return BagReadyStatus(ready=False, ready_at=None, counts=counts)
+        return BagReadyStatus(
+            ready=False,
+            ready_at_ros_ns=None,
+            counts=counts,
+            first_bag_timestamp_ns=first_bag_timestamp_ns,
+            latest_bag_timestamp_ns=latest_bag_timestamp_ns,
+            timestamp_source="rosbag2_serialized_message_time_stamp",
+        )
 
     def _summary(self) -> dict:
         return _summary(self._bag_dir, self._topics)
@@ -205,15 +276,3 @@ class BagRecorder:
     @staticmethod
     def available() -> bool:
         return shutil.which("ros2") is not None
-
-
-def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
-def _iso_from_unix_ns(value) -> str | None:
-    if not isinstance(value, int) or value <= 0:
-        return None
-    return datetime.fromtimestamp(value / 1_000_000_000.0, timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%S.%fZ"
-    )

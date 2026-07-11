@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import threading
 from dataclasses import dataclass, field, asdict
@@ -18,14 +19,25 @@ from typing import Any, Optional
 
 from ulid import ULID
 
-
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 # Reject filesystem-hostile chars + control chars. Japanese / non-ASCII kept
 # (ext4 is utf-8 native; ls/ros2 bag handle them fine).
 _FORBIDDEN_FS_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 _WHITESPACE = re.compile(r'\s+')
 _MULTI_UNDERSCORE = re.compile(r'_+')
+
+
+class EpisodeNotFoundError(LookupError):
+    """The episode id has no entry in the validated episode index."""
+
+
+class EpisodeMetadataError(RuntimeError):
+    """An indexed episode exists, but its authoritative metadata is unusable."""
+
+
+class EpisodeStateConflictError(RuntimeError):
+    """The requested mutation is incompatible with the episode lifecycle."""
 
 
 def _prepare_shared_directory(path: Path, shared_gid: int) -> None:
@@ -76,9 +88,14 @@ class EpisodeMeta:
     operator: Optional[str] = None
     tags: list[str] = field(default_factory=list)
     parent_session_id: Optional[str] = None
+    stop_frame_count_per_camera: dict[str, int] = field(default_factory=dict)
     expected_duration_s: Optional[float] = None
     started_at: str = ""
     stopped_at: Optional[str] = None
+    # Canonical ROS-clock interval used by dataset exporters. The effective
+    # episode interval is half-open: [timeline_start_ros_ns, timeline_end_ros_ns).
+    timeline_start_ros_ns: Optional[int] = None
+    timeline_end_ros_ns: Optional[int] = None
     duration_s: Optional[float] = None
     outcome: Optional[str] = None
     pinned: bool = False
@@ -130,6 +147,7 @@ class EpisodeStore:
     def __init__(self, output_dir: str | Path):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.shared_uid = self.output_dir.stat().st_uid
         self.shared_gid = self.output_dir.stat().st_gid
         _prepare_shared_directory(self.output_dir / "episodes", self.shared_gid)
         self._lock = threading.Lock()
@@ -158,29 +176,40 @@ class EpisodeStore:
                 raise RuntimeError(
                     f"another episode already active: {self._active_episode.episode_id}"
                 )
+            if self.get_episode(meta.episode_id) is not None:
+                raise RuntimeError(f"episode_id already exists: {meta.episode_id}")
             ep_dir = self._episode_dir(meta)
             _prepare_shared_directory(ep_dir, self.shared_gid)
             _prepare_shared_directory(ep_dir / "bag", self.shared_gid)
             _prepare_shared_directory(ep_dir / "videos", self.shared_gid)
             self._active_episode = meta
             self._active_dir = ep_dir
-            self._write_meta(ep_dir, meta)
+            try:
+                self._write_meta(ep_dir, meta)
+            except Exception:
+                self._active_episode = None
+                self._active_dir = None
+                raise
             return ep_dir
 
-    def stop_active(self, outcome: str) -> tuple[EpisodeMeta, Path]:
+    def stop_active(
+        self, outcome: str, timeline_end_ros_ns: int
+    ) -> tuple[EpisodeMeta, Path]:
         """Finalize active episode. Returns (meta, dir)."""
-        meta, ep_dir = self.begin_finalizing_active(outcome)
-        with self._lock:
-            if outcome == "discard":
-                meta.state = "discarded"
-            elif outcome == "abort":
-                meta.state = "failed"
-            else:
-                meta.state = "finished"
-            self._write_meta(ep_dir, meta)
-        return meta, ep_dir
+        meta, ep_dir = self.begin_finalizing_active(outcome, timeline_end_ros_ns)
+        if outcome == "discard":
+            meta.state = "discarded"
+        elif outcome == "abort":
+            meta.state = "failed"
+        else:
+            meta.state = "finished"
+        return self.commit_episode_finalization(meta, ep_dir), ep_dir
 
-    def begin_finalizing_active(self, outcome: str) -> tuple[EpisodeMeta, Path]:
+    def begin_finalizing_active(
+        self,
+        outcome: str,
+        timeline_end_ros_ns: Optional[int] = None,
+    ) -> tuple[EpisodeMeta, Path]:
         """Stop accepting samples for the active episode and release the active slot."""
         with self._lock:
             if self._active_episode is None:
@@ -191,13 +220,30 @@ class EpisodeStore:
                 raise RuntimeError("active episode directory is missing")
             meta.stopped_at = utc_now_iso()
             meta.outcome = outcome
-            started = datetime.strptime(
-                meta.started_at, "%Y-%m-%dT%H:%M:%S.%fZ"
-            ).replace(tzinfo=timezone.utc)
-            stopped = datetime.strptime(
-                meta.stopped_at, "%Y-%m-%dT%H:%M:%S.%fZ"
-            ).replace(tzinfo=timezone.utc)
-            meta.duration_s = (stopped - started).total_seconds()
+            if meta.timeline_start_ros_ns is not None:
+                if (
+                    timeline_end_ros_ns is None
+                    or timeline_end_ros_ns <= meta.timeline_start_ros_ns
+                ):
+                    raise RuntimeError(
+                        "timeline_end_ros_ns must be after timeline_start_ros_ns"
+                    )
+                meta.timeline_end_ros_ns = timeline_end_ros_ns
+                meta.duration_s = (
+                    timeline_end_ros_ns - meta.timeline_start_ros_ns
+                ) / 1_000_000_000.0
+            else:
+                if timeline_end_ros_ns is not None:
+                    raise RuntimeError(
+                        "timeline_end_ros_ns cannot be set before recording ready"
+                    )
+                started = datetime.strptime(
+                    meta.started_at, "%Y-%m-%dT%H:%M:%S.%fZ"
+                ).replace(tzinfo=timezone.utc)
+                stopped = datetime.strptime(
+                    meta.stopped_at, "%Y-%m-%dT%H:%M:%S.%fZ"
+                ).replace(tzinfo=timezone.utc)
+                meta.duration_s = (stopped - started).total_seconds()
             if outcome == "discard":
                 meta.state = "discarded"
             else:
@@ -206,6 +252,146 @@ class EpisodeStore:
             self._active_episode = None
             self._active_dir = None
             return meta, ep_dir
+
+    def commit_episode_finalization(
+        self, meta: EpisodeMeta, ep_dir: Path
+    ) -> EpisodeMeta:
+        """Atomically publish terminal metadata."""
+        if meta.state not in {"finished", "failed", "discarded"}:
+            raise EpisodeStateConflictError(
+                f"episode finalization is not terminal: {meta.episode_id} "
+                f"(state={meta.state})"
+            )
+        with self._lock:
+            found = self.get_episode(meta.episode_id)
+            if found is None:
+                raise EpisodeNotFoundError(meta.episode_id)
+            latest, indexed_dir = found
+            if indexed_dir.resolve() != ep_dir.resolve():
+                raise EpisodeMetadataError(
+                    f"episode directory does not match index: {meta.episode_id}"
+                )
+            meta.tags = list(dict.fromkeys([*latest.tags, *meta.tags]))
+            self._write_meta(ep_dir, meta)
+            return meta
+
+    def make_episode_videos_read_only(self, ep_dir: Path) -> bool:
+        """Prevent a finished source video or sidecar from changing after hardlink export."""
+        videos_dir = ep_dir / "videos"
+        if not videos_dir.exists():
+            return False
+        changed = False
+        for path in videos_dir.rglob("*"):
+            if path.is_symlink():
+                raise RuntimeError(f"video tree contains a symbolic link: {path}")
+            if path.is_file():
+                # The recorder normally runs as container root while the dataset
+                # exporter runs as the host owner of output_dir. Ownership must
+                # move before removing write bits or Linux protected_hardlinks
+                # will reject the exporter's os.link().
+                mode = stat.S_IMODE(path.stat().st_mode)
+                read_only_mode = mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+                path_stat = path.stat()
+                if (
+                    path_stat.st_uid != self.shared_uid
+                    or path_stat.st_gid != self.shared_gid
+                ):
+                    os.chown(path, self.shared_uid, self.shared_gid)
+                    changed = True
+                if mode != read_only_mode:
+                    path.chmod(read_only_mode)
+                    changed = True
+        return changed
+
+    def migrate_finished_episode_sources_read_only(self) -> list[str]:
+        """Apply the hardlink immutability contract to pre-contract episodes."""
+        migrated: list[str] = []
+        episodes_root = self.output_dir / "episodes"
+        if not episodes_root.exists():
+            return migrated
+        for meta_path in episodes_root.glob("*/*/*/meta.json"):
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"cannot inspect episode metadata: {meta_path}"
+                ) from exc
+            if data.get("state") != "finished" or data.get("outcome") != "success":
+                continue
+            if self.make_episode_videos_read_only(meta_path.parent):
+                episode_id = data.get("episode_id")
+                if not isinstance(episode_id, str) or not episode_id:
+                    raise RuntimeError(
+                        f"finished episode has no episode_id: {meta_path}"
+                    )
+                migrated.append(episode_id)
+        return migrated
+
+    def recover_finalizing_orphans(self) -> list[str]:
+        """Fail finalizers abandoned by a previous recorder process.
+
+        Finalization cannot be resumed or inferred as successful after process
+        death. The raw files remain for diagnosis; only the lifecycle state is
+        made terminal.
+        """
+        recovered: list[str] = []
+        episodes_root = self.output_dir / "episodes"
+        if not episodes_root.exists():
+            return recovered
+        for meta_path in episodes_root.glob("*/*/*/meta.json"):
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta = EpisodeMeta(
+                    **{
+                        key: value
+                        for key, value in data.items()
+                        if key in EpisodeMeta.__annotations__
+                    }
+                )
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"cannot inspect episode metadata: {meta_path}"
+                ) from exc
+            if meta.state != "finalizing":
+                continue
+            meta.state = "failed"
+            meta.outcome = "abort"
+            meta.stale_input_events = [
+                *meta.stale_input_events,
+                {
+                    "code": "finalizer_orphaned",
+                    "detail": "recorder restarted before episode finalization completed",
+                },
+            ]
+            self._write_meta(meta_path.parent, meta)
+            recovered.append(meta.episode_id)
+        return recovered
+
+    def mark_orphan_failed(self, episode_id: str) -> EpisodeMeta:
+        """Make an interrupted recording terminal without removing its files.
+
+        The metadata write and sqlite upsert share the store lock so API reads
+        cannot observe the new filesystem state with the old indexed state.
+        Replaying this operation for an already-failed orphan is idempotent.
+        """
+        with self._lock:
+            found = self.get_episode(episode_id)
+            if found is None:
+                raise EpisodeNotFoundError(episode_id)
+            meta, ep_dir = found
+            if meta.state == "failed" and meta.outcome == "abort":
+                return meta
+            if meta.state not in {"recording", "finalizing"}:
+                raise RuntimeError(
+                    f"episode is not an in-progress orphan: {episode_id} "
+                    f"(state={meta.state})"
+                )
+            meta.state = "failed"
+            meta.outcome = "abort"
+            if meta.stopped_at is None:
+                meta.stopped_at = utc_now_iso()
+            self._write_meta(ep_dir, meta)
+            return meta
 
     # ---- list / get ----
 
@@ -263,27 +449,60 @@ class EpisodeStore:
         if the episode isn't found."""
         allowed = {"trim_start_s", "trim_end_s", "task_description",
                    "tags", "pinned", "pin_reason", "outcome"}
-        found = self.get_episode(episode_id)
-        if found is None:
-            return None
-        _meta, ep_dir = found
-        meta_path = ep_dir / "meta.json"
-        try:
-            with meta_path.open() as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return None
-        for k, v in (changes or {}).items():
-            if k in allowed:
-                # Allow explicit null/None to clear trim_*.
-                data[k] = v
-        tmp = meta_path.with_suffix(".json.tmp")
-        with tmp.open("w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp.replace(meta_path)
-        try: self.index.upsert(data, ep_dir)
-        except Exception: pass
-        return data
+        with self._lock:
+            found = self.get_episode(episode_id)
+            if found is None:
+                return None
+            _meta, ep_dir = found
+            meta_path = ep_dir / "meta.json"
+            try:
+                with meta_path.open() as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                return None
+            for k, v in (changes or {}).items():
+                if k in allowed:
+                    # Allow explicit null/None to clear trim_*.
+                    data[k] = v
+            tmp = meta_path.with_suffix(".json.tmp")
+            with tmp.open("w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            tmp.replace(meta_path)
+            self.index.upsert(data, ep_dir)
+            return data
+
+    def add_episode_tags(self, episode_id: str, tags: list[str]) -> list[str]:
+        """Append tags without conflating missing and unreadable episodes."""
+        with self._lock:
+            found = self.get_episode(episode_id)
+            if found is None:
+                raise EpisodeNotFoundError(episode_id)
+            _meta, ep_dir = found
+            meta_path = ep_dir / "meta.json"
+            try:
+                with meta_path.open() as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise EpisodeMetadataError(
+                    f"episode metadata cannot be read: {episode_id}"
+                ) from exc
+            if not isinstance(data, dict) or data.get("episode_id") != episode_id:
+                raise EpisodeMetadataError(
+                    f"episode metadata does not match index: {episode_id}"
+                )
+            existing_tags = data.get("tags", [])
+            if not isinstance(existing_tags, list) or any(
+                not isinstance(tag, str) for tag in existing_tags
+            ):
+                raise EpisodeMetadataError(f"episode tags are invalid: {episode_id}")
+            merged_tags = list(dict.fromkeys([*existing_tags, *tags]))
+            data["tags"] = merged_tags
+            tmp = meta_path.with_suffix(".json.tmp")
+            with tmp.open("w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            tmp.replace(meta_path)
+            self.index.upsert(data, ep_dir)
+            return merged_tags
 
     def add_finalized_marker(self, episode_id: str, marker: dict) -> Optional[dict]:
         """Append a marker entry into a finalized episode's meta.json.
@@ -375,43 +594,52 @@ class EpisodeStore:
     def delete_episode(self, episode_id: str, force: bool = False) -> bool:
         """Remove the entire episode directory. Returns True if removed.
         Refuses pinned episodes unless force=True (Phase 1 audit log via api)."""
-        found = self.get_episode(episode_id)
-        if found is None:
-            return False
-        meta, ep_dir = found
-        if meta.pinned and not force:
-            raise PermissionError("episode is pinned; use force=true")
-        if self._active_episode is not None and self._active_episode.episode_id == episode_id:
-            raise RuntimeError("cannot delete the active recording episode")
-        import shutil
-        shutil.rmtree(ep_dir, ignore_errors=True)
-        try: self.index.delete(episode_id)
-        except Exception: pass
-        return True
+        with self._lock:
+            found = self.get_episode(episode_id)
+            if found is None:
+                return False
+            meta, ep_dir = found
+            if meta.pinned and not force:
+                raise PermissionError("episode is pinned; use force=true")
+            if self._active_episode is not None and self._active_episode.episode_id == episode_id:
+                raise RuntimeError("cannot delete the active recording episode")
+            shutil.rmtree(ep_dir)
+            self.index.delete(episode_id)
+            return True
 
     def get_episode(self, episode_id: str) -> Optional[tuple[EpisodeMeta, Path]]:
-        """Find an episode by full ULID. Folder name format is now
-        <HHMMSS>_<slug>_<ULID8>, so glob by the ULID 8-suffix then
-        verify the full episode_id against meta.json (collision-safe)."""
-        episodes_root = self.output_dir / "episodes"
-        if not episodes_root.exists():
+        """Read one episode through the startup-validated sqlite index."""
+        episode_dir = self.index.find_dir_by_episode_id(episode_id)
+        if episode_dir is None:
             return None
-        suffix = episode_id[-8:] if len(episode_id) >= 8 else episode_id
-        # Try new pattern first (suffix match), then legacy pattern (ULID == folder).
-        for pattern in (f"*/*/*{suffix}/meta.json", f"*/*/{episode_id}/meta.json"):
-            for meta_path in episodes_root.glob(pattern):
-                try:
-                    with meta_path.open() as f:
-                        data = json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if data.get("episode_id") != episode_id:
-                    continue
-                return (
-                    EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__}),
-                    meta_path.parent,
-                )
-        return None
+        meta_path = episode_dir / "meta.json"
+        try:
+            data = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise EpisodeMetadataError(
+                f"indexed episode metadata cannot be read: {episode_id}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise EpisodeMetadataError(
+                f"indexed episode metadata is not an object: {episode_id}"
+            )
+        if data.get("episode_id") != episode_id:
+            raise EpisodeMetadataError(
+                f"episode index mismatch for {episode_id}: {meta_path}"
+            )
+        try:
+            meta = EpisodeMeta(
+                **{
+                    key: value
+                    for key, value in data.items()
+                    if key in EpisodeMeta.__annotations__
+                }
+            )
+        except (TypeError, ValueError) as exc:
+            raise EpisodeMetadataError(
+                f"indexed episode metadata is invalid: {episode_id}"
+            ) from exc
+        return meta, episode_dir
 
     # ---- internals ----
 
@@ -434,9 +662,6 @@ class EpisodeStore:
         with tmp_path.open("w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         tmp_path.replace(meta_path)
-        # Mirror into the sqlite index so list queries don't have to FS-walk.
-        # Best-effort: a failure here doesn't block the meta.json write.
-        try:
-            self.index.upsert(data, ep_dir)
-        except Exception:
-            pass
+        # The index is a cache, but duplicate-id ambiguity is a storage
+        # invariant violation and must not be hidden after meta.json is written.
+        self.index.upsert(data, ep_dir)

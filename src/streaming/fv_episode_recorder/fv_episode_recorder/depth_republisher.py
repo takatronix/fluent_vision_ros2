@@ -25,6 +25,8 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, Image
 
+from .topic_discovery import depth_bag_topic
+
 LOG = logging.getLogger("fv_episode_recorder.depth_republish")
 
 
@@ -50,7 +52,7 @@ class _DepthRepublisher:
 
     @property
     def compressed_topic(self) -> str:
-        return f"{self.raw_topic.rstrip('/')}_compressed/compressedDepth"
+        return depth_bag_topic(self.raw_topic)
 
     def start(self) -> None:
         # Publisher first so the bag recorder's subscriber sees a publisher

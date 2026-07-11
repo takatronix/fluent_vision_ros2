@@ -18,7 +18,6 @@ Phase 1 Step 4: best-effort. Phase 4+ may extend with role detection per arm.
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,6 +31,14 @@ ALWAYS_INCLUDE: list[dict[str, str]] = [
     {"topic": "/tf_static",   "role": "tf",         "qos": "transient_local",  "stamp_source": "message_header"},
     {"topic": "/episode/markers", "role": "annotation", "qos": "reliable",     "stamp_source": "message_header"},
 ]
+
+
+def depth_bag_topic(raw_topic: str) -> str:
+    """Return the compressedDepth topic recorded for one raw depth stream."""
+    base_topic = raw_topic.rstrip("/")
+    if not base_topic:
+        raise ValueError("depth camera topic must not be empty")
+    return f"{base_topic}_compressed/compressedDepth"
 
 
 def _read_profile_inner(profile_name: str, profiles_dir: Path) -> Optional[dict[str, Any]]:
@@ -125,11 +132,15 @@ def discover_topics(profile: dict[str, Any]) -> list[dict[str, Any]]:
         # (lossless rvl/png ~5-10× compression) — recorder spawns a republisher
         # so we record the <topic>_compressed/compressedDepth topic, not raw.
         for c in er.get("cameras") or []:
-            if not isinstance(c, dict) or (c.get("kind") or "").lower() != "depth":
+            if (
+                not isinstance(c, dict)
+                or c.get("enabled", True) is False
+                or (c.get("kind") or "").lower() != "depth"
+            ):
                 continue
             t = c.get("topic")
             if t:
-                compressed = f"{t.rstrip('/')}_compressed/compressedDepth"
+                compressed = depth_bag_topic(t)
                 add(compressed, role="camera_depth_compressed", qos="best_effort",
                     stamp_source="message_header",
                     msg_type="sensor_msgs/msg/CompressedImage")
@@ -191,12 +202,16 @@ def discover_topics(profile: dict[str, Any]) -> list[dict[str, Any]]:
     # recorder spawns `ros2 run image_transport republish` per depth camera
     # at episode start to feed the compressed topic that we record here.
     for c in er.get("cameras") or []:
-        if not isinstance(c, dict) or (c.get("kind") or "").lower() != "depth":
+        if (
+            not isinstance(c, dict)
+            or c.get("enabled", True) is False
+            or (c.get("kind") or "").lower() != "depth"
+        ):
             continue
         t = c.get("topic")
         if not t:
             continue
-        compressed = f"{t.rstrip('/')}_compressed/compressedDepth"
+        compressed = depth_bag_topic(t)
         add(compressed, role="camera_depth_compressed", qos="best_effort",
             stamp_source="message_header",
             msg_type="sensor_msgs/msg/CompressedImage")
@@ -229,6 +244,8 @@ def discover_cameras(profile: dict[str, Any]) -> list[dict[str, Any]]:
         # 0 frames (the color writer was instantiated for an Image topic).
         if c.get("kind"):
             entry["kind"] = str(c["kind"])
+        if "enabled" in c:
+            entry["enabled"] = c["enabled"]
         out.append(entry)
     return out
 

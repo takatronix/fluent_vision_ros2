@@ -78,6 +78,7 @@ rosidl_target_interfaces(fv_player_node ${PROJECT_NAME} "rosidl_typesupport_cpp"
 add_executable(fv_counting_bag_recorder src/fv_counting_bag_recorder.cpp)
 ament_target_dependencies(fv_counting_bag_recorder
   rclcpp
+  rcutils
   rosbag2_cpp
   rosbag2_storage
   rosbag2_transport
