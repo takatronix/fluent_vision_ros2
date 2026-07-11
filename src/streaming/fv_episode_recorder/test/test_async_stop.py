@@ -64,12 +64,22 @@ from fv_episode_recorder.api_server import (
 )
 from fv_episode_recorder.bag_recorder import (
     BAG_FINALIZE_TIMEOUT_S,
-    BagReadyStatus,
     BagRecorder,
     DetachedBagRecording,
 )
 from fv_episode_recorder.camera_writer import CameraWriter
-from fv_episode_recorder.episode_store import EpisodeMeta, EpisodeStore, utc_now_iso
+from fv_episode_recorder.episode_store import (
+    EpisodeMeta,
+    EpisodeMetadataError,
+    EpisodeStore,
+    read_episode_meta,
+    utc_now_iso,
+)
+from fv_episode_recorder.episode_schema import (
+    JsonValue,
+    UnsupportedEpisodeSchemaVersionError,
+)
+from fv_episode_recorder.migrations import migrate_episode_document
 from fv_episode_recorder.retention import RetentionPolicy, RetentionRunner
 
 
@@ -102,7 +112,7 @@ class _ProcessThatTimesOut:
     def wait(self, timeout: float) -> int:
         self.wait_timeouts.append(timeout)
         if not self.terminated and not self.killed:
-            raise subprocess.TimeoutExpired("fv_counting_bag_recorder", timeout)
+            raise subprocess.TimeoutExpired("ros2 bag record", timeout)
         self.returncode = 0
         return self.returncode
 
@@ -117,9 +127,29 @@ class _ProcessThatIgnoresTerminate(_ProcessThatTimesOut):
     def wait(self, timeout: float) -> int:
         self.wait_timeouts.append(timeout)
         if not self.killed:
-            raise subprocess.TimeoutExpired("fv_counting_bag_recorder", timeout)
+            raise subprocess.TimeoutExpired("ros2 bag record", timeout)
         self.returncode = -9
         return self.returncode
+
+
+def test_bag_recorder_uses_standard_ros2_cli(tmp_path: Path, monkeypatch) -> None:
+    class _Process:
+        def poll(self) -> None:
+            return None
+
+    commands: list[list[str]] = []
+
+    def _popen(command: list[str], **_kwargs) -> _Process:
+        commands.append(command)
+        return _Process()
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    recorder = BagRecorder()
+
+    recorder.start(tmp_path / "bag", ["/joint_states"])
+
+    assert commands[0][:3] == ["ros2", "bag", "record"]
+    assert commands[0][-1] == "/joint_states"
 
 
 class _BagRecorder:
@@ -353,13 +383,6 @@ class _DepthProfileStartRequest(_StartRequest):
         self.app["get_profile"] = lambda _name: profile
 
 
-class _Fps60StartRequest(_StartRequest):
-    async def json(self) -> dict:
-        body = await super().json()
-        body["fps"] = 60
-        return body
-
-
 class _MissingProfileStartRequest(_StartRequest):
     def __init__(self, store: EpisodeStore, bag_recorder, camera_pool) -> None:
         super().__init__(store, bag_recorder, camera_pool)
@@ -392,42 +415,13 @@ class _MuxTracker:
 
 
 class _ReadyBagRecorder:
-    def __init__(self, coverage_stamp_ros_ns: int = 1_100_000_000) -> None:
+    def __init__(self) -> None:
         self.started = False
-        self.polls = 0
-        self.ready_topics: set[str] = set()
         self.topics: list[str] = []
-        self.coverage_stamp_ros_ns = coverage_stamp_ros_ns
 
-    def start(self, bag_dir: Path, topics: list[str], ready_topics: set[str] | None = None) -> None:
+    def start(self, bag_dir: Path, topics: list[str]) -> None:
         self.started = True
         self.topics = list(topics)
-        self.ready_topics = set(ready_topics or set())
-
-    def ready_status(self, required_topics: set[str]) -> BagReadyStatus:
-        self.polls += 1
-        counts = {topic: 1 if self.polls >= 2 else 0 for topic in required_topics}
-        timestamps = {
-            topic: 1_000_000_000 if self.polls >= 2 else 0 for topic in required_topics
-        }
-        latest_timestamps = {
-            topic: (
-                self.coverage_stamp_ros_ns
-                if self.polls >= 3
-                else 1_000_000_000
-                if self.polls >= 2
-                else 0
-            )
-            for topic in required_topics
-        }
-        return BagReadyStatus(
-            ready=all(count > 0 for count in counts.values()),
-            ready_at_ros_ns=1_000_000_000 if self.polls >= 2 else None,
-            counts=counts,
-            first_bag_timestamp_ns=timestamps,
-            latest_bag_timestamp_ns=latest_timestamps,
-            timestamp_source="rosbag2_serialized_message_time_stamp",
-        )
 
     def detach_for_finalize(self) -> _DetachedBag:
         return _DetachedBag()
@@ -435,113 +429,17 @@ class _ReadyBagRecorder:
 
 class _ReadyCameraPool:
     def __init__(self) -> None:
-        self.polls = 0
-        self.frame_polls = 0
-        self.enabled = False
         self.started_cameras: list[dict] = []
 
     def start_all(self, episode_dir: Path, cameras: list[dict], fps: int = 30) -> list[dict]:
-        self.started_cameras = cameras
-        self.enabled = bool(cameras[0].get("record_immediately"))
-        return [{"name": "top_camera", "frame_count": 0, "segments": []}]
-
-    def observed_frame_counts(self) -> dict[str, int]:
-        self.polls += 1
-        return {"top_camera": 1 if self.polls >= 2 else 0}
-
-    def observed_frame_stamps_ns(self) -> dict[str, int]:
-        return {"top_camera": 1_100_000_000 if self.polls >= 2 else 0}
-
-    def ros_now_ns(self) -> int:
-        return 1_200_000_000 if self.frame_polls == 0 else 1_300_000_000
-
-    def enable_recording(self) -> None:
-        self.enabled = True
-
-    def frame_counts(self) -> dict[str, int]:
-        self.frame_polls += 1
-        return {"top_camera": self.frame_polls if self.enabled else 0}
-
-    def recorded_frame_stamps_ns(self) -> dict[str, int]:
-        return {
-            "top_camera": (
-                1_300_000_000
-                if self.enabled and self.frame_polls >= 2
-                else 1_100_000_000
-                if self.enabled
-                else 0
-            )
-        }
+        self.started_cameras = list(cameras)
+        return [
+            {"name": camera["name"], "frame_count": 0, "segments": []}
+            for camera in cameras
+        ]
 
     def detach_all(self) -> _DetachedCameras:
         return _DetachedCameras()
-
-
-class _NeverRecordedCameraPool(_ReadyCameraPool):
-    def frame_counts(self) -> dict[str, int]:
-        self.frame_polls += 1
-        return {"top_camera": 0}
-
-
-class _NeverCoveredBagRecorder(_ReadyBagRecorder):
-    def ready_status(self, required_topics: set[str]) -> BagReadyStatus:
-        status = super().ready_status(required_topics)
-        return BagReadyStatus(
-            ready=status.ready,
-            ready_at_ros_ns=status.ready_at_ros_ns,
-            counts=status.counts,
-            first_bag_timestamp_ns=status.first_bag_timestamp_ns,
-            latest_bag_timestamp_ns={topic: 1_000_000_000 for topic in required_topics},
-            timestamp_source=status.timestamp_source,
-        )
-
-
-class _NeverReadyBagRecorder(_ReadyBagRecorder):
-    def ready_status(self, required_topics: set[str]) -> BagReadyStatus:
-        return BagReadyStatus(
-            ready=False,
-            ready_at_ros_ns=None,
-            counts={topic: 0 for topic in required_topics},
-            first_bag_timestamp_ns={topic: 0 for topic in required_topics},
-            latest_bag_timestamp_ns={topic: 0 for topic in required_topics},
-            timestamp_source="rosbag2_serialized_message_time_stamp",
-        )
-
-
-class _NeverObservedCameraPool(_ReadyCameraPool):
-    def observed_frame_counts(self) -> dict[str, int]:
-        return {"top_camera": 0}
-
-    def observed_frame_stamps_ns(self) -> dict[str, int]:
-        return {"top_camera": 0}
-
-
-class _StaleDepthBagRecorder(_ReadyBagRecorder):
-    def ready_status(self, required_topics: set[str]) -> BagReadyStatus:
-        status = super().ready_status(required_topics)
-        latest_timestamps = dict(status.latest_bag_timestamp_ns)
-        depth_topic = "/camera/depth_compressed/compressedDepth"
-        if depth_topic in latest_timestamps and status.ready:
-            latest_timestamps[depth_topic] = 1_000_000_000
-        return BagReadyStatus(
-            ready=status.ready,
-            ready_at_ros_ns=status.ready_at_ros_ns,
-            counts=status.counts,
-            first_bag_timestamp_ns=status.first_bag_timestamp_ns,
-            latest_bag_timestamp_ns=latest_timestamps,
-            timestamp_source=status.timestamp_source,
-        )
-
-
-class _EmptyCameraPool(_ReadyCameraPool):
-    def observed_frame_counts(self) -> dict[str, int]:
-        return {}
-
-    def observed_frame_stamps_ns(self) -> dict[str, int]:
-        return {}
-
-    def recorded_frame_stamps_ns(self) -> dict[str, int]:
-        return {"top_camera": 0}
 
 
 class _DepthOnlyCameraPool(_ReadyCameraPool):
@@ -549,7 +447,6 @@ class _DepthOnlyCameraPool(_ReadyCameraPool):
         self, episode_dir: Path, cameras: list[dict], fps: int = 30
     ) -> list[dict]:
         self.started_cameras = cameras
-        self.enabled = True
         return [
             {
                 "name": camera["name"],
@@ -560,20 +457,6 @@ class _DepthOnlyCameraPool(_ReadyCameraPool):
             }
             for camera in cameras
         ]
-
-    def observed_frame_counts(self) -> dict[str, int]:
-        return {}
-
-    def observed_frame_stamps_ns(self) -> dict[str, int]:
-        return {}
-
-    def frame_counts(self) -> dict[str, int]:
-        self.frame_polls += 1
-        return {}
-
-    def recorded_frame_stamps_ns(self) -> dict[str, int]:
-        return {}
-
 
 def _profile() -> dict:
     return {
@@ -628,7 +511,6 @@ def _meta(episode_id: str) -> EpisodeMeta:
         task_description="pick",
         profile="piper_single",
         started_at=utc_now_iso(),
-        timeline_start_ros_ns=1_000_000_000,
     )
 
 
@@ -656,6 +538,149 @@ def _write_finished_episode(
     (ep_dir / "meta.json").write_text(json.dumps(data))
     store.index.upsert(data, ep_dir)
     return ep_dir
+
+
+def test_v1_migration_produces_current_episode_metadata() -> None:
+    migrated = migrate_episode_document(
+        {
+            "schema_version": 1,
+            "episode_id": "legacy-episode",
+            "state": "finished",
+            "profile": "piper_single",
+            "started_at": "2026-07-09T00:00:00.000000Z",
+            "cameras": [
+                {
+                    "name": "top",
+                    "frame_count": 30,
+                    "video_timing_mode": "ros_header_stamp_to_pts",
+                    "video_pts_origin_ros_ns": 1,
+                    "video_time_base_num": 1,
+                    "video_time_base_den": 90_000,
+                }
+            ],
+            "future_extension": {"preserve": True},
+        }
+    )
+    meta = read_episode_meta(migrated)
+
+    assert meta.schema_version == 2
+    assert meta.episode_id == "legacy-episode"
+    assert "timeline_start_ros_ns" not in migrated
+    assert "timeline_end_ros_ns" not in migrated
+    assert "stop_frame_count_per_camera" not in migrated
+    assert migrated["cameras"] == [{"name": "top", "frame_count": 30}]
+    assert migrated["future_extension"] == {"preserve": True}
+
+
+def test_episode_store_migrates_metadata_before_opening_index(tmp_path: Path) -> None:
+    meta_path = tmp_path / "episodes" / "piper_single" / "2026-07-09"
+    meta_path = meta_path / "legacy" / "meta.json"
+    meta_path.parent.mkdir(parents=True)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "episode_id": "legacy",
+                "state": "finished",
+                "profile": "piper_single",
+                "started_at": "2026-07-09T00:00:00.000000Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    meta_path.chmod(0o664)
+
+    store = EpisodeStore(tmp_path)
+    migrated = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    assert migrated["schema_version"] == 2
+    assert "timeline_start_ros_ns" not in migrated
+    assert "timeline_end_ros_ns" not in migrated
+    assert "stop_frame_count_per_camera" not in migrated
+    assert stat.S_IMODE(meta_path.stat().st_mode) == 0o664
+    store.index.close()
+
+
+@pytest.mark.parametrize("schema_version", [3, 4])
+def test_episode_store_rejects_schema_without_forward_migration(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
+    meta_path = tmp_path / "episodes" / "piper_single" / "2026-07-09"
+    meta_path = meta_path / "future" / "meta.json"
+    meta_path.parent.mkdir(parents=True)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "episode_id": "future",
+                "state": "finished",
+                "profile": "piper_single",
+                "started_at": "2026-07-09T00:00:00.000000Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UnsupportedEpisodeSchemaVersionError, match="no forward migration"):
+        EpisodeStore(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        ({"episode_id": "missing-version"}, "must declare"),
+        ({"schema_version": 1, "episode_id": "old"}, "not current"),
+        ({"schema_version": 3, "episode_id": "unsupported"}, "not current"),
+        (
+            {
+                "schema_version": 2,
+                "episode_id": "obsolete",
+                "state": "finished",
+                "profile": "piper_single",
+                "started_at": "2026-07-09T00:00:00.000000Z",
+                "timeline_start_ros_ns": 1,
+            },
+            "removed fields",
+        ),
+    ],
+)
+def test_episode_schema_reader_rejects_unregistered_or_incomplete_metadata(
+    data: dict[str, JsonValue],
+    message: str,
+) -> None:
+    with pytest.raises(EpisodeMetadataError, match=message):
+        read_episode_meta(data)
+
+
+def test_episode_index_exposes_episode_schema_version(tmp_path: Path) -> None:
+    store = EpisodeStore(tmp_path)
+    _write_finished_episode(store, "schema-version", [], "2026-07-08T00:00:00.000000Z")
+
+    rows, _cursor = store.index.list(limit=10)
+
+    assert rows[0]["episode_schema_version"] == 2
+
+
+def test_episode_index_rebuild_rejects_unsupported_schema(tmp_path: Path) -> None:
+    store = EpisodeStore(tmp_path)
+    meta_path = tmp_path / "episodes" / "piper_single" / "2026-07-08"
+    meta_path = meta_path / "unsupported" / "meta.json"
+    meta_path.parent.mkdir(parents=True)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "episode_id": "unsupported",
+                "state": "finished",
+                "profile": "piper_single",
+                "started_at": "2026-07-08T00:00:00.000000Z",
+            }
+        )
+    )
+
+    with pytest.raises(UnsupportedEpisodeSchemaVersionError):
+        store.index.rebuild_from_filesystem()
 
 
 def test_retention_deletes_index_row_with_episode_dir(tmp_path: Path) -> None:
@@ -750,7 +775,7 @@ def test_startup_recovery_fails_finalizing_orphan_without_deleting_files(
     payload_path = episode_dir / "videos" / "cam" / "0000.mp4"
     payload_path.parent.mkdir()
     payload_path.write_bytes(b"unfinished")
-    first_store.begin_finalizing_active("success", 2_000_000_000)
+    first_store.begin_finalizing_active("success")
 
     restarted_store = EpisodeStore(tmp_path)
     recovered = restarted_store.recover_finalizing_orphans()
@@ -792,7 +817,7 @@ def test_recover_discard_removes_episode_files_and_index_row(tmp_path: Path) -> 
     async def run() -> None:
         first_store = EpisodeStore(tmp_path)
         episode_dir = first_store.start_episode(_meta("ep-discard-orphan"))
-        first_store.begin_finalizing_active("abort", 2_000_000_000)
+        first_store.begin_finalizing_active("abort")
         restarted_store = EpisodeStore(tmp_path)
 
         response = await _recover_episode(
@@ -810,7 +835,7 @@ def test_recover_discard_removes_episode_files_and_index_row(tmp_path: Path) -> 
 def test_episode_store_rejects_existing_episode_id(tmp_path: Path) -> None:
     store = EpisodeStore(tmp_path)
     store.start_episode(_meta("duplicate-id"))
-    store.begin_finalizing_active("abort", 2_000_000_000)
+    store.begin_finalizing_active("abort")
 
     with pytest.raises(RuntimeError, match="episode_id already exists"):
         store.start_episode(_meta("duplicate-id"))
@@ -1053,7 +1078,7 @@ def test_shutdown_drains_bounded_bag_finalizer_to_terminal_failure(
     async def run() -> None:
         store = EpisodeStore(tmp_path)
         store.start_episode(_meta("bag-timeout"))
-        meta, ep_dir = store.begin_finalizing_active("success", 2_000_000_000)
+        meta, ep_dir = store.begin_finalizing_active("success")
         detached_bag = _TimedOutDetachedBag()
         task = asyncio.create_task(
             api_server._finalize_stopped_episode(
@@ -1101,8 +1126,7 @@ def test_stop_detaches_active_episode_before_finalize(tmp_path: Path) -> None:
 
         assert response.status == 202
         assert payload["state"] == "finalizing"
-        assert payload["timeline_end_ros_ns"] == 2_000_000_000
-        assert payload["duration_s"] == 1.0
+        assert payload["duration_s"] >= 0.0
         assert store.active is None
 
         store.patch_episode_meta("ep-1", {"tags": ["dpex:record", "user:red"]})
@@ -1172,7 +1196,7 @@ def test_zero_frame_color_camera_finalizes_failed(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
-def test_camera_writer_warms_encoder_before_recording(tmp_path: Path, monkeypatch) -> None:
+def test_camera_writer_records_first_valid_frame(tmp_path: Path, monkeypatch) -> None:
     class _Stdin:
         def __init__(self) -> None:
             self.writes = 0
@@ -1203,14 +1227,7 @@ def test_camera_writer_warms_encoder_before_recording(tmp_path: Path, monkeypatc
     )
     monkeypatch.setattr(camera_writer, "_spawn_ffmpeg_encoder", lambda *_args: (proc, "test"))
 
-    writer = CameraWriter("cam", "/camera", tmp_path, node=None, record_immediately=False)
-    writer._on_image(_Msg())
-
-    assert writer.has_observed_frame()
-    assert writer.frame_count == 0
-    assert proc.stdin.writes == 0
-
-    writer.enable_recording()
+    writer = CameraWriter("cam", "/camera", tmp_path, node=None)
     writer._on_image(_Msg())
 
     assert writer.frame_count == 1
@@ -1244,7 +1261,6 @@ def test_camera_writer_skips_frame_without_ros_stamp(tmp_path: Path, monkeypatch
 
     writer._on_image(_Msg())
 
-    assert not writer.has_observed_frame()
     assert writer.frame_count == 0
     assert spawn_calls == 0
 
@@ -1279,7 +1295,7 @@ def test_camera_writer_rejects_unreadable_recorded_video(tmp_path: Path) -> None
         def close(self) -> int:
             return 1
 
-    writer = CameraWriter("cam", "/camera", tmp_path, node=None, record_immediately=False)
+    writer = CameraWriter("cam", "/camera", tmp_path, node=None)
     writer._sidecar = _Sidecar()
     writer.frame_count = 1
     writer._start_wall_ns = time.time_ns()
@@ -1405,13 +1421,13 @@ def test_camera_writer_summary_declares_ros_header_stamp_pts_origin(tmp_path: Pa
 
     summary = writer.summary()
 
-    assert summary["video_timing_mode"] == "ros_header_stamp_to_pts"
-    assert summary["video_pts_origin_ros_ns"] == 1_234_567_890
-    assert summary["video_time_base_num"] == 1
-    assert summary["video_time_base_den"] == 90_000
+    assert "video_timing_mode" not in summary
+    assert "video_pts_origin_ros_ns" not in summary
+    assert "video_time_base_num" not in summary
+    assert "video_time_base_den" not in summary
 
 
-def test_start_waits_for_bag_writer_and_camera_before_enabling_camera(
+def test_start_launches_bag_writer_and_cameras(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1422,50 +1438,23 @@ def test_start_waits_for_bag_writer_and_camera_before_enabling_camera(
         camera_pool = _ReadyCameraPool()
 
         response = await _start_episode(_StartRequest(store, bag_recorder, camera_pool))
-        payload = json.loads(response.body.decode("utf-8"))
 
         assert response.status == 201
         assert bag_recorder.started
-        assert bag_recorder.polls >= 3
-        assert bag_recorder.ready_topics == {
+        assert {
             "/follower_arm/joint_states_single",
             "/follower_arm/joint_ctrl",
             "/follower_arm/teleop_mux/status",
-        }
-        assert camera_pool.polls >= 2
-        assert camera_pool.enabled
-        assert camera_pool.frame_polls >= 2
-        assert camera_pool.started_cameras[0]["record_immediately"] is True
-        assert payload["preflight"]["recording_ready"]["bag_topics"] == {
-            "/follower_arm/joint_states_single": 1,
-            "/follower_arm/joint_ctrl": 1,
-            "/follower_arm/teleop_mux/status": 1,
-        }
-        coverage = payload["preflight"]["recording_coverage"]
-        assert coverage["latest_bag_timestamp_ros_ns"] == {
-            "/follower_arm/joint_states_single": 1_100_000_000,
-            "/follower_arm/joint_ctrl": 1_100_000_000,
-            "/follower_arm/teleop_mux/status": 1_100_000_000,
-        }
-        assert coverage["bag_alignment_tolerance_ns"] == 100_000_000
-        assert coverage["frame_counts"] == {"top_camera": 2}
-        assert payload["timeline_start_ros_ns"] == 1_200_000_000
-        assert (
-            payload["preflight"]["recording_ready"]["bag_ready_at_ros_ns"]
-            == 1_000_000_000
-        )
-        first_camera_stamp = payload["preflight"]["recording_ready"][
-            "first_camera_stamp_ros_ns"
-        ]["top_camera"]
-        last_camera_stamp = coverage["last_frame_stamp_ros_ns"]["top_camera"]
-        assert (
-            first_camera_stamp <= payload["timeline_start_ros_ns"] <= last_camera_stamp
-        )
+        }.issubset(bag_recorder.topics)
+        assert [camera["name"] for camera in camera_pool.started_cameras] == [
+            "top_camera"
+        ]
+        assert store.active is not None
 
     asyncio.run(run())
 
 
-def test_start_requires_profile_depth_topic_writer_coverage(
+def test_start_adds_profile_depth_topic_to_bag(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1489,11 +1478,6 @@ def test_start_requires_profile_depth_topic_writer_coverage(
         depth_topic = "/camera/depth_compressed/compressedDepth"
         assert response.status == 201
         assert bag_recorder.topics.count(depth_topic) == 1
-        assert depth_topic in bag_recorder.ready_topics
-        assert (
-            depth_topic
-            in payload["preflight"]["recording_coverage"]["latest_bag_timestamp_ros_ns"]
-        )
         assert depth_pool.started_cameras == [
             {
                 "name": "depth",
@@ -1519,37 +1503,6 @@ def test_start_requires_profile_depth_topic_writer_coverage(
     asyncio.run(run())
 
 
-def test_start_fails_when_depth_writer_sample_is_stale_at_t0(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    async def run() -> None:
-        monkeypatch.setattr(
-            api_server.BagRecorder, "available", staticmethod(lambda: True)
-        )
-        monkeypatch.setattr(api_server, "_READY_TIMEOUT_S", 0.01)
-        monkeypatch.setattr(api_server, "_READY_POLL_S", 0.001)
-        store = EpisodeStore(tmp_path)
-        depth_pool = _ReadyDepthPool()
-        request = _DepthStartRequest(
-            store,
-            _StaleDepthBagRecorder(),
-            _DepthOnlyCameraPool(),
-        )
-        request.app["depth_pool"] = depth_pool
-
-        response = await _start_episode(request)
-        payload = json.loads(response.body.decode("utf-8"))
-
-        assert response.status == 503
-        assert payload["error"] == "recording_coverage_timeout"
-        assert "/camera/depth_compressed/compressedDepth" in payload["detail"]
-        assert "earliest_acceptable_bag_stamp_ns=1100000000" in payload["detail"]
-        assert store.active is None
-
-    asyncio.run(run())
-
-
 def test_disabled_depth_camera_is_not_started_or_required(
     tmp_path: Path,
     monkeypatch,
@@ -1570,33 +1523,8 @@ def test_disabled_depth_camera_is_not_started_or_required(
         depth_topic = "/camera/depth_compressed/compressedDepth"
         assert response.status == 201
         assert depth_topic not in bag_recorder.topics
-        assert depth_topic not in bag_recorder.ready_topics
         assert camera_pool.started_cameras == []
         assert depth_pool.started_cameras == []
-
-    asyncio.run(run())
-
-
-def test_start_uses_three_frame_export_tolerance_for_bag_coverage(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    async def run() -> None:
-        monkeypatch.setattr(
-            api_server.BagRecorder, "available", staticmethod(lambda: True)
-        )
-        store = EpisodeStore(tmp_path)
-        bag_recorder = _ReadyBagRecorder(coverage_stamp_ros_ns=1_150_000_000)
-
-        response = await _start_episode(
-            _Fps60StartRequest(store, bag_recorder, _ReadyCameraPool())
-        )
-        payload = json.loads(response.body.decode("utf-8"))
-
-        assert response.status == 201
-        coverage = payload["preflight"]["recording_coverage"]
-        assert coverage["bag_alignment_tolerance_ns"] == 50_000_000
-        assert set(coverage["latest_bag_timestamp_ros_ns"].values()) == {1_150_000_000}
 
     asyncio.run(run())
 
@@ -1620,7 +1548,7 @@ def test_start_rejects_missing_profile_without_overrides(tmp_path: Path) -> None
     asyncio.run(run())
 
 
-def test_start_rejects_empty_override_without_ros_timestamp_evidence(
+def test_start_accepts_explicitly_empty_recording_inputs(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1628,159 +1556,12 @@ def test_start_rejects_empty_override_without_ros_timestamp_evidence(
         monkeypatch.setattr(
             api_server.BagRecorder, "available", staticmethod(lambda: True)
         )
-        monkeypatch.setattr(api_server, "_READY_TIMEOUT_S", 0.01)
-        monkeypatch.setattr(api_server, "_READY_POLL_S", 0.001)
         store = EpisodeStore(tmp_path)
 
         response = await _start_episode(
-            _EmptyOverrideStartRequest(store, _ReadyBagRecorder(), _EmptyCameraPool())
+            _EmptyOverrideStartRequest(store, _ReadyBagRecorder(), _ReadyCameraPool())
         )
-        payload = json.loads(response.body.decode("utf-8"))
-
-        assert response.status == 503
-        assert payload == {
-            "error": "recording_ready_timeout",
-            "code": "recording_ready_timeout",
-            "message": "recording inputs did not become ready before timeout",
-            "bag_ready": True,
-            "missing_bag": [],
-            "missing_cameras": [],
-            "bag_counts": {},
-            "camera_counts": {},
-            "first_bag_timestamp_ns": {},
-            "first_camera_stamp_ros_ns": {},
-            "bag_timestamp_source": "rosbag2_serialized_message_time_stamp",
-            "timeout_s": 0.01,
-        }
-        assert "detail" not in payload
-        assert store.active is None
+        assert response.status == 201
+        assert store.active is not None
 
     asyncio.run(run())
-
-
-def test_recording_ready_timeout_returns_structured_evidence(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    async def run() -> None:
-        monkeypatch.setattr(
-            api_server.BagRecorder, "available", staticmethod(lambda: True)
-        )
-        monkeypatch.setattr(api_server, "_READY_TIMEOUT_S", 0.01)
-        monkeypatch.setattr(api_server, "_READY_POLL_S", 0.001)
-        store = EpisodeStore(tmp_path)
-        first = await _start_episode(
-            _StartRequest(
-                store,
-                _NeverReadyBagRecorder(),
-                _NeverObservedCameraPool(),
-            )
-        )
-        payload = json.loads(first.body.decode("utf-8"))
-        expected_topics = [
-            "/follower_arm/joint_ctrl",
-            "/follower_arm/joint_states_single",
-            "/follower_arm/teleop_mux/status",
-        ]
-        assert first.status == 503
-        assert payload["error"] == "recording_ready_timeout"
-        assert payload["code"] == "recording_ready_timeout"
-        assert payload["message"] == (
-            "recording inputs did not become ready before timeout"
-        )
-        assert payload["bag_ready"] is False
-        assert payload["missing_bag"] == expected_topics
-        assert payload["missing_cameras"] == ["top_camera"]
-        assert payload["bag_counts"] == {topic: 0 for topic in expected_topics}
-        assert payload["camera_counts"] == {"top_camera": 0}
-        assert payload["first_bag_timestamp_ns"] == {
-            topic: 0 for topic in expected_topics
-        }
-        assert payload["first_camera_stamp_ros_ns"] == {"top_camera": 0}
-        assert payload["bag_timestamp_source"] == (
-            "rosbag2_serialized_message_time_stamp"
-        )
-        assert payload["timeout_s"] == 0.01
-        assert "detail" not in payload
-
-    asyncio.run(run())
-
-
-def test_start_fails_without_recorded_camera_frame(tmp_path: Path, monkeypatch) -> None:
-    async def run() -> None:
-        monkeypatch.setattr(api_server.BagRecorder, "available", staticmethod(lambda: True))
-        monkeypatch.setattr(api_server, "_READY_TIMEOUT_S", 0.01)
-        monkeypatch.setattr(api_server, "_READY_POLL_S", 0.001)
-        store = EpisodeStore(tmp_path)
-        camera_pool = _NeverRecordedCameraPool()
-
-        response = await _start_episode(_StartRequest(store, _ReadyBagRecorder(), camera_pool))
-        payload = json.loads(response.body.decode("utf-8"))
-
-        assert response.status == 503
-        assert payload["error"] == "recording_coverage_timeout"
-        assert camera_pool.enabled
-        assert store.active is None
-        episode = store.get_episode("01TESTASYNCSTOP0000000000")
-        assert episode is not None
-        assert episode[0].state == "failed"
-        assert episode[0].stale_input_events[0]["code"] == "recording_coverage_timeout"
-
-    asyncio.run(run())
-
-
-def test_start_fails_without_bag_sample_near_canonical_t0(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    async def run() -> None:
-        monkeypatch.setattr(
-            api_server.BagRecorder, "available", staticmethod(lambda: True)
-        )
-        monkeypatch.setattr(api_server, "_READY_TIMEOUT_S", 0.01)
-        monkeypatch.setattr(api_server, "_READY_POLL_S", 0.001)
-        store = EpisodeStore(tmp_path)
-
-        response = await _start_episode(
-            _StartRequest(store, _NeverCoveredBagRecorder(), _ReadyCameraPool())
-        )
-        payload = json.loads(response.body.decode("utf-8"))
-
-        assert response.status == 503
-        assert payload["error"] == "recording_coverage_timeout"
-        assert "missing_bag=" in payload["detail"]
-        assert "/follower_arm/joint_ctrl" in payload["detail"]
-        assert "latest_bag_stamps=" in payload["detail"]
-        assert "'/follower_arm/joint_ctrl': 1000000000" in payload["detail"]
-        assert "earliest_acceptable_bag_stamp_ns=1100000000" in payload["detail"]
-        assert store.active is None
-
-    asyncio.run(run())
-
-
-def test_bag_ready_status_reads_latest_writer_accepted_timestamps(
-    tmp_path: Path,
-) -> None:
-    topic = "/follower_arm/joint_ctrl"
-    ready_file = tmp_path / "bag_ready.json"
-    ready_file.write_text(
-        json.dumps(
-            {
-                "ready": True,
-                "ready_at_ros_ns": 1_000_000_000,
-                "bag_topics": {topic: 2},
-                "first_bag_timestamp_ns": {topic: 1_000_000_000},
-                "latest_bag_timestamp_ns": {topic: 1_100_000_000},
-                "timestamp_source": "rosbag2_serialized_message_time_stamp",
-            }
-        ),
-        encoding="utf-8",
-    )
-    recorder = BagRecorder()
-    recorder._ready_file = ready_file
-
-    status = recorder.ready_status({topic})
-
-    assert status.ready
-    assert status.counts == {topic: 2}
-    assert status.latest_bag_timestamp_ns == {topic: 1_100_000_000}

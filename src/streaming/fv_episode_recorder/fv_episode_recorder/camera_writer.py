@@ -195,7 +195,6 @@ class CameraWriter:
         output_dir: Path,
         fps: int = 30,
         node: Optional[Node] = None,
-        record_immediately: bool = True,
     ):
         self.name = name
         self.topic = topic
@@ -218,10 +217,6 @@ class CameraWriter:
         self._frame_pts: list[int] = []
         self._lock = threading.Lock()
         self._sub = None
-        self._recording_enabled = threading.Event()
-        if record_immediately:
-            self._recording_enabled.set()
-        self._first_observed_ros_ns = 0
         self.frame_count = 0
         self.width = 0
         self.height = 0
@@ -269,11 +264,6 @@ class CameraWriter:
                 self.height = h
                 LOG.info("[%s] first frame %dx%d → %s (%s)",
                          self.name, w, h, self._segment_file, self._codec_in_use)
-            if self._first_observed_ros_ns == 0:
-                self._first_observed_ros_ns = ros_stamp_ns
-            if not self._recording_enabled.is_set():
-                return
-
             try:
                 self._ffmpeg.stdin.write(img.tobytes())
             except (BrokenPipeError, ValueError) as exc:
@@ -304,20 +294,6 @@ class CameraWriter:
             self._segment_local += 1
             self.frame_count += 1
             self._last_recv_ns = recv_ns
-
-    def enable_recording(self) -> None:
-        if not self._recording_enabled.is_set():
-            self._start_wall_ns = time.time_ns()
-        self._recording_enabled.set()
-
-    def has_observed_frame(self) -> bool:
-        return self._first_observed_ros_ns > 0
-
-    def first_observed_ros_ns(self) -> int:
-        return self._first_observed_ros_ns
-
-    def last_recorded_ros_ns(self) -> int:
-        return self._frame_stamps_ns[-1] if self._frame_stamps_ns else 0
 
     def stop(self) -> dict:
         self.stop_recording()
@@ -394,10 +370,6 @@ class CameraWriter:
         return {
             "name": self.name,
             "topic": self.topic,
-            "video_timing_mode": "ros_header_stamp_to_pts",
-            "video_pts_origin_ros_ns": self._frame_stamps_ns[0] if self._frame_stamps_ns else None,
-            "video_time_base_num": VIDEO_TIME_BASE.numerator,
-            "video_time_base_den": VIDEO_TIME_BASE.denominator,
             "width": self.width,
             "height": self.height,
             "fps_nominal": self.fps_nominal,
@@ -631,39 +603,10 @@ class CameraWriterPool:
             cam_dir = videos_root / name
             writer = CameraWriter(
                 name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
-                record_immediately=bool(cam.get("record_immediately", True)),
             )
             writer.start()
             self._writers[name] = writer
         return [w.summary() for w in self._writers.values()] + self._depth_placeholders
-
-    def observed_frame_counts(self) -> dict[str, int]:
-        return {
-            name: 1 if writer.has_observed_frame() else 0
-            for name, writer in self._writers.items()
-        }
-
-    def observed_frame_stamps_ns(self) -> dict[str, int]:
-        return {
-            name: writer.first_observed_ros_ns()
-            for name, writer in self._writers.items()
-        }
-
-    def recorded_frame_stamps_ns(self) -> dict[str, int]:
-        return {
-            name: writer.last_recorded_ros_ns()
-            for name, writer in self._writers.items()
-        }
-
-    def ros_now_ns(self) -> int:
-        now_ns = int(self._node.get_clock().now().nanoseconds)
-        if now_ns <= 0:
-            raise RuntimeError("recorder ROS clock did not return a positive timestamp")
-        return now_ns
-
-    def enable_recording(self) -> None:
-        for writer in self._writers.values():
-            writer.enable_recording()
 
     def apply_depth_frame_counts(self, counts: dict[str, int]) -> None:
         """Patch the depth_bag placeholder summaries with the frame counts

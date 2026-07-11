@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from .episode_store import EpisodeMeta, EpisodeStore
+from .episode_store import EpisodeMeta, EpisodeStore, load_episode_meta
 
 LOG = logging.getLogger("fv_episode_recorder.retention")
 
@@ -92,16 +92,8 @@ class RetentionPlanner:
         episodes_root = self.store.output_dir / "episodes"
         if not episodes_root.exists():
             return out
-        import json
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
-            try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-                meta = EpisodeMeta(**{
-                    k: v for k, v in data.items() if k in EpisodeMeta.__annotations__
-                })
-            except Exception:
-                continue
+            meta, _data = load_episode_meta(meta_path)
             ep_dir = meta_path.parent
             size = 0
             try:

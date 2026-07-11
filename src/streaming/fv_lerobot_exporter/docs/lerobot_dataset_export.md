@@ -1,5 +1,16 @@
 # FV EpisodeからLeRobot Datasetへの変換仕様
 
+## 入力スキーマ
+
+recorderは起動時にepisode metadataをforward-only migrationで現行versionへ更新する。
+
+exporterはmigration済みのversion 2だけを入力として受け付ける。
+
+version 1などの旧versionをexporter内部で読み替えない。
+
+version欠落は`episode_schema_version_missing`、未登録versionは
+`episode_schema_version_unsupported`として停止する。
+
 ## 文書の位置付け
 
 この文書は、FluentVision episodeをLeRobot v3 datasetへ変換するロジックの正本である。
@@ -98,9 +109,6 @@ profileの`lerobot`セクションだけをLeRobot featureの意味と順序の�
 - `state == "finished"`
 - `outcome == "success"`
 - `started_at`が確定している
-- `timeline_start_ros_ns`と`timeline_end_ros_ns`が確定している
-- 両方の値が0より大きい
-- `timeline_start_ros_ns < timeline_end_ros_ns`である
 - 全episodeの`profile`名が一致する
 - `meta.json`、`bag/`、対象cameraのMP4、`frames.parquet`が存在する
 
@@ -207,33 +215,28 @@ FV episode recorderは、camera frameのROS timestampを`1/90000`秒単位の整
 
 **time base**は、PTSの整数1 tickが何秒を表すかを定める単位である。
 
-FV動画のtime baseは`1/90000`秒であり、camera metadataでは分子を`video_time_base_num`、分母を`video_time_base_den`へ保存する。
+FV episode schema version 2では、動画のtime baseを`1/90000`秒に固定する。
 
 **PTS origin**は、PTS 0に対応するROS絶対時刻である。
 
-FV動画のPTS originは最初に記録したcamera frameのROS timestampであり、`video_pts_origin_ros_ns`へ保存する。
+FV動画のPTS originは最初に記録したcamera frameのROS timestampである。
+
+変換時は`frames.parquet`の先頭`ros_stamp_ns`をPTS originとして読み取る。
 
 time baseはtickの単位を定め、PTS originは動画内相対時刻とROS絶対時刻の対応点を定めるため、両者は別の値である。
 
-camera metadataは次の値を持つ。
+timing mode、PTS origin、time baseをcamera metadataへ重複保存しない。
 
-```json
-{
-  "video_timing_mode": "ros_header_stamp_to_pts",
-  "video_pts_origin_ros_ns": 1234567890000000000,
-  "video_time_base_num": 1,
-  "video_time_base_den": 90000
-}
-```
+schema version 2、MP4、`frames.parquet`の組が時刻契約を表す。
 
 各camera frameのPTSは次の式で求める。
 
 ```text
 video_pts
-  = round((ros_stamp_ns - video_pts_origin_ros_ns) * 90000 / 1e9)
+  = round((ros_stamp_ns - first_ros_stamp_ns) * 90000 / 1e9)
 
 video timestamp in seconds
-  = video_pts * video_time_base_num / video_time_base_den
+  = video_pts / 90000
 ```
 
 `frames.parquet`は、各frameについて量子化後の整数`video_pts`と量子化前の`ros_stamp_ns`を持つ。
@@ -264,7 +267,7 @@ flowchart LR
         T2["frame 2<br/>ros_stamp_ns = R2"]
     end
 
-    ORIGIN["PTS origin<br/>video_pts_origin_ros_ns = R0"]
+    ORIGIN["PTS origin<br/>先頭sidecarのros_stamp_ns = R0"]
     QUANTIZE["1/90000秒単位へ量子化<br/>round((Rj - R0) × 90000 / 1e9)"]
 
     subgraph SIDECAR["frames.parquet"]
@@ -287,23 +290,17 @@ flowchart LR
     QUANTIZE --> S2 --> M2
 ```
 
-**video timing mode**は、camera frameの時刻を動画packetのPTSへ写す規則を表す。
+schema version 2は、ROS messageの`header.stamp`を先頭frameからの相対時刻へ変換し、`1/90000`秒単位へ量子化して動画packetのPTSへ設定する規則を意味する。
 
-`ros_header_stamp_to_pts`は、ROS messageの`header.stamp`を先頭frameからの相対時刻へ変換し、`1/90000`秒単位へ量子化して動画packetのPTSへ設定したことを表す。
+変換coreはschema version 2を要求し、PTS秒を`video_pts / 90000`で計算する。
 
-変換coreは`video_timing_mode == "ros_header_stamp_to_pts"`を要求する。
-
-変換coreは`video_time_base_num == 1`かつ`video_time_base_den == 90000`を要求し、宣言値からPTS秒を計算する。
-
-現在のFV recorderが生成する宣言値は`1/90000`であり、変換coreはtime baseを推測しない。
-
-`frames.parquet`の先頭`ros_stamp_ns`は`video_pts_origin_ros_ns`と一致しなければならない。
+変換coreは、各sidecar rowの`video_pts`が先頭`ros_stamp_ns`を原点とする量子化式と一致することを検証する。
 
 sidecar rowはROS timestampの狭義単調増加でなければならない。
 
 sidecarの先頭`video_pts`は0でなければならず、後続`video_pts`は狭義単調増加でなければならない。
 
-このPTS契約に違反したepisodeは`camera_video_pts_invalid`として変換を失敗させる。
+PTSの単調性に違反したepisodeは`camera_video_pts_invalid`、ROS timestampとの対応に違反したepisodeは`camera_video_pts_ros_stamp_mismatch`として変換を失敗させる。
 
 ```mermaid
 flowchart LR
@@ -425,7 +422,7 @@ profileのcamera、arm stream、joint、topic定義を型検証する。
 
 profile順にepisode cameraをtopicで対応付ける。
 
-一致したcameraごとにMP4、sidecar、解像度、PTS origin、time base、`video_pts`列を検証する。
+一致したcameraごとにMP4、sidecar、解像度、`video_pts`列とROS timestampの対応を検証する。
 
 camera mappingにはprimary cameraを設けない。
 
@@ -433,20 +430,26 @@ camera mappingにはprimary cameraを設けない。
 
 ### 4. 固定FPS gridを作る
 
-episode metadataの`timeline_start_ros_ns`を`T0`、`timeline_end_ros_ns`を`T1`とする。
+各cameraの先頭`ros_stamp_ns`のうち最も遅い時刻を`B0`とする。
 
-有効区間は`[T0, T1)`の半開区間である。
+この選択により、固定FPS gridはどのhardlink動画についてもPTS originより前を問い合わせない。
+
+各cameraと必須state topicの末尾timestampのうち最も遅い時刻を`B1`とする。
+
+末尾が早いstreamを基準にgridを切り詰めると長い欠損を隠すため、`B1`までgridを作り、各streamの不足を整列処理で判定する。
 
 gridの各絶対ROS timestampは次の式で決める。
 
 ```text
-t_i = T0 + round(i * 1e9 / fps)
-i = 0, 1, 2, ...
+n0 = ceil(B0 * fps / 1e9)
+n1 = floor(B1 * fps / 1e9)
+t_i = round((n0 + i) * 1e9 / fps)
+i = 0, 1, ..., n1 - n0
 ```
 
-`t_i < T1`を満たす時刻だけをgridに含め、その件数をrow数`N`とする。
+このgridはROS時刻0を原点とする周期列であり、特定cameraのframe timestampを起点にしない。
 
-camera timestampはgridの開始、終了、row数を決めない。
+cameraは開始境界と終了境界の判定材料になるが、primary cameraは設けない。
 
 ### 5. Bagを一回読む
 
@@ -478,9 +481,9 @@ source eventが古すぎる場合、sourceが`stop`の場合、JSONからsource�
 
 ```mermaid
 flowchart TB
-    INTERVAL["episode有効区間<br/>T0以上、T1未満"]
+    INTERVAL["実データから求めた区間<br/>B0以上、B1以下"]
     GRID["固定FPS row<br/>frame_index = i"]
-    ROSQUERY["ROS絶対時刻<br/>t_i = T0 + round(i × 1e9 / fps)"]
+    ROSQUERY["ROS絶対時刻<br/>時刻0基準の固定FPS格子"]
     VIDEOQUERY["動画問い合わせ時刻<br/>q_i = from_timestamp + i / fps"]
 
     CAMERA["各camera sidecar<br/>p_j = video_pts_j × time base"]
@@ -522,13 +525,13 @@ cameraごとの問い合わせ時刻は次の式で決める。
 q_i = from_timestamp + i / fps
 
 from_timestamp
-  = (timeline_start_ros_ns - video_pts_origin_ros_ns) / 1e9
+  = (t_0 - first_ros_stamp_ns) / 1e9
 ```
 
 camera側の候補時刻は、sidecarの整数`video_pts`をtime baseで秒へ変換した値である。
 
 ```text
-p_j = video_pts_j * video_time_base_num / video_time_base_den
+p_j = video_pts_j / 90000
 ```
 
 したがって、camera整列は`q_i`と`p_j`を比較し、量子化前の`ros_stamp_ns`とは比較しない。
@@ -637,13 +640,13 @@ dataset組立時に`episode_index`、dataset全体の`index`、`task_index`を�
 
 ### 10. 動画参照を作る
 
-先頭絶対ROS timestampは`timeline_start_ros_ns`である。
+先頭絶対ROS timestampは固定FPS gridの`t_0`である。
 
 cameraごとの`from_timestamp`は次の式で求める。
 
 ```text
 from_timestamp
-  = (timeline_start_ros_ns - video_pts_origin_ros_ns) / 1e9
+  = (t_0 - first_ros_stamp_ns) / 1e9
 ```
 
 `from_timestamp`が負になる場合は変換を失敗させる。

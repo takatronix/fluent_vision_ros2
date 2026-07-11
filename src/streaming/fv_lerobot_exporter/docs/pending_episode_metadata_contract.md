@@ -16,6 +16,6 @@ episode metadataはprofile名だけを保持している。
 
 `trim_start_s`と`trim_end_s`をepisode metadataまたはexport requestへ持たせるかどうかは未決である。
 
-現行exporterに両fieldは存在せず、canonical episode有効区間`[timeline_start_ros_ns, timeline_end_ros_ns)`をそのまま変換する。
+現行exporterに両fieldは存在せず、camera sidecarと必須state sampleから固定FPS gridの範囲を求める。
 
-trimを導入する場合は、canonical有効区間との関係、許容範囲、provenanceへの記録方法を先に決める。
+trimを導入する場合は、実データから求めたgridとの関係、許容範囲、provenanceへの記録方法を先に決める。

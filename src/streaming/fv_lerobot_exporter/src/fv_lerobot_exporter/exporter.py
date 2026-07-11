@@ -9,7 +9,7 @@ import os
 import shutil
 import stat
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from multiprocessing import get_context, set_forkserver_preload
 from pathlib import Path
@@ -50,6 +50,7 @@ from .timing import (
 JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 VIDEO_QUERY_TIMESTAMP_SOURCE_KEY = "video_query_timestamp_source"
 VIDEO_QUERY_TIMESTAMP_SOURCE_FRAME_INDEX = "frame_index_over_fps"
+RECORDER_VIDEO_TIME_BASE_DENOMINATOR = 90_000
 StampSource = Literal["message_header", "rosbag_recv", "system"]
 JointUnit = Literal["degrees", "percent"]
 StatValue = list[float] | list[int] | list[list[list[float]]]
@@ -240,10 +241,6 @@ class RecorderCameraMeta(BaseModel):
     topic: str = Field(..., min_length=1)
     width: int | None = None
     height: int | None = None
-    video_timing_mode: str | None = None
-    video_pts_origin_ros_ns: int | None = None
-    video_time_base_num: int | None = Field(default=None, gt=0)
-    video_time_base_den: int | None = Field(default=None, gt=0)
     segments: list[RecorderCameraSegment] = Field(default_factory=list)
 
 
@@ -257,6 +254,7 @@ class RecordedTopicMeta(BaseModel):
 class SourceEpisodeMeta(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    schema_version: Literal[2]
     episode_id: str = Field(..., min_length=1)
     state: str
     task_description: str = ""
@@ -264,21 +262,40 @@ class SourceEpisodeMeta(BaseModel):
     started_at: str
     stopped_at: str | None = None
     duration_s: float | None = Field(default=None, ge=0.0)
-    timeline_start_ros_ns: int = Field(..., gt=0)
-    timeline_end_ros_ns: int = Field(..., gt=0)
     outcome: str | None = None
     tags: list[str] = Field(default_factory=list)
     cameras: list[RecorderCameraMeta] = Field(default_factory=list)
     recorded_topics: list[RecordedTopicMeta] = Field(default_factory=list)
     bag_path: str = "bag/"
 
-    @model_validator(mode="after")
-    def validate_timeline(self) -> Self:
-        if self.timeline_end_ros_ns <= self.timeline_start_ros_ns:
-            raise ValueError(
-                "timeline_end_ros_ns must be greater than timeline_start_ros_ns"
-            )
-        return self
+def _read_current_source_episode(
+    raw_meta: JsonValue,
+    meta_path: Path,
+) -> SourceEpisodeMeta:
+    if not isinstance(raw_meta, dict):
+        raise LerobotDatasetExportError(
+            "episode_schema_version_missing",
+            f"episode meta must be a JSON object: {meta_path}",
+        )
+    schema_version = raw_meta.get("schema_version")
+    if type(schema_version) is not int or schema_version <= 0:
+        raise LerobotDatasetExportError(
+            "episode_schema_version_missing",
+            f"episode meta must declare a positive integer schema_version: {meta_path}",
+        )
+    if schema_version != 2:
+        raise LerobotDatasetExportError(
+            "episode_schema_version_unsupported",
+            f"episode schema_version {schema_version} is not current; "
+            f"expected 2: {meta_path}",
+        )
+    try:
+        return SourceEpisodeMeta.model_validate(raw_meta)
+    except ValidationError as exc:
+        raise LerobotDatasetExportError(
+            "episode_meta_invalid",
+            f"episode meta is invalid: {meta_path}",
+        ) from exc
 
 
 class FrameSidecarRow(BaseModel):
@@ -337,6 +354,7 @@ class CameraExportMapping:
     height: int
     source_video: Path
     frame_pts_seconds: list[float]
+    video_origin_ros_ns: int
     from_timestamp_s: float
     sidecar_rows: list[FrameSidecarRow]
 
@@ -510,16 +528,15 @@ def _load_episodes_for_export(
                 "episode_meta_invalid",
                 f"episode meta is invalid: {meta_path}",
             ) from exc
+        if not isinstance(raw_meta, dict):
+            raise LerobotDatasetExportError(
+                "episode_schema_version_missing",
+                f"episode meta must be a JSON object: {meta_path}",
+            )
         raw_episode_id = raw_meta.get("episode_id")
         if raw_episode_id not in requested_ids:
             continue
-        try:
-            meta = SourceEpisodeMeta.model_validate(raw_meta)
-        except ValidationError as exc:
-            raise LerobotDatasetExportError(
-                "episode_meta_invalid",
-                f"episode meta is invalid: {meta_path}",
-            ) from exc
+        meta = _read_current_source_episode(raw_meta, meta_path)
         episode_dir = meta_path.parent.resolve()
         matches[meta.episode_id][episode_dir] = EpisodeForExport(
             meta=meta,
@@ -667,12 +684,6 @@ def _convert_episode(
     max_mux_status_age_s: float,
 ) -> EpisodeExportData:
     camera_mappings = _resolve_camera_mappings(episode, profile)
-    frame_stamps = _fixed_fps_timeline(
-        timeline_start_ros_ns=episode.meta.timeline_start_ros_ns,
-        timeline_end_ros_ns=episode.meta.timeline_end_ros_ns,
-        fps=fps,
-    )
-
     stamp_sources = _recorded_topic_stamp_sources(episode.meta)
     required_bag_topics = _required_bag_topics(profile)
     optional_action_topics = _configured_action_bag_topics(profile)
@@ -687,6 +698,23 @@ def _convert_episode(
             "mux_status_missing",
             f"episode {episode.meta.episode_id} has no mux status samples",
         )
+    frame_stamps = _fixed_fps_timeline_from_recorded_data(
+        camera_mappings=camera_mappings,
+        bag=bag,
+        profile=profile,
+        fps=fps,
+    )
+    grid_start_ros_ns = frame_stamps[0]
+    camera_mappings = [
+        replace(
+            mapping,
+            from_timestamp_s=(
+                grid_start_ros_ns - mapping.video_origin_ros_ns
+            )
+            / 1_000_000_000.0,
+        )
+        for mapping in camera_mappings
+    ]
     source_events = SourceEventIndex(
         events=bag.source_events,
         stamps=[event.stamp_ns for event in bag.source_events],
@@ -776,22 +804,61 @@ def _convert_episode(
     )
 
 
-def _fixed_fps_timeline(
-    *, timeline_start_ros_ns: int, timeline_end_ros_ns: int, fps: int
+def _fixed_fps_timeline_from_recorded_data(
+    *,
+    camera_mappings: list[CameraExportMapping],
+    bag: BagTopicData,
+    profile: ProfileExportSpec,
+    fps: int,
 ) -> list[int]:
-    if timeline_end_ros_ns <= timeline_start_ros_ns:
+    camera_first_stamps = [
+        mapping.sidecar_rows[0].ros_stamp_ns for mapping in camera_mappings
+    ]
+    last_stamps = [mapping.sidecar_rows[-1].ros_stamp_ns for mapping in camera_mappings]
+    for stream in profile.lerobot.arm_streams:
+        topic = stream.rx.joint_state.topic
+        samples = bag.joint_samples_by_topic.get(topic)
+        if not samples:
+            raise LerobotDatasetExportError(
+                "joint_samples_missing",
+                f"no samples for required joint state topic {topic}",
+            )
+        last_stamps.append(samples[-1].stamp_ns)
+
+    # Hardlinked videos start at local PTS zero, so the dataset timeline cannot
+    # query before any camera origin. This boundary selection does not make a
+    # camera the master clock; the fixed-FPS grid remains anchored to ROS time zero.
+    available_start_ros_ns = max(camera_first_stamps)
+    available_end_ros_ns = max(last_stamps)
+    return _fixed_fps_timeline_for_interval(
+        available_start_ros_ns=available_start_ros_ns,
+        available_end_ros_ns=available_end_ros_ns,
+        fps=fps,
+    )
+
+
+def _fixed_fps_timeline_for_interval(
+    *, available_start_ros_ns: int, available_end_ros_ns: int, fps: int
+) -> list[int]:
+    if available_end_ros_ns < available_start_ros_ns:
         raise LerobotDatasetExportError(
-            "episode_timeline_invalid",
-            "timeline_end_ros_ns must be greater than timeline_start_ros_ns",
+            "episode_timeline_empty",
+            "camera and required joint streams have no common ROS timestamp interval",
         )
-    duration_ns = timeline_end_ros_ns - timeline_start_ros_ns
-    frame_count = (duration_ns * fps + 1_000_000_000 - 1) // 1_000_000_000
-    stamps: list[int] = []
-    for frame_index in range(frame_count):
-        stamp_ns = timeline_start_ros_ns + round(frame_index * 1_000_000_000 / fps)
-        if stamp_ns >= timeline_end_ros_ns:
-            break
-        stamps.append(stamp_ns)
+
+    first_grid_index = (
+        available_start_ros_ns * fps + 1_000_000_000 - 1
+    ) // 1_000_000_000
+    last_grid_index = available_end_ros_ns * fps // 1_000_000_000
+    stamps = [
+        (grid_index * 1_000_000_000 + fps // 2) // fps
+        for grid_index in range(first_grid_index, last_grid_index + 1)
+    ]
+    if not stamps:
+        raise LerobotDatasetExportError(
+            "episode_timeline_empty",
+            "camera and required joint streams share no fixed-FPS grid timestamp",
+        )
     return stamps
 
 
@@ -1260,24 +1327,6 @@ def _resolve_camera_mappings(
                 "camera_segments_unsupported",
                 f"camera {episode_camera.name} must have exactly one mp4 segment",
             )
-        if (
-            episode_camera.video_timing_mode != "ros_header_stamp_to_pts"
-            or not episode_camera.video_pts_origin_ros_ns
-            or episode_camera.video_time_base_num is None
-            or episode_camera.video_time_base_den is None
-        ):
-            raise LerobotDatasetExportError(
-                "camera_video_timing_contract_missing",
-                f"camera {episode_camera.name} does not declare ros_header_stamp_to_pts video timing",
-            )
-        if (
-            episode_camera.video_time_base_num != 1
-            or episode_camera.video_time_base_den != 90_000
-        ):
-            raise LerobotDatasetExportError(
-                "camera_video_time_base_invalid",
-                f"camera {episode_camera.name} video time base must be 1/90000",
-            )
         segment = episode_camera.segments[0]
         source_video = (
             episode.episode_dir / "videos" / episode_camera.name / segment.file
@@ -1306,15 +1355,25 @@ def _resolve_camera_mappings(
                 "camera_sidecar_video_mismatch",
                 f"camera {episode_camera.name} sidecar does not map one-to-one to {segment.file}",
             )
-        if sidecar_rows[0].ros_stamp_ns != episode_camera.video_pts_origin_ros_ns:
+        video_origin_ros_ns = sidecar_rows[0].ros_stamp_ns
+        expected_video_pts = [
+            round(
+                (row.ros_stamp_ns - video_origin_ros_ns)
+                * RECORDER_VIDEO_TIME_BASE_DENOMINATOR
+                / 1_000_000_000
+            )
+            for row in sidecar_rows
+        ]
+        if any(
+            row.video_pts != expected
+            for row, expected in zip(sidecar_rows, expected_video_pts)
+        ):
             raise LerobotDatasetExportError(
-                "camera_video_pts_origin_mismatch",
-                f"camera {episode_camera.name} video origin does not match its first sidecar frame",
+                "camera_video_pts_ros_stamp_mismatch",
+                f"camera {episode_camera.name} sidecar PTS does not match ROS timestamps",
             )
         frame_pts_seconds = [
-            row.video_pts
-            * episode_camera.video_time_base_num
-            / episode_camera.video_time_base_den
+            row.video_pts / RECORDER_VIDEO_TIME_BASE_DENOMINATOR
             for row in sidecar_rows
         ]
         if frame_pts_seconds[0] != 0.0 or any(
@@ -1324,14 +1383,6 @@ def _resolve_camera_mappings(
             raise LerobotDatasetExportError(
                 "camera_video_pts_invalid",
                 f"camera {episode_camera.name} video PTS must start at zero and increase strictly",
-            )
-        from_timestamp_s = (
-            episode.meta.timeline_start_ros_ns - episode_camera.video_pts_origin_ros_ns
-        ) / 1_000_000_000.0
-        if from_timestamp_s < 0:
-            raise LerobotDatasetExportError(
-                "camera_video_query_before_origin",
-                f"observation.images.{camera.name} starts after the canonical timeline",
             )
         width = int(episode_camera.width or 0)
         height = int(episode_camera.height or 0)
@@ -1347,7 +1398,8 @@ def _resolve_camera_mappings(
                 height=height,
                 source_video=source_video,
                 frame_pts_seconds=frame_pts_seconds,
-                from_timestamp_s=from_timestamp_s,
+                video_origin_ros_ns=video_origin_ros_ns,
+                from_timestamp_s=0.0,
                 sidecar_rows=sidecar_rows,
             )
         )

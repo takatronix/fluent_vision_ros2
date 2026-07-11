@@ -19,7 +19,16 @@ from typing import Any, Optional
 
 from ulid import ULID
 
-SCHEMA_VERSION = 3
+from .episode_schema import (
+    CURRENT_EPISODE_SCHEMA_VERSION,
+    EpisodeSchemaError,
+    JsonObject,
+    JsonValue,
+    read_current_episode_document,
+)
+from .migrations import migrate_episode_store
+
+SCHEMA_VERSION = CURRENT_EPISODE_SCHEMA_VERSION
 
 # Reject filesystem-hostile chars + control chars. Japanese / non-ASCII kept
 # (ext4 is utf-8 native; ls/ros2 bag handle them fine).
@@ -88,14 +97,9 @@ class EpisodeMeta:
     operator: Optional[str] = None
     tags: list[str] = field(default_factory=list)
     parent_session_id: Optional[str] = None
-    stop_frame_count_per_camera: dict[str, int] = field(default_factory=dict)
     expected_duration_s: Optional[float] = None
     started_at: str = ""
     stopped_at: Optional[str] = None
-    # Canonical ROS-clock interval used by dataset exporters. The effective
-    # episode interval is half-open: [timeline_start_ros_ns, timeline_end_ros_ns).
-    timeline_start_ros_ns: Optional[int] = None
-    timeline_end_ros_ns: Optional[int] = None
     duration_s: Optional[float] = None
     outcome: Optional[str] = None
     pinned: bool = False
@@ -133,6 +137,40 @@ class EpisodeMeta:
     controller_at_end: Optional[dict[str, Any]] = None
 
 
+def _episode_meta_from_fields(data: JsonObject) -> EpisodeMeta:
+    return EpisodeMeta(
+        **{
+            key: value
+            for key, value in data.items()
+            if key in EpisodeMeta.__annotations__
+        }
+    )
+
+
+def _decode_episode_meta(data: JsonValue) -> tuple[EpisodeMeta, JsonObject]:
+    try:
+        document = read_current_episode_document(data)
+        return _episode_meta_from_fields(document), document
+    except (EpisodeSchemaError, TypeError, ValueError) as exc:
+        raise EpisodeMetadataError(str(exc)) from exc
+
+
+def read_episode_meta(data: JsonValue) -> EpisodeMeta:
+    """Decode metadata only after it satisfies the current schema."""
+    meta, _document = _decode_episode_meta(data)
+    return meta
+
+
+def load_episode_meta(meta_path: Path) -> tuple[EpisodeMeta, JsonObject]:
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EpisodeMetadataError(
+            f"episode metadata cannot be read: {meta_path}"
+        ) from exc
+    return _decode_episode_meta(data)
+
+
 class EpisodeStore:
     """Filesystem-backed episode store.
 
@@ -150,6 +188,7 @@ class EpisodeStore:
         self.shared_uid = self.output_dir.stat().st_uid
         self.shared_gid = self.output_dir.stat().st_gid
         _prepare_shared_directory(self.output_dir / "episodes", self.shared_gid)
+        migrate_episode_store(self.output_dir)
         self._lock = threading.Lock()
         self._active_episode: Optional[EpisodeMeta] = None
         self._active_dir: Optional[Path] = None
@@ -192,11 +231,9 @@ class EpisodeStore:
                 raise
             return ep_dir
 
-    def stop_active(
-        self, outcome: str, timeline_end_ros_ns: int
-    ) -> tuple[EpisodeMeta, Path]:
+    def stop_active(self, outcome: str) -> tuple[EpisodeMeta, Path]:
         """Finalize active episode. Returns (meta, dir)."""
-        meta, ep_dir = self.begin_finalizing_active(outcome, timeline_end_ros_ns)
+        meta, ep_dir = self.begin_finalizing_active(outcome)
         if outcome == "discard":
             meta.state = "discarded"
         elif outcome == "abort":
@@ -208,7 +245,6 @@ class EpisodeStore:
     def begin_finalizing_active(
         self,
         outcome: str,
-        timeline_end_ros_ns: Optional[int] = None,
     ) -> tuple[EpisodeMeta, Path]:
         """Stop accepting samples for the active episode and release the active slot."""
         with self._lock:
@@ -220,30 +256,13 @@ class EpisodeStore:
                 raise RuntimeError("active episode directory is missing")
             meta.stopped_at = utc_now_iso()
             meta.outcome = outcome
-            if meta.timeline_start_ros_ns is not None:
-                if (
-                    timeline_end_ros_ns is None
-                    or timeline_end_ros_ns <= meta.timeline_start_ros_ns
-                ):
-                    raise RuntimeError(
-                        "timeline_end_ros_ns must be after timeline_start_ros_ns"
-                    )
-                meta.timeline_end_ros_ns = timeline_end_ros_ns
-                meta.duration_s = (
-                    timeline_end_ros_ns - meta.timeline_start_ros_ns
-                ) / 1_000_000_000.0
-            else:
-                if timeline_end_ros_ns is not None:
-                    raise RuntimeError(
-                        "timeline_end_ros_ns cannot be set before recording ready"
-                    )
-                started = datetime.strptime(
-                    meta.started_at, "%Y-%m-%dT%H:%M:%S.%fZ"
-                ).replace(tzinfo=timezone.utc)
-                stopped = datetime.strptime(
-                    meta.stopped_at, "%Y-%m-%dT%H:%M:%S.%fZ"
-                ).replace(tzinfo=timezone.utc)
-                meta.duration_s = (stopped - started).total_seconds()
+            started = datetime.strptime(
+                meta.started_at, "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=timezone.utc)
+            stopped = datetime.strptime(
+                meta.stopped_at, "%Y-%m-%dT%H:%M:%S.%fZ"
+            ).replace(tzinfo=timezone.utc)
+            meta.duration_s = (stopped - started).total_seconds()
             if outcome == "discard":
                 meta.state = "discarded"
             else:
@@ -311,20 +330,17 @@ class EpisodeStore:
             return migrated
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
             try:
-                data = json.loads(meta_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    f"cannot inspect episode metadata: {meta_path}"
-                ) from exc
-            if data.get("state") != "finished" or data.get("outcome") != "success":
+                meta, _data = load_episode_meta(meta_path)
+            except EpisodeMetadataError as exc:
+                raise RuntimeError(f"cannot inspect episode metadata: {meta_path}") from exc
+            if meta.state != "finished" or meta.outcome != "success":
                 continue
             if self.make_episode_videos_read_only(meta_path.parent):
-                episode_id = data.get("episode_id")
-                if not isinstance(episode_id, str) or not episode_id:
+                if not meta.episode_id:
                     raise RuntimeError(
                         f"finished episode has no episode_id: {meta_path}"
                     )
-                migrated.append(episode_id)
+                migrated.append(meta.episode_id)
         return migrated
 
     def recover_finalizing_orphans(self) -> list[str]:
@@ -340,15 +356,8 @@ class EpisodeStore:
             return recovered
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
             try:
-                data = json.loads(meta_path.read_text(encoding="utf-8"))
-                meta = EpisodeMeta(
-                    **{
-                        key: value
-                        for key, value in data.items()
-                        if key in EpisodeMeta.__annotations__
-                    }
-                )
-            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                meta, _data = load_episode_meta(meta_path)
+            except EpisodeMetadataError as exc:
                 raise RuntimeError(
                     f"cannot inspect episode metadata: {meta_path}"
                 ) from exc
@@ -407,9 +416,7 @@ class EpisodeStore:
             episodes_root.glob("*/*/*/meta.json"), key=lambda p: p.stat().st_mtime, reverse=True
         ):
             try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-                meta = EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__})
+                meta, _data = load_episode_meta(meta_path)
                 ep_dir = meta_path.parent
                 size = 0
                 try:
@@ -421,7 +428,7 @@ class EpisodeStore:
                 results.append((meta, size))
                 if len(results) >= limit:
                     break
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except OSError:
                 continue
         return results
 
@@ -455,11 +462,7 @@ class EpisodeStore:
                 return None
             _meta, ep_dir = found
             meta_path = ep_dir / "meta.json"
-            try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                return None
+            _current, data = load_episode_meta(meta_path)
             for k, v in (changes or {}).items():
                 if k in allowed:
                     # Allow explicit null/None to clear trim_*.
@@ -480,9 +483,8 @@ class EpisodeStore:
             _meta, ep_dir = found
             meta_path = ep_dir / "meta.json"
             try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError) as exc:
+                _current, data = load_episode_meta(meta_path)
+            except EpisodeMetadataError as exc:
                 raise EpisodeMetadataError(
                     f"episode metadata cannot be read: {episode_id}"
                 ) from exc
@@ -516,11 +518,7 @@ class EpisodeStore:
             return None
         _meta, ep_dir = found
         meta_path = ep_dir / "meta.json"
-        try:
-            with meta_path.open() as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return None
+        _current, data = load_episode_meta(meta_path)
         markers = data.setdefault("markers", [])
         markers.append(marker)
         tmp = meta_path.with_suffix(".json.tmp")
@@ -537,11 +535,7 @@ class EpisodeStore:
         if not episodes_root.exists():
             return False
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
-            try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
+            _meta, data = load_episode_meta(meta_path)
             markers = data.get("markers", []) or []
             new_markers = [m for m in markers if m.get("marker_id") != marker_id]
             if len(new_markers) != len(markers):
@@ -569,11 +563,7 @@ class EpisodeStore:
         if not episodes_root.exists():
             return None
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
-            try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
+            _meta, data = load_episode_meta(meta_path)
             markers = data.get("markers", []) or []
             for m in markers:
                 if m.get("marker_id") != marker_id:
@@ -614,31 +604,15 @@ class EpisodeStore:
             return None
         meta_path = episode_dir / "meta.json"
         try:
-            data = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            meta, data = load_episode_meta(meta_path)
+        except EpisodeMetadataError as exc:
             raise EpisodeMetadataError(
-                f"indexed episode metadata cannot be read: {episode_id}"
+                f"indexed episode metadata is invalid: {episode_id}: {exc}"
             ) from exc
-        if not isinstance(data, dict):
-            raise EpisodeMetadataError(
-                f"indexed episode metadata is not an object: {episode_id}"
-            )
         if data.get("episode_id") != episode_id:
             raise EpisodeMetadataError(
                 f"episode index mismatch for {episode_id}: {meta_path}"
             )
-        try:
-            meta = EpisodeMeta(
-                **{
-                    key: value
-                    for key, value in data.items()
-                    if key in EpisodeMeta.__annotations__
-                }
-            )
-        except (TypeError, ValueError) as exc:
-            raise EpisodeMetadataError(
-                f"indexed episode metadata is invalid: {episode_id}"
-            ) from exc
         return meta, episode_dir
 
     # ---- internals ----

@@ -98,13 +98,12 @@ def test_historical_source_migration_only_changes_finished_success(
             task_description="pick",
             profile="piper_single_teleop",
             started_at="2026-07-10T00:00:00.000000Z",
-            timeline_start_ros_ns=1_000_000_000,
         )
     )
     finished_video = finished_dir / "videos" / "top_camera" / "0000.mp4"
     finished_video.parent.mkdir()
     finished_video.write_bytes(b"finished")
-    store.stop_active("success", 2_000_000_000)
+    store.stop_active("success")
 
     failed_dir = store.start_episode(
         EpisodeMeta(
@@ -112,13 +111,12 @@ def test_historical_source_migration_only_changes_finished_success(
             task_description="pick",
             profile="piper_single_teleop",
             started_at="2026-07-10T00:00:01.000000Z",
-            timeline_start_ros_ns=2_000_000_000,
         )
     )
     failed_video = failed_dir / "videos" / "top_camera" / "0000.mp4"
     failed_video.parent.mkdir()
     failed_video.write_bytes(b"failed")
-    store.stop_active("abort", 3_000_000_000)
+    store.stop_active("abort")
 
     assert store.migrate_finished_episode_sources_read_only() == [
         "01TESTFINISHED00000000000"

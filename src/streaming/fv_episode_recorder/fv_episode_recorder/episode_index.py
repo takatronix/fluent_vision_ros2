@@ -30,9 +30,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from .episode_schema import episode_schema_version, read_current_episode_document
+
 LOG = logging.getLogger("fv_episode_recorder.index")
 
-SCHEMA_VERSION = 1
+INDEX_SCHEMA_VERSION = 2
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -41,6 +43,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 CREATE TABLE IF NOT EXISTS episodes (
     episode_id        TEXT PRIMARY KEY,
+    episode_schema_version INTEGER NOT NULL,
     state             TEXT NOT NULL,
     task_description  TEXT NOT NULL,
     profile           TEXT NOT NULL,
@@ -157,19 +160,22 @@ class EpisodeIndex:
                 else None
             )
             if schema_exists is not None and (
-                row is None or row["version"] != SCHEMA_VERSION
+                row is None or row["version"] != INDEX_SCHEMA_VERSION
             ):
                 LOG.warning(
                     "index schema version %s != %d, dropping + rebuilding",
                     row["version"] if row is not None else "missing",
-                    SCHEMA_VERSION,
+                    INDEX_SCHEMA_VERSION,
                 )
                 self._conn.execute("DROP TABLE IF EXISTS episodes")
                 self._conn.execute("DROP TABLE IF EXISTS schema_version")
             self._conn.executescript(_DDL)
             row = self._conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
             if row is None:
-                self._conn.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
+                self._conn.execute(
+                    "INSERT INTO schema_version(version) VALUES (?)",
+                    (INDEX_SCHEMA_VERSION,),
+                )
 
     def rebuild_from_filesystem(self) -> int:
         """Wipe the episodes table and re-populate by walking meta.json files.
@@ -187,8 +193,10 @@ class EpisodeIndex:
                     try:
                         with meta_path.open() as f:
                             data = json.load(f)
-                    except (OSError, json.JSONDecodeError):
-                        continue
+                    except (OSError, json.JSONDecodeError) as exc:
+                        raise RuntimeError(
+                            f"episode metadata cannot be indexed: {meta_path}"
+                        ) from exc
                     ep_dir = meta_path.parent
                     self._insert_row_locked(data, ep_dir)
                     inserted += 1
@@ -214,6 +222,7 @@ class EpisodeIndex:
             self._insert_row_locked(meta_dict, ep_dir)
 
     def _insert_row_locked(self, data: dict, ep_dir: Path) -> None:
+        data = read_current_episode_document(data)
         episode_id = data.get("episode_id") or ""
         if not episode_id:
             return
@@ -237,12 +246,14 @@ class EpisodeIndex:
         self._conn.execute(
             """
             INSERT INTO episodes (
-                episode_id, state, task_description, profile, robot_id,
+                episode_id, episode_schema_version, state,
+                task_description, profile, robot_id,
                 started_at, stopped_at, duration_s, outcome, pinned,
                 size_bytes, marker_count, tags, source, env, controller_label,
                 batch_id, ep_dir, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(episode_id) DO UPDATE SET
+                episode_schema_version = excluded.episode_schema_version,
                 state            = excluded.state,
                 task_description = excluded.task_description,
                 profile          = excluded.profile,
@@ -264,6 +275,7 @@ class EpisodeIndex:
             """,
             (
                 episode_id,
+                episode_schema_version(data),
                 data.get("state") or "unknown",
                 data.get("task_description") or "",
                 profile,

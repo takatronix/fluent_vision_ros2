@@ -21,13 +21,13 @@ ros2 launch fv_episode_recorder fv_episode_recorder_launch.py output_dir:=/tmp/d
 curl -X POST http://localhost:8083/api/v1/episodes \
   -H 'Content-Type: application/json' \
   -d '{"task_description":"Pick up the white cube","profile":"piper_single_teleop"}'
-# → 201 after the bag/camera ready barrier
-#   {"episode_id":"01J...","timeline_start_ros_ns":..., ...}
+# → 201 after the configured writers have started
+#   {"episode_id":"01J...","bag_path":"...","meta_path":"...", ...}
 
 curl -X POST http://localhost:8083/api/v1/episodes/<id>/stop \
   -H 'Content-Type: application/json' \
   -d '{"outcome":"success"}'
-# → 202 {"state":"finalizing","timeline_end_ros_ns":..., ...}
+# → 202 {"state":"finalizing", ...}
 # Poll GET /api/v1/episodes/<id> until finished, failed, or discarded.
 
 curl http://localhost:8083/api/v1/episodes
@@ -35,21 +35,22 @@ curl http://localhost:8083/api/v1/episodes
 
 ## Design
 
-`meta.json` schema version 3 records the effective episode as the half-open ROS-clock interval
-`[timeline_start_ros_ns, timeline_end_ros_ns)`. `timeline_start_ros_ns` is fixed
-only after the standard rosbag2 writer and every color-camera writer have each
-accepted a valid sample. The start response then waits until every required bag
-topic has a writer-accepted sample at or after `T0 - min(0.1s, 3/fps)` and every
-enabled color camera contains a frame at or after T0. Camera writers retain pre-T0 raw frames,
-while dataset export excludes samples outside the canonical interval. A successful finalization makes the video tree
+The recorder starts the configured bag and camera writers and reports only
+whether those operations succeeded. It does not diagnose ROS input health or
+decide whether missing inputs should block recording. VLAbor health/status owns
+input warnings and errors so every recorder caller observes the same system
+state without a second recorder-specific health contract.
+
+The recorder does not persist an exporter-specific canonical start or end
+timestamp. Dataset export derives its fixed-FPS timeline from the camera
+sidecars and required bag samples.
+
+A successful finalization makes the video tree
 read-only after transferring file ownership to the dataset-root owner, so that
 the host exporter can still create hardlinks with `fs.protected_hardlinks=1`.
-Enabled depth cameras use their lossless compressedDepth bag topic as a required
-bag topic, so start cannot succeed before rosbag2 has accepted depth data too.
-If this ready barrier times out, `POST /api/v1/episodes` returns a typed `503`
-payload with `code`, `message`, `missing_bag`, `missing_cameras`,
-`bag_counts`, `camera_counts`, and the observed timestamp evidence. It does not
-encode those fields into a `detail` string.
+Enabled depth cameras add their lossless compressedDepth topic to the bag topic
+list. Missing depth input is reported by VLAbor health/status; it does not alter
+the recorder start API contract.
 On startup, abandoned `finalizing` episodes become `failed/abort` without
 success inference, and historical `finished/success` sources are migrated to
 the same read-only ownership contract.
@@ -62,5 +63,34 @@ not use different payload shapes.
 `POST /api/v1/episodes/{episode_id}/tags` atomically appends the required
 `tags` list and removes duplicates without replacing tags written by another
 client.
+
+### Episode metadata schema versions
+
+Every `meta.json` declares `schema_version`. Before opening the sqlite index or
+serving requests, the recorder applies registered forward-only migrations to
+every older metadata file. Normal recorder code reads and writes only the
+current version 2 schema.
+
+Version 1 migrates to version 2. The migration preserves unrelated metadata and
+removes the obsolete canonical timeline and stop-count snapshot fields. It does
+not rewrite MP4 files or synthesize a missing `video_pts` sidecar column.
+
+| Contract | Version 1 | Native version 2 | Migrated version 1 |
+| --- | --- | --- | --- |
+| Effective episode interval | Not recorded | Derived during export from recorded samples | Derived only when the recorded data satisfies the version 2 export contract |
+| Start handling | API request time | Writers start immediately | Metadata migration does not alter recording data |
+| Stop camera counts | Camera summaries | Camera summaries | Camera summaries |
+| MP4 timing | No stable declared contract | ROS header timestamps mapped to packet PTS | Existing MP4 is not rewritten |
+| Camera timing metadata | Absent or incomplete | No duplicated mode, origin, or time-base fields | Obsolete fields are removed |
+| Frame sidecar | No `video_pts` column | Includes the MP4 packet `video_pts` | Existing sidecar is not rewritten |
+
+A migrated version 1 episode can be listed, edited, replayed, and previewed under
+the version 2 metadata model. Export remains unavailable when the recorded
+camera sidecar and MP4 do not satisfy the version 2 timing contract.
+
+A missing version, a version without a forward migration, or a failed migration
+stops recorder startup. Metadata files are replaced atomically only after their
+migrated document passes current-schema validation. `index.db` is then rebuilt
+from the migrated `meta.json` files.
 
 - [FV EpisodeからLeRobot Datasetへの変換仕様](../fv_lerobot_exporter/docs/lerobot_dataset_export.md)

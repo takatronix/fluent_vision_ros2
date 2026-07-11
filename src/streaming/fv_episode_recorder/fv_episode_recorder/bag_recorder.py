@@ -1,13 +1,7 @@
-"""rosbag2_transport recorder subprocess wrapper.
-
-The helper process uses rosbag2_transport::Recorder with a standard
-SequentialWriter wrapper that only counts successful writer_->write() calls
-for the episode ready barrier.
-"""
+"""`ros2 bag record` subprocess wrapper for episode bags."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -76,23 +70,12 @@ class DetachedBagRecording:
         return _summary(self.bag_dir, self.topics)
 
 
-@dataclass(frozen=True)
-class BagReadyStatus:
-    ready: bool
-    ready_at_ros_ns: int | None
-    counts: dict[str, int]
-    first_bag_timestamp_ns: dict[str, int]
-    latest_bag_timestamp_ns: dict[str, int]
-    timestamp_source: str
-
-
 class BagRecorder:
-    """Single-instance bag recorder. Owns at most one recorder helper process."""
+    """Single-instance bag recorder. Owns at most one `ros2 bag record` process."""
 
     def __init__(self, max_bag_size_mb: int = 1024, storage: str = "sqlite3"):
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self._bag_dir: Optional[Path] = None
-        self._ready_file: Optional[Path] = None
         self._topics: list[str] = []
         self.max_bag_size_mb = max_bag_size_mb
         self.storage = storage  # "sqlite3" (rosbag2 default on Humble)
@@ -101,36 +84,25 @@ class BagRecorder:
     def active(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def start(self, bag_dir: Path, topics: list[str], ready_topics: set[str] | None = None) -> None:
+    def start(self, bag_dir: Path, topics: list[str]) -> None:
         if self.active:
             raise RuntimeError("bag recorder already active")
         if not topics:
             LOG.warning("bag start with empty topic list — recording will be empty")
-        required = set(ready_topics or set())
         bag_dir = Path(bag_dir)
-        ready_file = bag_dir.with_name("bag_ready.json")
         if bag_dir.exists() and any(bag_dir.iterdir()):
             stale = bag_dir.with_name(bag_dir.name + f".stale-{int(time.time())}")
             bag_dir.rename(stale)
             LOG.warning("pre-existing non-empty bag dir moved to %s", stale)
         elif bag_dir.exists():
             bag_dir.rmdir()
-        try:
-            ready_file.unlink()
-        except FileNotFoundError:
-            pass
-
         cmd = [
-            "ros2", "run", "fv_recorder", "fv_counting_bag_recorder",
-            "--output", str(bag_dir),
-            "--storage", self.storage,
-            "--max-bag-size", str(self.max_bag_size_mb * 1024 * 1024),
-            "--ready-file", str(ready_file),
+            "ros2", "bag", "record",
+            "-o", str(bag_dir),
+            "-s", self.storage,
+            "-b", str(self.max_bag_size_mb * 1024 * 1024),
+            *topics,
         ]
-        for topic in topics:
-            cmd.extend(["--topic", topic])
-        for topic in sorted(required):
-            cmd.extend(["--ready-topic", topic])
         env = os.environ.copy()
         LOG.info("starting bag recorder: %s", " ".join(cmd))
         self._proc = subprocess.Popen(
@@ -141,7 +113,6 @@ class BagRecorder:
             preexec_fn=os.setsid if hasattr(os, "setsid") else None,
         )
         self._bag_dir = bag_dir
-        self._ready_file = ready_file
         self._topics = topics
 
     def stop(self, timeout_s: float = BAG_FINALIZE_TIMEOUT_S) -> dict:
@@ -165,102 +136,11 @@ class BagRecorder:
                 pass
         self._proc = None
         self._bag_dir = None
-        self._ready_file = None
         self._topics = []
         return DetachedBagRecording(proc=proc, bag_dir=bag_dir, topics=topics)
 
-    def ready_status(self, required_topics: set[str]) -> BagReadyStatus:
-        counts = {topic: 0 for topic in required_topics}
-        first_bag_timestamp_ns = {topic: 0 for topic in required_topics}
-        latest_bag_timestamp_ns = {topic: 0 for topic in required_topics}
-        if not required_topics:
-            return BagReadyStatus(
-                ready=True,
-                ready_at_ros_ns=None,
-                counts=counts,
-                first_bag_timestamp_ns=first_bag_timestamp_ns,
-                latest_bag_timestamp_ns=latest_bag_timestamp_ns,
-                timestamp_source="rosbag2_serialized_message_time_stamp",
-            )
-        if self._ready_file is not None and self._ready_file.exists():
-            try:
-                raw = json.loads(self._ready_file.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeError(f"bag ready status is unreadable: {exc}") from exc
-            raw_counts = raw.get("bag_topics")
-            if isinstance(raw_counts, dict):
-                for topic in required_topics:
-                    value = raw_counts.get(topic)
-                    if isinstance(value, int):
-                        counts[topic] = value
-            raw_first_timestamps = raw.get("first_bag_timestamp_ns")
-            if isinstance(raw_first_timestamps, dict):
-                for topic in required_topics:
-                    value = raw_first_timestamps.get(topic)
-                    if isinstance(value, int):
-                        first_bag_timestamp_ns[topic] = value
-            raw_latest_timestamps = raw.get("latest_bag_timestamp_ns")
-            if isinstance(raw_latest_timestamps, dict):
-                for topic in required_topics:
-                    value = raw_latest_timestamps.get(topic)
-                    if isinstance(value, int):
-                        latest_bag_timestamp_ns[topic] = value
-            ready = bool(raw.get("ready")) and all(counts[topic] > 0 for topic in required_topics)
-            timestamp_source = raw.get("timestamp_source")
-            if timestamp_source != "rosbag2_serialized_message_time_stamp":
-                raise RuntimeError(
-                    f"bag ready status has invalid timestamp_source: {timestamp_source!r}"
-                )
-            ready_at_ros_ns = raw.get("ready_at_ros_ns") if ready else None
-            if ready and (
-                not isinstance(ready_at_ros_ns, int)
-                or ready_at_ros_ns <= 0
-                or any(first_bag_timestamp_ns[topic] <= 0 for topic in required_topics)
-                or any(latest_bag_timestamp_ns[topic] <= 0 for topic in required_topics)
-                or any(
-                    latest_bag_timestamp_ns[topic] < first_bag_timestamp_ns[topic]
-                    for topic in required_topics
-                )
-            ):
-                raise RuntimeError("bag ready status has invalid ROS timestamps")
-            if not ready and self._proc is not None and self._proc.poll() is not None:
-                raise RuntimeError(
-                    f"bag recorder exited before ready: rc={self._proc.returncode} "
-                    f"stderr={self._stderr_tail()}"
-                )
-            return BagReadyStatus(
-                ready=ready,
-                ready_at_ros_ns=ready_at_ros_ns,
-                counts=counts,
-                first_bag_timestamp_ns=first_bag_timestamp_ns,
-                latest_bag_timestamp_ns=latest_bag_timestamp_ns,
-                timestamp_source=timestamp_source,
-            )
-        if self._proc is not None and self._proc.poll() is not None:
-            raise RuntimeError(
-                f"bag recorder exited before ready: rc={self._proc.returncode} "
-                f"stderr={self._stderr_tail()}"
-            )
-        return BagReadyStatus(
-            ready=False,
-            ready_at_ros_ns=None,
-            counts=counts,
-            first_bag_timestamp_ns=first_bag_timestamp_ns,
-            latest_bag_timestamp_ns=latest_bag_timestamp_ns,
-            timestamp_source="rosbag2_serialized_message_time_stamp",
-        )
-
     def _summary(self) -> dict:
         return _summary(self._bag_dir, self._topics)
-
-    def _stderr_tail(self) -> str:
-        if self._proc is None or self._proc.stderr is None:
-            return ""
-        try:
-            data = self._proc.stderr.read() or b""
-        except OSError:
-            return ""
-        return data.decode("utf-8", errors="replace")[-1000:]
 
     def abort(self) -> None:
         """Kill without waiting — for crash recovery / discard paths."""

@@ -55,13 +55,12 @@ def _alignment_test_episodes(tmp_path: Path) -> list[exporter.EpisodeForExport]:
     return [
         exporter.EpisodeForExport(
             meta=exporter.SourceEpisodeMeta(
+                schema_version=2,
                 episode_id=f"episode-{index}",
                 state="finished",
                 task_description="task",
                 profile="profile",
                 started_at="2026-07-10T00:00:00+00:00",
-                timeline_start_ros_ns=1_000_000_000,
-                timeline_end_ros_ns=2_000_000_000,
                 outcome="success",
             ),
             episode_dir=tmp_path / f"episode-{index}",
@@ -237,12 +236,12 @@ def test_alignment_executor_is_singleton_during_concurrent_first_use(
     assert results[0] is results[1] is created[0]
 
 
-def test_fixed_fps_timeline_uses_canonical_half_open_episode_interval() -> None:
-    assert exporter._fixed_fps_timeline(
-        timeline_start_ros_ns=1_010_000_000,
-        timeline_end_ros_ns=1_110_000_000,
+def test_fixed_fps_timeline_uses_absolute_ros_clock_grid() -> None:
+    assert exporter._fixed_fps_timeline_for_interval(
+        available_start_ros_ns=1_010_000_000,
+        available_end_ros_ns=1_110_000_000,
         fps=30,
-    ) == [1_010_000_000, 1_043_333_333, 1_076_666_667]
+    ) == [1_033_333_333, 1_066_666_667, 1_100_000_000]
 
 
 def test_nearest_camera_frame_prefers_previous_on_midpoint_tie() -> None:
@@ -863,7 +862,7 @@ def test_export_allows_initial_latched_mux_status_after_first_frame(
     assert response.frame_count == 3
 
 
-def test_export_refuses_unaligned_canonical_timeline_start(
+def test_export_refuses_when_required_joint_stream_starts_too_late(
     tmp_path: Path,
 ) -> None:
     _write_episode_store(tmp_path, joint_stamp_offset_ns=166_666_667)
@@ -951,7 +950,6 @@ def test_export_and_reader_reuse_one_camera_frame_for_three_grid_ticks(
         tmp_path,
         frame_stamps_ns=[1_000_000_000],
         bag_sample_stamps_ns=bag_stamps_ns,
-        timeline_end_ros_ns=1_026_000_000,
     )
 
     response = export_lerobot_dataset(
@@ -979,13 +977,12 @@ def test_export_and_reader_reuse_one_camera_frame_for_three_grid_ticks(
 
 def test_export_refuses_fourth_reuse_of_same_camera_frame(tmp_path: Path) -> None:
     bag_stamps_ns = [
-        1_000_000_000 + round(index * 1_000_000_000 / 120) for index in range(5)
+        1_000_000_000 + round(index * 1_000_000_000 / 120) for index in range(6)
     ]
     _write_episode_store(
         tmp_path,
         frame_stamps_ns=[1_000_000_000],
         bag_sample_stamps_ns=bag_stamps_ns,
-        timeline_end_ros_ns=1_041_000_000,
     )
 
     with pytest.raises(LerobotDatasetExportError) as exc_info:
@@ -1005,8 +1002,45 @@ def test_export_refuses_fourth_reuse_of_same_camera_frame(tmp_path: Path) -> Non
     assert "carry_frames=4" in exc_info.value.detail
 
 
-def test_export_refuses_undeclared_video_timing_contract(tmp_path: Path) -> None:
-    _write_episode_store(tmp_path, declare_video_timing_contract=False)
+def test_export_uses_schema_v2_video_timing_without_meta_duplicates(
+    tmp_path: Path,
+) -> None:
+    _write_episode_store(tmp_path)
+
+    response = export_lerobot_dataset(
+        request=LerobotDatasetExportRequest(
+            dataset_id="dataset-1",
+            dataset_name="dataset_1",
+            episode_ids=[EPISODE_ID],
+        ),
+        profile_payload=_profile_payload(),
+        datasets_dir=tmp_path,
+    )
+
+    assert response.frame_count == 3
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "expected_code"),
+    [
+        (None, "episode_schema_version_missing"),
+        (1, "episode_schema_version_unsupported"),
+        (3, "episode_schema_version_unsupported"),
+    ],
+)
+def test_export_dispatches_episode_schema_explicitly(
+    tmp_path: Path,
+    schema_version: int | None,
+    expected_code: str,
+) -> None:
+    _write_episode_store(tmp_path)
+    meta_path = next((tmp_path / "episodes").glob("*/*/*/meta.json"))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if schema_version is None:
+        del meta["schema_version"]
+    else:
+        meta["schema_version"] = schema_version
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
     with pytest.raises(LerobotDatasetExportError) as exc_info:
         export_lerobot_dataset(
@@ -1019,15 +1053,12 @@ def test_export_refuses_undeclared_video_timing_contract(tmp_path: Path) -> None
             datasets_dir=tmp_path,
         )
 
-    assert exc_info.value.code == "camera_video_timing_contract_missing"
+    assert exc_info.value.code == expected_code
 
 
 @pytest.mark.parametrize(
     "field",
-    [
-        "timeline_start_ros_ns",
-        "timeline_end_ros_ns",
-    ],
+    ["profile"],
 )
 def test_export_refuses_incomplete_finished_episode_meta(
     tmp_path: Path, field: str
@@ -1052,35 +1083,36 @@ def test_export_refuses_incomplete_finished_episode_meta(
     assert exc_info.value.code == "episode_meta_invalid"
 
 
-def test_export_refuses_zero_canonical_timeline_clock(tmp_path: Path) -> None:
+def test_export_does_not_use_removed_recorder_timeline_metadata(tmp_path: Path) -> None:
     _write_episode_store(tmp_path)
     meta_path = next((tmp_path / "episodes").glob("*/*/*/meta.json"))
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     meta["timeline_start_ros_ns"] = 0
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
-    with pytest.raises(LerobotDatasetExportError) as exc_info:
-        export_lerobot_dataset(
-            request=LerobotDatasetExportRequest(
-                dataset_id="dataset-1",
-                dataset_name="dataset_1",
-                episode_ids=[EPISODE_ID],
-            ),
-            profile_payload=_profile_payload(),
-            datasets_dir=tmp_path,
-        )
+    response = export_lerobot_dataset(
+        request=LerobotDatasetExportRequest(
+            dataset_id="dataset-1",
+            dataset_name="dataset_1",
+            episode_ids=[EPISODE_ID],
+        ),
+        profile_payload=_profile_payload(),
+        datasets_dir=tmp_path,
+    )
 
-    assert exc_info.value.code == "episode_meta_invalid"
+    assert response.frame_count == 3
 
 
-def test_export_rejects_camera_time_base_other_than_one_over_90000(
+def test_export_rejects_sidecar_pts_that_do_not_match_ros_timestamps(
     tmp_path: Path,
 ) -> None:
     _write_episode_store(tmp_path)
-    meta_path = next((tmp_path / "episodes").glob("*/*/*/meta.json"))
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    meta["cameras"][0]["video_time_base_den"] = 1_000
-    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    sidecar_path = next((tmp_path / "episodes").glob("*/*/*/videos/wrist/frames.parquet"))
+    sidecar_path.chmod(0o644)
+    rows = pq.read_table(sidecar_path).to_pylist()
+    rows[1]["video_pts"] += 1
+    pq.write_table(pa.Table.from_pylist(rows), sidecar_path)
+    sidecar_path.chmod(0o444)
 
     with pytest.raises(LerobotDatasetExportError) as exc_info:
         export_lerobot_dataset(
@@ -1093,7 +1125,7 @@ def test_export_rejects_camera_time_base_other_than_one_over_90000(
             datasets_dir=tmp_path,
         )
 
-    assert exc_info.value.code == "camera_video_time_base_invalid"
+    assert exc_info.value.code == "camera_video_pts_ros_stamp_mismatch"
 
 
 def test_export_preserves_unknown_stop_metadata_as_null(tmp_path: Path) -> None:
@@ -1119,14 +1151,12 @@ def test_export_preserves_unknown_stop_metadata_as_null(tmp_path: Path) -> None:
     assert provenance["source_episodes"][0]["duration_s"] is None
 
 
-def test_export_uses_canonical_start_for_all_camera_video_offsets(
+def test_export_uses_inferred_grid_start_for_all_camera_video_offsets(
     tmp_path: Path,
 ) -> None:
     _write_episode_store(
         tmp_path,
         second_camera_stamps_ns=[1_033_333_333, 1_066_666_667],
-        timeline_start_ros_ns=1_033_333_333,
-        timeline_end_ros_ns=1_100_000_000,
     )
 
     response = export_lerobot_dataset(
@@ -1198,7 +1228,6 @@ def test_export_refuses_interior_fixed_fps_alignment_gap(tmp_path: Path) -> None
     _write_episode_store(
         tmp_path,
         frame_stamps_ns=[1_000_000_000, 1_033_333_333, 1_400_000_000],
-        timeline_end_ros_ns=1_300_000_000,
     )
 
     with pytest.raises(LerobotDatasetExportError) as exc_info:
@@ -1404,24 +1433,14 @@ def _write_episode_store(
     frame_stamps_ns: list[int] | None = None,
     bag_sample_stamps_ns: list[int] | None = None,
     second_camera_stamps_ns: list[int] | None = None,
-    timeline_start_ros_ns: int | None = None,
-    timeline_end_ros_ns: int | None = None,
-    declare_video_timing_contract: bool = True,
 ) -> None:
     if frame_stamps_ns is None:
         frame_stamps_ns = [1_000_000_000, 1_033_333_333, 1_066_666_667]
-    if timeline_start_ros_ns is None:
-        timeline_start_ros_ns = frame_stamps_ns[0]
-    if timeline_end_ros_ns is None:
-        timeline_end_ros_ns = timeline_start_ros_ns + round(
-            len(frame_stamps_ns) * 1_000_000_000 / 30
-        )
     episode_dir = root / "episodes" / "2026" / "07" / episode_id
     camera_dir = episode_dir / "videos" / "wrist"
     camera_dir.mkdir(parents=True)
     _write_video(camera_dir / "segment-000.mp4", frame_count=len(frame_stamps_ns))
-    if declare_video_timing_contract:
-        _remux_video_pts(camera_dir / "segment-000.mp4", frame_stamps_ns)
+    _remux_video_pts(camera_dir / "segment-000.mp4", frame_stamps_ns)
     _write_frames_sidecar(camera_dir / "frames.parquet", frame_stamps_ns)
     _write_bag(
         episode_dir / "bag",
@@ -1443,11 +1462,6 @@ def _write_episode_store(
         "height": 4,
         "segments": [{"file": "segment-000.mp4"}],
     }
-    if declare_video_timing_contract:
-        camera_meta["video_timing_mode"] = "ros_header_stamp_to_pts"
-        camera_meta["video_pts_origin_ros_ns"] = frame_stamps_ns[0]
-        camera_meta["video_time_base_num"] = 1
-        camera_meta["video_time_base_den"] = 90_000
     camera_metas = [camera_meta]
     if second_camera_stamps_ns is not None:
         second_camera_dir = episode_dir / "videos" / "top"
@@ -1466,14 +1480,11 @@ def _write_episode_store(
                 "topic": SECOND_CAMERA_TOPIC,
                 "width": 4,
                 "height": 4,
-                "video_timing_mode": "ros_header_stamp_to_pts",
-                "video_pts_origin_ros_ns": second_camera_stamps_ns[0],
-                "video_time_base_num": 1,
-                "video_time_base_den": 90_000,
                 "segments": [{"file": "segment-000.mp4"}],
             }
         )
     meta = {
+        "schema_version": 2,
         "episode_id": episode_id,
         "state": "finished",
         "task_description": "pick block",
@@ -1481,8 +1492,6 @@ def _write_episode_store(
         "started_at": "2026-07-06T01:00:00Z",
         "stopped_at": "2026-07-06T01:00:00.200000Z",
         "duration_s": 0.2,
-        "timeline_start_ros_ns": timeline_start_ros_ns,
-        "timeline_end_ros_ns": timeline_end_ros_ns,
         "outcome": "success",
         "tags": ["dpex:record"],
         "cameras": camera_metas,

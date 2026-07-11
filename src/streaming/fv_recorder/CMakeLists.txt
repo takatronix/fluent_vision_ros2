@@ -74,22 +74,10 @@ ament_target_dependencies(fv_player_node
 )
 rosidl_target_interfaces(fv_player_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
-# Create counting bag recorder helper for fv_episode_recorder.
-add_executable(fv_counting_bag_recorder src/fv_counting_bag_recorder.cpp)
-ament_target_dependencies(fv_counting_bag_recorder
-  rclcpp
-  rcutils
-  rosbag2_cpp
-  rosbag2_storage
-  rosbag2_transport
-  nlohmann_json
-)
-
 # Install executables
 install(TARGETS
   fv_recorder_node
   fv_player_node
-  fv_counting_bag_recorder
   DESTINATION lib/${PROJECT_NAME}
 )
 
