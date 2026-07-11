@@ -183,10 +183,28 @@ private:
         }
 
         RCLCPP_INFO(get_logger(), "opening Insta360 X3 at %s", selected_path.c_str());
-        if (!camera_.open(selected_path, cv::CAP_V4L2) && !camera_.open(selected_path)) {
+        // Some OpenCV builds reject V4L2 open-by-path ("can't be used to
+        // capture by name") — resolve the by-id symlink to /dev/videoN and
+        // open by index first, keeping the path forms as fallback.
+        int device_index = -1;
+        std::error_code ec;
+        const auto resolved = std::filesystem::canonical(selected_path, ec);
+        if (!ec) {
+            const std::string real = resolved.string();
+            const auto pos = real.rfind("video");
+            if (pos != std::string::npos) {
+                device_index = std::atoi(real.c_str() + pos + 5);
+            }
+        }
+        const bool opened =
+            (device_index >= 0 && camera_.open(device_index, cv::CAP_V4L2)) ||
+            camera_.open(selected_path, cv::CAP_V4L2) ||
+            camera_.open(selected_path);
+        if (!opened) {
             RCLCPP_WARN_THROTTLE(
                 get_logger(), *get_clock(), 5000,
-                "failed to open Insta360 X3 at %s", selected_path.c_str());
+                "failed to open Insta360 X3 at %s (index %d)",
+                selected_path.c_str(), device_index);
             return false;
         }
 
