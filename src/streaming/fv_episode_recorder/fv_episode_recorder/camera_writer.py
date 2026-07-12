@@ -1,25 +1,16 @@
 """Per-camera writer: subscribes to a camera topic, writes mp4 + frames.parquet.
 
-Phase 1 Step 3 minimum:
-  - CompressedImage subscriber (BEST_EFFORT, qos_profile_sensor_data)
-  - cv2.VideoWriter with mp4v fourcc (CPU encode, swap to h264_nvenc later)
-  - 1 mp4 file per camera (segment rotation lands in Step 3.5)
-  - FramesSidecar populates frames.parquet
-
-Future steps:
-  - segment rotation (10 min default)
-  - h264_nvenc (Tegra hw encode)
-  - sensor_msgs/Image (uncompressed) support
-  - cameras_downscale for untagged pool (Phase 2.5 always_on)
+CompressedImage callbacks only enqueue immutable message data. A per-camera
+worker decodes and persists frames, then finalizes one timestamped VFR MP4.
 """
 
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
+import queue
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -31,65 +22,23 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, Image
 
 from .frames_sidecar import FramesSidecar
+from .vfr_video import EncoderConfig, VfrMp4Writer, probe_h264_encoder
 
 LOG = logging.getLogger("fv_episode_recorder.camera")
 
 
-def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> tuple[subprocess.Popen, str] | None:
-    """Try ffmpeg with H.264 encoders in priority order. Returns (proc, codec_used)
-    or None if all encoders failed. Output is faststart mp4 for HTML5 video.
+@dataclass(frozen=True)
+class _QueuedFrame:
+    data: bytes
+    ros_stamp_ns: int
+    recv_stamp_ns: int
 
-    Priority: h264_nvenc (Tegra HW encode) → libx264 (CPU). Both produce
-    browser-native H.264 mp4 (Chrome / Safari / Firefox HW decode)."""
-    if not shutil.which("ffmpeg"):
-        LOG.error("ffmpeg not found in PATH")
-        return None
-    encoder_tries = [
-        # (codec, extra args)
-        ("h264_nvenc", ["-preset", "p1", "-tune", "ll"]),    # Tegra HW, fastest
-        ("libx264",    ["-preset", "ultrafast", "-tune", "zerolatency"]),
-    ]
-    for codec, extra in encoder_tries:
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}", "-r", str(fps),
-            "-i", "pipe:0",
-            "-c:v", codec,
-            *extra,
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            str(out_path),
-        ]
-        try:
-            # Probe encoder availability first (some builds list h264_nvenc but
-            # fail at runtime if no GPU). Spawn a tiny test pipe.
-            test = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.04:r=25",
-                 "-c:v", codec, *extra, "-f", "null", "-"],
-                stderr=subprocess.PIPE, timeout=10,
-            )
-            if test.returncode != 0:
-                LOG.warning("[encoder probe] %s unavailable: %s", codec,
-                            test.stderr.decode("utf-8", errors="replace")[:200])
-                continue
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-            LOG.warning("[encoder probe] %s probe failed: %s", codec, exc)
-            continue
-        # Launch the real encoder pipe.
-        try:
-            proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            )
-            LOG.info("ffmpeg encoder ready: %s → %s (%dx%d @ %dfps)",
-                     codec, out_path.name, width, height, fps)
-            return proc, codec
-        except Exception as exc:
-            LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
-            continue
-    LOG.error("no H.264 encoder available (tried %s)", [c for c, _ in encoder_tries])
-    return None
+
+class _Stop:
+    pass
+
+
+_STOP = _Stop()
 
 
 class CameraWriter:
@@ -102,6 +51,8 @@ class CameraWriter:
         output_dir: Path,
         fps: int = 30,
         node: Optional[Node] = None,
+        encoder: Optional[EncoderConfig] = None,
+        queue_size: int = 120,
     ):
         self.name = name
         self.topic = topic
@@ -109,14 +60,16 @@ class CameraWriter:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.fps_nominal = fps
         self._node = node
+        if encoder is None:
+            raise RuntimeError("CameraWriter requires a probed encoder")
 
         self._segment_file = self.output_dir / "0000.mp4"
         self._sidecar = FramesSidecar(self.output_dir / "frames.parquet")
 
-        # ffmpeg subprocess (H.264 encoder) replaces cv2.VideoWriter which
-        # only had MPEG-4 part 2 — that codec is not browser-playable.
-        self._ffmpeg: Optional[subprocess.Popen] = None
-        self._codec_in_use: str = ""
+        self._video = VfrMp4Writer(self._segment_file, fps, encoder)
+        self._queue: queue.Queue[_QueuedFrame | _Stop] = queue.Queue(maxsize=queue_size)
+        self._worker: Optional[threading.Thread] = None
+        self._failure: Optional[RuntimeError] = None
         self._frame_index = 0
         self._segment_local = 0
         self._last_recv_ns = 0
@@ -133,88 +86,121 @@ class CameraWriter:
     def start(self) -> None:
         if self._node is None:
             raise RuntimeError("CameraWriter requires a rclpy Node to attach subscriber")
-        self._sub = self._node.create_subscription(
-            CompressedImage,
-            self.topic,
-            self._on_image,
-            qos_profile_sensor_data,
+        self._worker = threading.Thread(
+            target=self._run_worker, name=f"camera-writer-{self.name}", daemon=True,
         )
+        self._worker.start()
+        try:
+            self._sub = self._node.create_subscription(
+                CompressedImage,
+                self.topic,
+                self._on_image,
+                qos_profile_sensor_data,
+            )
+        except Exception:
+            self._queue.put(_STOP)
+            self._worker.join()
+            self._worker = None
+            raise
         self._start_wall_ns = time.time_ns()
         LOG.info("camera writer started: %s topic=%s out=%s", self.name, self.topic, self.output_dir)
 
     def _on_image(self, msg: CompressedImage) -> None:
-        if self._stopped:
-            return
         with self._lock:
+            if self._failure is not None:
+                return
+            if self._stopped:
+                return
             recv_ns = time.time_ns()
-            # decode jpeg/png compressed bytes
-            arr = np.frombuffer(msg.data, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                LOG.warning("[%s] decode failed, skipping frame", self.name)
-                return
-            h, w = img.shape[:2]
-            if self._ffmpeg is None:
-                spawned = _spawn_ffmpeg_encoder(self._segment_file, w, h, self.fps_nominal)
-                if spawned is None:
-                    LOG.error("[%s] no H.264 encoder available — frame dropped", self.name)
-                    return
-                self._ffmpeg, self._codec_in_use = spawned
-                self.width = w
-                self.height = h
-                LOG.info("[%s] first frame %dx%d → %s (%s)",
-                         self.name, w, h, self._segment_file, self._codec_in_use)
-
+            ros_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+            queued = _QueuedFrame(bytes(msg.data), ros_stamp_ns, recv_ns)
             try:
-                self._ffmpeg.stdin.write(img.tobytes())
-            except (BrokenPipeError, ValueError) as exc:
-                LOG.warning("[%s] ffmpeg pipe write failed: %s", self.name, exc)
-                return
+                self._queue.put_nowait(queued)
+            except queue.Full:
+                self._set_failure_locked(
+                    RuntimeError(f"[{self.name}] camera frame queue overflow")
+                )
 
-            ros_stamp_ns = (
-                msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-                if msg.header.stamp.sec or msg.header.stamp.nanosec else recv_ns
-            )
-            self._sidecar.append({
-                "frame_index": self._frame_index,
-                "segment_file": self._segment_file.name,
-                "segment_local_frame": self._segment_local,
-                "ros_stamp_ns": ros_stamp_ns,
-                "recv_stamp_ns": recv_ns,
-                "source_seq": -1,
-                "dropped_before": 0,  # naive (Phase 1.5 fills with seq gap detection)
-                "keyframe": True,  # mp4v: every frame is intra-coded; refine later
-            })
-            self._frame_index += 1
-            self._segment_local += 1
-            self.frame_count += 1
-            self._last_recv_ns = recv_ns
-            self._first_frame_received = True
+    def _run_worker(self) -> None:
+        try:
+            while True:
+                item = self._queue.get()
+                if item is _STOP:
+                    break
+                if not isinstance(item, _QueuedFrame):
+                    raise RuntimeError("invalid camera worker queue item")
+                frame = self._video.append(item.data, item.ros_stamp_ns)
+                self._sidecar.append(
+                    {
+                        "frame_index": self._frame_index,
+                        "segment_file": self._segment_file.name,
+                        "segment_local_frame": self._segment_local,
+                        "ros_stamp_ns": item.ros_stamp_ns,
+                        "video_pts": frame.video_pts,
+                        "recv_stamp_ns": item.recv_stamp_ns,
+                        "source_seq": -1,
+                        "dropped_before": 0,
+                        "keyframe": True,
+                    }
+                )
+                with self._lock:
+                    self._frame_index += 1
+                    self._segment_local += 1
+                    self.frame_count += 1
+                    self._last_recv_ns = item.recv_stamp_ns
+                    self._first_frame_received = True
+                    self.width = self._video.width
+                    self.height = self._video.height
+                    failure = self._failure
+                if failure is not None:
+                    raise failure
+            self._video.close()
+        except Exception as exc:
+            try:
+                self._video.abort()
+            except Exception as cleanup_exc:
+                exc = RuntimeError(f"{exc}; video cleanup failed: {cleanup_exc}")
+            self._set_failure(RuntimeError(f"[{self.name}] camera worker failed: {exc}"))
+        finally:
+            try:
+                self._sidecar.close()
+            except Exception as exc:
+                self._set_failure(RuntimeError(f"[{self.name}] sidecar close failed: {exc}"))
+
+    def _set_failure(self, failure: RuntimeError) -> None:
+        with self._lock:
+            self._set_failure_locked(failure)
+
+    def _set_failure_locked(self, failure: RuntimeError) -> None:
+        if self._failure is None:
+            self._failure = failure
+            LOG.error("%s", failure)
 
     def stop(self) -> dict:
         with self._lock:
             self._stopped = True
-            if self._sub is not None and self._node is not None:
+            sub = self._sub
+            self._sub = None
+        if sub is not None and self._node is not None:
+            self._node.destroy_subscription(sub)
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            while worker.is_alive():
                 try:
-                    self._node.destroy_subscription(self._sub)
-                except Exception:
-                    pass
-                self._sub = None
-            if self._ffmpeg is not None:
-                try:
-                    self._ffmpeg.stdin.close()
-                except Exception:
-                    pass
-                try:
-                    self._ffmpeg.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    LOG.warning("[%s] ffmpeg flush timeout, killing", self.name)
-                    self._ffmpeg.kill()
-                    self._ffmpeg.wait(timeout=3)
-                self._ffmpeg = None
-            self._sidecar.close()
+                    self._queue.put(_STOP, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            worker.join(timeout=20)
+            if worker.is_alive():
+                self._set_failure(RuntimeError(f"[{self.name}] camera worker did not stop"))
+        self._worker = None
+        with self._lock:
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
+            failure = self._failure
+        if failure is not None:
+            raise failure
         return self.summary()
 
     def summary(self) -> dict:
@@ -383,36 +369,51 @@ class CameraWriterPool:
         placeholder summary so the play modal still knows the depth track
         exists (preview reads from bag via /depth_preview endpoint). The
         topic is appended to bag_topics by topic_discovery."""
+        color_cameras = [
+            cam for cam in cameras if (cam.get("kind") or "color").lower() != "depth"
+        ]
+        encoder = probe_h264_encoder() if color_cameras else None
         videos_root = episode_dir / "videos"
         videos_root.mkdir(exist_ok=True)
         self._depth_placeholders = []
-        for cam in cameras:
-            name = cam["name"]
-            topic = cam["topic"]
-            kind = (cam.get("kind") or "color").lower()
-            if kind == "depth":
-                # No on-disk writer — depth lives in the bag. Synthesize a
-                # summary entry so the UI shows the depth thumbnail and can
-                # pull preview frames from /depth_preview/{cam}/{frame_idx}.
-                self._depth_placeholders.append({
-                    "name": name,
-                    "topic": topic,
-                    "kind": "depth_bag",
-                    "video_dir": None,
-                    "sidecar_file": None,
-                    "segments": [],
-                    "frame_count": 0,         # filled in at stop from bag
-                    "width": 0, "height": 0,
-                    "fps_actual": 0.0,
-                    "fps_nominal": fps,
-                })
-                continue
-            cam_dir = videos_root / name
-            writer = CameraWriter(
-                name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
-            )
-            writer.start()
-            self._writers[name] = writer
+        try:
+            for cam in cameras:
+                name = cam["name"]
+                topic = cam["topic"]
+                kind = (cam.get("kind") or "color").lower()
+                if kind == "depth":
+                    # No on-disk writer — depth lives in the bag. Synthesize a
+                    # summary entry so the UI shows the depth thumbnail and can
+                    # pull preview frames from /depth_preview/{cam}/{frame_idx}.
+                    self._depth_placeholders.append({
+                        "name": name,
+                        "topic": topic,
+                        "kind": "depth_bag",
+                        "video_dir": None,
+                        "sidecar_file": None,
+                        "segments": [],
+                        "frame_count": 0,         # filled in at stop from bag
+                        "width": 0, "height": 0,
+                        "fps_actual": 0.0,
+                        "fps_nominal": fps,
+                    })
+                    continue
+                cam_dir = videos_root / name
+                writer = CameraWriter(
+                    name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
+                    encoder=encoder,
+                )
+                writer.start()
+                self._writers[name] = writer
+        except Exception:
+            for writer in self._writers.values():
+                try:
+                    writer.stop()
+                except Exception as exc:
+                    LOG.error("camera cleanup after start failure failed: %s", exc)
+            self._writers.clear()
+            self._depth_placeholders = []
+            raise
         return [w.summary() for w in self._writers.values()] + self._depth_placeholders
 
     def apply_depth_frame_counts(self, counts: dict[str, int]) -> None:
@@ -428,16 +429,26 @@ class CameraWriterPool:
 
     def stop_all(self) -> list[dict]:
         summaries = []
-        for name, writer in list(self._writers.items()):
-            summaries.append(writer.stop())
+        failure = None
+        for writer in self._writers.values():
+            try:
+                summaries.append(writer.stop())
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
         self._writers.clear()
         # Re-emit depth placeholders so meta.cameras keeps them.
         out = summaries + list(self._depth_placeholders)
         self._depth_placeholders = []
+        if failure is not None:
+            raise failure
         return out
 
     def is_active(self) -> bool:
         return bool(self._writers)
 
     def frame_counts(self) -> dict[str, int]:
+        for writer in self._writers.values():
+            if writer._failure is not None:
+                raise writer._failure
         return {name: w.frame_count for name, w in self._writers.items()}

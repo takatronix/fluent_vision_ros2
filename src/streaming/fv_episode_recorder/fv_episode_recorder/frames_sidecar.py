@@ -5,6 +5,7 @@ One sidecar per camera. Columns (Codex #4 minimum):
     segment_file          string  # mp4 file basename, e.g. "0000.mp4"
     segment_local_frame   int32   # index within that segment
     ros_stamp_ns          int64   # message header stamp (camera capture time)
+    video_pts             int64   # MP4 PTS at time base 1/1000000
     recv_stamp_ns         int64   # recorder receive time
     source_seq            int64   # publisher sequence number if available, else -1
     dropped_before        int32   # frames missed before this one (gap detection)
@@ -27,11 +28,12 @@ SCHEMA = pa.schema([
     ("segment_file", pa.string()),
     ("segment_local_frame", pa.int32()),
     ("ros_stamp_ns", pa.int64()),
+    ("video_pts", pa.int64()),
     ("recv_stamp_ns", pa.int64()),
     ("source_seq", pa.int64()),
     ("dropped_before", pa.int32()),
     ("keyframe", pa.bool_()),
-])
+], metadata={b"video_time_base": b"1/1000000"})
 
 
 class FramesSidecar:

@@ -17,7 +17,7 @@ setup(
         ('share/' + package_name + '/config',
             glob('config/*.yaml')),
     ],
-    install_requires=['setuptools', 'aiohttp', 'pydantic', 'python-ulid'],
+    install_requires=['setuptools', 'aiohttp', 'av', 'pydantic', 'python-ulid'],
     zip_safe=True,
     maintainer='FluentVision',
     maintainer_email='dev@fluentvision.io',
