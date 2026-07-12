@@ -7,17 +7,68 @@ sqlite index / FTS / tags table are Phase 2.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
-from dataclasses import dataclass, field, asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Literal, Optional, Self
 
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+    model_validator,
+)
 from ulid import ULID
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+EPISODE_DIR_MODE = 0o2770
+META_FILE_MODE = 0o660
+FINISHED_VIDEO_DIR_MODE = 0o750
+FINISHED_VIDEO_FILE_MODE = 0o440
+MAX_EPISODE_TAGS = 64
+MAX_EPISODE_TAG_LENGTH = 128
+
+# Finished videos are owned by the output root owner. This keeps hardlinks
+# available when a privileged recorder writes into a host-owned bind mount.
+
+JsonObject = dict[str, JsonValue]
+Number = StrictInt | StrictFloat
+
+
+class EpisodeSchemaError(ValueError):
+    """meta.json is missing a supported schema or violates that schema."""
+
+
+class DuplicateEpisodeIdError(EpisodeSchemaError):
+    """The same episode ID is present in more than one directory."""
+
+
+class EpisodeIndexSyncError(Exception):
+    """meta.json changed but its disposable index projection did not."""
+
+
+def _migrate_v1_to_v2(data: JsonObject) -> JsonObject:
+    migrated = dict(data)
+    migrated["schema_version"] = 2
+    return migrated
+
+
+# Each entry migrates exactly one version forward. Add future migrations here;
+# metadata without a complete path to SCHEMA_VERSION is rejected.
+EPISODE_MIGRATIONS: dict[int, Callable[[JsonObject], JsonObject]] = {
+    1: _migrate_v1_to_v2,
+}
 
 # Reject filesystem-hostile chars + control chars. Japanese / non-ASCII kept
 # (ext4 is utf-8 native; ls/ros2 bag handle them fine).
@@ -74,24 +125,24 @@ class EpisodeMeta:
     outcome: Optional[str] = None
     pinned: bool = False
     pin_reason: Optional[str] = None
-    cameras: list[dict[str, Any]] = field(default_factory=list)
-    recorded_topics: list[dict[str, Any]] = field(default_factory=list)
+    cameras: list[JsonObject] = field(default_factory=list)
+    recorded_topics: list[JsonObject] = field(default_factory=list)
     topic_discovery_source: str = "profile"
     bag_path: str = "bag/"
     bag_split_count: int = 0
-    annotation_revisions: list[dict[str, Any]] = field(default_factory=list)
-    markers: list[dict[str, Any]] = field(default_factory=list)
+    annotation_revisions: list[JsonObject] = field(default_factory=list)
+    markers: list[JsonObject] = field(default_factory=list)
     recorder_version: str = "fv_episode_recorder/0.1.0"
     container_image_tag: Optional[str] = None
-    stale_input_events: list[dict[str, Any]] = field(default_factory=list)
-    quality_metrics: Optional[dict[str, Any]] = None
+    stale_input_events: list[JsonObject] = field(default_factory=list)
+    quality_metrics: Optional[JsonObject] = None
     manifest_file: Optional[str] = None
     # remote import (Phase 4.5+ reserved)
     source: str = "local"  # local | remote_imported | remote_proxy
     remote_manifest_url: Optional[str] = None
-    remote_signed_urls: Optional[dict[str, Any]] = None
+    remote_signed_urls: Optional[JsonObject] = None
     # env / scene (Phase 2.7+ optional)
-    env_config: Optional[dict[str, Any]] = None
+    env_config: Optional[JsonObject] = None
     # Non-destructive clip trim. Seconds from started_at. None = no trim.
     # Playback / joint chart / future exports honor these; underlying bag +
     # mp4 stay intact so the operator can widen the trim later.
@@ -103,8 +154,183 @@ class EpisodeMeta:
     # Shape: {"<arm_topic>": {"source": "ai|leader|none",
     #                          "ai_controller": "<name>", "ai_route_key": "...",
     #                          "enabled": bool}}
-    controller_at_start: Optional[dict[str, Any]] = None
-    controller_at_end: Optional[dict[str, Any]] = None
+    controller_at_start: Optional[dict[str, JsonObject]] = None
+    controller_at_end: Optional[dict[str, JsonObject]] = None
+
+
+class _StrictMetaModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class CameraSegmentV2(_StrictMetaModel):
+    file: StrictStr
+    frame_count: StrictInt
+    size_bytes: StrictInt
+
+
+class CameraV2(_StrictMetaModel):
+    name: StrictStr
+    topic: StrictStr
+    codec: Optional[StrictStr] = None
+    kind: Optional[StrictStr] = None
+    encoding: Optional[StrictStr] = None
+    width: Optional[StrictInt] = None
+    height: Optional[StrictInt] = None
+    fps_nominal: Optional[StrictInt] = None
+    fps_actual: Optional[Number] = None
+    frame_count: Optional[StrictInt] = None
+    video_dir: Optional[StrictStr] = None
+    sidecar_file: Optional[StrictStr] = None
+    segments: list[CameraSegmentV2] = Field(default_factory=list)
+    total_png_bytes: Optional[StrictInt] = None
+
+
+class RecordedTopicV2(_StrictMetaModel):
+    topic: StrictStr
+    role: StrictStr
+    qos: StrictStr
+    stamp_source: StrictStr
+    msg_type: Optional[StrictStr] = None
+
+
+class EpisodeMetaV2(_StrictMetaModel):
+    schema_version: Literal[2]
+    episode_id: StrictStr
+    state: Literal["recording", "finalizing", "finished", "failed", "discarded"]
+    task_description: StrictStr
+    profile: StrictStr
+    robot_id: Optional[StrictStr] = None
+    operator: Optional[StrictStr] = None
+    tags: list[StrictStr] = Field(default_factory=list)
+    parent_session_id: Optional[StrictStr] = None
+    expected_duration_s: Optional[Number] = None
+    started_at: StrictStr
+    stopped_at: Optional[StrictStr] = None
+    duration_s: Optional[Number] = None
+    outcome: Optional[Literal["success", "abort", "discard"]] = None
+    pinned: StrictBool = False
+    pin_reason: Optional[StrictStr] = None
+    cameras: list[CameraV2] = Field(default_factory=list)
+    recorded_topics: list[RecordedTopicV2] = Field(default_factory=list)
+    topic_discovery_source: StrictStr = "profile"
+    bag_path: StrictStr = "bag/"
+    bag_split_count: StrictInt = 0
+    annotation_revisions: list[JsonObject] = Field(default_factory=list)
+    markers: list[JsonObject] = Field(default_factory=list)
+    recorder_version: StrictStr = "fv_episode_recorder/0.1.0"
+    container_image_tag: Optional[StrictStr] = None
+    stale_input_events: list[JsonObject] = Field(default_factory=list)
+    quality_metrics: Optional[JsonObject] = None
+    manifest_file: Optional[StrictStr] = None
+    source: Literal["local", "remote_imported", "remote_proxy"] = "local"
+    remote_manifest_url: Optional[StrictStr] = None
+    remote_signed_urls: Optional[JsonObject] = None
+    env_config: Optional[JsonObject] = None
+    trim_start_s: Optional[Number] = None
+    trim_end_s: Optional[Number] = None
+    controller_at_start: Optional[dict[StrictStr, JsonObject]] = None
+    controller_at_end: Optional[dict[StrictStr, JsonObject]] = None
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> Self:
+        if not self.episode_id or not self.task_description or not self.profile or not self.started_at:
+            raise ValueError("episode_id, task_description, profile, and started_at must be non-empty")
+        if normalize_episode_tags(list(self.tags)) != self.tags:
+            raise ValueError("tags must be unique")
+        allowed_outcomes = {
+            "recording": {None},
+            "finalizing": {None, "success", "abort", "discard"},
+            "finished": {"success"},
+            "failed": {"abort"},
+            "discarded": {"discard"},
+        }[self.state]
+        if self.outcome not in allowed_outcomes:
+            raise ValueError(
+                f"episode state {self.state} does not allow outcome {self.outcome!r}"
+            )
+        return self
+
+
+def normalize_episode_tags(tags: list[str]) -> list[str]:
+    if not isinstance(tags, list):
+        raise EpisodeSchemaError("tags must be a list of strings")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise EpisodeSchemaError("tags must be a list of strings")
+        if not tag or tag != tag.strip():
+            raise EpisodeSchemaError("tags must be non-empty and have no surrounding whitespace")
+        if len(tag) > MAX_EPISODE_TAG_LENGTH:
+            raise EpisodeSchemaError(
+                f"tag exceeds {MAX_EPISODE_TAG_LENGTH} characters"
+            )
+        if any(ord(char) < 32 or ord(char) == 127 for char in tag):
+            raise EpisodeSchemaError("tags must not contain control characters")
+        if tag not in seen:
+            normalized.append(tag)
+            seen.add(tag)
+    if len(normalized) > MAX_EPISODE_TAGS:
+        raise EpisodeSchemaError(f"at most {MAX_EPISODE_TAGS} tags are allowed")
+    return normalized
+
+
+def migrate_episode_meta(data: JsonObject) -> tuple[JsonObject, bool]:
+    if "schema_version" not in data:
+        raise EpisodeSchemaError("meta.json is missing schema_version")
+    version = data["schema_version"]
+    if type(version) is not int:
+        raise EpisodeSchemaError("meta.json schema_version must be an integer")
+    migrated = dict(data)
+    changed = False
+    while version != SCHEMA_VERSION:
+        migration = EPISODE_MIGRATIONS.get(version)
+        if migration is None:
+            raise EpisodeSchemaError(
+                f"unsupported meta.json schema_version {version}; expected {SCHEMA_VERSION}"
+            )
+        migrated = migration(migrated)
+        next_version = migrated.get("schema_version")
+        if type(next_version) is not int or next_version <= version:
+            raise EpisodeSchemaError(f"invalid migration from schema_version {version}")
+        version = next_version
+        changed = True
+    return migrated, changed
+
+
+def validate_episode_meta(data: JsonObject) -> None:
+    try:
+        EpisodeMetaV2.model_validate(data)
+    except ValidationError as exc:
+        raise EpisodeSchemaError(f"invalid meta.json schema v{SCHEMA_VERSION}: {exc}") from exc
+
+
+def _write_meta_file(meta_path: Path, data: JsonObject) -> None:
+    validate_episode_meta(data)
+    tmp_path = meta_path.with_suffix(".json.tmp")
+    with tmp_path.open("w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp_path.chmod(META_FILE_MODE)
+    tmp_path.replace(meta_path)
+
+
+def read_episode_meta(meta_path: Path, migrate: bool = True) -> tuple[EpisodeMeta, JsonObject]:
+    try:
+        with meta_path.open() as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EpisodeSchemaError(f"unable to read {meta_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise EpisodeSchemaError(f"meta.json must contain a JSON object: {meta_path}")
+    data, changed = migrate_episode_meta(raw)
+    validate_episode_meta(data)
+    if changed:
+        if not migrate:
+            raise EpisodeSchemaError(
+                f"meta.json schema_version {raw['schema_version']} requires migration"
+            )
+        _write_meta_file(meta_path, data)
+    return EpisodeMeta(**data), data
 
 
 class EpisodeStore:
@@ -121,10 +347,12 @@ class EpisodeStore:
     def __init__(self, output_dir: str | Path):
         self.output_dir = Path(output_dir)
         self._lock = threading.Lock()
+        output_stat = self.output_dir.stat()
+        self._shared_uid = output_stat.st_uid
+        self._shared_gid = output_stat.st_gid
         self._active_episode: Optional[EpisodeMeta] = None
         self._active_dir: Optional[Path] = None
-        # sqlite cache built lazily — recorder_node calls ensure_consistent()
-        # on startup to detect drift + rebuild. Mutations below call upsert
+        # sqlite cache is rebuilt by recorder_node on startup. Mutations below call upsert
         # so the index stays in sync with on-disk meta.json.
         from .episode_index import EpisodeIndex
         self.index = EpisodeIndex(self.output_dir)
@@ -146,10 +374,23 @@ class EpisodeStore:
                 raise RuntimeError(
                     f"another episode already active: {self._active_episode.episode_id}"
                 )
+            validate_episode_meta(asdict(meta))
+            if self.get_episode(meta.episode_id) is not None:
+                raise DuplicateEpisodeIdError(
+                    f"episode ID already exists: {meta.episode_id}"
+                )
             ep_dir = self._episode_dir(meta)
-            ep_dir.mkdir(parents=True, exist_ok=True)
-            (ep_dir / "bag").mkdir(exist_ok=True)
-            (ep_dir / "videos").mkdir(exist_ok=True)
+            for directory in (
+                self.output_dir / "episodes",
+                self.output_dir / "episodes" / meta.profile,
+                self.output_dir / "episodes" / meta.profile / meta.started_at[:10],
+                ep_dir,
+                ep_dir / "bag",
+                ep_dir / "videos",
+            ):
+                directory.mkdir(mode=EPISODE_DIR_MODE, exist_ok=True)
+                os.chown(directory, self._shared_uid, self._shared_gid)
+                directory.chmod(EPISODE_DIR_MODE)
             self._active_episode = meta
             self._active_dir = ep_dir
             self._write_meta(ep_dir, meta)
@@ -178,6 +419,8 @@ class EpisodeStore:
             else:
                 meta.state = "finished"
             self._write_meta(ep_dir, meta)
+            if meta.state == "finished" and meta.outcome == "success":
+                self.protect_finished_video_sources(ep_dir)
             self._active_episode = None
             self._active_dir = None
             return meta, ep_dir
@@ -192,27 +435,27 @@ class EpisodeStore:
         episodes_root = self.output_dir / "episodes"
         if not episodes_root.exists():
             return results
+        seen: dict[str, Path] = {}
         for meta_path in sorted(
             episodes_root.glob("*/*/*/meta.json"), key=lambda p: p.stat().st_mtime, reverse=True
         ):
+            meta, _data = read_episode_meta(meta_path)
+            previous = seen.get(meta.episode_id)
+            if previous is not None and previous != meta_path.parent:
+                raise DuplicateEpisodeIdError(
+                    f"duplicate episode ID {meta.episode_id}: {previous} and {meta_path.parent}"
+                )
+            seen[meta.episode_id] = meta_path.parent
+            ep_dir = meta_path.parent
+            size = 0
             try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-                meta = EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__})
-                ep_dir = meta_path.parent
-                size = 0
-                try:
-                    for f in ep_dir.rglob("*"):
-                        if f.is_file():
-                            size += f.stat().st_size
-                except OSError:
-                    pass
-                results.append((meta, size))
-                if len(results) >= limit:
-                    break
-            except (json.JSONDecodeError, TypeError, ValueError):
-                continue
-        return results
+                for file_path in ep_dir.rglob("*"):
+                    if file_path.is_file():
+                        size += file_path.stat().st_size
+            except OSError:
+                pass
+            results.append((meta, size))
+        return results[:limit]
 
     def list_episodes_indexed(
         self,
@@ -234,31 +477,35 @@ class EpisodeStore:
 
     def patch_episode_meta(self, episode_id: str, changes: dict) -> Optional[dict]:
         """Update a small allow-list of meta fields on disk (trim / task /
-        tags / pinned + reason). Returns the updated meta dict, or None
+        pinned + reason). Returns the updated meta dict, or None
         if the episode isn't found."""
         allowed = {"trim_start_s", "trim_end_s", "task_description",
-                   "tags", "pinned", "pin_reason", "outcome"}
+                   "pinned", "pin_reason"}
         found = self.get_episode(episode_id)
         if found is None:
             return None
         _meta, ep_dir = found
         meta_path = ep_dir / "meta.json"
-        try:
-            with meta_path.open() as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return None
+        _meta, data = read_episode_meta(meta_path)
         for k, v in (changes or {}).items():
             if k in allowed:
                 # Allow explicit null/None to clear trim_*.
                 data[k] = v
-        tmp = meta_path.with_suffix(".json.tmp")
-        with tmp.open("w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp.replace(meta_path)
-        try: self.index.upsert(data, ep_dir)
-        except Exception: pass
+        self._write_meta_data(ep_dir, data)
         return data
+
+    def merge_episode_tags(self, episode_id: str, tags: list[str]) -> Optional[dict]:
+        """Merge validated tags into meta.json and its index row atomically per process."""
+        requested = normalize_episode_tags(tags)
+        with self._lock:
+            found = self.get_episode(episode_id)
+            if found is None:
+                return None
+            _meta, ep_dir = found
+            _stored_meta, data = read_episode_meta(ep_dir / "meta.json")
+            data["tags"] = normalize_episode_tags([*data["tags"], *requested])
+            self._write_meta_data(ep_dir, data)
+            return data
 
     def add_finalized_marker(self, episode_id: str, marker: dict) -> Optional[dict]:
         """Append a marker entry into a finalized episode's meta.json.
@@ -272,19 +519,10 @@ class EpisodeStore:
             return None
         _meta, ep_dir = found
         meta_path = ep_dir / "meta.json"
-        try:
-            with meta_path.open() as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return None
+        _meta, data = read_episode_meta(meta_path)
         markers = data.setdefault("markers", [])
         markers.append(marker)
-        tmp = meta_path.with_suffix(".json.tmp")
-        with tmp.open("w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp.replace(meta_path)
-        try: self.index.upsert(data, ep_dir)
-        except Exception: pass
+        self._write_meta_data(ep_dir, data)
         return marker
 
     def delete_finalized_marker(self, marker_id: str) -> bool:
@@ -293,21 +531,12 @@ class EpisodeStore:
         if not episodes_root.exists():
             return False
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
-            try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
+            _meta, data = read_episode_meta(meta_path)
             markers = data.get("markers", []) or []
             new_markers = [m for m in markers if m.get("marker_id") != marker_id]
             if len(new_markers) != len(markers):
                 data["markers"] = new_markers
-                tmp = meta_path.with_suffix(".json.tmp")
-                with tmp.open("w") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                tmp.replace(meta_path)
-                try: self.index.upsert(data, meta_path.parent)
-                except Exception: pass
+                self._write_meta_data(meta_path.parent, data)
                 return True
         return False
 
@@ -325,11 +554,7 @@ class EpisodeStore:
         if not episodes_root.exists():
             return None
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
-            try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
+            _meta, data = read_episode_meta(meta_path)
             markers = data.get("markers", []) or []
             for m in markers:
                 if m.get("marker_id") != marker_id:
@@ -338,12 +563,7 @@ class EpisodeStore:
                     if k in allowed and v is not None:
                         m[k] = v
                 m["rev"] = (m.get("rev", 0) or 0) + 1
-                tmp = meta_path.with_suffix(".json.tmp")
-                with tmp.open("w") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                tmp.replace(meta_path)
-                try: self.index.upsert(data, meta_path.parent)
-                except Exception: pass
+                self._write_meta_data(meta_path.parent, data)
                 return m
         return None
 
@@ -359,9 +579,13 @@ class EpisodeStore:
         if self._active_episode is not None and self._active_episode.episode_id == episode_id:
             raise RuntimeError("cannot delete the active recording episode")
         import shutil
-        shutil.rmtree(ep_dir, ignore_errors=True)
-        try: self.index.delete(episode_id)
-        except Exception: pass
+        shutil.rmtree(ep_dir, ignore_errors=False)
+        try:
+            self.index.delete(episode_id)
+        except Exception as exc:
+            raise EpisodeIndexSyncError(
+                f"episode files deleted for {episode_id}; startup index rebuild required"
+            ) from exc
         return True
 
     def get_episode(self, episode_id: str) -> Optional[tuple[EpisodeMeta, Path]]:
@@ -371,22 +595,94 @@ class EpisodeStore:
         episodes_root = self.output_dir / "episodes"
         if not episodes_root.exists():
             return None
-        suffix = episode_id[-8:] if len(episode_id) >= 8 else episode_id
-        # Try new pattern first (suffix match), then legacy pattern (ULID == folder).
-        for pattern in (f"*/*/*{suffix}/meta.json", f"*/*/{episode_id}/meta.json"):
-            for meta_path in episodes_root.glob(pattern):
-                try:
-                    with meta_path.open() as f:
-                        data = json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    continue
-                if data.get("episode_id") != episode_id:
-                    continue
-                return (
-                    EpisodeMeta(**{k: v for k, v in data.items() if k in EpisodeMeta.__annotations__}),
-                    meta_path.parent,
+        matches: list[tuple[EpisodeMeta, Path]] = []
+        for meta_path in episodes_root.glob("*/*/*/meta.json"):
+            meta, _data = read_episode_meta(meta_path)
+            if meta.episode_id == episode_id:
+                matches.append((meta, meta_path.parent))
+        if len(matches) > 1:
+            locations = ", ".join(str(ep_dir) for _meta, ep_dir in matches)
+            raise DuplicateEpisodeIdError(
+                f"duplicate episode ID {episode_id}: {locations}"
+            )
+        return matches[0] if matches else None
+
+    def fail_orphan_episode(self, episode_id: str, episode_dir: Path) -> EpisodeMeta:
+        """Mark a crashed recording/finalizing episode failed without deleting files."""
+        found = self.get_episode(episode_id)
+        if found is None:
+            raise FileNotFoundError(f"orphan episode not found: {episode_id}")
+        meta, ep_dir = found
+        if ep_dir.resolve() != episode_dir.resolve():
+            raise EpisodeSchemaError(
+                f"orphan lock directory does not match metadata for {episode_id}"
+            )
+        if meta.state in ("recording", "finalizing"):
+            meta.state = "failed"
+            meta.outcome = "abort"
+            if meta.stopped_at is None:
+                meta.stopped_at = utc_now_iso()
+            self._write_meta(ep_dir, meta)
+        return meta
+
+    def fail_incomplete_episodes(self) -> int:
+        """Fail closed any recording/finalizing metadata left by a prior process."""
+        episodes_root = self.output_dir / "episodes"
+        if not episodes_root.exists():
+            return 0
+        failed = 0
+        seen: dict[str, Path] = {}
+        for meta_path in episodes_root.glob("*/*/*/meta.json"):
+            meta, _data = read_episode_meta(meta_path)
+            previous = seen.get(meta.episode_id)
+            if previous is not None and previous != meta_path.parent:
+                raise DuplicateEpisodeIdError(
+                    f"duplicate episode ID {meta.episode_id}: {previous} and {meta_path.parent}"
                 )
-        return None
+            seen[meta.episode_id] = meta_path.parent
+            if meta.state not in ("recording", "finalizing"):
+                continue
+            meta.state = "failed"
+            meta.outcome = "abort"
+            if meta.stopped_at is None:
+                meta.stopped_at = utc_now_iso()
+            self._write_meta(meta_path.parent, meta)
+            failed += 1
+        return failed
+
+    def migrate_finished_video_permissions(self) -> int:
+        """Apply the read-only source contract to historical successful episodes only."""
+        migrated = 0
+        episodes_root = self.output_dir / "episodes"
+        if not episodes_root.exists():
+            return migrated
+        seen: dict[str, Path] = {}
+        for meta_path in episodes_root.glob("*/*/*/meta.json"):
+            meta, _data = read_episode_meta(meta_path)
+            previous = seen.get(meta.episode_id)
+            if previous is not None and previous != meta_path.parent:
+                raise DuplicateEpisodeIdError(
+                    f"duplicate episode ID {meta.episode_id}: {previous} and {meta_path.parent}"
+                )
+            seen[meta.episode_id] = meta_path.parent
+            if meta.state == "finished" and meta.outcome == "success":
+                self.protect_finished_video_sources(meta_path.parent)
+                migrated += 1
+        return migrated
+
+    def protect_finished_video_sources(self, ep_dir: Path) -> None:
+        videos_root = ep_dir / "videos"
+        if not videos_root.exists():
+            return
+        for path in videos_root.rglob("*"):
+            if path.is_file():
+                os.chown(path, self._shared_uid, self._shared_gid)
+                path.chmod(FINISHED_VIDEO_FILE_MODE)
+            elif path.is_dir():
+                os.chown(path, self._shared_uid, self._shared_gid)
+                path.chmod(FINISHED_VIDEO_DIR_MODE)
+        os.chown(videos_root, self._shared_uid, self._shared_gid)
+        videos_root.chmod(FINISHED_VIDEO_DIR_MODE)
 
     # ---- internals ----
 
@@ -403,15 +699,17 @@ class EpisodeStore:
         return self.output_dir / "episodes" / meta.profile / date_str / folder_name
 
     def _write_meta(self, ep_dir: Path, meta: EpisodeMeta) -> None:
-        meta_path = ep_dir / "meta.json"
-        tmp_path = meta_path.with_suffix(".json.tmp")
         data = asdict(meta)
-        with tmp_path.open("w") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        tmp_path.replace(meta_path)
-        # Mirror into the sqlite index so list queries don't have to FS-walk.
-        # Best-effort: a failure here doesn't block the meta.json write.
+        self._write_meta_data(ep_dir, data)
+
+    def _write_meta_data(self, ep_dir: Path, data: JsonObject) -> None:
+        _write_meta_file(ep_dir / "meta.json", data)
+        # meta.json is authoritative and cannot be rolled back after rename.
+        # A failed index projection is reported; recorder startup rebuilds the
+        # complete disposable index from metadata before serving requests.
         try:
             self.index.upsert(data, ep_dir)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise EpisodeIndexSyncError(
+                f"meta.json committed for {data['episode_id']}; startup index rebuild required"
+            ) from exc

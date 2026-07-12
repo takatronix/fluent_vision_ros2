@@ -31,6 +31,7 @@ from .preflight import run_preflight
 from .schemas import (
     EpisodeSummary,
     ListEpisodesResponse,
+    MergeEpisodeTagsRequest,
     StartEpisodeRequest,
     StartEpisodeResponse,
     StopEpisodeRequest,
@@ -91,6 +92,7 @@ def build_app(
     app.router.add_get("/api/v1/episodes/{episode_id}", _get_episode)
     app.router.add_delete("/api/v1/episodes/{episode_id}", _delete_episode)
     app.router.add_patch("/api/v1/episodes/{episode_id}", _patch_episode)
+    app.router.add_post("/api/v1/episodes/{episode_id}/tags", _merge_episode_tags)
     app.router.add_get("/api/v1/episodes/{episode_id}/files/{tail:.*}", _episode_file)
     app.router.add_get("/api/v1/episodes/{episode_id}/depth_preview/{camera}/{frame}", _depth_preview)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints", _episode_joints)
@@ -527,7 +529,7 @@ async def _stop_episode(request: web.Request) -> web.Response:
 
     # If discard, blow away the dir entirely
     if req.outcome == "discard":
-        shutil.rmtree(ep_dir, ignore_errors=True)
+        store.delete_episode(episode_id)
         LOG.info("episode discarded and dir removed: %s", episode_id)
 
     # Step 6: release active lock
@@ -1408,14 +1410,33 @@ async def _retention_put_policy(request: web.Request) -> web.Response:
 
 async def _patch_episode(request: web.Request) -> web.Response:
     """Update a small allow-list of episode fields (trim, task_description,
-    tags, pinned). Used by the play modal's clip / rename / pin actions."""
+    pinned). Used by the play modal's clip / rename / pin actions."""
     episode_id = request.match_info["episode_id"]
     try:
         body = await request.json()
     except Exception:
         body = {}
+    if "tags" in body:
+        return web.json_response(
+            {"error": "use_tags_operation",
+             "detail": "merge tags with POST /api/v1/episodes/{episode_id}/tags"},
+            status=400,
+        )
     store: EpisodeStore = request.app["store"]
     updated = store.patch_episode_meta(episode_id, body)
+    if updated is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    return web.json_response(updated)
+
+
+async def _merge_episode_tags(request: web.Request) -> web.Response:
+    episode_id = request.match_info["episode_id"]
+    try:
+        req = MergeEpisodeTagsRequest(**await request.json())
+    except Exception as exc:
+        return web.json_response({"error": "invalid_request", "detail": str(exc)}, status=400)
+    store: EpisodeStore = request.app["store"]
+    updated = store.merge_episode_tags(episode_id, req.tags)
     if updated is None:
         return web.json_response({"error": "not_found"}, status=404)
     return web.json_response(updated)
@@ -1445,7 +1466,7 @@ async def _recover_episode(request: web.Request) -> web.Response:
 
     body: {action: "finalize_aborted" | "discard"}
       finalize_aborted: keep files, mark state=failed/outcome=abort, release lock
-      discard:          rmtree the episode dir, release lock
+      discard:          remove files and index row, release lock
     """
     episode_id = request.match_info["episode_id"]
     try:
@@ -1465,17 +1486,12 @@ async def _recover_episode(request: web.Request) -> web.Response:
     found = store.get_episode(episode_id)
     if found is None:
         return web.json_response({"error": "not_found"}, status=404)
-    meta, ep_dir = found
-
+    _meta, ep_dir = found
     if action == "discard":
-        shutil.rmtree(ep_dir, ignore_errors=True)
+        store.delete_episode(episode_id, force=True)
         result = {"episode_id": episode_id, "state": "discarded", "files_removed": True}
-    else:  # finalize_aborted
-        meta.state = "failed"
-        meta.outcome = "abort"
-        if meta.stopped_at is None:
-            meta.stopped_at = utc_now_iso()
-        store._write_meta(ep_dir, meta)  # noqa: SLF001
+    else:
+        meta = store.fail_orphan_episode(episode_id, ep_dir)
         result = {"episode_id": episode_id, "state": meta.state, "outcome": meta.outcome}
 
     if active_lock is not None:

@@ -20,7 +20,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from .episode_store import EpisodeMeta, EpisodeStore
+from .episode_store import (
+    DuplicateEpisodeIdError,
+    EpisodeMeta,
+    EpisodeStore,
+    read_episode_meta,
+)
 
 LOG = logging.getLogger("fv_episode_recorder.retention")
 
@@ -92,16 +97,16 @@ class RetentionPlanner:
         episodes_root = self.store.output_dir / "episodes"
         if not episodes_root.exists():
             return out
-        import json
+        seen: dict[str, Path] = {}
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
-            try:
-                with meta_path.open() as f:
-                    data = json.load(f)
-                meta = EpisodeMeta(**{
-                    k: v for k, v in data.items() if k in EpisodeMeta.__annotations__
-                })
-            except Exception:
-                continue
+            meta, _data = read_episode_meta(meta_path)
+            previous = seen.get(meta.episode_id)
+            if previous is not None and previous != meta_path.parent:
+                raise DuplicateEpisodeIdError(
+                    f"duplicate episode ID {meta.episode_id}: "
+                    f"{previous} and {meta_path.parent}"
+                )
+            seen[meta.episode_id] = meta_path.parent
             ep_dir = meta_path.parent
             size = 0
             try:
@@ -302,7 +307,7 @@ class RetentionRunner:
                     and self._scheduled[c.meta.episode_id] <= now]
             for c in ripe:
                 try:
-                    shutil.rmtree(c.ep_dir, ignore_errors=False)
+                    self.store.delete_episode(c.meta.episode_id)
                     deleted.append({
                         "episode_id": c.meta.episode_id,
                         "task": c.meta.task_description,

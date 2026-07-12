@@ -12,9 +12,8 @@ still read meta.json on demand (`get_episode`).
 
 Reliability model:
   - All writes are: meta.json first (atomic rename), then index update.
-  - If a meta.json mutation happens but the index update is skipped
-    (recorder crash, manual rm -rf, etc.), the next startup detects
-    drift (count mismatch) and triggers a full rebuild.
+  - Every startup rebuilds all rows from meta.json, repairing field drift even
+    when the filesystem and index have the same episode count.
   - The index file is a single sqlite DB at `<output_dir>/index.db`;
     safe to delete — the next startup rebuilds.
 """
@@ -26,13 +25,12 @@ import logging
 import sqlite3
 import threading
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 LOG = logging.getLogger("fv_episode_recorder.index")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -41,6 +39,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 CREATE TABLE IF NOT EXISTS episodes (
     episode_id        TEXT PRIMARY KEY,
+    episode_schema_version INTEGER NOT NULL,
     state             TEXT NOT NULL,
     task_description  TEXT NOT NULL,
     profile           TEXT NOT NULL,
@@ -162,52 +161,64 @@ class EpisodeIndex:
     def rebuild_from_filesystem(self) -> int:
         """Wipe the episodes table and re-populate by walking meta.json files.
         Called on startup and as a manual recovery action. Returns count."""
+        from .episode_store import DuplicateEpisodeIdError, read_episode_meta
+
         episodes_root = self.output_dir / "episodes"
-        with self._lock:
-            self._conn.execute("DELETE FROM episodes")
-            if not episodes_root.exists():
-                return 0
-            inserted = 0
+        records: list[tuple[dict[str, Any], Path]] = []
+        seen: dict[str, Path] = {}
+        if episodes_root.exists():
             for meta_path in episodes_root.glob("*/*/*/meta.json"):
-                try:
-                    with meta_path.open() as f:
-                        data = json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    continue
-                ep_dir = meta_path.parent
-                self._insert_row_locked(data, ep_dir)
-                inserted += 1
-            return inserted
+                meta, data = read_episode_meta(meta_path)
+                previous = seen.get(meta.episode_id)
+                if previous is not None and previous != meta_path.parent:
+                    raise DuplicateEpisodeIdError(
+                        f"duplicate episode ID {meta.episode_id}: "
+                        f"{previous} and {meta_path.parent}"
+                    )
+                seen[meta.episode_id] = meta_path.parent
+                records.append((data, meta_path.parent))
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("DELETE FROM episodes")
+                for data, ep_dir in records:
+                    self._insert_row_locked(data, ep_dir)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return len(records)
 
     def ensure_consistent(self) -> None:
-        """Cheap sanity check: if FS episode count disagrees with index count
-        by more than a small drift, rebuild. Called on startup."""
-        episodes_root = self.output_dir / "episodes"
-        if not episodes_root.exists():
-            return
-        try:
-            fs_count = sum(1 for _ in episodes_root.glob("*/*/*/meta.json"))
-        except OSError:
-            return
-        with self._lock:
-            idx_count = self._conn.execute("SELECT COUNT(*) AS c FROM episodes").fetchone()["c"]
-        # Drift > 5 episodes OR drift > 5% triggers rebuild.
-        drift = abs(fs_count - idx_count)
-        threshold = max(5, int(0.05 * fs_count))
-        if drift > threshold:
-            LOG.info("index drift detected: fs=%d idx=%d → rebuilding", fs_count, idx_count)
-            self.rebuild_from_filesystem()
+        """Rebuild the index projection from authoritative metadata."""
+        self.rebuild_from_filesystem()
 
     # ---- mutators (called by EpisodeStore after meta.json writes) ----
 
     def upsert(self, meta_dict: dict, ep_dir: Path) -> None:
+        from .episode_store import DuplicateEpisodeIdError, validate_episode_meta
+
+        validate_episode_meta(meta_dict)
         with self._lock:
+            existing = self._conn.execute(
+                "SELECT ep_dir FROM episodes WHERE episode_id = ?",
+                (meta_dict.get("episode_id"),),
+            ).fetchone()
+            if (existing is not None
+                    and Path(existing["ep_dir"]).resolve() != ep_dir.resolve()):
+                raise DuplicateEpisodeIdError(
+                    f"duplicate episode ID {meta_dict.get('episode_id')}: "
+                    f"{existing['ep_dir']} and {ep_dir}"
+                )
             self._insert_row_locked(meta_dict, ep_dir)
 
     def _insert_row_locked(self, data: dict, ep_dir: Path) -> None:
         episode_id = data.get("episode_id") or ""
         if not episode_id:
-            return
+            raise ValueError("episode_id is required for index rows")
+        episode_schema_version = data.get("schema_version")
+        if episode_schema_version != 2:
+            raise ValueError("episode schema_version 2 is required for index rows")
         tags = data.get("tags") or []
         markers = data.get("markers") or []
         profile = data.get("profile") or ""
@@ -216,12 +227,13 @@ class EpisodeIndex:
         self._conn.execute(
             """
             INSERT INTO episodes (
-                episode_id, state, task_description, profile, robot_id,
+                episode_id, episode_schema_version, state, task_description, profile, robot_id,
                 started_at, stopped_at, duration_s, outcome, pinned,
                 size_bytes, marker_count, tags, source, env, controller_label,
                 batch_id, ep_dir, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(episode_id) DO UPDATE SET
+                episode_schema_version = excluded.episode_schema_version,
                 state            = excluded.state,
                 task_description = excluded.task_description,
                 profile          = excluded.profile,
@@ -243,6 +255,7 @@ class EpisodeIndex:
             """,
             (
                 episode_id,
+                episode_schema_version,
                 data.get("state") or "unknown",
                 data.get("task_description") or "",
                 profile,
@@ -310,13 +323,20 @@ class EpisodeIndex:
             rows = rows[:limit]
         # Parse tags JSON back so the caller doesn't have to.
         for r in rows:
-            try:
-                r["tags"] = json.loads(r.get("tags") or "[]")
-            except Exception:
-                r["tags"] = []
+            r["tags"] = json.loads(r["tags"])
+            if not isinstance(r["tags"], list):
+                raise ValueError(f"invalid tags in index row {r['episode_id']}")
             r["pinned"] = bool(r.get("pinned"))
         return rows, next_cursor
 
     def total_count(self) -> int:
         with self._lock:
             return int(self._conn.execute("SELECT COUNT(*) AS c FROM episodes").fetchone()["c"])
+
+    def find_dir_by_episode_id(self, episode_id: str) -> Optional[Path]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ep_dir FROM episodes WHERE episode_id = ?",
+                (episode_id,),
+            ).fetchone()
+        return Path(row["ep_dir"]) if row is not None else None

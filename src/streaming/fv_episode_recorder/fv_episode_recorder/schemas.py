@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from .episode_store import normalize_episode_tags
 
 
 # ---------- Episode lifecycle ----------
@@ -27,6 +29,11 @@ class StartEpisodeRequest(BaseModel):
     cameras_override: Optional[list[dict[str, Any]]] = None
     fps: int = Field(default=30, ge=1, le=120)
     record_bag: bool = True
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, tags: list[str]) -> list[str]:
+        return normalize_episode_tags(tags)
 
 
 class StartEpisodeResponse(BaseModel):
@@ -50,6 +57,15 @@ class StopEpisodeResponse(BaseModel):
     bag_size_bytes: int = 0
     video_size_bytes: int = 0
     manifest_pending: bool = True
+
+
+class MergeEpisodeTagsRequest(BaseModel):
+    tags: list[str]
+
+    @field_validator("tags")
+    @classmethod
+    def validate_tags(cls, tags: list[str]) -> list[str]:
+        return normalize_episode_tags(tags)
 
 
 # ---------- List / Get ----------

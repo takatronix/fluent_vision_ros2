@@ -67,20 +67,23 @@ class FVEpisodeRecorderNode(Node):
         self.host = str(self.get_parameter("host").value)
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.active_lock = ActiveLock(self.output_dir)
+        orphan = self.active_lock.detect_orphan()
+        if orphan and orphan.get("status") == "another_alive":
+            self.get_logger().error("another recorder instance appears alive — exiting")
+            sys.exit(2)
         self.store = EpisodeStore(self.output_dir)
-        # sqlite index: detect drift vs filesystem + rebuild if needed so
-        # episodes deleted via `rm -rf` while recorder was down are dropped.
-        try:
-            self.store.index.ensure_consistent()
-        except Exception as exc:
-            self.get_logger().warning(f"episode index consistency check failed: {exc}")
+        # meta.json is authoritative: rebuild every row so same-count field
+        # drift and filesystem deletions are both repaired at startup.
+        self.store.index.rebuild_from_filesystem()
+        failed_incomplete = self.store.fail_incomplete_episodes()
+        self.store.migrate_finished_video_permissions()
         self.bag_recorder = BagRecorder(max_bag_size_mb=1024)
         self.camera_pool = CameraWriterPool(node=self)
         # Depth republisher: compresses raw 16UC1 → CompressedImage (png) so
         # the bag stores depth at ~5-10× smaller size losslessly. Lifecycle
         # bound to the active episode (start_all / stop_all).
         self.depth_pool = DepthRepublisherPool(node=self)
-        self.active_lock = ActiveLock(self.output_dir)
         self.marker_manager = MarkerManager()
         # Track mux source (teleop vs VLA + controller name) so the play
         # modal can label each recording without having to decode the bag.
@@ -96,36 +99,18 @@ class FVEpisodeRecorderNode(Node):
         self._retention_task = None  # asyncio.Task — set in main() after loop exists
 
         # Step 6: detect orphan from previous run (recorder crash mid-record)
-        orphan = self.active_lock.detect_orphan()
         if orphan and orphan.get("status") == "orphan":
             self._orphan_payload = orphan
             self.get_logger().warning(
                 f"orphan episode detected: id={orphan.get('episode_id')} "
                 f"dir={orphan.get('episode_dir')} — call POST /api/v1/episodes/{orphan.get('episode_id')}/recover"
             )
-            # Mark the meta as failed if the dir is still there
-            ep_dir = Path(orphan.get("episode_dir", ""))
-            meta_path = ep_dir / "meta.json"
-            if meta_path.exists():
-                try:
-                    import json
-                    with meta_path.open() as f:
-                        data = json.load(f)
-                    if data.get("state") in ("recording", "finalizing"):
-                        data["state"] = "failed"
-                        data["outcome"] = "abort"
-                        tmp = meta_path.with_suffix(".json.tmp")
-                        with tmp.open("w") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
-                        tmp.replace(meta_path)
-                except Exception as exc:
-                    self.get_logger().warning(f"orphan meta rewrite failed: {exc}")
             # The lock is left in place until operator calls /recover so the
             # event remains visible across multiple restarts.
-        elif orphan and orphan.get("status") == "another_alive":
-            self.get_logger().error("another recorder instance appears alive — exiting")
-            import sys
-            sys.exit(2)
+        elif failed_incomplete:
+            self.get_logger().warning(
+                f"marked {failed_incomplete} incomplete episode(s) failed/abort; files preserved"
+            )
 
     def get_profile(self, profile_name: str) -> dict:
         """Lazy-load + cache profile yaml."""
