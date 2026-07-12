@@ -14,6 +14,7 @@ start rather than silently bagging raw depth.
 from __future__ import annotations
 
 import logging
+import queue
 import struct
 import threading
 from dataclasses import dataclass, field
@@ -49,6 +50,13 @@ class _DepthRepublisher:
     pub: object = None
     _frame_count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _frames: queue.Queue[Image | None] = field(
+        default_factory=lambda: queue.Queue(maxsize=120)
+    )
+    _worker: threading.Thread | None = None
+    _worker_error: Exception | None = None
+    _queue_drops: int = 0
+    _stopped: bool = False
 
     @property
     def compressed_topic(self) -> str:
@@ -60,26 +68,94 @@ class _DepthRepublisher:
         self.pub = self.node.create_publisher(
             CompressedImage, self.compressed_topic, qos_profile_sensor_data,
         )
-        self.sub = self.node.create_subscription(
-            Image, self.raw_topic, self._on_image, qos_profile_sensor_data,
+        worker = threading.Thread(
+            target=self._run,
+            name=f"depth-republisher-{self.name}",
+            daemon=True,
         )
+        try:
+            self.sub = self.node.create_subscription(
+                Image, self.raw_topic, self._on_image, qos_profile_sensor_data,
+            )
+            worker.start()
+        except Exception:
+            if self.sub is not None:
+                self.node.destroy_subscription(self.sub)
+                self.sub = None
+            self.node.destroy_publisher(self.pub)
+            self.pub = None
+            raise
+        self._worker = worker
         LOG.info("depth republish: %s → %s", self.raw_topic, self.compressed_topic)
 
     def stop(self) -> None:
         with self._lock:
-            if self.sub is not None:
-                try: self.node.destroy_subscription(self.sub)
-                except Exception: pass
-                self.sub = None
+            self._stopped = True
+            subscription = self.sub
+            self.sub = None
+            worker = self._worker
+        if subscription is not None:
+            try:
+                self.node.destroy_subscription(subscription)
+            except Exception:
+                pass
+        if worker is not None:
+            self._frames.put(None)
+            worker.join(timeout=15)
+            if worker.is_alive():
+                raise RuntimeError("depth republisher queue drain timed out")
+            self._worker = None
+        with self._lock:
             if self.pub is not None:
-                try: self.node.destroy_publisher(self.pub)
-                except Exception: pass
+                try:
+                    self.node.destroy_publisher(self.pub)
+                except Exception:
+                    pass
                 self.pub = None
-            LOG.info("depth republish stopped: %s (frames=%d)", self.raw_topic, self._frame_count)
+        if self._worker_error is not None:
+            raise RuntimeError(f"depth republisher worker failed: {self._worker_error}")
+        if self._queue_drops:
+            raise RuntimeError(
+                f"depth republisher queue overflow dropped {self._queue_drops} frames"
+            )
+        LOG.info(
+            "depth republish stopped: %s (frames=%d)",
+            self.raw_topic,
+            self._frame_count,
+        )
 
     def _on_image(self, msg: Image) -> None:
+        with self._lock:
+            if self._stopped or self.pub is None:
+                return
+            try:
+                self._frames.put_nowait(msg)
+            except queue.Full:
+                self._queue_drops += 1
+                if self._queue_drops == 1 or self._queue_drops % 30 == 0:
+                    LOG.error(
+                        "depth republisher queue full (%s); dropped frames=%d",
+                        self.raw_topic,
+                        self._queue_drops,
+                    )
+
+    def _run(self) -> None:
+        while True:
+            msg = self._frames.get()
+            try:
+                if msg is None:
+                    return
+                if self._worker_error is None:
+                    self._encode_and_publish(msg)
+            except Exception as exc:
+                self._worker_error = exc
+                LOG.exception("depth republisher worker failed: %s", self.raw_topic)
+            finally:
+                self._frames.task_done()
+
+    def _encode_and_publish(self, msg: Image) -> None:
         if self.pub is None:
-            return
+            raise RuntimeError("depth publisher stopped before queued frames drained")
         try:
             if msg.encoding in ("16UC1", "mono16"):
                 arr = np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(msg.height, msg.width)
@@ -87,23 +163,19 @@ class _DepthRepublisher:
                 f = np.frombuffer(bytes(msg.data), dtype=np.float32).reshape(msg.height, msg.width)
                 arr = np.nan_to_num(f * 1000.0, nan=0.0, posinf=0.0, neginf=0.0).astype(np.uint16)
             else:
-                return
-        except ValueError:
-            return
+                raise RuntimeError(f"unsupported depth encoding: {msg.encoding}")
+        except ValueError as exc:
+            raise RuntimeError("depth frame shape does not match message dimensions") from exc
         # Encode as 16-bit PNG. cv2.imencode handles uint16 grayscale lossless.
         ok, png = cv2.imencode(".png", arr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
         if not ok:
-            return
+            raise RuntimeError("depth PNG encoding failed")
         out = CompressedImage()
         out.header = msg.header
         out.format = "16UC1; compressedDepth png"
         out.data = _CONFIG_HEADER + png.tobytes()
-        try:
-            self.pub.publish(out)
-            with self._lock:
-                self._frame_count += 1
-        except Exception as exc:
-            LOG.warning("depth republish publish failed (%s): %s", self.raw_topic, exc)
+        self.pub.publish(out)
+        self._frame_count += 1
 
 
 class DepthRepublisherPool:
@@ -140,15 +212,16 @@ class DepthRepublisherPool:
         '0 frames' empty-state even though the bag has the frames."""
         pubs = self.detach_all()
         counts: dict[str, int] = {}
+        errors: list[str] = []
         for r in pubs:
-            try:
-                counts[r.name] = int(getattr(r, "_frame_count", 0))
-            except Exception:
-                counts[r.name] = 0
             try:
                 r.stop()
             except Exception as exc:
-                LOG.warning("republisher stop failed for %s: %s", r.raw_topic, exc)
+                LOG.error("republisher stop failed for %s: %s", r.raw_topic, exc)
+                errors.append(f"{r.name}: {exc}")
+            counts[r.name] = r._frame_count
+        if errors:
+            raise RuntimeError("; ".join(errors))
         return counts
 
     def detach_all(self) -> list[_DepthRepublisher]:

@@ -92,5 +92,3 @@ A missing version, a version without a forward migration, or a failed migration
 stops recorder startup. Metadata files are replaced atomically only after their
 migrated document passes current-schema validation. `index.db` is then rebuilt
 from the migrated `meta.json` files.
-
-- [FV EpisodeからLeRobot Datasetへの変換仕様](../fv_lerobot_exporter/docs/lerobot_dataset_export.md)

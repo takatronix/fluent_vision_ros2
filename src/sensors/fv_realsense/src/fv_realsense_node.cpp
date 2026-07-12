@@ -1362,9 +1362,10 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
             last_device_ts_ms_ = device_ts_ms;
             last_ros_stamp_ = now;
             // Surface the event at most once per 10 s to avoid log spam.
-            static rclcpp::Time s_last_log{0, 0, RCL_SYSTEM_TIME};
-            if ((now - s_last_log).nanoseconds() > static_cast<int64_t>(1e10)) {
-                s_last_log = now;
+            const auto steady_now = std::chrono::steady_clock::now();
+            static auto s_last_log = steady_now - std::chrono::seconds(11);
+            if (steady_now - s_last_log > std::chrono::seconds(10)) {
+                s_last_log = steady_now;
                 RCLCPP_INFO(
                     this->get_logger(),
                     "device->ROS time mapping re-anchored "

@@ -83,7 +83,7 @@ class FVEpisodeRecorderNode(Node):
                 "made historical finished episode sources read-only: "
                 + ", ".join(migrated_sources)
             )
-        self.bag_recorder = BagRecorder(max_bag_size_mb=1024)
+        self.bag_recorder = BagRecorder()
         self.camera_pool = CameraWriterPool(node=self)
         # Depth republisher: compresses raw 16UC1 → CompressedImage (png) so
         # the bag stores depth at ~5-10× smaller size losslessly. Lifecycle

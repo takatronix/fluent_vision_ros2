@@ -15,6 +15,7 @@ Future steps:
 from __future__ import annotations
 
 import logging
+import queue
 import shutil
 import subprocess
 import threading
@@ -36,64 +37,93 @@ from .frames_sidecar import FramesSidecar
 
 LOG = logging.getLogger("fv_episode_recorder.camera")
 VIDEO_TIME_BASE = Fraction(1, 90_000)
+EncoderSpec = tuple[str, tuple[str, ...]]
+ENCODER_CANDIDATES: tuple[EncoderSpec, ...] = (
+    ("h264_nvenc", ("-preset", "p1", "-tune", "ll")),
+    ("libx264", ("-preset", "ultrafast", "-tune", "zerolatency")),
+)
 
 
-def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> tuple[subprocess.Popen, str] | None:
-    """Try ffmpeg with H.264 encoders in priority order. Returns (proc, codec_used)
-    or None if all encoders failed. Output is faststart mp4 for HTML5 video.
-
-    Priority: h264_nvenc (Tegra HW encode) → libx264 (CPU). Both produce
-    browser-native H.264 mp4 (Chrome / Safari / Firefox HW decode)."""
+def _select_h264_encoder() -> EncoderSpec | None:
+    """Probe the encoder once, outside camera subscription callbacks."""
     if not shutil.which("ffmpeg"):
         LOG.error("ffmpeg not found in PATH")
         return None
-    encoder_tries = [
-        # (codec, extra args)
-        ("h264_nvenc", ["-preset", "p1", "-tune", "ll"]),    # Tegra HW, fastest
-        ("libx264",    ["-preset", "ultrafast", "-tune", "zerolatency"]),
-    ]
-    for codec, extra in encoder_tries:
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}", "-r", str(fps),
-            "-i", "pipe:0",
-            "-c:v", codec,
-            *extra,
-            "-bf", "0",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            str(out_path),
-        ]
+    for codec, extra in ENCODER_CANDIDATES:
         try:
-            # Probe encoder availability first (some builds list h264_nvenc but
-            # fail at runtime if no GPU). Spawn a tiny test pipe.
+            # Thor NVENC rejects the old 64x64 probe even though the actual
+            # 640x480 camera stream is supported.
             test = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.04:r=25",
-                 "-c:v", codec, *extra, "-f", "null", "-"],
-                stderr=subprocess.PIPE, timeout=10,
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=black:s=640x480:d=0.04:r=25",
+                    "-c:v", codec, *extra, "-f", "null", "-",
+                ],
+                stderr=subprocess.PIPE,
+                timeout=10,
             )
-            if test.returncode != 0:
-                LOG.warning("[encoder probe] %s unavailable: %s", codec,
-                            test.stderr.decode("utf-8", errors="replace")[:200])
-                continue
+            if test.returncode == 0:
+                LOG.info("selected H.264 encoder: %s", codec)
+                return codec, extra
+            LOG.warning(
+                "[encoder probe] %s unavailable: %s",
+                codec,
+                test.stderr.decode("utf-8", errors="replace")[:200],
+            )
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
             LOG.warning("[encoder probe] %s probe failed: %s", codec, exc)
-            continue
-        # Launch the real encoder pipe.
-        try:
-            proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            )
-            LOG.info("ffmpeg encoder ready: %s → %s (%dx%d @ %dfps)",
-                     codec, out_path.name, width, height, fps)
-            return proc, codec
-        except Exception as exc:
-            LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
-            continue
-    LOG.error("no H.264 encoder available (tried %s)", [c for c, _ in encoder_tries])
+    LOG.error("no H.264 encoder available (tried %s)", [c for c, _ in ENCODER_CANDIDATES])
     return None
+
+
+def _spawn_ffmpeg_encoder(
+    out_path: Path,
+    width: int,
+    height: int,
+    fps: int,
+    encoder: EncoderSpec | None = None,
+) -> tuple[subprocess.Popen, str] | None:
+    """Start one H.264 encoder selected before recording begins.
+
+    Output is faststart mp4 for HTML5 video. The optional selection is kept for
+    direct callers; production CameraWriterPool always supplies its cached
+    recorder-startup result.
+    """
+    selected = encoder or _select_h264_encoder()
+    if selected is None:
+        return None
+    codec, extra = selected
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", codec,
+        *extra,
+        "-bf", "0",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except Exception as exc:
+        LOG.error("[encoder] %s spawn failed: %s", codec, exc)
+        return None
+    LOG.info(
+        "ffmpeg encoder ready: %s -> %s (%dx%d @ %dfps)",
+        codec,
+        out_path.name,
+        width,
+        height,
+        fps,
+    )
+    return proc, codec
 
 
 def _timestamp_ticks(stamp_ns: int, first_stamp_ns: int) -> int:
@@ -195,6 +225,7 @@ class CameraWriter:
         output_dir: Path,
         fps: int = 30,
         node: Optional[Node] = None,
+        encoder: EncoderSpec | None = None,
     ):
         self.name = name
         self.topic = topic
@@ -202,6 +233,7 @@ class CameraWriter:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.fps_nominal = fps
         self._node = node
+        self._encoder = encoder
 
         self._segment_file = self.output_dir / "0000.mp4"
         self._sidecar = FramesSidecar(self.output_dir / "frames.parquet")
@@ -216,6 +248,12 @@ class CameraWriter:
         self._frame_stamps_ns: list[int] = []
         self._frame_pts: list[int] = []
         self._lock = threading.Lock()
+        self._frames: queue.Queue[tuple[bytes, int, int] | None] = queue.Queue(
+            maxsize=max(60, fps * 4)
+        )
+        self._worker: threading.Thread | None = None
+        self._worker_error: Exception | None = None
+        self._queue_drops = 0
         self._sub = None
         self.frame_count = 0
         self.width = 0
@@ -227,73 +265,116 @@ class CameraWriter:
     def start(self) -> None:
         if self._node is None:
             raise RuntimeError("CameraWriter requires a rclpy Node to attach subscriber")
+        if self._encoder is None:
+            raise RuntimeError("no H.264 encoder is available")
+        worker = threading.Thread(
+            target=self._run,
+            name=f"camera-writer-{self.name}",
+            daemon=True,
+        )
         self._sub = self._node.create_subscription(
             CompressedImage,
             self.topic,
             self._on_image,
             qos_profile_sensor_data,
         )
+        try:
+            worker.start()
+        except Exception:
+            self._node.destroy_subscription(self._sub)
+            self._sub = None
+            raise
+        self._worker = worker
         self._start_wall_ns = time.time_ns()
         LOG.info("camera writer started: %s topic=%s out=%s", self.name, self.topic, self.output_dir)
 
     def _on_image(self, msg: CompressedImage) -> None:
-        if self._stopped:
+        recv_ns = time.time_ns()
+        ros_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        if ros_stamp_ns <= 0:
+            LOG.warning("[%s] ROS header stamp is missing, skipping frame", self.name)
             return
         with self._lock:
             if self._stopped:
                 return
-            recv_ns = time.time_ns()
-            ros_stamp_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
-            if ros_stamp_ns <= 0:
-                LOG.warning("[%s] ROS header stamp is missing, skipping frame", self.name)
-                return
-            # decode jpeg/png compressed bytes
-            arr = np.frombuffer(msg.data, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                LOG.warning("[%s] decode failed, skipping frame", self.name)
-                return
-            h, w = img.shape[:2]
-            if self._ffmpeg is None:
-                spawned = _spawn_ffmpeg_encoder(self._segment_file, w, h, self.fps_nominal)
-                if spawned is None:
-                    LOG.error("[%s] no H.264 encoder available — frame dropped", self.name)
-                    return
-                self._ffmpeg, self._codec_in_use = spawned
-                self.width = w
-                self.height = h
-                LOG.info("[%s] first frame %dx%d → %s (%s)",
-                         self.name, w, h, self._segment_file, self._codec_in_use)
             try:
-                self._ffmpeg.stdin.write(img.tobytes())
-            except (BrokenPipeError, ValueError) as exc:
-                LOG.warning("[%s] ffmpeg pipe write failed: %s", self.name, exc)
-                return
+                self._frames.put_nowait((bytes(msg.data), ros_stamp_ns, recv_ns))
+            except queue.Full:
+                self._queue_drops += 1
+                if self._queue_drops == 1 or self._queue_drops % self.fps_nominal == 0:
+                    LOG.error(
+                        "[%s] camera writer queue full; dropped frames=%d",
+                        self.name,
+                        self._queue_drops,
+                    )
 
-            video_pts_origin_ros_ns = (
-                self._frame_stamps_ns[0] if self._frame_stamps_ns else ros_stamp_ns
+    def _run(self) -> None:
+        while True:
+            item = self._frames.get()
+            try:
+                if item is None:
+                    return
+                if self._worker_error is None:
+                    self._encode_frame(*item)
+            except Exception as exc:
+                self._worker_error = exc
+                LOG.exception("[%s] camera writer worker failed", self.name)
+            finally:
+                self._frames.task_done()
+
+    def _encode_frame(self, data: bytes, ros_stamp_ns: int, recv_ns: int) -> None:
+        arr = np.frombuffer(data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError("compressed camera frame decode failed")
+        h, w = img.shape[:2]
+        if self._ffmpeg is None:
+            spawned = _spawn_ffmpeg_encoder(
+                self._segment_file,
+                w,
+                h,
+                self.fps_nominal,
+                self._encoder,
             )
-            video_pts = _timestamp_ticks(
-                ros_stamp_ns,
-                video_pts_origin_ros_ns,
+            if spawned is None:
+                raise RuntimeError("H.264 encoder could not be started")
+            self._ffmpeg, self._codec_in_use = spawned
+            self.width = w
+            self.height = h
+            LOG.info(
+                "[%s] first frame %dx%d -> %s (%s)",
+                self.name,
+                w,
+                h,
+                self._segment_file,
+                self._codec_in_use,
             )
-            self._sidecar.append({
-                "frame_index": self._frame_index,
-                "segment_file": self._segment_file.name,
-                "segment_local_frame": self._segment_local,
-                "video_pts": video_pts,
-                "ros_stamp_ns": ros_stamp_ns,
-                "recv_stamp_ns": recv_ns,
-                "source_seq": -1,
-                "dropped_before": 0,  # naive (Phase 1.5 fills with seq gap detection)
-                "keyframe": True,  # mp4v: every frame is intra-coded; refine later
-            })
-            self._frame_stamps_ns.append(ros_stamp_ns)
-            self._frame_pts.append(video_pts)
-            self._frame_index += 1
-            self._segment_local += 1
-            self.frame_count += 1
-            self._last_recv_ns = recv_ns
+        try:
+            self._ffmpeg.stdin.write(img.tobytes())
+        except (BrokenPipeError, ValueError) as exc:
+            raise RuntimeError(f"ffmpeg pipe write failed: {exc}") from exc
+
+        video_pts_origin_ros_ns = (
+            self._frame_stamps_ns[0] if self._frame_stamps_ns else ros_stamp_ns
+        )
+        video_pts = _timestamp_ticks(ros_stamp_ns, video_pts_origin_ros_ns)
+        self._sidecar.append({
+            "frame_index": self._frame_index,
+            "segment_file": self._segment_file.name,
+            "segment_local_frame": self._segment_local,
+            "video_pts": video_pts,
+            "ros_stamp_ns": ros_stamp_ns,
+            "recv_stamp_ns": recv_ns,
+            "source_seq": -1,
+            "dropped_before": 0,
+            "keyframe": True,
+        })
+        self._frame_stamps_ns.append(ros_stamp_ns)
+        self._frame_pts.append(video_pts)
+        self._frame_index += 1
+        self._segment_local += 1
+        self.frame_count += 1
+        self._last_recv_ns = recv_ns
 
     def stop(self) -> dict:
         self.stop_recording()
@@ -302,22 +383,34 @@ class CameraWriter:
     def stop_recording(self) -> None:
         with self._lock:
             self._stopped = True
-            if self._sub is not None and self._node is not None:
-                try:
-                    self._node.destroy_subscription(self._sub)
-                except Exception:
-                    pass
-                self._sub = None
+            subscription = self._sub
+            self._sub = None
+            worker = self._worker
+        if subscription is not None and self._node is not None:
+            try:
+                self._node.destroy_subscription(subscription)
+            except Exception:
+                pass
+        if worker is not None:
+            self._frames.put(None)
+
+    def finalize(self) -> dict:
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout=15)
+            if worker.is_alive():
+                if self._ffmpeg is not None:
+                    self._ffmpeg.kill()
+                    worker.join(timeout=3)
+                raise RuntimeError("camera writer queue drain timed out")
+            self._worker = None
+        with self._lock:
+            ffmpeg_error: str | None = None
             if self._ffmpeg is not None:
                 try:
                     self._ffmpeg.stdin.close()
                 except Exception:
                     pass
-
-    def finalize(self) -> dict:
-        with self._lock:
-            ffmpeg_error: str | None = None
-            if self._ffmpeg is not None:
                 try:
                     returncode = self._ffmpeg.wait(timeout=15)
                 except subprocess.TimeoutExpired:
@@ -328,6 +421,12 @@ class CameraWriter:
                     ffmpeg_error = f"ffmpeg exited with code {returncode}"
                 self._ffmpeg = None
             sidecar_rows = self._sidecar.close()
+            if self._worker_error is not None:
+                raise RuntimeError(f"camera writer worker failed: {self._worker_error}")
+            if self._queue_drops:
+                raise RuntimeError(
+                    f"camera writer queue overflow dropped {self._queue_drops} frames"
+                )
             if ffmpeg_error is not None:
                 raise RuntimeError(ffmpeg_error)
             if self.frame_count > 0:
@@ -563,6 +662,7 @@ class CameraWriterPool:
 
     def __init__(self, node: Node):
         self._node = node
+        self._encoder = _select_h264_encoder()
         self._writers: dict[str, CameraWriter | DepthCameraWriter] = {}
         # Depth cameras don't have a writer (they go into the bag) but the
         # play modal still needs them in cameras[]. Stored here so stop_all
@@ -602,7 +702,12 @@ class CameraWriterPool:
                 continue
             cam_dir = videos_root / name
             writer = CameraWriter(
-                name=name, topic=topic, output_dir=cam_dir, fps=fps, node=self._node,
+                name=name,
+                topic=topic,
+                output_dir=cam_dir,
+                fps=fps,
+                node=self._node,
+                encoder=self._encoder,
             )
             writer.start()
             self._writers[name] = writer

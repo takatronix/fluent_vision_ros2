@@ -68,6 +68,7 @@ from fv_episode_recorder.bag_recorder import (
     DetachedBagRecording,
 )
 from fv_episode_recorder.camera_writer import CameraWriter
+from fv_episode_recorder.depth_republisher import DepthRepublisherPool, _DepthRepublisher
 from fv_episode_recorder.episode_store import (
     EpisodeMeta,
     EpisodeMetadataError,
@@ -1145,6 +1146,35 @@ def test_stop_detaches_active_episode_before_finalize(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_stop_quiesces_depth_before_detaching_bag(tmp_path: Path) -> None:
+    async def run() -> None:
+        events: list[str] = []
+
+        class _OrderedDepthPool(_DepthPool):
+            def stop_all(self) -> dict[str, int]:
+                events.append("depth")
+                return {}
+
+        class _OrderedBagRecorder(_BagRecorder):
+            def detach_for_finalize(self) -> _DetachedBag:
+                events.append("bag")
+                return super().detach_for_finalize()
+
+        store = EpisodeStore(tmp_path)
+        store.start_episode(_meta("ep-1"))
+        request = _Request(store, "ep-1")
+        request.app["depth_pool"] = _OrderedDepthPool()
+        request.app["bag_recorder"] = _OrderedBagRecorder()
+
+        response = await _stop_episode(request)
+
+        assert response.status == 202
+        assert events == ["depth", "bag"]
+        await asyncio.sleep(0.1)
+
+    asyncio.run(run())
+
+
 def test_finalizer_crash_reaches_failed_terminal_state(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1228,13 +1258,122 @@ def test_camera_writer_records_first_valid_frame(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(camera_writer, "_spawn_ffmpeg_encoder", lambda *_args: (proc, "test"))
 
     writer = CameraWriter("cam", "/camera", tmp_path, node=None)
-    writer._on_image(_Msg())
+    writer._encode_frame(_Msg.data, 1_000_000_002, time.time_ns())
 
     assert writer.frame_count == 1
     assert proc.stdin.writes == 1
     writer._sidecar.close()
     sidecar_row = pq.read_table(tmp_path / "frames.parquet").to_pylist()[0]
     assert sidecar_row["video_pts"] == 0
+
+
+def test_camera_subscription_callback_only_enqueues_frame(tmp_path: Path) -> None:
+    class _Node:
+        def create_subscription(self, _msg_type, _topic, callback, _qos):
+            self.callback = callback
+            return object()
+
+        def destroy_subscription(self, _subscription) -> None:
+            pass
+
+    class _Stamp:
+        sec = 1
+        nanosec = 2
+
+    class _Header:
+        stamp = _Stamp()
+
+    class _Msg:
+        header = _Header()
+        data = b"jpeg"
+
+    entered = threading.Event()
+    release = threading.Event()
+    writer = CameraWriter(
+        "cam",
+        "/camera",
+        tmp_path,
+        node=_Node(),
+        encoder=("test", ()),
+    )
+
+    def _slow_encode(*_args) -> None:
+        entered.set()
+        release.wait(timeout=2)
+
+    writer._encode_frame = _slow_encode
+    writer.start()
+    writer._on_image(_Msg())
+    assert entered.wait(timeout=1)
+
+    started_at = time.perf_counter()
+    writer._on_image(_Msg())
+    callback_elapsed = time.perf_counter() - started_at
+
+    release.set()
+    writer.stop_recording()
+    assert writer._worker is not None
+    writer._worker.join(timeout=1)
+    writer._sidecar.close()
+    assert callback_elapsed < 0.05
+
+
+def test_depth_subscription_callback_only_enqueues_frame() -> None:
+    class _Publisher:
+        def publish(self, _message) -> None:
+            pass
+
+    class _Node:
+        def create_publisher(self, _msg_type, _topic, _qos):
+            return _Publisher()
+
+        def create_subscription(self, _msg_type, _topic, callback, _qos):
+            self.callback = callback
+            return object()
+
+        def destroy_subscription(self, _subscription) -> None:
+            pass
+
+        def destroy_publisher(self, _publisher) -> None:
+            pass
+
+    entered = threading.Event()
+    release = threading.Event()
+    republisher = _DepthRepublisher("depth", "/depth", _Node())
+
+    def _slow_publish(_message) -> None:
+        entered.set()
+        release.wait(timeout=2)
+
+    republisher._encode_and_publish = _slow_publish
+    republisher.start()
+    republisher._on_image(_Image())
+    assert entered.wait(timeout=1)
+
+    started_at = time.perf_counter()
+    republisher._on_image(_Image())
+    callback_elapsed = time.perf_counter() - started_at
+
+    release.set()
+    republisher.stop()
+    assert callback_elapsed < 0.05
+
+
+def test_depth_pool_counts_frames_after_worker_drain() -> None:
+    class _Republisher:
+        name = "depth"
+        raw_topic = "/depth"
+        _frame_count = 1
+
+        def stop(self) -> None:
+            self._frame_count = 3
+
+    pool = DepthRepublisherPool(node=_Node())
+    pool._pubs = [_Republisher()]
+
+    counts = pool.stop_all()
+
+    assert counts == {"depth": 3}
 
 
 def test_camera_writer_skips_frame_without_ros_stamp(tmp_path: Path, monkeypatch) -> None:
@@ -1288,6 +1427,26 @@ def test_camera_writer_disables_b_frames(tmp_path: Path, monkeypatch) -> None:
 
     assert spawned == (process, "h264_nvenc")
     assert commands[0][commands[0].index("-bf") : commands[0].index("-bf") + 2] == ["-bf", "0"]
+
+
+def test_camera_writer_nvenc_probe_uses_real_camera_dimensions(monkeypatch) -> None:
+    class _Probe:
+        returncode = 0
+        stderr = b""
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(camera_writer.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+
+    def _run(command: list[str], **_kwargs) -> _Probe:
+        commands.append(command)
+        return _Probe()
+
+    monkeypatch.setattr(camera_writer.subprocess, "run", _run)
+
+    selected = camera_writer._select_h264_encoder()
+
+    assert selected == ("h264_nvenc", ("-preset", "p1", "-tune", "ll"))
+    assert "color=c=black:s=640x480:d=0.04:r=25" in commands[0]
 
 
 def test_camera_writer_rejects_unreadable_recorded_video(tmp_path: Path) -> None:

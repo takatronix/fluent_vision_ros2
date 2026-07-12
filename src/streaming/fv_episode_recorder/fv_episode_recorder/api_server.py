@@ -737,11 +737,10 @@ async def _stop_episode(request: web.Request) -> web.Response:
         )
     camera_pool: CameraWriterPool = request.app["camera_pool"]
 
-    # Detach all active episode resources. The slow flush/finalize happens in
-    # the background; this request only stops accepting new samples.
-    bag_recorder: BagRecorder = request.app["bag_recorder"]
-    detached_bag = bag_recorder.detach_for_finalize()
-
+    # Stop the in-process depth publisher before asking rosbag to flush. A
+    # compressed depth frame can be large enough to keep sqlite's writer
+    # transaction busy while SIGINT begins shutdown, which makes rosbag abort
+    # with SQLITE_BUSY instead of producing metadata.yaml.
     depth_pool = request.app.get("depth_pool")
     depth_frame_counts: dict[str, int] = {}
     initial_failures: list[FinalizeFailure] = []
@@ -753,6 +752,11 @@ async def _stop_episode(request: web.Request) -> web.Response:
             initial_failures.append(
                 FinalizeFailure(code="camera_write_error", detail=f"depth: {exc}")
             )
+
+    # Detach all active episode resources. The slow flush/finalize happens in
+    # the background; this request only stops accepting new samples.
+    bag_recorder: BagRecorder = request.app["bag_recorder"]
+    detached_bag = bag_recorder.detach_for_finalize()
     detached_cameras = camera_pool.detach_all()
     frame_count_per_camera = detached_cameras.frame_counts()
 
