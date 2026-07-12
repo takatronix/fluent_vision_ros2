@@ -11,9 +11,11 @@
 #     (calibration, surface corners, dock, navigation anchors).
 #   - cube faces moved 1-38 -> 300 band (see legacy below).
 #
-# Print sizes: tag_mm is the black-border edge; paper = tag_mm + 5mm
-# margin per side (cut along the margin edge). 3D-printable two-colour
-# plates: tools/generate_tag_mounts.py --flat-plates.
+# Print sizes: tag_mm is the NOMINAL 10x10-cell edge INCLUDING the
+# 1-cell white quiet ring; the black square is 0.8 * tag_mm. Detector
+# tag_size uses the BLACK edge (tag_mm 50 -> tag_size 0.040). Sheets
+# are cut along the artwork edge (= tag_mm exactly). 3D-printable
+# two-colour plates: tools/generate_tag_mounts.py --flat-plates.
 family: tag36h11
 allocations:
   - { ids: [0, 9],     class: calibration, tag_mm: 50,
