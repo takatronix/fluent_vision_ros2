@@ -7,6 +7,7 @@ import stat
 
 import pytest
 
+from fv_episode_recorder import episode_index
 from fv_episode_recorder.episode_store import (
     DuplicateEpisodeIdError,
     EPISODE_DIR_MODE,
@@ -39,8 +40,21 @@ def _meta(episode_id: str, tags: list[str] | None = None) -> EpisodeMeta:
 
 def _finish(store: EpisodeStore, episode_id: str, outcome: str = "success") -> Path:
     ep_dir = store.start_episode(_meta(episode_id, ["tag-a"]))
-    store.stop_active(outcome)
+    _complete_active(store, outcome)
     return ep_dir
+
+
+def _complete_active(store: EpisodeStore, outcome: str) -> None:
+    meta, ep_dir, index_error = store.begin_finalization(outcome)
+    assert index_error is None
+    if outcome == "success":
+        meta.state = "finished"
+        store.protect_finished_video_sources(ep_dir)
+    elif outcome == "abort":
+        meta.state = "failed"
+    else:
+        meta.state = "discarded"
+    store._write_meta(ep_dir, meta)
 
 
 def _raw_meta_path(root: Path, name: str) -> Path:
@@ -228,6 +242,64 @@ def test_incomplete_episode_becomes_failed_without_removing_files(tmp_path: Path
     assert artifact.read_bytes() == b"partial"
 
 
+def test_begin_finalization_does_not_scan_episode_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = EpisodeStore(tmp_path)
+    store.start_episode(_meta("episode-fast-stop"))
+
+    def fail_size_scan(_episode_dir: Path) -> int:
+        raise AssertionError("size scan must not run before the 202 response")
+
+    monkeypatch.setattr(episode_index, "_ep_dir_size", fail_size_scan)
+    meta, _ep_dir, index_error = store.begin_finalization("success")
+
+    assert meta.state == "finalizing"
+    assert index_error is None
+
+
+def test_terminal_size_scan_runs_outside_index_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = EpisodeStore(tmp_path)
+    ep_dir = _finish(store, "episode-size-scan")
+    meta, data = read_episode_meta(ep_dir / "meta.json")
+
+    def assert_unlocked(_episode_dir: Path) -> int:
+        acquired = store.index._lock.acquire(blocking=False)
+        assert acquired
+        store.index._lock.release()
+        return 123
+
+    monkeypatch.setattr(episode_index, "_ep_dir_size", assert_unlocked)
+    store.index.upsert(data, ep_dir, refresh_size=True)
+
+    rows, _cursor = store.index.list()
+    assert meta.state == "finished"
+    assert rows[0]["size_bytes"] == 123
+
+
+def test_finalizing_episode_is_excluded_from_delete_and_retention(tmp_path: Path) -> None:
+    store = EpisodeStore(tmp_path)
+    ep_dir = store.start_episode(_meta("episode-finalizing"))
+    store.begin_finalization("success")
+
+    with pytest.raises(RuntimeError, match="state=finalizing"):
+        store.delete_episode("episode-finalizing", force=True)
+
+    runner = RetentionRunner(store)
+    result = runner.tick(policy=RetentionPolicy(
+        enabled=True,
+        max_episodes=0,
+        grace_period_s=0,
+    ))
+
+    assert result["candidates"] == []
+    assert ep_dir.exists()
+
+
 def test_tag_merge_validates_deduplicates_and_updates_index(tmp_path: Path) -> None:
     store = EpisodeStore(tmp_path)
     _finish(store, "episode-tags")
@@ -241,6 +313,19 @@ def test_tag_merge_validates_deduplicates_and_updates_index(tmp_path: Path) -> N
     assert rows[0]["tags"] == ["tag-a", "tag-b"]
     with pytest.raises(EpisodeSchemaError):
         store.merge_episode_tags("episode-tags", [" invalid"])
+
+
+def test_finalizing_episode_rejects_metadata_mutation(tmp_path: Path) -> None:
+    store = EpisodeStore(tmp_path)
+    store.start_episode(_meta("episode-finalizing-mutation"))
+    store.begin_finalization("success")
+
+    with pytest.raises(RuntimeError, match="state=finalizing"):
+        store.patch_episode_meta("episode-finalizing-mutation", {"pinned": True})
+    with pytest.raises(RuntimeError, match="state=finalizing"):
+        store.merge_episode_tags("episode-finalizing-mutation", ["tag-b"])
+    with pytest.raises(RuntimeError, match="state=finalizing"):
+        store.add_finalized_marker("episode-finalizing-mutation", {"marker_id": "m1"})
 
 
 def test_index_projection_failure_is_reported_and_startup_rebuild_repairs_it(
@@ -275,7 +360,7 @@ def test_retention_deletion_removes_index_row(tmp_path: Path) -> None:
     camera_dir = ep_dir / "videos" / "camera"
     camera_dir.mkdir()
     (camera_dir / "0000.mp4").write_bytes(b"video")
-    store.stop_active("success")
+    _complete_active(store, "success")
     runner = RetentionRunner(store)
 
     result = runner.tick(policy=RetentionPolicy(
@@ -289,7 +374,7 @@ def test_retention_deletion_removes_index_row(tmp_path: Path) -> None:
     assert store.index.total_count() == 0
 
 
-def test_delete_index_failure_is_reported_and_startup_rebuild_removes_stale_row(
+def test_delete_index_failure_retains_episode_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -301,14 +386,14 @@ def test_delete_index_failure_is_reported_and_startup_rebuild_removes_stale_row(
         raise RuntimeError("injected index failure")
 
     monkeypatch.setattr(store.index, "delete", fail_delete)
-    with pytest.raises(EpisodeIndexSyncError, match="startup index rebuild required"):
+    with pytest.raises(EpisodeIndexSyncError, match="files retained"):
         store.delete_episode("episode-delete-index-failure")
 
-    assert not ep_dir.exists()
+    assert ep_dir.exists()
     assert store.index.total_count() == 1
     monkeypatch.setattr(store.index, "delete", original_delete)
-    assert store.index.rebuild_from_filesystem() == 0
-    assert store.index.total_count() == 0
+    assert store.index.rebuild_from_filesystem() == 1
+    assert store.index.total_count() == 1
 
 
 def test_successful_video_sources_are_read_only_and_historical_scope_is_narrow(
@@ -319,13 +404,13 @@ def test_successful_video_sources_are_read_only_and_historical_scope_is_narrow(
     success_video = success_dir / "videos" / "camera" / "0000.mp4"
     success_video.parent.mkdir()
     success_video.write_bytes(b"video")
-    store.stop_active("success")
+    _complete_active(store, "success")
 
     failed_dir = store.start_episode(_meta("episode-failed"))
     failed_video = failed_dir / "videos" / "camera" / "0000.mp4"
     failed_video.parent.mkdir()
     failed_video.write_bytes(b"video")
-    store.stop_active("abort")
+    _complete_active(store, "abort")
 
     success_video.chmod(0o660)
     failed_video.chmod(0o660)

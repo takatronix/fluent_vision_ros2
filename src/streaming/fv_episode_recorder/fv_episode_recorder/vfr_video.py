@@ -144,7 +144,7 @@ class VfrMp4Writer:
             self.output_path.unlink(missing_ok=True)
 
     def _open(self) -> None:
-        self._container = av.open(str(self.output_path), mode="w", options={"movflags": "+faststart"})
+        self._container = av.open(str(self.output_path), mode="w")
         self._stream = self._container.add_stream(self.encoder.codec, rate=self.fps_nominal)
         self._stream.width = self.width
         self._stream.height = self.height

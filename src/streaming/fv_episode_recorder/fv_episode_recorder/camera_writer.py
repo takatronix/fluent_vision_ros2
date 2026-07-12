@@ -154,6 +154,12 @@ class CameraWriter:
                     failure = self._failure
                 if failure is not None:
                     raise failure
+            with self._lock:
+                failure = self._failure
+            if failure is not None:
+                raise failure
+            if self.frame_count == 0:
+                raise RuntimeError(f"[{self.name}] no camera frames were recorded")
             self._video.close()
         except Exception as exc:
             try:
@@ -176,13 +182,26 @@ class CameraWriter:
             self._failure = failure
             LOG.error("%s", failure)
 
-    def stop(self) -> dict:
+    def request_stop(self) -> None:
         with self._lock:
             self._stopped = True
+
+    def _destroy_subscription(self) -> None:
+        with self._lock:
             sub = self._sub
-            self._sub = None
         if sub is not None and self._node is not None:
             self._node.destroy_subscription(sub)
+            with self._lock:
+                if self._sub is sub:
+                    self._sub = None
+
+    def stop(self) -> dict:
+        self.request_stop()
+        cleanup_failure: Optional[Exception] = None
+        try:
+            self._destroy_subscription()
+        except Exception as exc:
+            cleanup_failure = exc
         worker = self._worker
         if worker is not None and worker.is_alive():
             while worker.is_alive():
@@ -191,17 +210,37 @@ class CameraWriter:
                     break
                 except queue.Full:
                     continue
-            worker.join(timeout=20)
-            if worker.is_alive():
-                self._set_failure(RuntimeError(f"[{self.name}] camera worker did not stop"))
+            worker.join()
         self._worker = None
         with self._lock:
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
             failure = self._failure
+        if cleanup_failure is not None:
+            if failure is not None:
+                raise RuntimeError(f"{failure}; subscription cleanup failed: {cleanup_failure}")
+            raise cleanup_failure
         if failure is not None:
             raise failure
         return self.summary()
+
+    def has_pending_cleanup(self) -> bool:
+        with self._lock:
+            worker = self._worker
+            return self._sub is not None or (worker is not None and worker.is_alive())
+
+    def abort(self, detail: str = "camera finalization aborted") -> None:
+        self.request_stop()
+        self._set_failure(RuntimeError(f"[{self.name}] {detail}"))
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._queue.put_nowait(_STOP)
+        except queue.Full:
+            pass
 
     def summary(self) -> dict:
         size_bytes = self._segment_file.stat().st_size if self._segment_file.exists() else 0
@@ -269,6 +308,8 @@ class DepthCameraWriter:
         if self._stopped:
             return
         with self._lock:
+            if self._stopped:
+                return
             recv_ns = time.time_ns()
             self._encoding_seen = msg.encoding
             # Depth conventions: 16UC1 (mm, RealSense) or mono16 (also 16-bit).
@@ -310,19 +351,40 @@ class DepthCameraWriter:
             self.frame_count += 1
             self._last_recv_ns = recv_ns
 
-    def stop(self) -> dict:
+    def request_stop(self) -> None:
         with self._lock:
             self._stopped = True
-            if self._sub is not None and self._node is not None:
-                try:
-                    self._node.destroy_subscription(self._sub)
-                except Exception:
-                    pass
-                self._sub = None
+
+    def _destroy_subscription(self) -> None:
+        with self._lock:
+            sub = self._sub
+        if sub is not None and self._node is not None:
+            self._node.destroy_subscription(sub)
+            with self._lock:
+                if self._sub is sub:
+                    self._sub = None
+
+    def stop(self) -> dict:
+        self.request_stop()
+        cleanup_failure: Optional[Exception] = None
+        try:
+            self._destroy_subscription()
+        except Exception as exc:
+            cleanup_failure = exc
+        with self._lock:
             self._sidecar.close()
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
+        if cleanup_failure is not None:
+            raise cleanup_failure
         return self.summary()
+
+    def has_pending_cleanup(self) -> bool:
+        with self._lock:
+            return self._sub is not None
+
+    def abort(self) -> None:
+        self.request_stop()
 
     def summary(self) -> dict:
         # No single segment file — depth is a PNG sequence. Surface that so
@@ -358,7 +420,7 @@ class CameraWriterPool:
         self._node = node
         self._writers: dict[str, CameraWriter | DepthCameraWriter] = {}
         # Depth cameras don't have a writer (they go into the bag) but the
-        # play modal still needs them in cameras[]. Stored here so stop_all
+        # play modal still needs them in cameras[]. Stored here so finalize_all
         # can re-emit the placeholders alongside the real writers' summaries.
         self._depth_placeholders: list[dict] = []
 
@@ -408,11 +470,9 @@ class CameraWriterPool:
         except Exception:
             for writer in self._writers.values():
                 try:
-                    writer.stop()
+                    writer.request_stop()
                 except Exception as exc:
-                    LOG.error("camera cleanup after start failure failed: %s", exc)
-            self._writers.clear()
-            self._depth_placeholders = []
+                    LOG.error("camera quiesce after start failure failed: %s", exc)
             raise
         return [w.summary() for w in self._writers.values()] + self._depth_placeholders
 
@@ -427,22 +487,56 @@ class CameraWriterPool:
             if name in counts:
                 ph["frame_count"] = int(counts[name])
 
-    def stop_all(self) -> list[dict]:
+    def request_stop(self) -> list[dict[str, str]]:
+        failures = []
+        for name, writer in list(self._writers.items()):
+            try:
+                writer.request_stop()
+            except Exception as exc:
+                failures.append({
+                    "component": f"camera:{name}",
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc),
+                })
+        return failures
+
+    def finalize_all(self) -> tuple[list[dict], list[dict[str, str]]]:
         summaries = []
-        failure = None
-        for writer in self._writers.values():
+        failures = []
+        remaining = {}
+        for name, writer in list(self._writers.items()):
             try:
                 summaries.append(writer.stop())
             except Exception as exc:
-                if failure is None:
-                    failure = exc
-        self._writers.clear()
+                summaries.append(writer.summary())
+                failures.append({
+                    "component": f"camera:{name}",
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc),
+                })
+                if writer.has_pending_cleanup():
+                    remaining[name] = writer
+        self._writers = remaining
         # Re-emit depth placeholders so meta.cameras keeps them.
         out = summaries + list(self._depth_placeholders)
         self._depth_placeholders = []
-        if failure is not None:
-            raise failure
-        return out
+        return out, failures
+
+    def abort_all(self) -> None:
+        for writer in self._writers.values():
+            writer.abort()
+
+    def cleanup_pending(self) -> None:
+        for name, writer in list(self._writers.items()):
+            try:
+                writer.stop()
+            except Exception as exc:
+                LOG.error("camera cleanup retry failed for %s: %s", name, exc)
+            if not writer.has_pending_cleanup():
+                self._writers.pop(name, None)
+
+    def has_pending_cleanup(self) -> bool:
+        return any(writer.has_pending_cleanup() for writer in self._writers.values())
 
     def is_active(self) -> bool:
         return bool(self._writers)

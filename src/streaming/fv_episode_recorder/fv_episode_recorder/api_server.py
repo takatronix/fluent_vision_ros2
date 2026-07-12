@@ -12,8 +12,10 @@ Other endpoints (markers, replay, export, disk, retention) land in later steps.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -26,6 +28,13 @@ from .replay_runner import ReplayRunner
 from .bag_recorder import BagRecorder
 from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeMeta, EpisodeStore, new_episode_id, utc_now_iso
+from .finalization import (
+    ActiveRecording,
+    FinalizationJob,
+    finalize_episode,
+    run_in_daemon,
+    wait_for_finalizers,
+)
 from .marker_manager import MarkerManager
 from .preflight import run_preflight
 from .schemas import (
@@ -62,13 +71,13 @@ async def _cors_middleware(request, handler):
 
 def build_app(
     store: EpisodeStore,
-    bag_recorder: BagRecorder,
-    camera_pool: CameraWriterPool,
+    bag_recorder_factory: Callable[[], BagRecorder],
+    camera_pool_factory: Callable[[], CameraWriterPool],
     active_lock: Optional[ActiveLock] = None,
     marker_manager: Optional[MarkerManager] = None,
     mux_tracker=None,  # MuxTracker — used to label each ep VLA vs teleop
     retention_runner=None,  # RetentionRunner — exposes plan/tick via /retention/*
-    depth_pool=None,  # DepthRepublisherPool — compress raw depth to bag
+    depth_pool_factory=None,  # callable -> DepthRepublisherPool
     get_profile=None,  # callable: name -> dict; None = no profile lookup (override only)
 ) -> web.Application:
     app = web.Application(middlewares=[_cors_middleware])
@@ -77,12 +86,15 @@ def build_app(
     app["batch_runner"] = BatchRunner()
     app["retention_runner"] = retention_runner
     app["replay_runner"] = ReplayRunner()
-    app["depth_pool"] = depth_pool
-    app["bag_recorder"] = bag_recorder
-    app["camera_pool"] = camera_pool
+    app["bag_recorder_factory"] = bag_recorder_factory
+    app["camera_pool_factory"] = camera_pool_factory
+    app["depth_pool_factory"] = depth_pool_factory
+    app["active_recording"] = None
+    app["finalization_jobs"] = {}
     app["active_lock"] = active_lock
     app["marker_manager"] = marker_manager or MarkerManager()
     app["get_profile"] = get_profile
+    app.on_cleanup.append(_shutdown_finalizers)
 
     app.router.add_get("/api/v1/healthz", _healthz)
     app.router.add_post("/api/v1/episodes", _start_episode)
@@ -126,13 +138,96 @@ def build_app(
     return app
 
 
+def _schedule_finalization(
+    app: web.Application,
+    recording: ActiveRecording,
+    outcome: str,
+    failures: list[dict[str, str]],
+) -> EpisodeMeta:
+    store: EpisodeStore = app["store"]
+    meta, ep_dir, index_error = store.begin_finalization(outcome)
+    if index_error is not None:
+        LOG.error("finalizing index projection update failed: %s", index_error)
+    app["active_recording"] = None
+
+    mux_tracker = app.get("mux_tracker")
+    controller_at_end = mux_tracker.snapshot() if mux_tracker is not None else None
+    active_lock: Optional[ActiveLock] = app.get("active_lock")
+    if active_lock is not None:
+        try:
+            active_lock.release()
+        except Exception as exc:
+            failures.append({
+                "component": "active_lock",
+                "error_type": type(exc).__name__,
+                "detail": str(exc),
+            })
+
+    job = FinalizationJob(
+        store=store,
+        meta=meta,
+        episode_dir=ep_dir,
+        bag_recorder=recording.bag_recorder,
+        camera_pool=recording.camera_pool,
+        depth_pool=recording.depth_pool,
+        marker_manager=app["marker_manager"],
+        controller_at_end=controller_at_end,
+        failures=failures,
+    )
+    task = asyncio.create_task(_run_finalizer(app, job))
+    app["finalization_jobs"][meta.episode_id] = (job, task)
+    return meta
+
+
+def _failed_start_response(
+    app: web.Application,
+    recording: ActiveRecording,
+    component: str,
+    exc: BaseException,
+) -> web.Response:
+    failures = [{
+        "component": component,
+        "error_type": type(exc).__name__,
+        "detail": str(exc),
+    }]
+    failures.extend(recording.camera_pool.request_stop())
+    if recording.depth_pool is not None:
+        try:
+            recording.depth_pool.request_stop()
+        except Exception as cleanup_exc:
+            failures.append({
+                "component": "depth",
+                "error_type": type(cleanup_exc).__name__,
+                "detail": str(cleanup_exc),
+            })
+    try:
+        recording.bag_recorder.abort()
+    except Exception as cleanup_exc:
+        failures.append({
+            "component": "bag",
+            "error_type": type(cleanup_exc).__name__,
+            "detail": str(cleanup_exc),
+        })
+    meta = _schedule_finalization(app, recording, "abort", failures)
+    return web.json_response(
+        {
+            "error": "episode_start_failed",
+            "component": component,
+            "detail": str(exc),
+            "episode_id": meta.episode_id,
+            "state": meta.state,
+        },
+        status=500,
+    )
+
+
 async def _healthz(request: web.Request) -> web.Response:
     store: EpisodeStore = request.app["store"]
-    camera_pool: CameraWriterPool = request.app["camera_pool"]
     marker_manager: MarkerManager = request.app["marker_manager"]
     payload = {"status": "ok", "active_episode": None}
     if store.active is not None:
         meta = store.active
+        recording: ActiveRecording = request.app["active_recording"]
         active_markers = [
             {
                 "marker_id": m.marker_id,
@@ -147,7 +242,7 @@ async def _healthz(request: web.Request) -> web.Response:
             "task_description": meta.task_description,
             "profile": meta.profile,
             "started_at": meta.started_at,
-            "fps_per_camera": camera_pool.frame_counts(),
+            "fps_per_camera": recording.camera_pool.frame_counts(),
             "active_markers": active_markers,
         }
     # Include batch_runner state so the dashboard's WS recorder_status
@@ -236,7 +331,10 @@ async def _start_marker(request: web.Request) -> web.Response:
         "outcome": body.get("outcome"),
         "rev": 1,
     }
-    saved = store.add_finalized_marker(episode_id, marker)
+    try:
+        saved = store.add_finalized_marker(episode_id, marker)
+    except RuntimeError as exc:
+        return web.json_response({"error": "conflict", "detail": str(exc)}, status=409)
     if saved is None:
         return web.json_response({"error": "episode_not_found"}, status=404)
     LOG.info("marker added (finalized): %s episode=%s kind=%s task=%s",
@@ -273,7 +371,10 @@ async def _patch_marker(request: web.Request) -> web.Response:
     # files. This is what the timeline-drag editor in fv_episode_ui hits when
     # editing markers on past episodes.
     store: EpisodeStore = request.app["store"]
-    updated = store.patch_finalized_marker(marker_id, body)
+    try:
+        updated = store.patch_finalized_marker(marker_id, body)
+    except RuntimeError as exc:
+        return web.json_response({"error": "conflict", "detail": str(exc)}, status=409)
     if updated is not None:
         return web.json_response(updated)
     return web.json_response({"error": "not_found"}, status=404)
@@ -286,7 +387,11 @@ async def _delete_marker(request: web.Request) -> web.Response:
         return web.json_response({"marker_id": marker_id, "deleted": True})
     # Fall back to meta.json rewrite for finalized episodes.
     store: EpisodeStore = request.app["store"]
-    if store.delete_finalized_marker(marker_id):
+    try:
+        deleted = store.delete_finalized_marker(marker_id)
+    except RuntimeError as exc:
+        return web.json_response({"error": "conflict", "detail": str(exc)}, status=409)
+    if deleted:
         return web.json_response({"marker_id": marker_id, "deleted": True})
     return web.json_response({"error": "not_found"}, status=404)
 
@@ -381,10 +486,18 @@ async def _start_episode(request: web.Request) -> web.Response:
         topic_discovery_source=discovery_source,
         controller_at_start=controller_at_start,
     )
+    recording = ActiveRecording(
+        episode_id=ep_id,
+        bag_recorder=request.app["bag_recorder_factory"](),
+        camera_pool=request.app["camera_pool_factory"](),
+        depth_pool=(request.app["depth_pool_factory"]()
+                    if callable(request.app.get("depth_pool_factory")) else None),
+    )
     try:
         ep_dir = store.start_episode(meta)
     except RuntimeError as exc:
         return web.json_response({"error": "conflict", "detail": str(exc)}, status=409)
+    request.app["active_recording"] = recording
 
     # Step 6: acquire active lock
     active_lock: Optional[ActiveLock] = request.app.get("active_lock")
@@ -398,7 +511,7 @@ async def _start_episode(request: web.Request) -> web.Response:
     # topics have publishers before rosbag2 subscribes. Each depth camera
     # gets an in-process Image → CompressedImage relay (PNG-compressed,
     # lossless). Fail-loud: a republisher spawn failure aborts the episode.
-    depth_pool = request.app.get("depth_pool")
+    depth_pool = recording.depth_pool
     depth_cams = [c for c in cameras_resolved
                   if isinstance(c, dict) and (c.get("kind") or "").lower() == "depth"]
     if depth_cams and depth_pool is not None:
@@ -406,29 +519,28 @@ async def _start_episode(request: web.Request) -> web.Response:
             depth_pool.start_all(depth_cams)
         except Exception as exc:
             LOG.error("depth republisher start failed: %s", exc)
-            return web.json_response(
-                {"error": "depth_republisher_failed", "detail": str(exc)},
-                status=500,
-            )
+            return _failed_start_response(request.app, recording, "depth", exc)
 
     # Step 2: start bag recorder if topics provided and record_bag=true
-    bag_recorder: BagRecorder = request.app["bag_recorder"]
+    bag_recorder = recording.bag_recorder
     bag_started = False
     if req.record_bag and bag_topics:
         if not BagRecorder.available():
-            LOG.warning("ros2 not available, skipping bag record")
+            exc = RuntimeError("ros2 CLI is unavailable")
+            LOG.error("bag recorder start failed: %s", exc)
+            return _failed_start_response(request.app, recording, "bag", exc)
         else:
             try:
                 bag_recorder.start(ep_dir / "bag", bag_topics)
                 bag_started = True
             except Exception as exc:
                 LOG.error("bag recorder start failed: %s", exc)
-                # Don't fail the whole episode; record meta and continue.
+                return _failed_start_response(request.app, recording, "bag", exc)
 
     # Step 3+4: start camera writers (resolved from override or profile).
     # kind=depth entries are skipped here — they're bagged via the
     # republisher, not written to disk as a separate mp4/png stream.
-    camera_pool: CameraWriterPool = request.app["camera_pool"]
+    camera_pool = recording.camera_pool
     cameras_started: list[dict] = []
     if cameras_resolved:
         try:
@@ -437,6 +549,7 @@ async def _start_episode(request: web.Request) -> web.Response:
             store._write_meta(ep_dir, meta)  # noqa: SLF001
         except Exception as exc:
             LOG.error("camera_pool start failed: %s", exc)
+            return _failed_start_response(request.app, recording, "camera", exc)
 
     resp = StartEpisodeResponse(
         episode_id=ep_id,
@@ -470,88 +583,110 @@ async def _stop_episode(request: web.Request) -> web.Response:
             status=409,
         )
 
-    # Step 2: stop bag recorder first so metadata.yaml is flushed before meta write
-    bag_recorder: BagRecorder = request.app["bag_recorder"]
-    bag_summary: dict = {"size_bytes": 0, "split_count": 0}
-    if bag_recorder.active:
-        bag_summary = bag_recorder.stop(timeout_s=10.0)
-    elif req.outcome == "discard":
-        bag_recorder.abort()
+    recording: ActiveRecording = request.app["active_recording"]
+    failures: list[dict[str, str]] = []
+    failures.extend(recording.camera_pool.request_stop())
 
-    # Step 2b: stop depth republishers AFTER bag (so any in-flight compressed
-    # frames make it into the bag's final flush). The republisher pool
-    # returns per-camera frame counts which we hand to camera_pool so the
-    # depth placeholder summaries carry a real frame_count (without this
-    # the play modal shows '0 frames' even though the bag has them).
-    depth_pool = request.app.get("depth_pool")
     depth_frame_counts: dict[str, int] = {}
-    if depth_pool is not None:
+    quiesce_failed = False
+    if recording.depth_pool is not None:
         try:
-            depth_frame_counts = depth_pool.stop_all() or {}
+            depth_frame_counts = recording.depth_pool.request_stop() or {}
         except Exception as exc:
-            LOG.warning("depth republisher stop failed: %s", exc)
-    camera_pool: CameraWriterPool = request.app["camera_pool"]
+            quiesce_failed = True
+            failures.append({
+                "component": "depth",
+                "error_type": type(exc).__name__,
+                "detail": str(exc),
+            })
     if depth_frame_counts:
         try:
-            camera_pool.apply_depth_frame_counts(depth_frame_counts)
+            recording.camera_pool.apply_depth_frame_counts(depth_frame_counts)
         except Exception as exc:
-            LOG.warning("depth frame_count apply failed: %s", exc)
+            failures.append({
+                "component": "depth_metadata",
+                "error_type": type(exc).__name__,
+                "detail": str(exc),
+            })
 
-    # Step 3: stop camera writers, gather frame_count summaries. Called
-    # unconditionally because depth_bag placeholders also need to flush —
-    # a depth-only episode has no mp4 writers so is_active() is False but
-    # the placeholders must still come out for the play modal.
-    camera_summaries: list[dict] = camera_pool.stop_all()
-    frame_count_per_camera: dict[str, int] = {}
-    video_size_bytes = 0
-    for cs in camera_summaries:
-        frame_count_per_camera[cs["name"]] = cs["frame_count"]
-        for seg in cs.get("segments", []):
-            video_size_bytes += int(seg.get("size_bytes", 0))
-
-    # Flush markers (Phase 2) from in-memory manager into meta.json
-    mm: MarkerManager = request.app["marker_manager"]
-    pending_markers = mm.flush(episode_id)
-
-    meta, ep_dir = store.stop_active(req.outcome)
-    # Update meta with bag size + split_count + camera summaries + markers
-    meta.bag_split_count = int(bag_summary.get("split_count", 0))
-    if camera_summaries:
-        meta.cameras = camera_summaries
-    if pending_markers:
-        meta.markers = pending_markers
-    # Snapshot mux state at stop — used by the UI to tell operator-after-
-    # the-fact whether THIS run was VLA (with which controller) or teleop.
-    mux_tracker = request.app.get("mux_tracker")
-    if mux_tracker is not None:
-        meta.controller_at_end = mux_tracker.snapshot()
-    store._write_meta(ep_dir, meta)  # noqa: SLF001 — local helper, store is single owner
-
-    # If discard, blow away the dir entirely
-    if req.outcome == "discard":
-        store.delete_episode(episode_id)
-        LOG.info("episode discarded and dir removed: %s", episode_id)
-
-    # Step 6: release active lock
-    active_lock: Optional[ActiveLock] = request.app.get("active_lock")
-    if active_lock is not None:
-        active_lock.release()
+    try:
+        recording.bag_recorder.request_stop()
+    except Exception as exc:
+        quiesce_failed = True
+        failures.append({
+            "component": "bag",
+            "error_type": type(exc).__name__,
+            "detail": str(exc),
+        })
+    outcome = "abort" if quiesce_failed else req.outcome
+    meta = _schedule_finalization(request.app, recording, outcome, failures)
 
     resp = StopEpisodeResponse(
         episode_id=meta.episode_id,
         state=meta.state,
-        duration_s=meta.duration_s or 0.0,
-        frame_count_per_camera=frame_count_per_camera,
-        bag_size_bytes=int(bag_summary.get("size_bytes", 0)),
-        video_size_bytes=video_size_bytes,
-        manifest_pending=True,
+        finalization_pending=True,
     )
-    LOG.info(
-        "episode stopped: %s outcome=%s duration=%.1fs bag=%d video=%d frames=%s",
-        episode_id, req.outcome, resp.duration_s,
-        resp.bag_size_bytes, resp.video_size_bytes, frame_count_per_camera,
-    )
-    return web.json_response(resp.model_dump(), status=200)
+    if quiesce_failed:
+        LOG.error("episode quiesce failed; abort finalization accepted: %s", episode_id)
+        return web.json_response(
+            {
+                "error": "quiesce_failed",
+                "episode_id": meta.episode_id,
+                "state": meta.state,
+                "finalization_pending": True,
+                "failures": failures,
+            },
+            status=500,
+        )
+    LOG.info("episode finalization accepted: %s outcome=%s", episode_id, req.outcome)
+    return web.json_response(resp.model_dump(), status=202)
+
+
+async def _run_finalizer(app: web.Application, job: FinalizationJob) -> None:
+    def run() -> None:
+        try:
+            finalize_episode(job)
+        except Exception as exc:
+            LOG.exception("episode finalizer failed: %s", job.meta.episode_id)
+            job.fail_terminal("finalizer", exc)
+
+    try:
+        await run_in_daemon(run)
+    finally:
+        current = app["finalization_jobs"].get(job.meta.episode_id)
+        if (
+            current is not None
+            and current[0] is job
+            and not job.has_pending_cleanup()
+        ):
+            app["finalization_jobs"].pop(job.meta.episode_id, None)
+
+
+async def _wait_for_finalizers(app: web.Application, timeout_s: float) -> set[str]:
+    return await wait_for_finalizers(list(app["finalization_jobs"].values()), timeout_s)
+
+
+async def _shutdown_finalizers(app: web.Application) -> None:
+    timed_out_ids = await _wait_for_finalizers(app, timeout_s=20.0)
+    retained_jobs = [
+        job
+        for job, task in app["finalization_jobs"].values()
+        if (
+            job.meta.episode_id not in timed_out_ids
+            and task.done()
+            and job.has_pending_cleanup()
+        )
+    ]
+    cleanup_tasks = [
+        asyncio.create_task(run_in_daemon(job.cleanup_pending_resources))
+        for job in retained_jobs
+        if job.has_pending_cleanup()
+    ]
+    if cleanup_tasks:
+        _, pending = await asyncio.wait(cleanup_tasks, timeout=5.0)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
 
 async def _list_episodes(request: web.Request) -> web.Response:
@@ -1423,7 +1558,10 @@ async def _patch_episode(request: web.Request) -> web.Response:
             status=400,
         )
     store: EpisodeStore = request.app["store"]
-    updated = store.patch_episode_meta(episode_id, body)
+    try:
+        updated = store.patch_episode_meta(episode_id, body)
+    except RuntimeError as exc:
+        return web.json_response({"error": "conflict", "detail": str(exc)}, status=409)
     if updated is None:
         return web.json_response({"error": "not_found"}, status=404)
     return web.json_response(updated)
@@ -1436,7 +1574,10 @@ async def _merge_episode_tags(request: web.Request) -> web.Response:
     except Exception as exc:
         return web.json_response({"error": "invalid_request", "detail": str(exc)}, status=400)
     store: EpisodeStore = request.app["store"]
-    updated = store.merge_episode_tags(episode_id, req.tags)
+    try:
+        updated = store.merge_episode_tags(episode_id, req.tags)
+    except RuntimeError as exc:
+        return web.json_response({"error": "conflict", "detail": str(exc)}, status=409)
     if updated is None:
         return web.json_response({"error": "not_found"}, status=404)
     return web.json_response(updated)

@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional, Self
+from typing import Literal, Optional
 
 from pydantic import (
     BaseModel,
@@ -156,6 +156,7 @@ class EpisodeMeta:
     #                          "enabled": bool}}
     controller_at_start: Optional[dict[str, JsonObject]] = None
     controller_at_end: Optional[dict[str, JsonObject]] = None
+    finalization_failures: list[dict[str, str]] = field(default_factory=list)
 
 
 class _StrictMetaModel(BaseModel):
@@ -230,9 +231,10 @@ class EpisodeMetaV2(_StrictMetaModel):
     trim_end_s: Optional[Number] = None
     controller_at_start: Optional[dict[StrictStr, JsonObject]] = None
     controller_at_end: Optional[dict[StrictStr, JsonObject]] = None
+    finalization_failures: list[dict[StrictStr, StrictStr]] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_contract(self) -> Self:
+    def validate_contract(self) -> EpisodeMetaV2:
         if not self.episode_id or not self.task_description or not self.profile or not self.started_at:
             raise ValueError("episode_id, task_description, profile, and started_at must be non-empty")
         if normalize_episode_tags(list(self.tags)) != self.tags:
@@ -396,8 +398,11 @@ class EpisodeStore:
             self._write_meta(ep_dir, meta)
             return ep_dir
 
-    def stop_active(self, outcome: str) -> tuple[EpisodeMeta, Path]:
-        """Finalize active episode. Returns (meta, dir)."""
+    def begin_finalization(
+        self,
+        outcome: str,
+    ) -> tuple[EpisodeMeta, Path, Optional[EpisodeIndexSyncError]]:
+        """Persist finalizing state, then release the active episode slot."""
         with self._lock:
             if self._active_episode is None:
                 raise RuntimeError("no active episode")
@@ -412,18 +417,20 @@ class EpisodeStore:
                 meta.stopped_at, "%Y-%m-%dT%H:%M:%S.%fZ"
             ).replace(tzinfo=timezone.utc)
             meta.duration_s = (stopped - started).total_seconds()
-            if outcome == "discard":
-                meta.state = "discarded"
-            elif outcome == "abort":
-                meta.state = "failed"
-            else:
-                meta.state = "finished"
-            self._write_meta(ep_dir, meta)
-            if meta.state == "finished" and meta.outcome == "success":
-                self.protect_finished_video_sources(ep_dir)
+            meta.state = "finalizing"
+            data = asdict(meta)
+            _write_meta_file(ep_dir / "meta.json", data)
+            index_error = None
+            try:
+                self.index.upsert(data, ep_dir)
+            except Exception as exc:
+                index_error = EpisodeIndexSyncError(
+                    f"finalizing metadata committed for {meta.episode_id}; "
+                    f"startup index rebuild required: {exc}"
+                )
             self._active_episode = None
             self._active_dir = None
-            return meta, ep_dir
+            return meta, ep_dir, index_error
 
     # ---- list / get ----
 
@@ -484,7 +491,9 @@ class EpisodeStore:
         found = self.get_episode(episode_id)
         if found is None:
             return None
-        _meta, ep_dir = found
+        meta, ep_dir = found
+        if meta.state in ("recording", "finalizing"):
+            raise RuntimeError(f"cannot update episode while state={meta.state}")
         meta_path = ep_dir / "meta.json"
         _meta, data = read_episode_meta(meta_path)
         for k, v in (changes or {}).items():
@@ -501,7 +510,9 @@ class EpisodeStore:
             found = self.get_episode(episode_id)
             if found is None:
                 return None
-            _meta, ep_dir = found
+            meta, ep_dir = found
+            if meta.state in ("recording", "finalizing"):
+                raise RuntimeError(f"cannot update episode while state={meta.state}")
             _stored_meta, data = read_episode_meta(ep_dir / "meta.json")
             data["tags"] = normalize_episode_tags([*data["tags"], *requested])
             self._write_meta_data(ep_dir, data)
@@ -517,7 +528,9 @@ class EpisodeStore:
         found = self.get_episode(episode_id)
         if found is None:
             return None
-        _meta, ep_dir = found
+        meta, ep_dir = found
+        if meta.state in ("recording", "finalizing"):
+            raise RuntimeError(f"cannot update episode while state={meta.state}")
         meta_path = ep_dir / "meta.json"
         _meta, data = read_episode_meta(meta_path)
         markers = data.setdefault("markers", [])
@@ -531,10 +544,12 @@ class EpisodeStore:
         if not episodes_root.exists():
             return False
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
-            _meta, data = read_episode_meta(meta_path)
+            meta, data = read_episode_meta(meta_path)
             markers = data.get("markers", []) or []
             new_markers = [m for m in markers if m.get("marker_id") != marker_id]
             if len(new_markers) != len(markers):
+                if meta.state in ("recording", "finalizing"):
+                    raise RuntimeError(f"cannot update episode while state={meta.state}")
                 data["markers"] = new_markers
                 self._write_meta_data(meta_path.parent, data)
                 return True
@@ -554,11 +569,13 @@ class EpisodeStore:
         if not episodes_root.exists():
             return None
         for meta_path in episodes_root.glob("*/*/*/meta.json"):
-            _meta, data = read_episode_meta(meta_path)
+            meta, data = read_episode_meta(meta_path)
             markers = data.get("markers", []) or []
             for m in markers:
                 if m.get("marker_id") != marker_id:
                     continue
+                if meta.state in ("recording", "finalizing"):
+                    raise RuntimeError(f"cannot update episode while state={meta.state}")
                 for k, v in (changes or {}).items():
                     if k in allowed and v is not None:
                         m[k] = v
@@ -576,16 +593,39 @@ class EpisodeStore:
         meta, ep_dir = found
         if meta.pinned and not force:
             raise PermissionError("episode is pinned; use force=true")
-        if self._active_episode is not None and self._active_episode.episode_id == episode_id:
-            raise RuntimeError("cannot delete the active recording episode")
+        if meta.state in ("recording", "finalizing"):
+            raise RuntimeError(f"cannot delete episode while state={meta.state}")
+        return self._delete_episode(episode_id, ep_dir)
+
+    def discard_finalizing_episode(self, episode_id: str) -> bool:
+        found = self.get_episode(episode_id)
+        if found is None:
+            return False
+        meta, ep_dir = found
+        if meta.state != "finalizing" or meta.outcome != "discard":
+            raise RuntimeError("only a finalizing discard episode can use this operation")
+        return self._delete_episode(episode_id, ep_dir)
+
+    def _delete_episode(self, episode_id: str, ep_dir: Path) -> bool:
         import shutil
-        shutil.rmtree(ep_dir, ignore_errors=False)
         try:
             self.index.delete(episode_id)
         except Exception as exc:
             raise EpisodeIndexSyncError(
-                f"episode files deleted for {episode_id}; startup index rebuild required"
+                f"episode files retained for {episode_id}; index deletion failed"
             ) from exc
+        try:
+            shutil.rmtree(ep_dir, ignore_errors=False)
+        except Exception:
+            try:
+                _meta, data = read_episode_meta(ep_dir / "meta.json")
+                self.index.upsert(data, ep_dir, refresh_size=True)
+            except Exception as repair_exc:
+                raise EpisodeIndexSyncError(
+                    f"episode deletion incomplete for {episode_id}; "
+                    "startup index rebuild required"
+                ) from repair_exc
+            raise
         return True
 
     def get_episode(self, episode_id: str) -> Optional[tuple[EpisodeMeta, Path]]:
@@ -698,17 +738,27 @@ class EpisodeStore:
         folder_name = f"{hhmmss}_{slug}_{suffix}"
         return self.output_dir / "episodes" / meta.profile / date_str / folder_name
 
-    def _write_meta(self, ep_dir: Path, meta: EpisodeMeta) -> None:
+    def _write_meta(
+        self,
+        ep_dir: Path,
+        meta: EpisodeMeta,
+        refresh_size: bool = False,
+    ) -> None:
         data = asdict(meta)
-        self._write_meta_data(ep_dir, data)
+        self._write_meta_data(ep_dir, data, refresh_size=refresh_size)
 
-    def _write_meta_data(self, ep_dir: Path, data: JsonObject) -> None:
+    def _write_meta_data(
+        self,
+        ep_dir: Path,
+        data: JsonObject,
+        refresh_size: bool = False,
+    ) -> None:
         _write_meta_file(ep_dir / "meta.json", data)
         # meta.json is authoritative and cannot be rolled back after rename.
         # A failed index projection is reported; recorder startup rebuilds the
         # complete disposable index from metadata before serving requests.
         try:
-            self.index.upsert(data, ep_dir)
+            self.index.upsert(data, ep_dir, refresh_size=refresh_size)
         except Exception as exc:
             raise EpisodeIndexSyncError(
                 f"meta.json committed for {data['episode_id']}; startup index rebuild required"

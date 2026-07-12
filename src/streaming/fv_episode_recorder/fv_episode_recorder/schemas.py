@@ -52,11 +52,7 @@ class StopEpisodeRequest(BaseModel):
 class StopEpisodeResponse(BaseModel):
     episode_id: str
     state: str
-    duration_s: float
-    frame_count_per_camera: dict[str, int] = Field(default_factory=dict)
-    bag_size_bytes: int = 0
-    video_size_bytes: int = 0
-    manifest_pending: bool = True
+    finalization_pending: bool = True
 
 
 class MergeEpisodeTagsRequest(BaseModel):

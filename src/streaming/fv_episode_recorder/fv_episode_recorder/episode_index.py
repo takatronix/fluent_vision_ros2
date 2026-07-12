@@ -182,7 +182,7 @@ class EpisodeIndex:
             try:
                 self._conn.execute("DELETE FROM episodes")
                 for data, ep_dir in records:
-                    self._insert_row_locked(data, ep_dir)
+                    self._insert_row_locked(data, ep_dir, _ep_dir_size(ep_dir))
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
@@ -195,13 +195,19 @@ class EpisodeIndex:
 
     # ---- mutators (called by EpisodeStore after meta.json writes) ----
 
-    def upsert(self, meta_dict: dict, ep_dir: Path) -> None:
+    def upsert(
+        self,
+        meta_dict: dict,
+        ep_dir: Path,
+        refresh_size: bool = False,
+    ) -> None:
         from .episode_store import DuplicateEpisodeIdError, validate_episode_meta
 
         validate_episode_meta(meta_dict)
+        refreshed_size = _ep_dir_size(ep_dir) if refresh_size else None
         with self._lock:
             existing = self._conn.execute(
-                "SELECT ep_dir FROM episodes WHERE episode_id = ?",
+                "SELECT ep_dir, size_bytes FROM episodes WHERE episode_id = ?",
                 (meta_dict.get("episode_id"),),
             ).fetchone()
             if (existing is not None
@@ -210,9 +216,15 @@ class EpisodeIndex:
                     f"duplicate episode ID {meta_dict.get('episode_id')}: "
                     f"{existing['ep_dir']} and {ep_dir}"
                 )
-            self._insert_row_locked(meta_dict, ep_dir)
+            if refreshed_size is not None:
+                size_bytes = refreshed_size
+            elif existing is not None:
+                size_bytes = int(existing["size_bytes"])
+            else:
+                size_bytes = 0
+            self._insert_row_locked(meta_dict, ep_dir, size_bytes)
 
-    def _insert_row_locked(self, data: dict, ep_dir: Path) -> None:
+    def _insert_row_locked(self, data: dict, ep_dir: Path, size_bytes: int) -> None:
         episode_id = data.get("episode_id") or ""
         if not episode_id:
             raise ValueError("episode_id is required for index rows")
@@ -222,7 +234,6 @@ class EpisodeIndex:
         tags = data.get("tags") or []
         markers = data.get("markers") or []
         profile = data.get("profile") or ""
-        size = _ep_dir_size(ep_dir)
         controller_snap = data.get("controller_at_end") or data.get("controller_at_start")
         self._conn.execute(
             """
@@ -265,7 +276,7 @@ class EpisodeIndex:
                 data.get("duration_s"),
                 data.get("outcome"),
                 1 if data.get("pinned") else 0,
-                size,
+                size_bytes,
                 len(markers),
                 json.dumps(tags, ensure_ascii=False),
                 data.get("source") or "local",

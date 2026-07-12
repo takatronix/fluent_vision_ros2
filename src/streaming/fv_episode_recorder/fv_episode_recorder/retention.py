@@ -124,10 +124,10 @@ class RetentionPlanner:
         if not policy.enabled:
             return []
         all_eps = self._list_all()
-        # Drop pinned + active.
-        active_id = self.store.active.episode_id if self.store.active else None
+        # Only terminal episodes are eligible. Finalizing episodes no longer
+        # occupy the active slot but still own writers flushing into ep_dir.
         unpinned = [(m, d, s) for m, d, s in all_eps
-                    if not m.pinned and m.episode_id != active_id]
+                    if not m.pinned and m.state in ("finished", "failed", "discarded")]
 
         marks: dict[str, list[str]] = {}   # episode_id -> reasons
 

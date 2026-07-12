@@ -14,7 +14,7 @@ from fv_episode_recorder.vfr_video import (
 
 
 def _jpeg(value: int) -> bytes:
-    image = np.full((48, 64, 3), value, dtype=np.uint8)
+    image = np.full((480, 640, 3), value, dtype=np.uint8)
     ok, encoded = cv2.imencode(".jpg", image)
     assert ok
     return encoded.tobytes()

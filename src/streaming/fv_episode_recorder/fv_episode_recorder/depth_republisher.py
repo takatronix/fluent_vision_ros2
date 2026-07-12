@@ -47,6 +47,7 @@ class _DepthRepublisher:
     pub: object = None
     _frame_count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _stopped: bool = False
 
     @property
     def compressed_topic(self) -> str:
@@ -63,21 +64,48 @@ class _DepthRepublisher:
         )
         LOG.info("depth republish: %s → %s", self.raw_topic, self.compressed_topic)
 
-    def stop(self) -> None:
+    def request_stop(self) -> int:
         with self._lock:
-            if self.sub is not None:
-                try: self.node.destroy_subscription(self.sub)
-                except Exception: pass
-                self.sub = None
-            if self.pub is not None:
-                try: self.node.destroy_publisher(self.pub)
-                except Exception: pass
-                self.pub = None
-            LOG.info("depth republish stopped: %s (frames=%d)", self.raw_topic, self._frame_count)
+            self._stopped = True
+            return self._frame_count
+
+    def stop(self) -> None:
+        self.request_stop()
+        failures: list[str] = []
+        with self._lock:
+            sub = self.sub
+            pub = self.pub
+        if sub is not None:
+            try:
+                self.node.destroy_subscription(sub)
+            except Exception as exc:
+                failures.append(f"subscription: {exc}")
+            else:
+                with self._lock:
+                    if self.sub is sub:
+                        self.sub = None
+        if pub is not None:
+            try:
+                self.node.destroy_publisher(pub)
+            except Exception as exc:
+                failures.append(f"publisher: {exc}")
+            else:
+                with self._lock:
+                    if self.pub is pub:
+                        self.pub = None
+        with self._lock:
+            frame_count = self._frame_count
+        LOG.info("depth republish stopped: %s (frames=%d)", self.raw_topic, frame_count)
+        if failures:
+            raise RuntimeError(
+                f"depth republisher stop failed for {self.raw_topic}: "
+                + "; ".join(failures)
+            )
 
     def _on_image(self, msg: Image) -> None:
-        if self.pub is None:
-            return
+        with self._lock:
+            if self._stopped or self.pub is None:
+                return
         try:
             if msg.encoding in ("16UC1", "mono16"):
                 arr = np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(msg.height, msg.width)
@@ -97,8 +125,10 @@ class _DepthRepublisher:
         out.format = "16UC1; compressedDepth png"
         out.data = _CONFIG_HEADER + png.tobytes()
         try:
-            self.pub.publish(out)
             with self._lock:
+                if self._stopped or self.pub is None:
+                    return
+                self.pub.publish(out)
                 self._frame_count += 1
         except Exception as exc:
             LOG.warning("depth republish publish failed (%s): %s", self.raw_topic, exc)
@@ -130,6 +160,10 @@ class DepthRepublisherPool:
             })
         return out
 
+    def request_stop(self) -> dict[str, int]:
+        """Stop accepting depth frames without destroying ROS entities."""
+        return {republisher.name: republisher.request_stop() for republisher in self._pubs}
+
     def stop_all(self) -> dict[str, int]:
         """Tear down all republishers and return the per-camera frame count
         (republisher's internal counter, sampled before destruction so the
@@ -137,14 +171,19 @@ class DepthRepublisherPool:
         Without this the play modal sees frame_count=0 and renders the
         '0 frames' empty-state even though the bag has the frames."""
         counts: dict[str, int] = {}
+        failures: list[str] = []
+        remaining: list[_DepthRepublisher] = []
         for r in self._pubs:
-            try:
-                counts[r.name] = int(getattr(r, "_frame_count", 0))
-            except Exception:
-                counts[r.name] = 0
+            counts[r.name] = r._frame_count
             try:
                 r.stop()
             except Exception as exc:
-                LOG.warning("republisher stop failed for %s: %s", r.raw_topic, exc)
-        self._pubs = []
+                failures.append(str(exc))
+                remaining.append(r)
+        self._pubs = remaining
+        if failures:
+            raise RuntimeError("; ".join(failures))
         return counts
+
+    def has_pending_cleanup(self) -> bool:
+        return bool(self._pubs)

@@ -78,12 +78,6 @@ class FVEpisodeRecorderNode(Node):
         self.store.index.rebuild_from_filesystem()
         failed_incomplete = self.store.fail_incomplete_episodes()
         self.store.migrate_finished_video_permissions()
-        self.bag_recorder = BagRecorder(max_bag_size_mb=1024)
-        self.camera_pool = CameraWriterPool(node=self)
-        # Depth republisher: compresses raw 16UC1 → CompressedImage (png) so
-        # the bag stores depth at ~5-10× smaller size losslessly. Lifecycle
-        # bound to the active episode (start_all / stop_all).
-        self.depth_pool = DepthRepublisherPool(node=self)
         self.marker_manager = MarkerManager()
         # Track mux source (teleop vs VLA + controller name) so the play
         # modal can label each recording without having to decode the bag.
@@ -186,12 +180,17 @@ def main(args=None):
     # aiohttp loop in main thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = build_app(node.store, node.bag_recorder, node.camera_pool,
+    # Per-episode depth republisher instances compress raw 16UC1 →
+    # CompressedImage (png) so each background finalizer only tears down the
+    # publishers owned by its episode.
+    app = build_app(node.store,
+                    bag_recorder_factory=lambda: BagRecorder(max_bag_size_mb=1024),
+                    camera_pool_factory=lambda: CameraWriterPool(node=node),
                     active_lock=node.active_lock,
                     marker_manager=node.marker_manager,
                     mux_tracker=node.mux_tracker,
                     retention_runner=node.retention_runner,
-                    depth_pool=node.depth_pool,
+                    depth_pool_factory=lambda: DepthRepublisherPool(node=node),
                     get_profile=node.get_profile)
     # First mux discovery sweep happens on the 2s timer; trigger one now so
     # the very first POST /episodes already has a snapshot if publishers

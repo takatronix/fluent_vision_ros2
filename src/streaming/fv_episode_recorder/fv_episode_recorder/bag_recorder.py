@@ -30,12 +30,17 @@ class BagRecorder:
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self._bag_dir: Optional[Path] = None
         self._topics: list[str] = []
+        self._stop_requested = False
         self.max_bag_size_mb = max_bag_size_mb
         self.storage = storage  # "sqlite3" (rosbag2 default on Humble)
 
     @property
     def active(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def started(self) -> bool:
+        return self._proc is not None
 
     def start(self, bag_dir: Path, topics: list[str]) -> None:
         if self.active:
@@ -73,15 +78,12 @@ class BagRecorder:
         )
         self._bag_dir = bag_dir
         self._topics = topics
+        self._stop_requested = False
 
-    def stop(self, timeout_s: float = 10.0) -> dict:
-        """Stop the bag recorder gracefully (SIGINT) so metadata.yaml is finalized.
-
-        Returns summary dict with bag_dir / size_bytes / split_count.
-        """
-        if not self.active:
-            return self._summary()
-
+    def request_stop(self) -> None:
+        """Request a graceful stop without waiting for rosbag to flush."""
+        if self._stop_requested or not self.active:
+            return
         assert self._proc is not None
         # Send SIGINT to the whole process group so rosbag2 flushes metadata.
         try:
@@ -91,10 +93,20 @@ class BagRecorder:
                 self._proc.send_signal(signal.SIGINT)
         except ProcessLookupError:
             pass
+        self._stop_requested = True
+
+    def stop(self, timeout_s: float = 10.0) -> dict:
+        """Wait for a requested stop and return the finalized bag summary."""
+        if self._proc is None:
+            return self._summary()
+
+        self.request_stop()
+        forced = False
 
         try:
             self._proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
+            forced = True
             LOG.warning("bag recorder did not exit on SIGINT within %.1fs, sending SIGTERM", timeout_s)
             self._proc.terminate()
             try:
@@ -104,7 +116,14 @@ class BagRecorder:
                 self._proc.kill()
                 self._proc.wait(timeout=3.0)
 
-        return self._summary()
+        summary = self._summary()
+        if forced:
+            raise RuntimeError("rosbag flush timed out and required termination")
+        if self._proc.returncode not in (0, 130, None):
+            raise RuntimeError(f"rosbag exited with status {self._proc.returncode}")
+        if self._bag_dir is not None and not (self._bag_dir / "metadata.yaml").exists():
+            raise RuntimeError("rosbag metadata.yaml was not finalized")
+        return summary
 
     def _summary(self) -> dict:
         bag_dir = self._bag_dir
@@ -122,7 +141,7 @@ class BagRecorder:
         return {"bag_dir": str(bag_dir), "size_bytes": size, "split_count": splits, "topics": self._topics}
 
     def abort(self) -> None:
-        """Kill without waiting — for crash recovery / discard paths."""
+        """Kill the recorder and wait until it can no longer write the bag."""
         if self.active:
             try:
                 if hasattr(os, "killpg"):
@@ -131,6 +150,10 @@ class BagRecorder:
                     self._proc.kill()
             except ProcessLookupError:
                 pass
+            try:
+                self._proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("bag recorder did not exit after SIGKILL") from exc
 
     @staticmethod
     def available() -> bool:

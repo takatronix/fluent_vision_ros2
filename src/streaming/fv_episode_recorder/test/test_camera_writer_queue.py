@@ -1,5 +1,6 @@
 import importlib
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -169,3 +170,97 @@ def test_encoder_probe_precedes_every_subscription(monkeypatch: pytest.MonkeyPat
     )
 
     assert events == ["probe", "subscribe:left", "subscribe:right"]
+
+
+def test_stop_drains_worker_queue_before_returning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    module = _camera_writer_module(monkeypatch)
+
+    class Video:
+        width = 640
+        height = 480
+
+        def append(self, _data, _ros_stamp_ns):
+            return types.SimpleNamespace(video_pts=1)
+
+        def close(self):
+            pass
+
+        def abort(self):
+            pass
+
+    monkeypatch.setattr(module, "VfrMp4Writer", lambda *_args: Video())
+    writer = module.CameraWriter(
+        "color", "/camera", tmp_path, encoder=module.EncoderConfig("test", ()),
+    )
+    writer._worker = threading.Thread(target=writer._run_worker, daemon=True)
+    writer._worker.start()
+    writer._on_image(_message(1_000_000_000))
+
+    summary = writer.stop()
+
+    assert summary["frame_count"] == 1
+    assert writer._worker is None
+
+
+def test_empty_camera_worker_fails_episode_finalization(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    module = _camera_writer_module(monkeypatch)
+
+    class Video:
+        def close(self):
+            pass
+
+        def abort(self):
+            pass
+
+    monkeypatch.setattr(module, "VfrMp4Writer", lambda *_args: Video())
+    writer = module.CameraWriter(
+        "color", "/camera", tmp_path, encoder=module.EncoderConfig("test", ()),
+    )
+    writer._worker = threading.Thread(target=writer._run_worker, daemon=True)
+    writer._worker.start()
+
+    with pytest.raises(RuntimeError, match="no camera frames were recorded"):
+        writer.stop()
+
+
+def test_subscription_destroy_failure_keeps_cleanup_ownership(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    module = _camera_writer_module(monkeypatch)
+
+    class Video:
+        width = 640
+        height = 480
+
+        def append(self, _data, _ros_stamp_ns):
+            return types.SimpleNamespace(video_pts=1)
+
+        def close(self):
+            pass
+
+        def abort(self):
+            pass
+
+    class Node:
+        def destroy_subscription(self, _sub):
+            raise RuntimeError("destroy failed")
+
+    monkeypatch.setattr(module, "VfrMp4Writer", lambda *_args: Video())
+    writer = module.CameraWriter(
+        "color", "/camera", tmp_path, node=Node(),
+        encoder=module.EncoderConfig("test", ()),
+    )
+    writer._sub = object()
+    writer._worker = threading.Thread(target=writer._run_worker, daemon=True)
+    writer._worker.start()
+    writer._on_image(_message(1_000_000_000))
+
+    with pytest.raises(RuntimeError, match="destroy failed"):
+        writer.stop()
+
+    assert writer._worker is None
+    assert writer.has_pending_cleanup()
