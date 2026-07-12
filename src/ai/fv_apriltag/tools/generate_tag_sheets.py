@@ -89,8 +89,8 @@ def make_sheet(entries: List[Tuple[int, str]], tag_mm: float,
 
 
 FACE_NAMES = ('top', 'front', 'right', 'back', 'left', 'bottom')
-CUBE_BASE_IDS = {'60A': 1, '60B': 7, '60C': 13,
-                 '100A': 21, '100B': 27, '100C': 33}
+CUBE_BASE_IDS = {'60A': 300, '60B': 306, '60C': 312,
+                 '100A': 320, '100B': 326, '100C': 332}
 
 
 def cube_entries(*cubes: str) -> List[Tuple[int, str]]:
@@ -119,30 +119,34 @@ def main() -> int:
         ck = Path(args.cube_kit_out).expanduser()
         ck.mkdir(parents=True, exist_ok=True)
         make_sheet(cube_entries('60A', '60B'), 50.0,
-                   ck / 'sheet_cube60_ab_id01-12_50mm')
+                   ck / 'sheet_cube60_ab_id300-311_50mm')
         make_sheet(cube_entries('60C', '100A'), 50.0,
-                   ck / 'sheet_cube60c_100a_id13-26_50mm')
+                   ck / 'sheet_cube60c_100a_id312-325_50mm')
         make_sheet(cube_entries('100B', '100C'), 50.0,
-                   ck / 'sheet_cube100_bc_id27-38_50mm')
+                   ck / 'sheet_cube100_bc_id326-337_50mm')
 
     # Calibration spares: 12× ID 0 (paper tags wear; recut, re-paste).
     make_sheet([(0, 'CALIB')] * 12, 50.0,
                out / 'sheet_calibration_id000_x12_50mm')
-    # Mother-stem marks: unique IDs, 12 per sheet (registry 100-149).
-    for lo in (100, 112, 124):
-        ids = [(i, 'MOTHER STEM') for i in range(lo, lo + 12)]
-        make_sheet(ids, 50.0,
-                   out / f'sheet_mother_stem_id{lo}-{lo + 11}_50mm')
+    # Surface corner anchors: distinct id per corner (registry 10-19;
+    # 10-13 = first surface). Paper spares — the permanent install is
+    # the two-colour printed plate (generate_tag_mounts --flat-plates).
+    make_sheet([(i, f'CORNER ID{i}') for i in range(10, 14)], 50.0,
+               out / 'sheet_surface_corners_id010-013_50mm')
+    # Mother-stem marks: class id 100 for every stem (position tells
+    # individuals apart; registry v2).
+    make_sheet([(100, 'MOTHER STEM')] * 12, 50.0,
+               out / 'sheet_mother_stem_id100_x12_50mm')
     # Zone/nav markers, 100 mm, 2 per sheet. Duplicates of one ID are
     # legitimate (several keep-out spots share the meaning).
     make_sheet([(50, 'KEEP OUT')] * 2, 100.0,
                out / 'sheet_keep_out_id050_x2_100mm')
     make_sheet([(51, 'STOP'), (52, 'SLOW')], 100.0,
                out / 'sheet_stop_slow_id051_052_100mm')
-    make_sheet([(60, 'HOME'), (60, 'HOME')], 100.0,
-               out / 'sheet_home_id060_x2_100mm')
-    make_sheet([(61, 'ROW START'), (62, 'ROW END')], 100.0,
-               out / 'sheet_rows_id061_062_100mm')
+    make_sheet([(20, 'DOCK'), (20, 'DOCK')], 100.0,
+               out / 'sheet_dock_id020_x2_100mm')
+    make_sheet([(30, 'ROW N'), (31, 'ROW S')], 100.0,
+               out / 'sheet_row_anchors_id030_031_100mm')
     return 0
 
 

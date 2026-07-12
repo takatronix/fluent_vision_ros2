@@ -233,6 +233,43 @@ def generate_peg_two_piece(paper_mm: float, stake_mm: float,
           f' — both fit a 180mm bed straight')
 
 
+def generate_corner_stand(plate_mm: float, out: Path) -> None:
+    """Corner-registering stand for a printed two-colour tag plate.
+
+    A pocket tile with two lips hanging over two ADJACENT table edges:
+    pushed into a table corner it self-aligns against both edges, so a
+    permanently installed corner tag (registry surface_corner 10-19)
+    sits at a reproducible spot. One model fits all four corners
+    (rotate it). The printed plate drops into the pocket — add a dab of
+    glue / double-sided tape for permanence.
+
+    Print UPSIDE-DOWN (pocket face on the bed): the lips then rise
+    upward and nothing overhangs; the pocket floor finish is hidden
+    under the plate."""
+    pocket = plate_mm + POCKET_CLEARANCE_MM      # printed plate + fit
+    tile = pocket + 2 * BORDER_MM
+    tile_t = 6.0
+    pocket_d = 3.2                               # 3 mm plate sits ~flush
+    lip_t, lip_drop, lip_lap = 3.0, 8.0, 1.5
+    base_t = tile_t - pocket_d
+    bx = (tile - pocket) / 2.0
+    tris: List[Tri] = []
+    tris += _box_triangles(0, 0, 0, tile, tile, base_t)
+    # pocket rim strips
+    tris += _box_triangles(0, 0, base_t, tile, bx, tile_t)
+    tris += _box_triangles(0, tile - bx, base_t, tile, tile, tile_t)
+    tris += _box_triangles(0, bx, base_t, bx, tile - bx, tile_t)
+    tris += _box_triangles(tile - bx, bx, base_t, tile, tile - bx, tile_t)
+    # two lips over adjacent table edges (x=0 / y=0 planes), overlapping
+    # into the tile so the slicer unions them
+    tris += _box_triangles(-lip_t, -lip_t, -lip_drop, lip_lap, tile, tile_t)
+    tris += _box_triangles(-lip_t, -lip_t, -lip_drop, tile, lip_lap, tile_t)
+    write_stl_ascii(tris, out, name=f'fv_tag_corner_stand_{int(plate_mm)}')
+    print(f'corner stand: {out}  tile {tile:.1f}x{tile:.1f}x{tile_t}mm  '
+          f'pocket {pocket:.1f}mm depth {pocket_d}mm  '
+          f'lips {lip_t}x{lip_drop}mm')
+
+
 def generate_flat_plate_3mf(tag_id: int, tag_mm: float, out_3mf: Path,
                             label: str = 'CALIB') -> None:
     """Face-DOWN two-colour tag plate (calibration grade).
@@ -301,6 +338,15 @@ def main() -> int:
                    help='also emit a face-down two-colour plate 3MF '
                         'for this tag id (calibration grade, zero-step '
                         'face)')
+    p.add_argument('--flat-plates', default=None,
+                   help="comma list 'id[:LABEL][@mm]' of face-down "
+                        "two-colour plate 3MFs (calibration grade), "
+                        "e.g. '0:CALIB,10:ID10,20:DOCK@100'. "
+                        "Size defaults to 50mm, label to IDnnn")
+    p.add_argument('--corner-stand-mm', type=float, default=None,
+                   help='emit a corner-registering stand STL sized for '
+                        'a printed plate of this size [mm] (print 1 per '
+                        'installed corner)')
     args = p.parse_args()
     out = Path(args.out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -322,6 +368,23 @@ def main() -> int:
         generate_flat_plate_3mf(
             args.flat_plate_id, 50.0,
             out / f'tag_plate_flat_id{args.flat_plate_id:03d}_50mm.3mf')
+    if args.flat_plates:
+        for spec in args.flat_plates.split(','):
+            spec = spec.strip()
+            size = 50.0
+            if '@' in spec:
+                spec, sz = spec.rsplit('@', 1)
+                size = float(sz)
+            id_s, _, label = spec.partition(':')
+            tid = int(id_s)
+            generate_flat_plate_3mf(
+                tid, size,
+                out / f'tag_plate_flat_id{tid:03d}_{int(size)}mm.3mf',
+                label=label or f'ID{tid}')
+    if args.corner_stand_mm is not None:
+        generate_corner_stand(
+            args.corner_stand_mm,
+            out / f'tag_corner_stand_{int(args.corner_stand_mm)}mm.stl')
     return 0
 
 

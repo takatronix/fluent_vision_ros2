@@ -898,26 +898,30 @@ def generate_cube_body_stl(
 # --- ID layout --------------------------------------------------------------
 
 def default_cube_set() -> List[CubeSpec]:
-    """Default ID layout for the vlabor cube kit.
+    """Default ID layout for the cube kit (tag_registry.yaml v2 band).
 
-    ID 0  : reserved for hand-eye calibration (separate single tag)
-    ID 1-6  : cube60_a faces (top,front,right,back,left,bottom)
-    ID 7-12 : cube60_b
-    ID 13-18: cube60_c
-    ID 21-26: cube100_a (skip 19-20 — buffer + legacy calibration ID 20)
-    ID 27-32: cube100_b
-    ID 33-38: cube100_c
+    ID 0      : reserved for hand-eye calibration (separate single tag)
+    ID 300-305: cube60_a faces (top,front,right,back,left,bottom)
+    ID 306-311: cube60_b
+    ID 312-317: cube60_c
+    ID 320-325: cube100_a (318-319 = buffer)
+    ID 326-331: cube100_b
+    ID 332-337: cube100_c
+
+    v1 cubes (ids 1-18 / 21-38) stay valid physically until reprinted;
+    runtime configs (cubes_*.yaml) switch over together with the
+    physical cubes.
     """
     def faces(start: int) -> Dict[str, int]:
         return {name: start + i for i, name in enumerate(FACE_NAMES)}
 
     return [
-        CubeSpec('cube60_a',  60.0, 50.0, faces(1)),
-        CubeSpec('cube60_b',  60.0, 50.0, faces(7)),
-        CubeSpec('cube60_c',  60.0, 50.0, faces(13)),
-        CubeSpec('cube100_a', 100.0, 50.0, faces(21)),
-        CubeSpec('cube100_b', 100.0, 50.0, faces(27)),
-        CubeSpec('cube100_c', 100.0, 50.0, faces(33)),
+        CubeSpec('cube60_a',  60.0, 50.0, faces(300)),
+        CubeSpec('cube60_b',  60.0, 50.0, faces(306)),
+        CubeSpec('cube60_c',  60.0, 50.0, faces(312)),
+        CubeSpec('cube100_a', 100.0, 50.0, faces(320)),
+        CubeSpec('cube100_b', 100.0, 50.0, faces(326)),
+        CubeSpec('cube100_c', 100.0, 50.0, faces(332)),
     ]
 
 
