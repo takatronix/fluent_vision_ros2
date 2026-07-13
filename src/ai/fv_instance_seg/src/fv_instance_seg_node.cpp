@@ -1184,8 +1184,11 @@ void InstanceSegNode::drawStats(cv::Mat& image) {
     model_path = model_path_;
   }
 
-  // ASCII only: the overlay text is drawn with cv::putText (Hershey font),
-  // which has no glyphs for multibyte/Japanese and renders them as "????".
+  // fluent::text::drawShadow renders via OpenCV FreeType2 using
+  // NotoSansCJK (installed by fonts-noto-cjk in the image), so multibyte /
+  // Japanese model names render correctly. If that font is missing it
+  // falls back to cv::putText (Hershey, ASCII-only) and Japanese shows as
+  // "????" — install fonts-noto-cjk to fix.
   put(std::string("Device: ") + device);
   put(std::string("Backend: ") + backend);
   {
