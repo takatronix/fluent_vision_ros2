@@ -27,7 +27,19 @@ find_package(tf2_geometry_msgs REQUIRED)
 # Find system dependencies
 find_package(OpenCV REQUIRED)
 find_package(PCL REQUIRED)
-find_package(Freetype REQUIRED)
+# freetype テキスト描画 (fluent_text) はオプション: opencv2/freetype.hpp
+# (OpenCV contrib) が無い環境 (native Jetson/Jazzy 等) ではテキスト描画抜きで
+# ビルドする。コンテナ (contrib あり) では従来どおり有効。
+find_package(Freetype QUIET)
+find_path(OPENCV_FREETYPE_INCLUDE opencv2/freetype.hpp
+  PATHS ${OpenCV_INCLUDE_DIRS} NO_DEFAULT_PATH)
+if(FREETYPE_FOUND AND OPENCV_FREETYPE_INCLUDE)
+  set(FLUENT_HAS_FREETYPE TRUE)
+else()
+  set(FLUENT_HAS_FREETYPE FALSE)
+  message(WARNING "fluent_lib: opencv2/freetype.hpp not found - "
+                  "building WITHOUT fluent_text (text drawing disabled)")
+endif()
 find_package(yaml-cpp REQUIRED)
 
 # Include directories
@@ -40,8 +52,10 @@ set(FLUENT_LIB_SOURCES
   src/fluent_image.cpp
   src/fluent_cloud_impl.cpp
   src/fluent_utils.cpp
-  src/fluent_text.cpp
 )
+if(FLUENT_HAS_FREETYPE)
+  list(APPEND FLUENT_LIB_SOURCES src/fluent_text.cpp)
+endif()
 
 # Create library
 add_library(${PROJECT_NAME} SHARED ${FLUENT_LIB_SOURCES})
@@ -64,9 +78,11 @@ ament_target_dependencies(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME}
   ${OpenCV_LIBRARIES}
   ${PCL_LIBRARIES}
-  ${Freetype_LIBRARIES}
   yaml-cpp
 )
+if(FLUENT_HAS_FREETYPE)
+  target_link_libraries(${PROJECT_NAME} ${FREETYPE_LIBRARIES})
+endif()
 
 # Install headers
 install(DIRECTORY include/
@@ -102,9 +118,11 @@ ament_export_dependencies(
   tf2
   tf2_ros
   tf2_geometry_msgs
-  Freetype
   yaml-cpp
 )
+if(FLUENT_HAS_FREETYPE)
+  ament_export_dependencies(Freetype)
+endif()
 
 # Lint and test
 if(BUILD_TESTING)
