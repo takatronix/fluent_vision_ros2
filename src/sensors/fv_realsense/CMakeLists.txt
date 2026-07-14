@@ -34,9 +34,27 @@ set(REALSENSE2_FOUND FALSE)
 set(REALSENSE2_INCLUDE_DIRS "")
 set(REALSENSE2_LIBRARIES "")
 
+# 方法0: CMake config (正規)。ros-jazzy-librealsense2 は
+# /opt/ros/<distro>/lib/<arch>/cmake/realsense2/ に config を置く
+# (lib 本体も <arch> サブディレクトリ側 — 方法2 の固定パスには載らない)。
+find_package(realsense2 CONFIG QUIET)
+if(realsense2_FOUND)
+  set(REALSENSE2_FOUND TRUE)
+  set(REALSENSE2_LIBRARIES realsense2::realsense2)
+  # 本CMakeLists は include_directories(${REALSENSE2_INCLUDE_DIRS}) で
+  # ヘッダを渡す作りなので、imported target からも取り出しておく
+  get_target_property(_rs2_inc realsense2::realsense2 INTERFACE_INCLUDE_DIRECTORIES)
+  if(_rs2_inc)
+    set(REALSENSE2_INCLUDE_DIRS ${_rs2_inc})
+  endif()
+  message(STATUS "Found RealSense SDK via CMake config (${realsense2_DIR})")
+endif()
+
 # 方法1: pkg-configで検索
-pkg_check_modules(REALSENSE2_PKG QUIET realsense2)
-if(REALSENSE2_PKG_FOUND)
+if(NOT REALSENSE2_FOUND)
+  pkg_check_modules(REALSENSE2_PKG QUIET realsense2)
+endif()
+if(NOT REALSENSE2_FOUND AND REALSENSE2_PKG_FOUND)
   set(REALSENSE2_FOUND TRUE)
   set(REALSENSE2_INCLUDE_DIRS ${REALSENSE2_PKG_INCLUDE_DIRS})
   set(REALSENSE2_LIBRARIES ${REALSENSE2_PKG_LIBRARIES})
@@ -162,8 +180,10 @@ target_link_libraries(fv_realsense_node
   CURL::libcurl
 )
 if(ENABLE_REALSENSE)
-  # RealSense SDKライブラリのリンク
-  target_link_libraries(fv_realsense_node ${REALSENSE2_PKG_LIBRARIES})
+  # RealSense SDKライブラリのリンク (REALSENSE2_LIBRARIES は 方法0/1/2 の
+  # どの探索経路でも設定される共通変数。旧 REALSENSE2_PKG_LIBRARIES は
+  # pkg-config 経路以外では空でリンク漏れになるバグだった)
+  target_link_libraries(fv_realsense_node ${REALSENSE2_LIBRARIES})
   target_compile_definitions(fv_realsense_node PRIVATE ENABLE_REALSENSE=1)
 else()
   target_compile_definitions(fv_realsense_node PRIVATE ENABLE_REALSENSE=0)
