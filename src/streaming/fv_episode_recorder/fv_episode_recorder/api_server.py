@@ -163,6 +163,30 @@ async def _healthz(request: web.Request) -> web.Response:
     return web.json_response(payload)
 
 
+_VARIANT_ATTR_KEYS = ("variant", "grade", "class", "category", "species", "label")
+
+
+def _collect_detected_variants(markers: list[dict]) -> list[str]:
+    """Distinct variant/grade values from `detect` event markers, in first-seen
+    order. Reads marker.attributes ({key, value}) written by EventMarkerBridge
+    from structured `/fv/event/active` payloads (e.g. detect + variant=grade_A)."""
+    seen: list[str] = []
+    for m in markers or []:
+        if (m.get("task_description") or "").strip().lower() != "detect":
+            continue
+        for attr in (m.get("attributes") or []):
+            if not isinstance(attr, dict):
+                continue
+            if str(attr.get("key")) in _VARIANT_ATTR_KEYS:
+                val = attr.get("value")
+                if val in (None, ""):
+                    continue
+                sval = str(val)
+                if sval not in seen:
+                    seen.append(sval)
+    return seen
+
+
 # ---------- Marker handlers ----------
 
 async def _list_markers(request: web.Request) -> web.Response:
@@ -518,6 +542,12 @@ async def _stop_episode(request: web.Request) -> web.Response:
         meta.cameras = camera_summaries
     if pending_markers:
         meta.markers = pending_markers
+        # Roll up detected object variants/grades (Event Bus `detect` markers)
+        # to an episode-level list so the training-data query "which grades did
+        # this run touch?" doesn't have to scan every marker's attributes.
+        variants = _collect_detected_variants(pending_markers)
+        if variants:
+            meta.detected_variants = variants
     # Snapshot mux state at stop — used by the UI to tell operator-after-
     # the-fact whether THIS run was VLA (with which controller) or teleop.
     mux_tracker = request.app.get("mux_tracker")

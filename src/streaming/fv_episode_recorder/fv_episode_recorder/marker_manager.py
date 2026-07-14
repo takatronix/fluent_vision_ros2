@@ -43,7 +43,9 @@ class MarkerManager:
     # ---- mutators ----
 
     def start(self, episode_id: str, task_description: str,
-              kind: str = "subtask", tags: Optional[list] = None) -> Marker:
+              kind: str = "subtask", tags: Optional[list] = None,
+              outcome: Optional[str] = None,
+              attributes: Optional[list] = None) -> Marker:
         if kind not in ("subtask", "event", "note"):
             raise ValueError(f"invalid kind: {kind}")
         mid = new_episode_id()
@@ -54,10 +56,18 @@ class MarkerManager:
             task_description=task_description,
             started_at=utc_now_iso(),
             tags=list(tags or []),
+            # Free-form structured payload (e.g. detected asparagus variant /
+            # grade carried by the Event Bus). Each entry is {key, value, ...};
+            # surfaced in meta.json and rolled up onto the episode at stop.
+            attributes=list(attributes or []),
         )
         # event / note are point-in-time → auto-stop immediately
         if kind in ("event", "note"):
             m.stopped_at = m.started_at
+        # outcome is meaningful for point-in-time success/failure events too,
+        # not just subtask stop() — record it eagerly when supplied.
+        if outcome is not None:
+            m.outcome = outcome
         with self._lock:
             self._by_episode.setdefault(episode_id, {})[mid] = m
         return m

@@ -32,6 +32,7 @@ except ImportError:
 from .active_lock import ActiveLock
 from .api_server import build_app
 from .bag_recorder import BagRecorder
+from .event_bridge import EventMarkerBridge
 from .camera_writer import CameraWriterPool
 from .depth_republisher import DepthRepublisherPool
 from .episode_store import EpisodeStore
@@ -60,11 +61,17 @@ class FVEpisodeRecorderNode(Node):
         self.declare_parameter("profiles_dir", default_profiles)
         self.declare_parameter("port", 8083)
         self.declare_parameter("host", "0.0.0.0")
+        # Event Bus Contract v1: situation events (detect/grasp/success/...)
+        # re-published by fv_soundboard on this topic become episode markers.
+        self.declare_parameter("event_active_topic", "/fv/event/active")
+        self.declare_parameter("event_marker_enabled", True)
 
         self.output_dir = Path(self.get_parameter("output_dir").value)
         self.profiles_dir = Path(self.get_parameter("profiles_dir").value)
         self.port = int(self.get_parameter("port").value)
         self.host = str(self.get_parameter("host").value)
+        self.event_active_topic = str(self.get_parameter("event_active_topic").value)
+        self.event_marker_enabled = bool(self.get_parameter("event_marker_enabled").value)
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.store = EpisodeStore(self.output_dir)
@@ -82,6 +89,14 @@ class FVEpisodeRecorderNode(Node):
         self.depth_pool = DepthRepublisherPool(node=self)
         self.active_lock = ActiveLock(self.output_dir)
         self.marker_manager = MarkerManager()
+        # Event Bus → marker bridge: annotates the active episode with the
+        # situation-event stream (harvest-cycle phases + detected variant).
+        # Subscription is created lazily-safe here (before spin) like mux_tracker.
+        self.event_bridge = EventMarkerBridge(
+            self, self.store, self.marker_manager,
+            topic=self.event_active_topic,
+            enabled=self.event_marker_enabled,
+        )
         # Track mux source (teleop vs VLA + controller name) so the play
         # modal can label each recording without having to decode the bag.
         # Subscribes lazily — auto-discovers any `*/teleop_mux/status`

@@ -81,6 +81,10 @@ class EpisodeMeta:
     bag_split_count: int = 0
     annotation_revisions: list[dict[str, Any]] = field(default_factory=list)
     markers: list[dict[str, Any]] = field(default_factory=list)
+    # Distinct detected object variants/grades seen during the episode, rolled
+    # up from Event Bus `detect` markers at stop (e.g. ["grade_A", "grade_B"]).
+    # Episode-level index of what was worked on — training-data query key.
+    detected_variants: list[str] = field(default_factory=list)
     recorder_version: str = "fv_episode_recorder/0.1.0"
     container_image_tag: Optional[str] = None
     stale_input_events: list[dict[str, Any]] = field(default_factory=list)
