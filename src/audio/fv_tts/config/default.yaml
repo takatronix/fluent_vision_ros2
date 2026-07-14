@@ -1,8 +1,20 @@
 fv_tts:
   ros__parameters:
+    # エンジン差替え: "voicevox"(既定) | "pyopenjtalk"
+    engine: "voicevox"
+    voicevox_url: "http://127.0.0.1:50021"
+    voicevox_speaker: 3            # 3 = ずんだもん(ノーマル)
+    # 出力パイプライン(fv_audio_output)のサンプルレート。voicevox は 24kHz を返すので
+    # このレートへリサンプルしてから publish する(fv_audio_output の audio.sample_rate と合わせる)。
+    output_sample_rate: 48000
     default_voice: ""
     output_topic: "audio/tts/frame"
     playback_topic: "audio/output/frame"
     use_playback_topic: true
+    # Event Bus 契約: 任意テキスト発話 topic と 再生中フラグ
+    say_topic: "/aspa/tts/say"
+    speaking_topic: "/aspa/audio/speaking"
     cache_dir: "~/.fluent_voice_cache"
-    default_volume_db: 8.0
+    # voicevox は元々音量が大きいので既定は 0dB 前後を推奨。
+    # pyopenjtalk は小さめなので engine 切替時は +8dB 程度に上げる。
+    default_volume_db: 0.0

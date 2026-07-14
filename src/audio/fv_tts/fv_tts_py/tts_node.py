@@ -3,6 +3,8 @@ import hashlib
 import logging
 import os
 import sys
+import threading
+import time
 from array import array
 from pathlib import Path
 from typing import Dict, Optional
@@ -12,10 +14,12 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
-from std_msgs.msg import Empty
+from std_msgs.msg import Bool, Empty, String
 
 from fv_audio.msg import AudioFrame
 from fv_tts.srv import Speak
+
+from fv_tts_py.voicevox_backend import VoicevoxBackend, VoicevoxError
 
 # Set pyopenjtalk dictionary directory to user's home directory
 os.environ.setdefault("OPEN_JTALK_DICT_DIR", str(Path.home() / ".pyopenjtalk"))
@@ -54,9 +58,6 @@ class CachedAudio:
 class FvTtsNode(Node):
     def __init__(self) -> None:
         super().__init__("fv_tts")
-        self.get_logger().info("Starting FV TTS node (pyopenjtalk backend)")
-        if pyopenjtalk is None:
-            raise RuntimeError(f"pyopenjtalk is not available: {_IMPORT_ERROR}") from _IMPORT_ERROR
 
         self.declare_parameter("default_voice", "")
         self.declare_parameter("output_topic", "audio/tts/frame")
@@ -65,6 +66,16 @@ class FvTtsNode(Node):
         self.declare_parameter("stop_topic", "audio/output/stop")
         self.declare_parameter("cache_dir", "")
         self.declare_parameter("default_volume_db", 0.0)
+        # エンジン差替え: "voicevox"(既定) | "pyopenjtalk"
+        self.declare_parameter("engine", "voicevox")
+        self.declare_parameter("voicevox_url", "http://127.0.0.1:50021")
+        self.declare_parameter("voicevox_speaker", 3)   # 3 = ずんだもん(ノーマル)
+        # 出力パイプライン (fv_audio_output) のサンプルレート。voicevox は 24kHz を
+        # 返すので、このレート(既定 48kHz)へリサンプルしてから publish する。
+        self.declare_parameter("output_sample_rate", 48000)
+        # Event Bus 契約: 任意テキストを喋らせる topic I/F と再生中フラグ
+        self.declare_parameter("say_topic", "/aspa/tts/say")
+        self.declare_parameter("speaking_topic", "/aspa/audio/speaking")
 
         self.default_voice = self.get_parameter("default_voice").get_parameter_value().string_value
         self.output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
@@ -72,6 +83,36 @@ class FvTtsNode(Node):
         self.publish_playback = self.get_parameter("use_playback_topic").get_parameter_value().bool_value
         self.stop_topic = self.get_parameter("stop_topic").get_parameter_value().string_value
         self.default_volume_db = self.get_parameter("default_volume_db").get_parameter_value().double_value
+        self.engine = self.get_parameter("engine").get_parameter_value().string_value.strip().lower()
+        self.voicevox_url = self.get_parameter("voicevox_url").get_parameter_value().string_value
+        self.voicevox_speaker = self.get_parameter("voicevox_speaker").get_parameter_value().integer_value
+        self.output_sample_rate = self.get_parameter("output_sample_rate").get_parameter_value().integer_value
+        self.say_topic = self.get_parameter("say_topic").get_parameter_value().string_value
+        self.speaking_topic = self.get_parameter("speaking_topic").get_parameter_value().string_value
+
+        self.get_logger().info(f"Starting FV TTS node (engine={self.engine})")
+
+        # エンジンごとに必要リソースを確認 (fallback せず、駄目なら止める)
+        self.voicevox: Optional[VoicevoxBackend] = None
+        if self.engine == "pyopenjtalk":
+            if pyopenjtalk is None:
+                raise RuntimeError(
+                    f"engine=pyopenjtalk だが pyopenjtalk が使えません: {_IMPORT_ERROR}"
+                ) from _IMPORT_ERROR
+        elif self.engine == "voicevox":
+            self.voicevox = VoicevoxBackend(self.voicevox_url)
+            try:
+                ver = self.voicevox.version()
+                self.get_logger().info(
+                    f"VOICEVOX ENGINE {ver} @ {self.voicevox_url}, speaker={self.voicevox_speaker}")
+            except VoicevoxError as exc:
+                # 起動時点で不通なら分かりやすく警告 (実合成時に RuntimeError で止まる)
+                self.get_logger().warn(
+                    f"VOICEVOX ENGINE 未応答 ({self.voicevox_url}): {exc}. "
+                    f"`curl {self.voicevox_url}/version` で起動確認してください")
+        else:
+            raise RuntimeError(
+                f"未知の engine='{self.engine}' (voicevox | pyopenjtalk のいずれか)")
 
         cache_dir_param = self.get_parameter("cache_dir").get_parameter_value().string_value
         self.cache_dir = Path(cache_dir_param).expanduser() if cache_dir_param else None
@@ -86,12 +127,23 @@ class FvTtsNode(Node):
 
         self.tts_pub = self.create_publisher(AudioFrame, self.output_topic, qos)
         self.play_pub = self.create_publisher(AudioFrame, self.playback_topic, qos)
+        self.speaking_pub = self.create_publisher(Bool, self.speaking_topic, 10)
         self.srv = self.create_service(Speak, "speak", self.handle_speak)
+
+        # Event Bus 契約: soundboard 等が /aspa/tts/say に流す任意テキストを喋る
+        self.say_sub = self.create_subscription(String, self.say_topic, self.on_say, 10)
 
         # Barge-in/stop 後に古い音声が鳴らないよう、再生世代(epoch)を管理する。
         # epoch は AudioFrame.epoch に埋め込み、audio_output 側で stop 時に世代を進めて破棄する。
         self.playback_epoch = 1
         self.stop_sub = self.create_subscription(Empty, self.stop_topic, self.on_stop, qos)
+
+        # /aspa/audio/speaking (再生中フラグ) を再生尺ベースで上げ下げする。
+        # 実再生は fv_audio_output が非同期で行うため、再生尺 + tail からタイマで戻す。
+        self._speaking = False
+        self._speaking_end = 0.0
+        self._speaking_timer: Optional[threading.Timer] = None
+        self._speaking_lock = threading.Lock()
 
         self.cache: Dict[str, CachedAudio] = {}
 
@@ -118,25 +170,13 @@ class FvTtsNode(Node):
         volume_db = request.volume_db if request.volume_db != 0.0 else self.default_volume_db
         cache_key = request.cache_key or self.make_cache_key(text, voice_id, volume_db)
 
-        cached = self.cache.get(cache_key)
-        if cached is None and self.cache_dir:
-            cached = self.load_cache_from_disk(cache_key)
-
-        if cached is None:
-            self.get_logger().info("TTS cache miss, synthesizing...")
-            try:
-                cached = self.synthesize(text, voice_id, volume_db)
-            except Exception as exc:  # pylint: disable=broad-except
-                self.get_logger().error(f"TTS failed: {exc}")
-                response.success = False
-                response.message = f"TTS failed: {exc}"
-                return response
-            self.cache[cache_key] = cached
-            if self.cache_dir:
-                self.write_cache_to_disk(cache_key, cached)
-            self.get_logger().info(f"TTS synthesized: {len(cached.audio_bytes)} bytes, {cached.sample_rate}Hz")
-        else:
-            self.get_logger().info("TTS cache hit")
+        try:
+            cached = self.get_cached(text, voice_id, volume_db, cache_key)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().error(f"TTS failed: {exc}")
+            response.success = False
+            response.message = f"TTS failed: {exc}"
+            return response
 
         frame = self.build_frame(cached, stamp=request_stamp, epoch=request_epoch)
         response.frame = frame
@@ -148,14 +188,128 @@ class FvTtsNode(Node):
         if request.play and self.publish_playback:
             self.play_pub.publish(frame)
             response.played = True
-            audio_duration = len(cached.audio_bytes) / 2 / cached.sample_rate  # 16bit mono
-            self.get_logger().info(f"TTS published to playback: {audio_duration:.2f}s")
+            self.begin_speaking(cached)
         else:
             self.get_logger().warn(f"TTS NOT published to playback: play={request.play}, publish_playback={self.publish_playback}")
 
         return response
 
+    def on_say(self, msg: String) -> None:
+        """Event Bus: 任意テキストを喋る (/aspa/tts/say)。常に再生する。"""
+        text = (msg.data or "").strip()
+        if not text:
+            return
+        self.get_logger().info(f"say topic: text={text[:50]}")
+        voice_id = self.default_voice
+        volume_db = self.default_volume_db
+        cache_key = self.make_cache_key(text, voice_id, volume_db)
+        try:
+            cached = self.get_cached(text, voice_id, volume_db, cache_key)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().error(f"say TTS failed: {exc}")
+            return
+        stamp = self.get_clock().now().to_msg()
+        frame = self.build_frame(cached, stamp=stamp, epoch=self.playback_epoch)
+        self.tts_pub.publish(frame)
+        if self.publish_playback:
+            self.play_pub.publish(frame)
+            self.begin_speaking(cached)
+
+    def get_cached(self, text: str, voice_id: str, volume_db: float, cache_key: str) -> CachedAudio:
+        """キャッシュ参照→無ければ合成して格納。合成失敗は例外送出 (fallback 禁止)。"""
+        cached = self.cache.get(cache_key)
+        if cached is None and self.cache_dir:
+            cached = self.load_cache_from_disk(cache_key)
+        if cached is not None:
+            self.get_logger().info("TTS cache hit")
+            return cached
+        self.get_logger().info("TTS cache miss, synthesizing...")
+        cached = self.synthesize(text, voice_id, volume_db)
+        self.cache[cache_key] = cached
+        if self.cache_dir:
+            self.write_cache_to_disk(cache_key, cached)
+        self.get_logger().info(
+            f"TTS synthesized: {len(cached.audio_bytes)} bytes, {cached.sample_rate}Hz")
+        return cached
+
+    def begin_speaking(self, cached: CachedAudio) -> None:
+        """再生尺ぶん /aspa/audio/speaking=True を立て、tail 経過後 False に戻す。"""
+        bytes_per_sample = cached.channels * (cached.bit_depth // 8)
+        duration = len(cached.audio_bytes) / bytes_per_sample / cached.sample_rate if bytes_per_sample else 0.0
+        self.get_logger().info(f"TTS published to playback: {duration:.2f}s")
+        with self._speaking_lock:
+            if not self._speaking:
+                self._speaking = True
+                self.speaking_pub.publish(Bool(data=True))
+            # tail 0.15s: 再生完了とフラグ降下のずれを吸収
+            end = time.monotonic() + duration + 0.15
+            self._speaking_end = max(self._speaking_end, end)
+            if self._speaking_timer is not None:
+                self._speaking_timer.cancel()
+            delay = max(0.05, self._speaking_end - time.monotonic())
+            self._speaking_timer = threading.Timer(delay, self._end_speaking)
+            self._speaking_timer.daemon = True
+            self._speaking_timer.start()
+
+    def _end_speaking(self) -> None:
+        with self._speaking_lock:
+            # 後続発話でタイマが更新された場合はまだ喋っているので降ろさない
+            if time.monotonic() + 0.02 < self._speaking_end:
+                return
+            self._speaking = False
+            self._speaking_timer = None
+            self.speaking_pub.publish(Bool(data=False))
+
     def synthesize(self, text: str, voice_id: str, volume_db: float) -> CachedAudio:
+        """エンジンで分岐して合成。CachedAudio(16bit mono)を返す。"""
+        if self.engine == "voicevox":
+            return self._synthesize_voicevox(text, voice_id, volume_db)
+        return self._synthesize_pyopenjtalk(text, voice_id, volume_db)
+
+    def _synthesize_voicevox(self, text: str, voice_id: str, volume_db: float) -> CachedAudio:
+        if self.voicevox is None:
+            raise RuntimeError("voicevox backend が初期化されていません")
+        # voice_id が数値文字列なら speaker override、それ以外は既定 speaker
+        speaker = self.voicevox_speaker
+        if voice_id:
+            try:
+                speaker = int(voice_id)
+            except ValueError:
+                self.get_logger().warn(
+                    f"voicevox: voice_id='{voice_id}' は数値でないため既定 speaker={speaker} を使用")
+        try:
+            pcm_bytes, native_sr, channels, bit_depth = self.voicevox.synthesize(text, speaker)
+        except VoicevoxError as exc:
+            raise RuntimeError(f"VOICEVOX 合成失敗: {exc}") from exc
+        if channels != 1 or bit_depth != 16:
+            raise RuntimeError(
+                f"VOICEVOX 想定外フォーマット channels={channels} bit_depth={bit_depth} (mono/16bit 想定)")
+
+        waveform = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.float32) / 32768.0
+        if volume_db != 0.0:
+            waveform = waveform * float(10.0 ** (volume_db / 20.0))
+        # 出力パイプライン (fv_audio_output) は固定レート。合致しなければリサンプルする
+        # (でないと format mismatch で黙って drop される)。
+        out_sr = int(self.output_sample_rate) if self.output_sample_rate > 0 else native_sr
+        if native_sr != out_sr and waveform.size:
+            n_out = int(round(waveform.size * out_sr / native_sr))
+            src_idx = np.linspace(0.0, waveform.size - 1.0, n_out)
+            waveform = np.interp(src_idx, np.arange(waveform.size), waveform).astype(np.float32)
+            self.get_logger().debug(
+                f"voicevox resample {native_sr}->{out_sr}Hz ({waveform.size} samples)")
+        else:
+            out_sr = native_sr
+        waveform = np.clip(waveform, -1.0, 1.0)
+        pcm = (waveform * 32767.0).astype(np.int16)
+        audio_bytes = pcm.tobytes()
+        float_samples = pcm.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(np.square(float_samples)))) if float_samples.size else 0.0
+        peak = float(np.max(np.abs(float_samples))) if float_samples.size else 0.0
+        return CachedAudio(audio_bytes, int(out_sr), 1, 16, rms, peak)
+
+    def _synthesize_pyopenjtalk(self, text: str, voice_id: str, volume_db: float) -> CachedAudio:
+        if pyopenjtalk is None:
+            raise RuntimeError(f"pyopenjtalk is not available: {_IMPORT_ERROR}")
         options = {}
         if voice_id:
             options["voice"] = voice_id

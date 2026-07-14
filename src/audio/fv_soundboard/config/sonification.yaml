@@ -1,0 +1,99 @@
+# fv_soundboard パラメトリック・ソニフィケーション音文法 (差替え可)
+#
+# YOLO 検出等の class + 連続属性 (length_mm / curvature / confidence …) を
+# "シンセみたいな" 音に写像して、何が起きているか音だけで聴き分けられるようにする。
+#
+# 「進化成長」原則: クラス追加は class_families に 1 行足すだけ。未知クラスは
+# 黙殺せず明示ログを出して default_family に落ちる (fallback=静かに間違えない、を回避)。
+#
+# 音族:
+#   harvest = ベル系 (収穫対象。明るく協和)
+#   health  = 低めのざらつき (圃場異常。warning 寄り)
+#   safety  = 異質なアテンション音 (人/車。最優先 interrupt 級)
+#   neutral = 単音 (その他)
+
+version: 1
+sample_rate: 48000        # fv_audio_output と一致 (audio_frame シンクでリサンプル不要)
+
+defaults:
+  duration: 0.35
+  min_interval: 0.5       # class ごとのレート制限 [s] (検出高頻度の洪水を防ぐ)
+  max_queue: 8            # シンクのキュー上限。超過分は debug ログして drop
+  base_freq: 440.0        # 基準ピッチ (A4)。length_mm でオクターブ上下
+
+# ── class → 音族 (顧客 CVAT taxonomy) ──
+class_families:
+  # 収穫対象族
+  spear: harvest              # A品
+  off_grade_spear: harvest    # B品
+  young_spear: harvest        # 若芽 (収穫対象外)
+  uncertain_spear: harvest    # 曖昧
+  # 圃場健康族
+  brown_spot: health
+  stem_blight: health
+  leaf_spot: health
+  pest_insect: health
+  pest_insect_egg: health
+  pest_damage: health
+  weed: health
+  foliage_stressed: health
+  # 安全族
+  person: safety
+  vehecle: safety             # taxonomy 綴りに合わせる (vehicle ではない)
+  # その他 (構造物・マーカー等)
+  stem: neutral
+  fern: neutral
+  cut_stump: neutral
+  mother_stem: neutral
+  target: neutral
+  no_touch: neutral
+  container: neutral
+  robot_body: neutral
+
+default_family: neutral
+
+# ── 音族 → 音色 ──
+families:
+  harvest:
+    partials: [1.0, 2.0, 3.01, 4.2]
+    partial_gains: [1.0, 0.55, 0.35, 0.2]
+    decay: 6.0
+    interrupt: false
+  health:
+    partials: [1.0, 1.5, 2.0]
+    partial_gains: [1.0, 0.7, 0.5]
+    decay: 3.0
+    noise: 0.15             # ざらつき
+    interrupt: false
+  safety:
+    partials: [1.0, 1.414, 2.67]   # 非整数倍音 = 金属的/異質
+    partial_gains: [1.0, 0.8, 0.6]
+    decay: 1.6
+    am_hz: 11.0            # 振幅変調で警報的な異質さ
+    interrupt: true        # 最優先で割込む
+  neutral:
+    partials: [1.0]
+    partial_gains: [1.0]
+    decay: 4.0
+    interrupt: false
+
+# ── spear 族内の下位変化 (class → chord) ──
+class_variants:
+  spear:           {chord: major_third}    # A品 = 長三度和音 (明るい協和)
+  off_grade_spear: {chord: minor_third}    # B品 = 短三度 + 濁り
+  young_spear:     {chord: high_pin}       # 若芽 = 小さく高いピン
+  uncertain_spear: {chord: detune_wobble}  # 曖昧 = デチューン揺れ
+
+# ── 連続属性 → 音 ──
+params:
+  length_mm:
+    in_range: [200.0, 400.0]      # 圃場の想定レンジ [mm]
+    out_octaves: [0.5, -0.5]      # 短い→+半オクターブ / 長い→-半オクターブ (長いほど低い)
+  curvature:
+    in_range: [0.0, 0.5]
+    vibrato_hz: 6.0
+    vibrato_depth_semitones: [0.0, 0.7]   # 0=純音 / 曲がり大=深いビブラート
+  confidence:
+    in_range: [0.0, 1.0]
+    gain: [0.25, 1.0]             # 低確信=小さく / 高確信=大きく
+    brightness: [0.3, 1.0]        # 低確信=暗く / 高確信=明るい倍音

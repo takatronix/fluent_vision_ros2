@@ -1,0 +1,286 @@
+# fv_soundboard 状況イベント登録表 (共通デフォルト)
+#
+# 1本のイベント名を受けて ①音を鳴らす ②必要なら喋る ③記録用マーカーを出す。
+# サウンドは差し替え可 (sound の stem を変えるか sounds/<stem>.wav を置換)。
+# 案件固有の台詞やマッピングは、このファイルをコピーして registry_file で差し替える
+# か、上書き用の events.yaml をプロファイル側に置く (aspa は「アスパラ」用語で上書き)。
+#
+# 各イベントのフィールド:
+#   sound     : sounds/<sound>.wav (省略/"" で無音・喋りのみ)
+#   say       : TTS 台詞 (空なら喋らない)。speak=true で既定発話、false なら要求時のみ
+#   speak     : 既定で喋るか (false=音のみ。呼び出し側フラグで個別に上書き可)
+#   interrupt : 再生中の音を止めて即割込むか (停止/警告など緊急系)
+#   record    : episode_recorder に渡す意味マーカー名 (空=記録しない)
+#   category  : system | nav | harvest | interaction | health (UI/フィルタ用)
+#   variants  : (任意) 種別マップ。variant名 → {sound?, say?}。
+#               入力 JSON に "variant":"grade_A" 等が来たときの解決:
+#                 sounds/<variants[v].sound>.wav → sounds/<sound>_<v>.wav → base sounds/<sound>.wav
+#               variant 専用音源が無ければ base を鳴らし、variants[v].say を TTS で補う。
+#
+# 命名は ASCII 固定 (キー)。表示・台詞のみ日本語。
+#
+# 連続パラメータのソニフィケーション (class + attrs) は events.yaml ではなく
+# config/sonification.yaml の音文法で扱う (このファイルは離散cue専用)。
+
+version: 1
+
+events:
+  # ── system / lifecycle ────────────────────────────────
+  ready:
+    sound: ready
+    say: "準備ができました"
+    speak: true
+    interrupt: false
+    record: ready
+    category: system
+  auto_start:
+    sound: auto_start
+    say: "自動運転を開始します"
+    speak: true
+    interrupt: false
+    record: auto_start
+    category: system
+  auto_stop:
+    sound: auto_stop
+    say: "自動運転を停止しました"
+    speak: true
+    interrupt: false
+    record: auto_stop
+    category: system
+  pause:
+    sound: pause
+    say: "一時停止します"
+    speak: false
+    interrupt: false
+    record: pause
+    category: system
+  resume:
+    sound: resume
+    say: "再開します"
+    speak: false
+    interrupt: false
+    record: resume
+    category: system
+  stop:
+    sound: stop
+    say: "停止します"
+    speak: true
+    interrupt: true          # 停止は最優先で割込む
+    record: stop
+    category: system
+  shutdown:
+    sound: shutdown
+    say: "システムを終了します"
+    speak: false
+    interrupt: false
+    record: shutdown
+    category: system
+
+  # ── navigation (自立走行) ─────────────────────────────
+  nav_start:
+    sound: nav_start
+    say: "移動を開始します"
+    speak: false
+    interrupt: false
+    record: nav_start
+    category: nav
+  waypoint:
+    sound: waypoint
+    say: ""
+    speak: false
+    interrupt: false
+    record: waypoint
+    category: nav
+  goal_reached:
+    sound: goal_reached
+    say: "目的地に到着しました"
+    speak: true
+    interrupt: false
+    record: goal_reached
+    category: nav
+  obstacle:
+    sound: obstacle
+    say: "障害物を検知しました"
+    speak: false
+    interrupt: false
+    record: obstacle
+    category: nav
+  blocked:
+    sound: blocked
+    say: "経路がふさがれています"
+    speak: true
+    interrupt: false
+    record: blocked
+    category: nav
+  low_battery:
+    sound: low_battery
+    say: "バッテリー残量が少なくなっています"
+    speak: true
+    interrupt: false
+    record: low_battery
+    category: nav
+  localization_lost:
+    sound: localization_lost
+    say: "自己位置を見失いました"
+    speak: true
+    interrupt: false
+    record: localization_lost
+    category: nav
+
+  # ── harvest / manipulation (対象操作) ─────────────────
+  detect:
+    sound: detect
+    say: "対象を検出しました"
+    speak: false
+    interrupt: false
+    record: detect
+    category: harvest
+    # 種別 (等級) の例。variant 専用 wav (sounds/detect_grade_A.wav 等) を置けば
+    # それを鳴らし、無ければ base(detect.wav) + 下記 say を TTS で補う。
+    # 連続パラメータで鳴らしたい場合は class/attrs → sonification.yaml を使う。
+    variants:
+      grade_A:
+        say: "A品を検出しました"
+      grade_B:
+        say: "B品を検出しました"
+  approach:
+    sound: approach
+    say: ""
+    speak: false
+    interrupt: false
+    record: approach
+    category: harvest
+  grasp:
+    sound: grasp
+    say: ""
+    speak: false
+    interrupt: false
+    record: grasp
+    category: harvest
+  harvest:
+    sound: harvest
+    say: ""
+    speak: false
+    interrupt: false
+    record: harvest
+    category: harvest
+  place:
+    sound: place
+    say: ""
+    speak: false
+    interrupt: false
+    record: place
+    category: harvest
+  success:
+    sound: success
+    say: "成功しました"
+    speak: false
+    interrupt: false
+    record: success
+    category: harvest
+  failure:
+    sound: failure
+    say: "失敗しました"
+    speak: false
+    interrupt: false
+    record: failure
+    category: harvest
+  retry:
+    sound: retry
+    say: "もう一度試します"
+    speak: false
+    interrupt: false
+    record: retry
+    category: harvest
+
+  # ── interaction (通知・対話) ──────────────────────────
+  notify:
+    sound: notify
+    say: ""
+    speak: false
+    interrupt: false
+    record: notify
+    category: interaction
+  warning:
+    sound: warning
+    say: "注意してください"
+    speak: false
+    interrupt: true
+    record: warning
+    category: interaction
+  attention:
+    sound: attention
+    say: ""
+    speak: false
+    interrupt: false
+    record: attention
+    category: interaction
+
+  # ── system-health (バッテリ/センサ/通信/温度など機器異常) ──
+  # camera/D555 watchdog 等の監視ノードが /fv/event に publish して鳴らす想定。
+  # 発火例:
+  #   ros2 topic pub -1 /fv/event std_msgs/String "{data: 'sensor_lost'}"
+  #   ros2 topic pub -1 /fv/event std_msgs/String "{data: 'battery_critical'}"
+  battery_low:                 # low_battery の別名 (同一音源を流用。重複wavは作らない)
+    sound: low_battery
+    say: "バッテリー残量が少なくなっています"
+    speak: true
+    interrupt: false
+    record: battery_low
+    category: health
+  battery_critical:
+    sound: battery_critical
+    say: "バッテリーがありません。充電してください"
+    speak: true
+    interrupt: true            # 深刻: 最優先で割込む
+    record: battery_critical
+    category: health
+  sensor_lost:                 # センサー/カメラ途絶 (下行=欠落感)
+    sound: sensor_lost
+    say: "センサーが応答しません"
+    speak: true
+    interrupt: false
+    record: sensor_lost
+    category: health
+  sensor_recovered:            # 復帰 (上行=安心感)
+    sound: sensor_recovered
+    say: "センサーが復帰しました"
+    speak: true
+    interrupt: false
+    record: sensor_recovered
+    category: health
+  node_down:                   # ノード死
+    sound: node_down
+    say: "システムに異常があります"
+    speak: true
+    interrupt: false
+    record: node_down
+    category: health
+  system_error:                # 一般異常
+    sound: system_error
+    say: "システムエラーが発生しました"
+    speak: false
+    interrupt: true
+    record: system_error
+    category: health
+  thermal_warning:             # 温度上昇
+    sound: thermal_warning
+    say: "温度が高くなっています"
+    speak: true
+    interrupt: false
+    record: thermal_warning
+    category: health
+  comms_lost:                  # 通信断 (UI分隊のバックエンド断検知とも対応)
+    sound: comms_lost
+    say: "通信が切れました"
+    speak: true
+    interrupt: false
+    record: comms_lost
+    category: health
+  comms_recovered:             # 通信復帰
+    sound: comms_recovered
+    say: "通信が回復しました"
+    speak: false
+    interrupt: false
+    record: comms_recovered
+    category: health

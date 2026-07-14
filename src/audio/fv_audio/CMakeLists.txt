@@ -14,7 +14,6 @@ find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
-find_package(fluent_lib REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 find_package(PkgConfig REQUIRED)
@@ -53,7 +52,6 @@ ament_target_dependencies(fv_audio_node
   std_msgs
   std_srvs
   diagnostic_msgs
-  fluent_lib
 )
 
 target_include_directories(fv_audio_node PRIVATE ${ALSA_INCLUDE_DIRS})

@@ -1,0 +1,28 @@
+fv_soundboard:
+  ros__parameters:
+    # ── 出力シンク (複数指定で同時多シンク) ──
+    #   ["aplay"]               … Thor ローカル ALSA 再生 (現状の既定)
+    #   ["audio_frame"]         … Pi 側 fv_audio_output へ AudioFrame publish (Pi 運用時)
+    #   ["aplay", "audio_frame"]… Thor と Pi 両方で同時に鳴らす
+    output_backends: ["aplay"]
+
+    # aplay シンク用。HDMI/USB スピーカー接続後は `aplay -l` で確認し hw:X,0 を指定。
+    audio_device: "default"
+    master_volume: 0.8
+
+    # audio_frame シンク用 (fv_audio_output と一致させる)
+    audio_frame_topic: "/audio/output/frame"
+    audio_stop_topic: "/audio/output/stop"
+    output_sample_rate: 48000
+
+    enable_tts: true
+    event_topic: "/fv/event"
+    event_out_topic: "/fv/event/active"
+    tts_say_topic: "/aspa/tts/say"
+    speaking_topic: "/aspa/audio/speaking"
+
+    # パラメトリック・ソニフィケーション (連続パラメータ→合成)
+    enable_sonification: true
+
+    # registry_file / sounds_dir / sonification_file は既定で share/fv_soundboard 配下。
+    # 差し替え時のみ絶対パスを指定する。
