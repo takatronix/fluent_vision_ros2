@@ -31,7 +31,7 @@ if [ -z "${TORCH_PACKAGES+x}" ]; then
   if [ "${ARCH}" = "aarch64" ]; then
     TORCH_PACKAGES=""
   else
-    TORCH_PACKAGES="torch==2.6.0 torchvision"
+    TORCH_PACKAGES="torch==2.7.1 torchvision==0.22.1"
   fi
 else
   TORCH_PACKAGES="${TORCH_PACKAGES}"
