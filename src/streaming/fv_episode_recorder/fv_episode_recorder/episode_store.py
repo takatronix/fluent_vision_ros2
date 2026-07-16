@@ -34,12 +34,12 @@ from ulid import ULID
 SCHEMA_VERSION = 2
 EPISODE_DIR_MODE = 0o2770
 META_FILE_MODE = 0o660
-FINISHED_VIDEO_DIR_MODE = 0o750
-FINISHED_VIDEO_FILE_MODE = 0o440
+FINISHED_PAYLOAD_DIR_MODE = 0o750
+FINISHED_PAYLOAD_FILE_MODE = 0o440
 MAX_EPISODE_TAGS = 64
 MAX_EPISODE_TAG_LENGTH = 128
 
-# Finished videos are owned by the output root owner. This keeps hardlinks
+# Finished payloads are owned by the output root owner. This keeps hardlinks
 # available when a privileged recorder writes into a host-owned bind mount.
 
 JsonObject = dict[str, JsonValue]
@@ -690,8 +690,8 @@ class EpisodeStore:
             failed += 1
         return failed
 
-    def migrate_finished_video_permissions(self) -> int:
-        """Apply the read-only source contract to historical successful episodes only."""
+    def migrate_finished_payload_permissions(self) -> int:
+        """Apply the read-only payload contract to historical successful episodes."""
         migrated = 0
         episodes_root = self.output_dir / "episodes"
         if not episodes_root.exists():
@@ -706,23 +706,23 @@ class EpisodeStore:
                 )
             seen[meta.episode_id] = meta_path.parent
             if meta.state == "finished" and meta.outcome == "success":
-                self.protect_finished_video_sources(meta_path.parent)
+                self.protect_finished_payload_sources(meta_path.parent)
                 migrated += 1
         return migrated
 
-    def protect_finished_video_sources(self, ep_dir: Path) -> None:
-        videos_root = ep_dir / "videos"
-        if not videos_root.exists():
-            return
-        for path in videos_root.rglob("*"):
-            if path.is_file():
-                os.chown(path, self._shared_uid, self._shared_gid)
-                path.chmod(FINISHED_VIDEO_FILE_MODE)
-            elif path.is_dir():
-                os.chown(path, self._shared_uid, self._shared_gid)
-                path.chmod(FINISHED_VIDEO_DIR_MODE)
-        os.chown(videos_root, self._shared_uid, self._shared_gid)
-        videos_root.chmod(FINISHED_VIDEO_DIR_MODE)
+    def protect_finished_payload_sources(self, ep_dir: Path) -> None:
+        for payload_root in (ep_dir / "bag", ep_dir / "videos"):
+            if not payload_root.exists():
+                continue
+            for path in payload_root.rglob("*"):
+                if path.is_file():
+                    os.chown(path, self._shared_uid, self._shared_gid)
+                    path.chmod(FINISHED_PAYLOAD_FILE_MODE)
+                elif path.is_dir():
+                    os.chown(path, self._shared_uid, self._shared_gid)
+                    path.chmod(FINISHED_PAYLOAD_DIR_MODE)
+            os.chown(payload_root, self._shared_uid, self._shared_gid)
+            payload_root.chmod(FINISHED_PAYLOAD_DIR_MODE)
 
     # ---- internals ----
 

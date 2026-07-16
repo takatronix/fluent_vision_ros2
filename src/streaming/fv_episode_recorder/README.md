@@ -70,9 +70,11 @@ the ROS header timestamp relative to that camera's first frame, using a
 `ros_stamp_ns` and the resulting `video_pts`, so consumers can map the video
 timeline back to ROS time without retiming the recording.
 
-After a successful finalization, video files are owned by the output root
-owner and made read-only. Consumers running as that owner can hardlink the
-source files on the same filesystem without copying or mutating them.
+After a successful finalization, bag and video payload files are owned by the
+output root owner and made read-only. Consumers running as that owner can
+hardlink the source files on the same filesystem without copying or mutating
+them. `meta.json` remains mutable for episode annotations and is not part of
+this hardlink source contract.
 
 ## Design
 

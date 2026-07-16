@@ -205,9 +205,9 @@ def finalize_episode(job: FinalizationJob) -> None:
 
     if not job.failures and job.meta.outcome == "success":
         try:
-            job.store.protect_finished_video_sources(job.episode_dir)
+            job.store.protect_finished_payload_sources(job.episode_dir)
         except Exception as exc:
-            job.add_failure("video_permissions", exc)
+            job.add_failure("payload_permissions", exc)
 
     with job._terminal_lock:
         if not job._terminal_committed:

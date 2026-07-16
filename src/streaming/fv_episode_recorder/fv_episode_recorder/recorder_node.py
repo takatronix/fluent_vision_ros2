@@ -77,7 +77,7 @@ class FVEpisodeRecorderNode(Node):
         # drift and filesystem deletions are both repaired at startup.
         self.store.index.rebuild_from_filesystem()
         failed_incomplete = self.store.fail_incomplete_episodes()
-        self.store.migrate_finished_video_permissions()
+        self.store.migrate_finished_payload_permissions()
         self.marker_manager = MarkerManager()
         # Track mux source (teleop vs VLA + controller name) so the play
         # modal can label each recording without having to decode the bag.

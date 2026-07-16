@@ -16,8 +16,8 @@ from fv_episode_recorder.episode_store import (
     EpisodeIndexSyncError,
     EpisodeSchemaError,
     EpisodeStore,
-    FINISHED_VIDEO_DIR_MODE,
-    FINISHED_VIDEO_FILE_MODE,
+    FINISHED_PAYLOAD_DIR_MODE,
+    FINISHED_PAYLOAD_FILE_MODE,
     META_FILE_MODE,
     read_episode_meta,
 )
@@ -49,7 +49,7 @@ def _complete_active(store: EpisodeStore, outcome: str) -> None:
     assert index_error is None
     if outcome == "success":
         meta.state = "finished"
-        store.protect_finished_video_sources(ep_dir)
+        store.protect_finished_payload_sources(ep_dir)
     elif outcome == "abort":
         meta.state = "failed"
     else:
@@ -396,35 +396,53 @@ def test_delete_index_failure_retains_episode_files(
     assert store.index.total_count() == 1
 
 
-def test_successful_video_sources_are_read_only_and_historical_scope_is_narrow(
+def test_successful_payload_sources_are_read_only_and_historical_scope_is_narrow(
     tmp_path: Path,
 ) -> None:
     store = EpisodeStore(tmp_path)
     success_dir = store.start_episode(_meta("episode-success"))
+    success_bag = success_dir / "bag" / "bag_0.db3"
+    success_bag.write_bytes(b"bag")
     success_video = success_dir / "videos" / "camera" / "0000.mp4"
     success_video.parent.mkdir()
     success_video.write_bytes(b"video")
     _complete_active(store, "success")
 
     failed_dir = store.start_episode(_meta("episode-failed"))
+    failed_bag = failed_dir / "bag" / "bag_0.db3"
+    failed_bag.write_bytes(b"bag")
     failed_video = failed_dir / "videos" / "camera" / "0000.mp4"
     failed_video.parent.mkdir()
     failed_video.write_bytes(b"video")
     _complete_active(store, "abort")
 
+    success_bag.chmod(0o660)
     success_video.chmod(0o660)
+    failed_bag.chmod(0o660)
     failed_video.chmod(0o660)
-    assert store.migrate_finished_video_permissions() == 1
+    assert store.migrate_finished_payload_permissions() == 1
 
     assert stat.S_IMODE(success_dir.stat().st_mode) == EPISODE_DIR_MODE
     assert stat.S_IMODE((success_dir / "meta.json").stat().st_mode) == META_FILE_MODE
-    assert stat.S_IMODE(success_video.parent.stat().st_mode) == FINISHED_VIDEO_DIR_MODE
-    assert stat.S_IMODE(success_video.stat().st_mode) == FINISHED_VIDEO_FILE_MODE
+    assert stat.S_IMODE(success_bag.parent.stat().st_mode) == FINISHED_PAYLOAD_DIR_MODE
+    assert stat.S_IMODE(success_bag.stat().st_mode) == FINISHED_PAYLOAD_FILE_MODE
+    assert stat.S_IMODE(success_video.parent.stat().st_mode) == FINISHED_PAYLOAD_DIR_MODE
+    assert stat.S_IMODE(success_video.stat().st_mode) == FINISHED_PAYLOAD_FILE_MODE
+    assert stat.S_IMODE(failed_bag.stat().st_mode) == 0o660
     assert stat.S_IMODE(failed_video.stat().st_mode) == 0o660
     output_stat = tmp_path.stat()
-    for path in (success_dir, success_video.parent, success_video):
+    for path in (
+        success_dir,
+        success_bag.parent,
+        success_bag,
+        success_video.parent,
+        success_video,
+    ):
         assert path.stat().st_uid == output_stat.st_uid
         assert path.stat().st_gid == output_stat.st_gid
-    linked = tmp_path / "linked.mp4"
-    os.link(success_video, linked)
-    assert linked.read_bytes() == b"video"
+    linked_bag = tmp_path / "linked.db3"
+    linked_video = tmp_path / "linked.mp4"
+    os.link(success_bag, linked_bag)
+    os.link(success_video, linked_video)
+    assert linked_bag.read_bytes() == b"bag"
+    assert linked_video.read_bytes() == b"video"

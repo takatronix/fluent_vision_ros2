@@ -98,7 +98,7 @@ class FakeStore:
         self.written_states.append(meta.state)
 
 
-    def protect_finished_video_sources(self, _episode_dir: Path) -> None:
+    def protect_finished_payload_sources(self, _episode_dir: Path) -> None:
         pass
 
     def discard_finalizing_episode(self, _episode_id: str) -> bool:
