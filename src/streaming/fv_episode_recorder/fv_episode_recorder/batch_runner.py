@@ -39,7 +39,6 @@ class BatchConfig:
     setup_s: float = 5.0        # countdown before each recording starts
     tags: list[str] = field(default_factory=list)
     record_topics_override: Optional[list] = None
-    cameras_override: Optional[list] = None
     outcome_on_timeout: str = "success"   # outcome stamped when record_s expires
 
 
@@ -213,8 +212,6 @@ class BatchRunner:
                 }
                 if cfg.record_topics_override:
                     req_body["record_topics_override"] = cfg.record_topics_override
-                if cfg.cameras_override:
-                    req_body["cameras_override"] = cfg.cameras_override
                 try:
                     resp = await start_fn(req_body)
                     state.current_episode_id = resp.get("episode_id")

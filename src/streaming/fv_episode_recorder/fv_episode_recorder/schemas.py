@@ -8,12 +8,46 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .episode_store import normalize_episode_tags
 
 
 # ---------- Episode lifecycle ----------
+
+class CameraSelector(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: Optional[str] = Field(default=None, min_length=1)
+    topic: Optional[str] = Field(default=None, min_length=1)
+    kind: Optional[str] = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def require_condition(self) -> "CameraSelector":
+        if self.name is None and self.topic is None and self.kind is None:
+            raise ValueError("camera selector requires name, topic, or kind")
+        return self
+
+
+class TopicSelector(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    topic: Optional[str] = Field(default=None, min_length=1)
+    role: Optional[str] = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def require_condition(self) -> "TopicSelector":
+        if self.topic is None and self.role is None:
+            raise ValueError("topic selector requires topic or role")
+        return self
+
+
+class RecordingResourceSelectors(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cameras: Optional[list[CameraSelector]] = None
+    topics: Optional[list[TopicSelector]] = None
+
 
 class StartEpisodeRequest(BaseModel):
     task_description: str = Field(..., min_length=1)
@@ -26,7 +60,8 @@ class StartEpisodeRequest(BaseModel):
     env_config: Optional[dict[str, Any]] = None
     record_topics_override: Optional[list[dict[str, Any]]] = None
     record_bag_topics: Optional[list[str]] = None  # Step 2: simple topic name list for bag
-    cameras_override: Optional[list[dict[str, Any]]] = None
+    include: Optional[RecordingResourceSelectors] = None
+    exclude: Optional[RecordingResourceSelectors] = None
     fps: int = Field(default=30, ge=1, le=120)
     record_bag: bool = True
 

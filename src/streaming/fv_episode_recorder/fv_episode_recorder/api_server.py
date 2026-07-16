@@ -414,36 +414,57 @@ async def _start_episode(request: web.Request) -> web.Response:
     started_at = utc_now_iso()
 
     # Step 4: profile-driven topic + camera discovery (override > profile auto)
-    from .topic_discovery import discover_cameras, discover_topics
+    from .topic_discovery import (
+        RecordingSelectionError,
+        discover_cameras,
+        discover_topics,
+        select_cameras,
+        select_topics,
+    )
     get_profile = request.app.get("get_profile")
     profile_dict = get_profile(req.profile) if callable(get_profile) else {}
 
+    profile_cameras = discover_cameras(profile_dict) if profile_dict else []
+    try:
+        cameras_resolved = select_cameras(
+            profile_cameras,
+            include=req.include.cameras if req.include is not None else None,
+            exclude=req.exclude.cameras if req.exclude is not None else None,
+        )
+    except RecordingSelectionError as exc:
+        return web.json_response(
+            {"error": "recording_selector_no_match", "detail": str(exc)},
+            status=400,
+        )
+
     if req.record_topics_override:
         recorded_topics_meta = req.record_topics_override
-        bag_topics = [t["topic"] if isinstance(t, dict) else t for t in req.record_topics_override]
         discovery_source = "request_override"
     elif req.record_bag_topics:
         recorded_topics_meta = [
             {"topic": t, "role": "unknown", "qos": "default", "stamp_source": "rosbag_recv"}
             for t in req.record_bag_topics
         ]
-        bag_topics = list(req.record_bag_topics)
         discovery_source = "request_override"
     elif profile_dict:
-        recorded_topics_meta = discover_topics(profile_dict)
-        bag_topics = [d["topic"] for d in recorded_topics_meta]
+        recorded_topics_meta = discover_topics(profile_dict, cameras_resolved)
         discovery_source = "profile"
     else:
         recorded_topics_meta = []
-        bag_topics = []
         discovery_source = "none"
 
-    if req.cameras_override is not None:
-        cameras_resolved = req.cameras_override
-    elif profile_dict:
-        cameras_resolved = discover_cameras(profile_dict)
-    else:
-        cameras_resolved = []
+    try:
+        recorded_topics_meta = select_topics(
+            recorded_topics_meta,
+            include=req.include.topics if req.include is not None else None,
+            exclude=req.exclude.topics if req.exclude is not None else None,
+        )
+    except RecordingSelectionError as exc:
+        return web.json_response(
+            {"error": "recording_selector_no_match", "detail": str(exc)},
+            status=400,
+        )
+    bag_topics = [topic["topic"] for topic in recorded_topics_meta]
 
     # Step 5: disk preflight (refuse with 503 if not enough room).
     preflight_cfg = (req.model_dump().get("preflight") or {}) if hasattr(req, "model_dump") else {}

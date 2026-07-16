@@ -19,12 +19,19 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 
+from .schemas import CameraSelector, TopicSelector
+
 LOG = logging.getLogger("fv_episode_recorder.discovery")
+
+
+class RecordingSelectionError(ValueError):
+    """A recording selector does not match the resolved profile resources."""
 
 # Topics every episode should include regardless of profile.
 ALWAYS_INCLUDE: list[dict[str, str]] = [
@@ -93,10 +100,93 @@ def load_profile_yaml(
     return inner
 
 
-def discover_topics(profile: dict[str, Any]) -> list[dict[str, Any]]:
+def _camera_matches(camera: Mapping[str, Any], selector: CameraSelector) -> bool:
+    kind = camera.get("kind") or "color"
+    return (
+        (selector.name is None or camera.get("name") == selector.name)
+        and (selector.topic is None or camera.get("topic") == selector.topic)
+        and (selector.kind is None or kind.casefold() == selector.kind.casefold())
+    )
+
+
+def select_cameras(
+    cameras: list[dict[str, Any]],
+    *,
+    include: Optional[list[CameraSelector]],
+    exclude: Optional[list[CameraSelector]],
+) -> list[dict[str, Any]]:
+    for selector in [*(include or []), *(exclude or [])]:
+        if not any(_camera_matches(camera, selector) for camera in cameras):
+            raise RecordingSelectionError(
+                f"camera selector matched no profile cameras: "
+                f"{selector.model_dump(exclude_none=True)}"
+            )
+
+    selected = (
+        [
+            camera
+            for camera in cameras
+            if any(_camera_matches(camera, selector) for selector in include)
+        ]
+        if include is not None
+        else list(cameras)
+    )
+    if exclude is not None:
+        selected = [
+            camera
+            for camera in selected
+            if not any(_camera_matches(camera, selector) for selector in exclude)
+        ]
+    return selected
+
+
+def _topic_matches(topic: Mapping[str, Any], selector: TopicSelector) -> bool:
+    role = topic.get("role") or "unknown"
+    return (
+        (selector.topic is None or topic.get("topic") == selector.topic)
+        and (selector.role is None or role.casefold() == selector.role.casefold())
+    )
+
+
+def select_topics(
+    topics: list[dict[str, Any]],
+    *,
+    include: Optional[list[TopicSelector]],
+    exclude: Optional[list[TopicSelector]],
+) -> list[dict[str, Any]]:
+    for selector in [*(include or []), *(exclude or [])]:
+        if not any(_topic_matches(topic, selector) for topic in topics):
+            raise RecordingSelectionError(
+                f"topic selector matched no resolved topics: "
+                f"{selector.model_dump(exclude_none=True)}"
+            )
+
+    selected = (
+        [
+            topic
+            for topic in topics
+            if any(_topic_matches(topic, selector) for selector in include)
+        ]
+        if include is not None
+        else list(topics)
+    )
+    if exclude is not None:
+        selected = [
+            topic
+            for topic in selected
+            if not any(_topic_matches(topic, selector) for selector in exclude)
+        ]
+    return selected
+
+
+def discover_topics(
+    profile: dict[str, Any],
+    cameras: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
     """Walk profile yaml and emit a deduped, role-tagged topic list."""
     discovered: list[dict[str, Any]] = []
     seen: set[str] = set()
+    resolved_cameras = cameras if cameras is not None else discover_cameras(profile)
 
     def add(topic: str, role: str, qos: str = "default",
             stamp_source: str = "rosbag_recv", msg_type: Optional[str] = None):
@@ -124,7 +214,7 @@ def discover_topics(profile: dict[str, Any]) -> list[dict[str, Any]]:
         # Depth is recorded via the compressedDepth image_transport plugin
         # (lossless rvl/png ~5-10× compression) — recorder spawns a republisher
         # so we record the <topic>_compressed/compressedDepth topic, not raw.
-        for c in er.get("cameras") or []:
+        for c in resolved_cameras:
             if not isinstance(c, dict) or (c.get("kind") or "").lower() != "depth":
                 continue
             t = c.get("topic")
@@ -190,7 +280,7 @@ def discover_topics(profile: dict[str, Any]) -> list[dict[str, Any]]:
     # compressed_depth_image_transport plugin (lossless rvl/png 5-10×). The
     # recorder spawns `ros2 run image_transport republish` per depth camera
     # at episode start to feed the compressed topic that we record here.
-    for c in er.get("cameras") or []:
+    for c in resolved_cameras:
         if not isinstance(c, dict) or (c.get("kind") or "").lower() != "depth":
             continue
         t = c.get("topic")

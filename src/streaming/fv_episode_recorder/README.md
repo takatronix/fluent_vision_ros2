@@ -30,6 +30,27 @@ curl -X POST http://localhost:8083/api/v1/episodes/<id>/stop \
 curl http://localhost:8083/api/v1/episodes
 ```
 
+The profile defines the complete camera and bag-topic catalog. A start request
+may narrow that catalog with typed `include` and `exclude` selectors; it does
+not redefine camera topics or codecs.
+
+```json
+{
+  "task_description": "Pick up the white cube",
+  "profile": "piper_single_teleop",
+  "exclude": {
+    "cameras": [{"kind": "depth"}],
+    "topics": [{"role": "annotation"}]
+  }
+}
+```
+
+Camera selectors match `name`, `topic`, and `kind`. Topic selectors match
+`topic` and `role`. Conditions within one selector are ANDed; selectors in a
+list are ORed. Excluding a camera also prevents camera-derived bag topics and
+per-episode workers from being created. A selector that matches no resolved
+profile resource rejects the start request.
+
 Stopping an episode closes its ROS subscriptions and releases the active slot
 before rosbag and camera encoders finish flushing. The episode remains
 `finalizing` until its per-episode background job commits `finished`, `failed`,
