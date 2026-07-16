@@ -109,3 +109,28 @@ def test_abort_fails_if_process_survives_sigkill(
 
     with pytest.raises(RuntimeError, match="did not exit after SIGKILL"):
         recorder.abort()
+
+
+def test_start_uses_observed_recorder_with_explicit_topics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def start_process(command: list[str], **_kwargs) -> FakeProcess:
+        commands.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", start_process)
+    recorder = BagRecorder(max_bag_size_mb=32, storage="sqlite3")
+
+    recorder.start(tmp_path / "bag", ["/state", "/command"])
+
+    assert commands == [[
+        "ros2", "run", "fv_recorder", "fv_observed_bag_recorder",
+        "--output", str(tmp_path / "bag"),
+        "--storage", "sqlite3",
+        "--max-bag-size", str(32 * 1024 * 1024),
+        "--topic", "/state",
+        "--topic", "/command",
+    ]]

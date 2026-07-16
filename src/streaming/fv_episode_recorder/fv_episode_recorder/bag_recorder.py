@@ -1,6 +1,6 @@
-"""ros2 bag record subprocess wrapper.
+"""Observed rosbag2 recorder subprocess wrapper.
 
-Phase 1 Step 2: spawn `ros2 bag record` as subprocess into the episode's bag/
+Phase 1 Step 2: spawn the standard rosbag2 recorder wrapper into the episode's bag/
 directory. Topics are passed explicitly (Step 4 wires profile-driven discovery;
 for now caller passes the list).
 
@@ -59,12 +59,13 @@ class BagRecorder:
             bag_dir.rmdir()
 
         cmd = [
-            "ros2", "bag", "record",
-            "-o", str(bag_dir),
-            "-s", self.storage,
-            "-b", str(self.max_bag_size_mb * 1024 * 1024),
-            *topics,
+            "ros2", "run", "fv_recorder", "fv_observed_bag_recorder",
+            "--output", str(bag_dir),
+            "--storage", self.storage,
+            "--max-bag-size", str(self.max_bag_size_mb * 1024 * 1024),
         ]
+        for topic in topics:
+            cmd.extend(("--topic", topic))
         # ros2 needs an inherited env (ROS_DISTRO, AMENT_PREFIX_PATH, etc).
         env = os.environ.copy()
         LOG.info("starting bag recorder: %s", " ".join(cmd))

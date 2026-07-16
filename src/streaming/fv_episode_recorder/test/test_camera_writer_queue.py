@@ -18,12 +18,25 @@ class _Sidecar:
         return len(self.rows)
 
 
+class _Publisher:
+    def publish(self, _message) -> None:
+        pass
+
+
 def _camera_writer_module(monkeypatch: pytest.MonkeyPatch):
+    class Time:
+        def __init__(self):
+            self.sec = 0
+            self.nanosec = 0
+
     rclpy = types.ModuleType("rclpy")
     rclpy_node = types.ModuleType("rclpy.node")
     rclpy_node.Node = object
     rclpy_qos = types.ModuleType("rclpy.qos")
     rclpy_qos.qos_profile_sensor_data = object()
+    builtin_interfaces = types.ModuleType("builtin_interfaces")
+    builtin_interfaces_msg = types.ModuleType("builtin_interfaces.msg")
+    builtin_interfaces_msg.Time = Time
     sensor_msgs = types.ModuleType("sensor_msgs")
     sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
     sensor_msgs_msg.CompressedImage = object
@@ -34,6 +47,8 @@ def _camera_writer_module(monkeypatch: pytest.MonkeyPatch):
         "rclpy": rclpy,
         "rclpy.node": rclpy_node,
         "rclpy.qos": rclpy_qos,
+        "builtin_interfaces": builtin_interfaces,
+        "builtin_interfaces.msg": builtin_interfaces_msg,
         "sensor_msgs": sensor_msgs,
         "sensor_msgs.msg": sensor_msgs_msg,
         "fv_episode_recorder.frames_sidecar": sidecar,
@@ -133,6 +148,7 @@ def test_worker_persists_ros_stamp_with_video_pts(monkeypatch: pytest.MonkeyPatc
     writer = module.CameraWriter(
         "color", "/camera", tmp_path, encoder=module.EncoderConfig("test", ()),
     )
+    writer._tick_publisher = _Publisher()
     writer._queue.put(module._QueuedFrame(b"jpeg", 123_456_789, 987_654_321))
     writer._queue.put(module._STOP)
 
@@ -140,6 +156,50 @@ def test_worker_persists_ros_stamp_with_video_pts(monkeypatch: pytest.MonkeyPatc
 
     assert writer._sidecar.rows[0]["ros_stamp_ns"] == 123_456_789
     assert writer._sidecar.rows[0]["video_pts"] == 42
+
+
+def test_worker_publishes_tick_after_video_and_sidecar_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _camera_writer_module(monkeypatch)
+    events: list[str] = []
+
+    class Video:
+        width = 64
+        height = 48
+
+        def append(self, _data, _ros_stamp_ns):
+            events.append("video")
+            return types.SimpleNamespace(video_pts=42)
+
+        def close(self):
+            pass
+
+        def abort(self):
+            pass
+
+    class Sidecar(_Sidecar):
+        def append(self, row: dict) -> None:
+            events.append("sidecar")
+            super().append(row)
+
+    class Publisher:
+        def publish(self, _message) -> None:
+            events.append("tick")
+
+    monkeypatch.setattr(module, "VfrMp4Writer", lambda *_args: Video())
+    monkeypatch.setattr(module, "FramesSidecar", Sidecar)
+    writer = module.CameraWriter(
+        "color", "/camera", tmp_path, encoder=module.EncoderConfig("test", ()),
+    )
+    writer._tick_publisher = Publisher()
+    writer._queue.put(module._QueuedFrame(b"jpeg", 123_456_789, 987_654_321))
+    writer._queue.put(module._STOP)
+
+    writer._run_worker()
+
+    assert events == ["video", "sidecar", "tick"]
 
 
 def test_encoder_probe_precedes_every_subscription(monkeypatch: pytest.MonkeyPatch,
@@ -194,6 +254,7 @@ def test_stop_drains_worker_queue_before_returning(
     writer = module.CameraWriter(
         "color", "/camera", tmp_path, encoder=module.EncoderConfig("test", ()),
     )
+    writer._tick_publisher = _Publisher()
     writer._worker = threading.Thread(target=writer._run_worker, daemon=True)
     writer._worker.start()
     writer._on_image(_message(1_000_000_000))
@@ -249,12 +310,16 @@ def test_subscription_destroy_failure_keeps_cleanup_ownership(
         def destroy_subscription(self, _sub):
             raise RuntimeError("destroy failed")
 
+        def destroy_publisher(self, _publisher):
+            pass
+
     monkeypatch.setattr(module, "VfrMp4Writer", lambda *_args: Video())
     writer = module.CameraWriter(
         "color", "/camera", tmp_path, node=Node(),
         encoder=module.EncoderConfig("test", ()),
     )
     writer._sub = object()
+    writer._tick_publisher = _Publisher()
     writer._worker = threading.Thread(target=writer._run_worker, daemon=True)
     writer._worker.start()
     writer._on_image(_message(1_000_000_000))

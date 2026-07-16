@@ -8,6 +8,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_auto REQUIRED)
+find_package(builtin_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -74,10 +75,20 @@ ament_target_dependencies(fv_player_node
 )
 rosidl_target_interfaces(fv_player_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 
+add_executable(fv_observed_bag_recorder src/fv_observed_bag_recorder.cpp)
+ament_target_dependencies(fv_observed_bag_recorder
+  builtin_interfaces
+  rclcpp
+  rosbag2_cpp
+  rosbag2_storage
+  rosbag2_transport
+)
+
 # Install executables
 install(TARGETS
   fv_recorder_node
   fv_player_node
+  fv_observed_bag_recorder
   DESTINATION lib/${PROJECT_NAME}
 )
 

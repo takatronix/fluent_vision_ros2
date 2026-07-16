@@ -17,6 +17,7 @@ from typing import Optional
 import cv2
 import numpy as np
 import rclpy
+from builtin_interfaces.msg import Time
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, Image
@@ -39,6 +40,13 @@ class _Stop:
 
 
 _STOP = _Stop()
+_CAMERA_WRITE_TICK_PREFIX = "/fv_episode_recorder/write_tick/camera"
+
+
+def _time_message(timestamp_ns: int) -> Time:
+    message = Time()
+    message.sec, message.nanosec = divmod(timestamp_ns, 1_000_000_000)
+    return message
 
 
 class CameraWriter:
@@ -75,6 +83,7 @@ class CameraWriter:
         self._last_recv_ns = 0
         self._lock = threading.Lock()
         self._sub = None
+        self._tick_publisher = None
         self._first_frame_received = False
         self.frame_count = 0
         self.width = 0
@@ -91,6 +100,11 @@ class CameraWriter:
         )
         self._worker.start()
         try:
+            self._tick_publisher = self._node.create_publisher(
+                Time,
+                f"{_CAMERA_WRITE_TICK_PREFIX}/{self.name}",
+                10,
+            )
             self._sub = self._node.create_subscription(
                 CompressedImage,
                 self.topic,
@@ -98,6 +112,7 @@ class CameraWriter:
                 qos_profile_sensor_data,
             )
         except Exception:
+            self._destroy_tick_publisher()
             self._queue.put(_STOP)
             self._worker.join()
             self._worker = None
@@ -143,6 +158,9 @@ class CameraWriter:
                         "keyframe": True,
                     }
                 )
+                if self._tick_publisher is None:
+                    raise RuntimeError(f"[{self.name}] write tick publisher is unavailable")
+                self._tick_publisher.publish(_time_message(time.time_ns()))
                 with self._lock:
                     self._frame_index += 1
                     self._segment_local += 1
@@ -195,6 +213,15 @@ class CameraWriter:
                 if self._sub is sub:
                     self._sub = None
 
+    def _destroy_tick_publisher(self) -> None:
+        with self._lock:
+            publisher = self._tick_publisher
+        if publisher is not None and self._node is not None:
+            self._node.destroy_publisher(publisher)
+            with self._lock:
+                if self._tick_publisher is publisher:
+                    self._tick_publisher = None
+
     def stop(self) -> dict:
         self.request_stop()
         cleanup_failure: Optional[Exception] = None
@@ -212,6 +239,11 @@ class CameraWriter:
                     continue
             worker.join()
         self._worker = None
+        try:
+            self._destroy_tick_publisher()
+        except Exception as exc:
+            if cleanup_failure is None:
+                cleanup_failure = exc
         with self._lock:
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
