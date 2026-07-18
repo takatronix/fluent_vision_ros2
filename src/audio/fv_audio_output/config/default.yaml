@@ -8,4 +8,11 @@ fv_audio_output:
     audio.bit_depth: 16
     audio.start_threshold_frames: 0
     audio.drain_after_frame: false
+    audio.reconnect.enabled: true
+    audio.reconnect.interval_ms: 1000
+    # Optional hardware mixer restoration after a USB reconnect.
+    # Example: card="hw:UACDemoV10", control="PCM", volume_percent=100
+    audio.mixer.card: ""
+    audio.mixer.control: "PCM"
+    audio.mixer.volume_percent: -1
     queue.max_frames: 32
