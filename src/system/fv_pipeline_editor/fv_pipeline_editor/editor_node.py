@@ -330,8 +330,21 @@ class FVPipelineEditorNode(Node):
         self.declare_parameter('models_dir', '')
         self.declare_parameter('ml_hub_url', 'http://localhost:7000')
         self.declare_parameter('ml_hub_token', '')
+        # 子ノードの RMW。既定 'rmw_cyclonedds_cpp' は fv_realsense の
+        # librealsense2 シンボル衝突回避 (fluent_vision 由来)。'' で親環境を
+        # 継承 — FastDDS プロファイル前提のスタック (aspa: D555 の 16MB
+        # 受信バッファ必須) では '' にしないと子が映像を受けられない。
+        self.declare_parameter('child_rmw_implementation', 'rmw_cyclonedds_cpp')
+        # launch 時に同名実行ファイルの「孤児」を pgrep -f で殺す挙動。
+        # 同じ実行ファイルをエディタ外でも常駐させるスタック (aspa の
+        # perception_node 等) では巻き添えになるので false にすること。
+        self.declare_parameter('kill_orphans_on_launch', True)
 
         self.port = self.get_parameter('port').value
+        self.child_rmw = str(
+            self.get_parameter('child_rmw_implementation').value).strip()
+        self.kill_orphans = bool(
+            self.get_parameter('kill_orphans_on_launch').value)
         self.pipeline_dir = self.get_parameter('pipeline_dir').value
         self.builtin_dir = self.get_parameter('builtin_dir').value
         self.manifest_roots = self.get_parameter('manifest_search_roots').value
@@ -394,6 +407,7 @@ class FVPipelineEditorNode(Node):
 
         # Process management
         self._processes: Dict[str, subprocess.Popen] = {}
+        self._stderr_tails: Dict[str, list] = {}   # node_id -> 末尾ログ行
         self._process_lock = threading.Lock()
         self._containers: Dict[str, Dict[str, str]] = {}
         self._container_lock = threading.Lock()
@@ -1136,7 +1150,10 @@ class FVPipelineEditorNode(Node):
         self._kill_process(node_id)
 
         # Kill orphaned processes from previous editor sessions
-        self._kill_orphaned(executable)
+        # (kill_orphans_on_launch=false のスタックでは無効 — pgrep -f は
+        # エディタ外で常駐する同名ノードまで巻き添えにするため)
+        if self.kill_orphans:
+            self._kill_orphaned(executable)
 
         # Build ros2 run command
         cmd = ['ros2', 'run', package, executable, '--ros-args']
@@ -1161,9 +1178,10 @@ class FVPipelineEditorNode(Node):
             f'Launching [{node_id}]: {" ".join(cmd[:8])}...')
 
         try:
-            # Use CycloneDDS to avoid FastRTPS symbol collision with librealsense2
+            # child_rmw_implementation='' -> 親環境を継承 (パラメータ解説参照)
             launch_env = os.environ.copy()
-            launch_env['RMW_IMPLEMENTATION'] = 'rmw_cyclonedds_cpp'
+            if self.child_rmw:
+                launch_env['RMW_IMPLEMENTATION'] = self.child_rmw
 
             proc = subprocess.Popen(
                 cmd,
@@ -1174,6 +1192,23 @@ class FVPipelineEditorNode(Node):
             )
             with self._process_lock:
                 self._processes[node_id] = proc
+            # stderr は常時ドレインする (ROSログはstderr行き)。読み手なしの
+            # PIPE は 64KB で詰まり、trtexec ビルドのような饒舌な子を
+            # ブロックさせる (実測しかけた 2026-07-18)。末尾だけ保持して
+            # クラッシュ時の診断に使う。
+            tail: list = []
+            self._stderr_tails[node_id] = tail
+
+            def _drain(p=proc, t=tail):
+                try:
+                    for line in iter(p.stderr.readline, b''):
+                        t.append(line.decode('utf-8', errors='replace'))
+                        if len(t) > 50:
+                            del t[:len(t) - 50]
+                except Exception:
+                    pass
+            threading.Thread(target=_drain, daemon=True,
+                             name=f'stderr-{node_id}').start()
 
             await ws.send_json({
                 'type': 'launch_result',
@@ -1602,11 +1637,10 @@ class FVPipelineEditorNode(Node):
                     status = 'stopped' if poll == 0 else 'error'
                     stderr_output = ''
                     if poll != 0:
-                        try:
-                            stderr_output = proc.stderr.read().decode(
-                                'utf-8', errors='replace')[-500:]
-                        except Exception:
-                            pass
+                        # ドレインスレッドが貯めた末尾 (直接 read すると
+                        # ドレインと競合するのでこちらを使う)
+                        tail = self._stderr_tails.get(node_id, [])
+                        stderr_output = ''.join(tail)[-500:]
                         self.get_logger().warn(
                             f'Node [{node_id}] crashed (exit={poll}): '
                             f'{stderr_output}')
