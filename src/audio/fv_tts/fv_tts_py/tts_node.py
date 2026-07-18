@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -69,13 +70,14 @@ class FvTtsNode(Node):
         # エンジン差替え: "voicevox"(既定) | "pyopenjtalk"
         self.declare_parameter("engine", "voicevox")
         self.declare_parameter("voicevox_url", "http://127.0.0.1:50021")
-        self.declare_parameter("voicevox_speaker", 3)   # 3 = ずんだもん(ノーマル)
+        self.declare_parameter("voicevox_speaker", 30)  # No.7 (アナウンス)
         # 出力パイプライン (fv_audio_output) のサンプルレート。voicevox は 24kHz を
         # 返すので、このレート(既定 48kHz)へリサンプルしてから publish する。
         self.declare_parameter("output_sample_rate", 48000)
         # Event Bus 契約: 任意テキストを喋らせる topic I/F と再生中フラグ
         self.declare_parameter("say_topic", "/aspa/tts/say")
         self.declare_parameter("speaking_topic", "/aspa/audio/speaking")
+        self.declare_parameter("settings_topic", "/aspa/tts/settings")
 
         self.default_voice = self.get_parameter("default_voice").get_parameter_value().string_value
         self.output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
@@ -89,6 +91,7 @@ class FvTtsNode(Node):
         self.output_sample_rate = self.get_parameter("output_sample_rate").get_parameter_value().integer_value
         self.say_topic = self.get_parameter("say_topic").get_parameter_value().string_value
         self.speaking_topic = self.get_parameter("speaking_topic").get_parameter_value().string_value
+        self.settings_topic = self.get_parameter("settings_topic").value
 
         self.get_logger().info(f"Starting FV TTS node (engine={self.engine})")
 
@@ -132,6 +135,13 @@ class FvTtsNode(Node):
 
         # Event Bus 契約: soundboard 等が /aspa/tts/say に流す任意テキストを喋る
         self.say_sub = self.create_subscription(String, self.say_topic, self.on_say, 10)
+        # Scene Viewerの永続設定。TRANSIENT_LOCALなのでTTS再起動時にも最新話者を受信。
+        settings_qos = QoSProfile(depth=1)
+        settings_qos.reliability = ReliabilityPolicy.RELIABLE
+        settings_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        settings_qos.history = HistoryPolicy.KEEP_LAST
+        self.settings_sub = self.create_subscription(
+            String, self.settings_topic, self.on_settings, settings_qos)
 
         # Barge-in/stop 後に古い音声が鳴らないよう、再生世代(epoch)を管理する。
         # epoch は AudioFrame.epoch に埋め込み、audio_output 側で stop 時に世代を進めて破棄する。
@@ -146,6 +156,23 @@ class FvTtsNode(Node):
         self._speaking_lock = threading.Lock()
 
         self.cache: Dict[str, CachedAudio] = {}
+
+    def on_settings(self, msg: String) -> None:
+        try:
+            obj = json.loads(msg.data or "{}")
+            speaker = int(obj["voicevox_speaker"])
+            if speaker < 0:
+                raise ValueError("speaker must be >= 0")
+        except KeyError:
+            return
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warn(f"TTS settings parse failed: {exc}")
+            return
+        previous = self.voicevox_speaker
+        self.voicevox_speaker = speaker
+        if previous != speaker:
+            self.get_logger().info(
+                f"VOICEVOX speaker changed: {previous} -> {speaker}")
 
     def on_stop(self, _msg: Empty) -> None:
         """音声停止を受けたら再生世代を進める。"""
@@ -351,10 +378,22 @@ class FvTtsNode(Node):
         frame.epoch = int(epoch) if epoch is not None else 0
         return frame
 
+    def cache_voice_id(self, voice_id: str) -> str:
+        """Resolve the actual voice so changing the default cannot reuse old audio."""
+        if self.engine != "voicevox":
+            return voice_id
+        if voice_id:
+            try:
+                return str(int(voice_id))
+            except ValueError:
+                pass
+        return str(self.voicevox_speaker)
+
     def make_cache_key(self, text: str, voice_id: str, volume_db: float) -> str:
         digest = hashlib.sha1()  # nosec B303
+        digest.update(self.engine.encode("utf-8"))
         digest.update(text.encode("utf-8"))
-        digest.update(voice_id.encode("utf-8"))
+        digest.update(self.cache_voice_id(voice_id).encode("utf-8"))
         digest.update(str(volume_db).encode("utf-8"))
         return digest.hexdigest()
 

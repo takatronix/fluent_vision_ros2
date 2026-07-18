@@ -1,7 +1,11 @@
 fv_audio_output:
   ros__parameters:
     audio.device_id: "default"
+    audio.volume_topic: "/audio/output/volume"
+    audio.volume: 1.0
     audio.sample_rate: 48000
     audio.channels: 1
     audio.bit_depth: 16
+    audio.start_threshold_frames: 0
+    audio.drain_after_frame: false
     queue.max_frames: 32

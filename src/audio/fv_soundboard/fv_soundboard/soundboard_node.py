@@ -223,6 +223,8 @@ class SoundboardNode(Node):
         self.declare_parameter("master_volume", 0.8)
         self.declare_parameter("event_topic", "/fv/event")
         self.declare_parameter("event_out_topic", "/fv/event/active")  # recorder等が購読
+        self.declare_parameter("preview_topic", "/fv/sound/play")
+        self.declare_parameter("settings_topic", "/fv/sound/settings")
         self.declare_parameter("tts_say_topic", "/aspa/tts/say")
         self.declare_parameter("speaking_topic", "/aspa/audio/speaking")
         self.declare_parameter("enable_tts", True)
@@ -242,6 +244,8 @@ class SoundboardNode(Node):
         self.master_volume = float(gp("master_volume"))
         self.enable_tts = bool(gp("enable_tts"))
         self.output_sample_rate = int(gp("output_sample_rate"))
+        self.robot_enabled = True
+        self.disabled_events = set()
 
         self.registry = self._load_registry(gp("registry_file"))
 
@@ -266,8 +270,16 @@ class SoundboardNode(Node):
 
         # 入力
         self.create_subscription(String, gp("event_topic"), self._on_event, 20)
-        # 直接ファイル/イベント再生用の別口 (任意)
-        self.create_subscription(String, "/fv/sound/play", self._on_event, 20)
+        # プレビューは無効化設定を迂回し、recorder markerへも転送しない。
+        self.create_subscription(String, gp("preview_topic"), self._on_preview, 20)
+        # Scene Viewerが永続設定をlatched publishする。soundboardを再起動しても
+        # 最新値を即受信できる。
+        settings_qos = QoSProfile(depth=1)
+        settings_qos.reliability = ReliabilityPolicy.RELIABLE
+        settings_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        settings_qos.history = HistoryPolicy.KEEP_LAST
+        self.create_subscription(
+            String, gp("settings_topic"), self._on_settings, settings_qos)
 
         # /aspa/audio/speaking の再生尺ベース管理 (シンク非依存の best-effort 推定)
         self._speaking = False
@@ -331,14 +343,40 @@ class SoundboardNode(Node):
         return p if os.path.exists(p) else None
 
     # ── event handling ──────────────────────────────────
+    def _on_settings(self, msg: String):
+        try:
+            obj = json.loads(msg.data or "{}")
+            if not isinstance(obj, dict):
+                raise ValueError("object required")
+            enabled = bool(obj.get("robot_enabled", True))
+            disabled = {
+                str(name) for name in obj.get("disabled_events", [])
+                if str(name) in self.registry
+            }
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warn(f"settings parse失敗: {exc}")
+            return
+        self.robot_enabled = enabled
+        self.disabled_events = disabled
+        self.get_logger().info(
+            f"audio settings: robot={'on' if enabled else 'off'}, "
+            f"disabled={len(disabled)}")
+
+    def _on_preview(self, msg: String):
+        self._handle_event(msg, preview=True)
+
     def _on_event(self, msg: String):
+        self._handle_event(msg, preview=False)
+
+    def _handle_event(self, msg: String, preview=False):
         raw = (msg.data or "").strip()
         if not raw:
             return
 
         # "say:任意テキスト" → 登録外の即時発話
         if raw.startswith("say:"):
-            self._speak(raw[4:].strip())
+            if preview or self.robot_enabled:
+                self._speak(raw[4:].strip())
             return
 
         # JSON個別指定 or 登録名
@@ -368,9 +406,17 @@ class SoundboardNode(Node):
         # 登録イベント or 構造化データ (variant/class/attrs) がある時のみ forward。
         # 未登録の bare 名は記録を汚さないよう再送しない (下で warn)。
         # 構造化キーがあれば JSON で forward (エピソードに種別を残す)。
-        if spec is not None or variant is not None or cls is not None or attrs is not None:
+        if (not preview
+                and (spec is not None or variant is not None
+                     or cls is not None or attrs is not None)):
             marker = (spec.get("record") if spec else None) or name or (cls or "")
             self._forward_marker(marker, variant, cls, attrs)
+
+        # 記録マーカーは音の設定に関係なく残す。プレビューだけはOFF設定を
+        # 迂回して、設定中に各音を必ず確認できる。
+        if not preview and (
+                not self.robot_enabled or name in self.disabled_events):
+            return
 
         # ── sonification (連続パラメータ → 合成) ──
         # class/attrs があり sonifier 有効なら合成音を鳴らす。合成音が状況を伝えるので

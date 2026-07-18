@@ -33,6 +33,48 @@ events:
     interrupt: false
     record: ready
     category: system
+  mode_manual:
+    sound: auto_stop
+    say: "手動運転モードに切り替えました"
+    speak: true
+    interrupt: false
+    record: mode_manual
+    category: system
+  mode_standby:
+    sound: pause
+    say: "待機モードに切り替えました"
+    speak: true
+    interrupt: false
+    record: mode_standby
+    category: system
+  mode_waypoint:
+    sound: nav_start
+    say: "目的地移動モードに切り替えました"
+    speak: true
+    interrupt: false
+    record: mode_waypoint
+    category: system
+  mode_patrol:
+    sound: auto_start
+    say: "巡回モードに切り替えました"
+    speak: true
+    interrupt: false
+    record: mode_patrol
+    category: system
+  mode_harvest:
+    sound: harvest
+    say: "収穫モードに切り替えました"
+    speak: true
+    interrupt: false
+    record: mode_harvest
+    category: system
+  mode_estop:
+    sound: stop
+    say: "非常停止しました"
+    speak: true
+    interrupt: true
+    record: mode_estop
+    category: system
   auto_start:
     sound: auto_start
     say: "自動運転を開始します"

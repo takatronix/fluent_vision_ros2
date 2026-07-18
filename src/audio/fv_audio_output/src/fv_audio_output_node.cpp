@@ -40,6 +40,14 @@ FvAudioOutputNode::FvAudioOutputNode()
     "audio/output/frame", audio_qos,
     std::bind(&FvAudioOutputNode::handleFrame, this, std::placeholders::_1));
 
+  // UI volume is latched so a restarted output node immediately receives the
+  // last setting from the scene viewer.
+  rclcpp::QoS volume_qos(1);
+  volume_qos.reliable().transient_local();
+  volume_sub_ = this->create_subscription<std_msgs::msg::Float32>(
+    config_.volume_topic, volume_qos,
+    std::bind(&FvAudioOutputNode::handleVolume, this, std::placeholders::_1));
+
   play_file_srv_ = this->create_service<fv_audio_output::srv::PlayFile>(
     "audio/output/play_file",
     std::bind(&FvAudioOutputNode::handlePlayFile, this,
@@ -87,17 +95,28 @@ void FvAudioOutputNode::loadParameters()
   const uint32_t default_chunk_duration_ms = config_.chunk_duration_ms;
   const size_t default_qos_depth = config_.qos_depth;
   const bool default_qos_reliable = config_.qos_reliable;
+  const uint32_t default_start_threshold_frames = config_.start_threshold_frames;
+  const bool default_drain_after_frame = config_.drain_after_frame;
 
   this->declare_parameter("audio.device_id", config_.device_id);
+  this->declare_parameter("audio.volume_topic", config_.volume_topic);
+  this->declare_parameter<double>("audio.volume", static_cast<double>(config_.volume));
   this->declare_parameter<int>("audio.sample_rate", static_cast<int>(config_.sample_rate));
   this->declare_parameter<int>("audio.channels", static_cast<int>(config_.channels));
   this->declare_parameter<int>("audio.bit_depth", static_cast<int>(config_.bit_depth));
   this->declare_parameter<int>("queue.max_frames", static_cast<int>(config_.max_queue_frames));
   this->declare_parameter<int>("audio.chunk_duration_ms", static_cast<int>(default_chunk_duration_ms));
+  this->declare_parameter<int>(
+    "audio.start_threshold_frames", static_cast<int>(default_start_threshold_frames));
+  this->declare_parameter<bool>("audio.drain_after_frame", default_drain_after_frame);
   this->declare_parameter<int>("audio.qos.depth", static_cast<int>(default_qos_depth));
   this->declare_parameter<bool>("audio.qos.reliable", default_qos_reliable);
 
   config_.device_id = this->get_parameter("audio.device_id").as_string();
+  config_.volume_topic = this->get_parameter("audio.volume_topic").as_string();
+  config_.volume = static_cast<float>(std::clamp(
+    this->get_parameter("audio.volume").as_double(), 0.0, 1.0));
+  volume_.store(config_.volume);
   config_.sample_rate = this->get_parameter("audio.sample_rate").as_int();
   config_.channels = this->get_parameter("audio.channels").as_int();
   config_.bit_depth = this->get_parameter("audio.bit_depth").as_int();
@@ -117,6 +136,11 @@ void FvAudioOutputNode::loadParameters()
   } else {
     config_.chunk_duration_ms = static_cast<uint32_t>(chunk_duration_ms_param);
   }
+  const int64_t start_threshold_param =
+    this->get_parameter("audio.start_threshold_frames").as_int();
+  config_.start_threshold_frames = static_cast<uint32_t>(
+    std::max<int64_t>(0, start_threshold_param));
+  config_.drain_after_frame = this->get_parameter("audio.drain_after_frame").as_bool();
 
   const int64_t qos_depth_param = this->get_parameter("audio.qos.depth").as_int();
   if (qos_depth_param <= 0) {
@@ -130,10 +154,12 @@ void FvAudioOutputNode::loadParameters()
   config_.qos_reliable = this->get_parameter("audio.qos.reliable").as_bool();
 
   RCLCPP_INFO(this->get_logger(),
-    "Output config: device=%s rate=%uHz channels=%u bits=%u queue=%zu "
-    "chunk=%ums qos_depth=%zu reliable=%s",
-    config_.device_id.c_str(), config_.sample_rate, config_.channels, config_.bit_depth,
-    config_.max_queue_frames, config_.chunk_duration_ms, config_.qos_depth,
+    "Output config: device=%s volume=%.2f rate=%uHz channels=%u bits=%u queue=%zu "
+    "chunk=%ums start_threshold=%u drain_after_frame=%s qos_depth=%zu reliable=%s",
+    config_.device_id.c_str(), config_.volume, config_.sample_rate,
+    config_.channels, config_.bit_depth,
+    config_.max_queue_frames, config_.chunk_duration_ms, config_.start_threshold_frames,
+    config_.drain_after_frame ? "true" : "false", config_.qos_depth,
     config_.qos_reliable ? "true" : "false");
 }
 
@@ -243,8 +269,14 @@ bool FvAudioOutputNode::openDevice()
   if (err < 0) {
     RCLCPP_WARN(this->get_logger(), "snd_pcm_sw_params_current failed: %s", snd_strerror(err));
   } else {
-    // Start playback automatically when buffer is at least half full
-    err = snd_pcm_sw_params_set_start_threshold(handle, sw_params, buffer_size / 2);
+    const snd_pcm_uframes_t start_threshold =
+      config_.start_threshold_frames == 0 ?
+      std::max<snd_pcm_uframes_t>(1, buffer_size / 2) :
+      std::min<snd_pcm_uframes_t>(
+        buffer_size,
+        std::max<snd_pcm_uframes_t>(1, config_.start_threshold_frames));
+
+    err = snd_pcm_sw_params_set_start_threshold(handle, sw_params, start_threshold);
     if (err < 0) {
       RCLCPP_WARN(this->get_logger(), "snd_pcm_sw_params_set_start_threshold failed: %s", snd_strerror(err));
     }
@@ -259,7 +291,7 @@ bool FvAudioOutputNode::openDevice()
     if (err < 0) {
       RCLCPP_WARN(this->get_logger(), "snd_pcm_sw_params failed: %s", snd_strerror(err));
     } else {
-      RCLCPP_INFO(this->get_logger(), "ALSA software params: start_threshold=%lu frames", buffer_size / 2);
+      RCLCPP_INFO(this->get_logger(), "ALSA software params: start_threshold=%lu frames", start_threshold);
     }
   }
 
@@ -329,6 +361,15 @@ void FvAudioOutputNode::handleFrame(const fv_audio::msg::AudioFrame::SharedPtr m
   RCLCPP_DEBUG_THROTTLE(
     this->get_logger(), *this->get_clock(), 2000,
     "Frame queued for playback");
+}
+
+void FvAudioOutputNode::handleVolume(const std_msgs::msg::Float32::SharedPtr msg)
+{
+  const float next = std::clamp(msg->data, 0.0F, 1.0F);
+  const float previous = volume_.exchange(next);
+  if (previous != next) {
+    RCLCPP_INFO(this->get_logger(), "Master volume: %.0f%%", next * 100.0F);
+  }
 }
 
 void FvAudioOutputNode::handleStop(const std_msgs::msg::Empty::SharedPtr /*msg*/)
@@ -484,6 +525,10 @@ void FvAudioOutputNode::playbackThread()
         }
       }
 
+      const float master_volume = volume_.load();
+      if (master_volume < 1.0F) {
+        applyVolumeScale(queued_frame.data, master_volume);
+      }
       size_t total_bytes = queued_frame.data.size();
       size_t bytes_written = 0;
       uint8_t * data_ptr = queued_frame.data.data();
@@ -531,8 +576,22 @@ void FvAudioOutputNode::playbackThread()
         }
         RCLCPP_INFO(this->get_logger(), "Playback interrupted, dropped remaining audio");
       } else if (bytes_written > 0) {
-        // 正常完了: drain せずに即座に playback_done を送信
-        // （次のフレームがあれば連続再生される）
+        // Discrete cues can be shorter than the ALSA buffer. Optionally wait
+        // until the hardware has consumed the complete frame before reporting
+        // completion or accepting an interrupting cue.
+        if (config_.drain_after_frame && pcm_handle_) {
+          const int drain_result = snd_pcm_drain(pcm_handle_);
+          if (drain_result < 0) {
+            RCLCPP_WARN(
+              this->get_logger(), "snd_pcm_drain failed: %s", snd_strerror(drain_result));
+          }
+          const int prepare_result = snd_pcm_prepare(pcm_handle_);
+          if (prepare_result < 0) {
+            RCLCPP_ERROR(
+              this->get_logger(), "snd_pcm_prepare after drain failed: %s",
+              snd_strerror(prepare_result));
+          }
+        }
         RCLCPP_INFO(this->get_logger(), "Playback done, publishing notification");
         fv_audio::msg::PlaybackDone done_msg;
         done_msg.header = queued_frame.header;

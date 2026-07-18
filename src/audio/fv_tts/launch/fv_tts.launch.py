@@ -13,7 +13,7 @@ def generate_launch_description():
                 # エンジン差替え: "voicevox"(既定) | "pyopenjtalk"
                 'engine': 'voicevox',
                 'voicevox_url': 'http://127.0.0.1:50021',
-                'voicevox_speaker': 3,
+                'voicevox_speaker': 30,
                 'output_sample_rate': 48000,
                 'default_voice': '',
                 'output_topic': 'audio/tts/frame',
@@ -21,6 +21,7 @@ def generate_launch_description():
                 'use_playback_topic': True,
                 'say_topic': '/aspa/tts/say',
                 'speaking_topic': '/aspa/audio/speaking',
+                'settings_topic': '/aspa/tts/settings',
                 'cache_dir': '~/.fluent_voice_cache',
             }],
         )

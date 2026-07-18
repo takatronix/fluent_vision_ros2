@@ -13,7 +13,14 @@ ros2 run fv_audio_output fv_audio_output_node --ros-args --params-file install/f
 
 主なパラメータ:
 - `audio.device_id`: ALSAデバイス名（例: `default`, `hw:1,0`）
+- `audio.volume`: 全AudioFrameへ適用する初期マスター音量 (0.0〜1.0)。
+- `audio.volume_topic`: 実行中のマスター音量を受ける `std_msgs/Float32`。
+  TRANSIENT_LOCAL QoSで、UI再起動後も最新値を受け取れます。
 - `audio.sample_rate`, `audio.channels`, `audio.bit_depth`: フレームと一致している必要があります。
+- `audio.start_threshold_frames`: ALSAが再生を開始するフレーム数。0は従来どおり
+  バッファの半分、1は短い通知音を即時開始します。
+- `audio.drain_after_frame`: trueなら各AudioFrameを実デバイスが再生し終わるまで待ってから
+  完了通知を出します。離散cue/TTS向けで、連続ストリームではfalseを使用します。
 - `queue.max_frames`: バッファに保持するフレーム数。溢れると古いフレームから破棄します。
 
 `fv_tts`と組み合わせる場合、`audio/output/frame`トピックを共有すればテキスト合成結果が自動で再生されます。

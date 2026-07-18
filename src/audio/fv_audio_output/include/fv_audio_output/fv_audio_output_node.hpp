@@ -18,6 +18,7 @@
 #include "fv_audio/msg/playback_done.hpp"
 #include "fv_audio_output/srv/play_file.hpp"
 #include "std_msgs/msg/empty.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/header.hpp"
 
 namespace fv_audio_output
@@ -26,13 +27,17 @@ namespace fv_audio_output
 struct OutputConfig
 {
   std::string device_id = "default";
+  std::string volume_topic = "/audio/output/volume";
+  float volume = 1.0F;
   uint32_t sample_rate = 48000;
   uint32_t channels = 1;
   uint32_t bit_depth = 16;
   size_t max_queue_frames = 8;
   uint32_t chunk_duration_ms = 30;  // 内部チャンク分割サイズ（停止応答性向上用）
+  uint32_t start_threshold_frames = 0;  // 0 = ALSA buffer の半分
   size_t qos_depth = 10;
   bool qos_reliable = true;
+  bool drain_after_frame = false;
 };
 
 // 再生キュー用の構造体（フレームデータとヘッダーをペアで保持）
@@ -55,6 +60,7 @@ private:
   void closeDevice();
   void playbackThread();
   void handleFrame(const fv_audio::msg::AudioFrame::SharedPtr msg);
+  void handleVolume(const std_msgs::msg::Float32::SharedPtr msg);
   void handleStop(const std_msgs::msg::Empty::SharedPtr msg);
   void handlePause(const std_msgs::msg::Empty::SharedPtr msg);
   void handleResume(const std_msgs::msg::Empty::SharedPtr msg);
@@ -77,6 +83,7 @@ private:
   std::atomic<bool> running_{false};
 
   rclcpp::Subscription<fv_audio::msg::AudioFrame>::SharedPtr audio_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr volume_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr pause_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr resume_sub_;
@@ -84,6 +91,7 @@ private:
   rclcpp::Publisher<fv_audio::msg::PlaybackDone>::SharedPtr playback_done_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr paused_pub_;  // 一時停止完了通知
 
+  std::atomic<float> volume_{1.0F};
   std::atomic<bool> stop_requested_{false};  // 停止リクエストフラグ
   std::atomic<bool> pause_requested_{false};  // 一時停止リクエストフラグ
   std::atomic<bool> is_paused_{false};  // 一時停止中フラグ
