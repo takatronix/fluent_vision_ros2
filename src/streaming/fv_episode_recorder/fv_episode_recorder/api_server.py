@@ -13,6 +13,7 @@ Other endpoints (markers, replay, export, disk, retention) land in later steps.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import asdict
 from pathlib import Path
@@ -38,6 +39,29 @@ from .schemas import (
 )
 
 LOG = logging.getLogger("fv_episode_recorder.api")
+
+
+def resolve_environment() -> str:
+    """Resolve the runtime environment for the replay safety gate (REP-02).
+
+    Order: explicit ASPA_ENVIRONMENT wins, else derived from ASPA_PROFILE,
+    else "unknown". Fail-closed — callers treat "unknown" like "real".
+    """
+    env = os.environ.get("ASPA_ENVIRONMENT")
+    if env:
+        return env
+    profile = os.environ.get("ASPA_PROFILE")
+    if profile:
+        if profile.endswith("_real"):
+            return "real"
+        if profile.endswith("_sim"):
+            return "sim"
+        if profile == "aspa_replay":
+            return "replay"
+        if profile == "aspa_dev":
+            return "dev"
+        return "unknown"
+    return "unknown"
 
 
 @web.middleware
@@ -324,6 +348,17 @@ async def _start_episode(request: web.Request) -> web.Response:
     if store.active is not None:
         return web.json_response(
             {"error": "conflict", "detail": f"episode {store.active.episode_id} is already active"},
+            status=409,
+        )
+
+    # Refuse recording while a replay is running — the reverse of the guard in
+    # _replay_start — so the two runners don't fight over /tf and joint_cmd
+    # topics (and so we don't accidentally record the replayed bag).
+    replay: ReplayRunner = request.app["replay_runner"]
+    if replay.is_running():
+        return web.json_response(
+            {"error": "replay_active",
+             "detail": "stop the active replay before starting a recording"},
             status=409,
         )
 
@@ -1326,6 +1361,24 @@ async def _replay_start(request: web.Request) -> web.Response:
     person/home_pose/e-stop precheck + ack token before real-hardware mode.
     """
     from datetime import datetime, timezone
+
+    # REP-02 real-environment gate (fail-closed). Bag replay republishes
+    # /cmd_vel, /cmd_vel_nav, /odom straight to the motor driver, so it is
+    # forbidden on real hardware and on any environment we cannot identify.
+    # ASPA_ALLOW_REPLAY=1 is a bench-testing escape hatch that bypasses the
+    # gate ONLY when the environment is "unknown" — never when it is "real".
+    environment = resolve_environment()
+    if environment == "real" or (
+        environment == "unknown" and os.environ.get("ASPA_ALLOW_REPLAY") != "1"
+    ):
+        LOG.warning("replay refused: forbidden environment %r (REP-02)", environment)
+        return web.json_response(
+            {"error": "replay_forbidden",
+             "environment": environment,
+             "detail": "ROS bag replay is forbidden outside sim/replay environments (REP-02)"},
+            status=403,
+        )
+
     store: EpisodeStore = request.app["store"]
     episode_id = request.match_info["episode_id"]
     found = store.get_episode(episode_id)
