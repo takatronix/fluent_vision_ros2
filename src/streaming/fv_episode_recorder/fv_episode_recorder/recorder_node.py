@@ -207,7 +207,11 @@ def main(args=None):
     rclpy.init(args=args)
     node = FVEpisodeRecorderNode()
 
-    # ROS2 spin in background thread
+    # ROS2 spin in background thread. Single-threaded on purpose: camera
+    # callbacks only enqueue (workers do the heavy work), and rclpy's
+    # MultiThreadedExecutor adds GIL/dispatch overhead that measurably
+    # drops large-message throughput (E2E 2026-07-18: 21MB x3 frames fell
+    # to 0 fps under MultiThreadedExecutor).
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)

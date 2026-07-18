@@ -229,6 +229,11 @@ def discover_cameras(profile: dict[str, Any]) -> list[dict[str, Any]]:
         # 0 frames (the color writer was instantiated for an Image topic).
         if c.get("kind"):
             entry["kind"] = str(c["kind"])
+        # depth_lossy (10-bit-luma HEVC) + raw-Image color knobs. Passed
+        # through untyped; CameraWriterPool validates and fails loud.
+        for key in ("d_min", "d_max", "cq", "depth_scale_mm", "fps", "raw"):
+            if c.get(key) is not None:
+                entry[key] = c[key]
         out.append(entry)
     return out
 
