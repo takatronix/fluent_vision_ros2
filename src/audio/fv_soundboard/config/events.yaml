@@ -49,7 +49,7 @@ events:
     category: system
   mode_waypoint:
     sound: nav_start
-    say: "目的地移動モードに切り替えました"
+    say: "目的地へ移動中です"
     speak: true
     interrupt: false
     record: mode_waypoint
