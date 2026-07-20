@@ -1,0 +1,34 @@
+fv_visual_condition_detector:
+  ros__parameters:
+    input_image_topic: "/aspa/restamped/color_compressed"
+    input_image_type: "compressed"
+    status_topic: "/visual_condition/status"
+    event_topic: "/visual_condition/events"
+
+    model_path: "/home/aspa/.aspa/models/visual-condition-multihead.onnx"
+    providers: "TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider"
+    input_width: 224
+    input_height: 224
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+
+    threshold: 0.50
+    min_on_sec: 0.30
+    min_off_sec: 0.30
+    processing_frequency: 10.0
+    qos_reliability: "best_effort"
+    log_every_n_frames: 30
+
+    condition_labels:
+      - soiling
+      - fog
+      - rain
+      - snow
+      - night
+      - blur
+      - exposure
+      - occlusion
+    domain_labels:
+      - driving
+      - driving_fisheye
+      - field

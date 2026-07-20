@@ -1,28 +1,18 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>fv_tts</name>
-  <version>0.1.0</version>
-  <description>Text-to-speech node for FluentVision that wraps Open JTalk/pyopenjtalk.</description>
-  <maintainer email="maintainer@example.com">Fluent Robotics</maintainer>
-  <license>MIT</license>
+  <version>0.2.0</version>
+  <description>Native voicevox_core ROS 2 TTS for ASPA dialogue.</description>
+  <maintainer email="info@vegetalia.co.jp">ASPA Team</maintainer>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>ament_cmake_python</buildtool_depend>
-
-  <build_depend>rclpy</build_depend>
-  <build_depend>fv_audio</build_depend>
-  <build_depend>rosidl_default_generators</build_depend>
-
+  <build_depend>fluent_dialogue_dora_interfaces</build_depend>
+  <exec_depend>fluent_dialogue_dora_interfaces</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>fv_audio</exec_depend>
-  <exec_depend>rosidl_default_runtime</exec_depend>
-  <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>pyopenjtalk</exec_depend>
-
-  <member_of_group>rosidl_interface_packages</member_of_group>
-
-  <export>
-    <build_type>ament_cmake</build_type>
-  </export>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
 </package>

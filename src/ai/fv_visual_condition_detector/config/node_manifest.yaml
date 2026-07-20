@@ -1,0 +1,31 @@
+# node_manifest.yaml - fv_visual_condition_detector
+
+nodes:
+  - key: fv_visual_condition_detector
+    package: fv_visual_condition_detector
+    exec: fv_visual_condition_detector_node
+    category: ai
+    label: "Visual Condition Detector"
+
+    inputs:
+      - param: input_image_topic
+        type: image
+
+    outputs:
+      - param: status_topic
+        type: string
+        label: condition_status
+      - param: event_topic
+        type: string
+        label: condition_event
+
+    default_parameters:
+      input_image_topic: "/aspa/restamped/color_compressed"
+      input_image_type: "compressed"
+      status_topic: "/visual_condition/status"
+      event_topic: "/visual_condition/events"
+      model_path: "/home/aspa/.aspa/models/visual-condition-multihead.onnx"
+      threshold: 0.50
+      min_on_sec: 0.30
+      min_off_sec: 0.30
+      processing_frequency: 10.0

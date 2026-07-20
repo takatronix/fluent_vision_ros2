@@ -1,93 +1,100 @@
-#!/usr/bin/env python3
-"""VOICEVOX ENGINE を叩く TTS バックエンド。
+from __future__ import annotations
 
-fv_tts のエンジン差替え機構 (engine="voicevox") 用。ローカルで動く
-VOICEVOX ENGINE (既定 http://127.0.0.1:50021) の 2 段 API を呼ぶ:
-
-  1. POST /audio_query?text=<text>&speaker=<id>   → 合成用クエリ(JSON)
-  2. POST /synthesis?speaker=<id>  (body=上記JSON) → 24kHz mono 16bit WAV
-
-返ってきた WAV からヘッダを剥がして PCM(int16) と実サンプルレートを取り出す。
-接続不可・HTTP エラー・想定外フォーマットは握りつぶさず例外送出する (fallback 禁止)。
-
-依存は標準ライブラリのみ (urllib / wave)。エンジン本体は外部プロセスなので
-rosdep 依存には含めず、起動確認は `curl http://127.0.0.1:50021/version`。
-"""
-import io
-import urllib.parse
-import urllib.request
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
 import wave
 
 
-class VoicevoxError(RuntimeError):
-    """VOICEVOX ENGINE との通信・合成に失敗したときの明示例外。"""
+@dataclass(frozen=True)
+class SynthesizedAudio:
+    pcm: bytes
+    sample_rate_hz: int
+    channels: int
+    bit_depth: int = 16
 
 
-class VoicevoxBackend:
-    """VOICEVOX ENGINE の HTTP クライアント。
+def decode_pcm16_wav(data: bytes) -> SynthesizedAudio:
+    try:
+        with wave.open(BytesIO(data), "rb") as wav:
+            if wav.getcomptype() != "NONE" or wav.getsampwidth() != 2:
+                raise ValueError("VOICEVOX output must be uncompressed PCM16 WAV")
+            channels = wav.getnchannels()
+            sample_rate = wav.getframerate()
+            pcm = wav.readframes(wav.getnframes())
+    except (EOFError, wave.Error) as exc:
+        raise ValueError("VOICEVOX returned an invalid WAV payload") from exc
+    if channels <= 0 or sample_rate <= 0 or not pcm:
+        raise ValueError("VOICEVOX returned empty or malformed audio")
+    return SynthesizedAudio(pcm, sample_rate, channels)
 
-    synthesize(text, speaker) -> (pcm_int16_bytes, sample_rate, channels, bit_depth)
-    """
 
-    def __init__(self, url: str = "http://127.0.0.1:50021", timeout: float = 15.0) -> None:
-        self.url = url.rstrip("/")
-        self.timeout = float(timeout)
+class VoicevoxCoreBackend:
+    """Blocking native voicevox_core backend; no HTTP Engine is involved."""
 
-    # ── public ──────────────────────────────────────────
-    def synthesize(self, text: str, speaker: int):
-        """text を speaker で合成し、生 PCM(int16 LE) とフォーマットを返す。"""
-        if not text:
-            raise VoicevoxError("text is empty")
-        query = self._audio_query(text, int(speaker))
-        wav_bytes = self._synthesis(query, int(speaker))
-        return self._decode_wav(wav_bytes)
-
-    def version(self) -> str:
-        """ENGINE のバージョン文字列 (疎通確認用)。"""
+    def __init__(
+        self,
+        *,
+        onnxruntime_filename: str,
+        open_jtalk_dict_dir: str,
+        voice_model_path: str,
+        acceleration_mode: str,
+        cpu_num_threads: int,
+        style_id: int,
+    ) -> None:
+        required = {
+            "onnxruntime_filename": onnxruntime_filename,
+            "open_jtalk_dict_dir": open_jtalk_dict_dir,
+            "voice_model_path": voice_model_path,
+        }
+        missing = [name for name, value in required.items() if not value.strip()]
+        if missing:
+            raise ValueError(f"missing VOICEVOX path parameter(s): {', '.join(missing)}")
+        if cpu_num_threads < 0 or style_id < 0:
+            raise ValueError("cpu_num_threads and style_id must be non-negative")
         try:
-            with urllib.request.urlopen(f"{self.url}/version", timeout=self.timeout) as resp:
-                return resp.read().decode("utf-8", errors="ignore").strip()
-        except Exception as exc:  # noqa: BLE001
-            raise VoicevoxError(f"version取得失敗 ({self.url}): {exc}") from exc
+            from voicevox_core import AccelerationMode
+            from voicevox_core.blocking import (
+                Onnxruntime,
+                OpenJtalk,
+                Synthesizer,
+                VoiceModelFile,
+            )
+        except ImportError as exc:
+            raise RuntimeError("voicevox_core Python package is not installed") from exc
 
-    # ── internal ────────────────────────────────────────
-    def _audio_query(self, text: str, speaker: int) -> bytes:
-        params = urllib.parse.urlencode({"text": text, "speaker": speaker})
-        # audio_query はクエリ文字列で渡す POST (body 無し)
-        req = urllib.request.Request(f"{self.url}/audio_query?{params}", data=b"", method="POST")
+        modes = {
+            "auto": AccelerationMode.AUTO,
+            "cpu": AccelerationMode.CPU,
+            "gpu": AccelerationMode.GPU,
+        }
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return resp.read()
-        except Exception as exc:  # noqa: BLE001
-            raise VoicevoxError(
-                f"audio_query失敗 ({self.url}, speaker={speaker}): {exc}") from exc
+            mode = modes[acceleration_mode.lower()]
+        except KeyError as exc:
+            raise ValueError("acceleration_mode must be auto, cpu, or gpu") from exc
 
-    def _synthesis(self, query_json: bytes, speaker: int) -> bytes:
-        params = urllib.parse.urlencode({"speaker": speaker})
-        req = urllib.request.Request(
-            f"{self.url}/synthesis?{params}",
-            data=query_json,
-            headers={"Content-Type": "application/json"},
-            method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return resp.read()
-        except Exception as exc:  # noqa: BLE001
-            raise VoicevoxError(
-                f"synthesis失敗 ({self.url}, speaker={speaker}): {exc}") from exc
+        runtime_path = Path(onnxruntime_filename).expanduser().resolve()
+        dictionary_path = Path(open_jtalk_dict_dir).expanduser().resolve()
+        model_path = Path(voice_model_path).expanduser().resolve()
+        if not runtime_path.is_file():
+            raise FileNotFoundError(f"VOICEVOX ONNX Runtime was not found: {runtime_path}")
+        if not dictionary_path.is_dir():
+            raise FileNotFoundError(f"Open JTalk dictionary was not found: {dictionary_path}")
+        if not model_path.is_file():
+            raise FileNotFoundError(f"VOICEVOX voice model was not found: {model_path}")
 
-    @staticmethod
-    def _decode_wav(wav_bytes: bytes):
-        try:
-            with wave.open(io.BytesIO(wav_bytes), "rb") as w:
-                channels = w.getnchannels()
-                bit_depth = w.getsampwidth() * 8
-                sample_rate = w.getframerate()
-                pcm = w.readframes(w.getnframes())
-        except wave.Error as exc:
-            raise VoicevoxError(f"WAV decode失敗: {exc}") from exc
-        if bit_depth != 16:
-            raise VoicevoxError(f"想定外のbit_depth={bit_depth} (16bit想定)")
-        if not pcm:
-            raise VoicevoxError("合成結果が空 (PCM 0 bytes)")
-        return pcm, int(sample_rate), int(channels), int(bit_depth)
+        onnxruntime = Onnxruntime.load_once(filename=runtime_path)
+        self._synthesizer = Synthesizer(
+            onnxruntime,
+            OpenJtalk(dictionary_path),
+            acceleration_mode=mode,
+            cpu_num_threads=cpu_num_threads,
+        )
+        with VoiceModelFile.open(model_path) as model:
+            self._synthesizer.load_voice_model(model)
+        self._style_id = style_id
+
+    def synthesize(self, text: str) -> SynthesizedAudio:
+        query = self._synthesizer.create_audio_query(text, self._style_id)
+        wav = self._synthesizer.synthesis(query, self._style_id)
+        return decode_pcm16_wav(wav)

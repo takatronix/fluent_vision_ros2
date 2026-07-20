@@ -1,3 +1,1 @@
-from .tts_node import main
-
-__all__ = ["main"]
+"""Native VOICEVOX TTS package."""

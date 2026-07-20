@@ -301,7 +301,7 @@ events:
   system_error:                # 一般異常
     sound: system_error
     say: "システムエラーが発生しました"
-    speak: false
+    speak: true
     interrupt: true
     record: system_error
     category: health

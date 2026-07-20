@@ -11,7 +11,10 @@ find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  msg/EnvironmentChange.msg
+  msg/EnvironmentEvent.msg
   msg/EpisodeMarker.msg
+  srv/EpisodeSearch.srv
   DEPENDENCIES std_msgs builtin_interfaces
 )
 

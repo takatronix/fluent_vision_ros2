@@ -24,6 +24,7 @@ setup(
         'python-ulid',
         'pyarrow',
     ],
+    tests_require=['pytest'],
     zip_safe=True,
     maintainer='FluentVision',
     maintainer_email='dev@fluentvision.io',
@@ -32,6 +33,11 @@ setup(
     entry_points={
         'console_scripts': [
             'recorder_node = fv_episode_recorder.recorder_node:main',
+            'episode_recorder = fv_episode_recorder.annotation_recorder_node:main',
+            'video_anomaly_detector = fv_episode_recorder.video_anomaly_detector_node:main',
+            'moss_realtime_adapter = fv_episode_recorder.moss_realtime_adapter_node:main',
+            'moss_vl_realtime_runtime = fv_episode_recorder.moss_runtime:main',
+            'episode_search = fv_episode_recorder.episode_search_node:main',
         ],
     },
 )

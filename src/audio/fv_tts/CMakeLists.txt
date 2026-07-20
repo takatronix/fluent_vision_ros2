@@ -1,46 +1,20 @@
 cmake_minimum_required(VERSION 3.8)
 project(fv_tts)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
-
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
+find_package(fluent_dialogue_dora_interfaces REQUIRED)
 find_package(rclpy REQUIRED)
-find_package(fv_audio REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
-
-set(service_files
-  "srv/Speak.srv"
-)
-
-rosidl_generate_interfaces(${PROJECT_NAME}
-  ${service_files}
-  DEPENDENCIES fv_audio
-)
+find_package(std_msgs REQUIRED)
 
 ament_python_install_package(fv_tts_py PACKAGE_DIR fv_tts_py)
 
-install(PROGRAMS
-  scripts/fv_tts_node
-  DESTINATION lib/${PROJECT_NAME}
-)
+install(PROGRAMS scripts/fv_tts_node DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY launch config resource DESTINATION share/${PROJECT_NAME})
 
-install(DIRECTORY
-  launch
-  config
-  DESTINATION share/${PROJECT_NAME}
-)
-
-install(DIRECTORY resource/
-  DESTINATION share/${PROJECT_NAME}
-)
-
-ament_export_dependencies(
-  rclpy
-  fv_audio
-  rosidl_default_runtime
-)
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_fv_tts test/test_fv_tts.py)
+endif()
 
 ament_package()

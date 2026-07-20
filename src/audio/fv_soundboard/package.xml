@@ -3,30 +3,15 @@
 <package format="3">
   <name>fv_soundboard</name>
   <version>0.1.0</version>
-  <description>状況イベント → サウンド + 任意TTS + 記録マーカーのサウンドボード。
-  離散cue(wav) + variant種別 + パラメトリック・ソニフィケーション。出力はローカルaplay /
-  fv_audio_output(AudioFrame) の多シンク切替。Event Bus v1.1。</description>
+  <description>Resolve /fv/event into SYSTEM TTS requests and playback cues.</description>
   <maintainer email="maintainer@example.com">Fluent Robotics</maintainer>
   <license>MIT</license>
-
   <buildtool_depend>ament_python</buildtool_depend>
-
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>fluent_dialogue_dora_interfaces</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>ament_index_python</exec_depend>
-  <exec_depend>python3-yaml</exec_depend>
-  <exec_depend>python3-numpy</exec_depend>
-  <!-- output_backends=audio_frame 時のみ必要 (AudioFrame msg) -->
-  <exec_depend>fv_audio</exec_depend>
-  <!-- output_backends=aplay 時の実再生に aplay を使う -->
-  <exec_depend>alsa-utils</exec_depend>
-
-  <test_depend>ament_copyright</test_depend>
-  <test_depend>ament_flake8</test_depend>
-  <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
-
-  <export>
-    <build_type>ament_python</build_type>
-  </export>
+  <export><build_type>ament_python</build_type></export>
 </package>
