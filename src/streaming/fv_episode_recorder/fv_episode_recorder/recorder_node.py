@@ -35,6 +35,7 @@ from .bag_recorder import BagRecorder
 from .event_bridge import EventMarkerBridge
 from .camera_writer import CameraWriterPool
 from .depth_republisher import DepthRepublisherPool
+from .environment_annotation_bridge import EnvironmentAnnotationBridge
 from .episode_store import EpisodeStore
 from .marker_manager import MarkerManager
 from .mux_tracker import MuxTracker
@@ -65,6 +66,12 @@ class FVEpisodeRecorderNode(Node):
         # re-published by fv_soundboard on this topic become episode markers.
         self.declare_parameter("event_active_topic", "/fv/event/active")
         self.declare_parameter("event_marker_enabled", True)
+        self.declare_parameter("environment_change_topic", "/environment/change")
+        self.declare_parameter(
+            "environment_annotation_topic", "/environment/annotation"
+        )
+        self.declare_parameter("episode_search_service", "/episode/search")
+        self.declare_parameter("environment_annotation_enabled", True)
 
         self.output_dir = Path(self.get_parameter("output_dir").value)
         self.profiles_dir = Path(self.get_parameter("profiles_dir").value)
@@ -72,6 +79,18 @@ class FVEpisodeRecorderNode(Node):
         self.host = str(self.get_parameter("host").value)
         self.event_active_topic = str(self.get_parameter("event_active_topic").value)
         self.event_marker_enabled = bool(self.get_parameter("event_marker_enabled").value)
+        self.environment_change_topic = str(
+            self.get_parameter("environment_change_topic").value
+        )
+        self.environment_annotation_topic = str(
+            self.get_parameter("environment_annotation_topic").value
+        )
+        self.episode_search_service = str(
+            self.get_parameter("episode_search_service").value
+        )
+        self.environment_annotation_enabled = bool(
+            self.get_parameter("environment_annotation_enabled").value
+        )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.store = EpisodeStore(self.output_dir)
@@ -96,6 +115,15 @@ class FVEpisodeRecorderNode(Node):
             self, self.store, self.marker_manager,
             topic=self.event_active_topic,
             enabled=self.event_marker_enabled,
+        )
+        self.environment_annotation_bridge = EnvironmentAnnotationBridge(
+            self,
+            self.store,
+            self.marker_manager,
+            change_topic=self.environment_change_topic,
+            annotation_topic=self.environment_annotation_topic,
+            search_service=self.episode_search_service,
+            enabled=self.environment_annotation_enabled,
         )
         # Track mux source (teleop vs VLA + controller name) so the play
         # modal can label each recording without having to decode the bag.

@@ -20,7 +20,6 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image
 
-from .annotation_store import AnnotationStore, default_episode_root
 from .moss_rounds import EpisodeRoundOwnership, MossRoundParser
 
 
@@ -41,13 +40,14 @@ class MossRealtimeAdapterNode(Node):
     def __init__(self) -> None:
         super().__init__("moss_realtime_adapter")
 
-        default_root = default_episode_root()
         self.declare_parameter("image_topic", "/aspa/restamped/color_compressed")
         self.declare_parameter("image_type", "compressed")
         self.declare_parameter("environment_change_topic", "/environment/change")
         self.declare_parameter("environment_event_topic", "/environment/event")
+        self.declare_parameter(
+            "environment_annotation_topic", "/environment/annotation"
+        )
         self.declare_parameter("runtime_url", "ws://127.0.0.1:18081/v1/realtime")
-        self.declare_parameter("database_path", str(default_root / "annotations.db"))
         self.declare_parameter("sample_fps", 1.0)
         self.declare_parameter("jpeg_quality", 85)
 
@@ -55,13 +55,17 @@ class MossRealtimeAdapterNode(Node):
         self.image_type = str(self.get_parameter("image_type").value).strip().lower()
         self.change_topic = str(self.get_parameter("environment_change_topic").value)
         self.event_topic = str(self.get_parameter("environment_event_topic").value)
+        self.annotation_topic = str(
+            self.get_parameter("environment_annotation_topic").value
+        )
         self.runtime_url = str(self.get_parameter("runtime_url").value)
-        database_path = str(self.get_parameter("database_path").value)
         self.sample_fps = max(0.01, float(self.get_parameter("sample_fps").value))
         self.jpeg_quality = min(100, max(1, int(self.get_parameter("jpeg_quality").value)))
 
-        self.annotation_store = AnnotationStore(database_path)
         self.event_pub = self.create_publisher(EnvironmentEvent, self.event_topic, 10)
+        self.annotation_pub = self.create_publisher(
+            EnvironmentEvent, self.annotation_topic, 10
+        )
         self.change_sub = self.create_subscription(
             EnvironmentChange,
             self.change_topic,
@@ -94,6 +98,7 @@ class MossRealtimeAdapterNode(Node):
         self._prompts: queue.Queue[FocusPrompt] = queue.Queue()
         self._episode_lock = threading.Lock()
         self._ownership = EpisodeRoundOwnership()
+        self._steered_episode_ids: set[str] = set()
         self._focus_started_at: dict[str, float] = {}
         self._frame_acks = 0
         self._runtime_frame_drops = 0
@@ -357,26 +362,22 @@ class MossRealtimeAdapterNode(Node):
         focus_started_at: Optional[float],
     ) -> None:
         annotation_id = f"{episode_id}:moss"
-        try:
-            write = self.annotation_store.upsert_annotation(
-                annotation_id=annotation_id,
-                episode_id=episode_id,
-                text=semantic_text,
-            )
-        except Exception as exc:
-            self.get_logger().error(f"annotation commit failed: {exc}")
-            return
-
-        if not write.created:
-            self.get_logger().info(
-                f"MOSS annotation corrected: episode={episode_id} revision={write.revision}"
-            )
-            return
-
         event = EnvironmentEvent()
-        event.episode_id = write.episode_id
-        event.annotation_id = write.annotation_id
-        event.text = write.text
+        event.episode_id = episode_id
+        event.annotation_id = annotation_id
+        event.text = semantic_text
+
+        # Every completed round updates the recorder marker. Only the first
+        # round enters the live dialogue stream; later rounds are corrections.
+        self.annotation_pub.publish(event)
+        is_first = episode_id not in self._steered_episode_ids
+        self._steered_episode_ids.add(episode_id)
+        if not is_first:
+            self.get_logger().info(
+                f"MOSS annotation corrected: episode={episode_id}"
+            )
+            return
+
         self.event_pub.publish(event)
         if focus_started_at is not None:
             latency_ms = (time.monotonic() - focus_started_at) * 1000.0
@@ -424,8 +425,6 @@ class MossRealtimeAdapterNode(Node):
         self._worker.join(timeout=3.0)
         if self._worker.is_alive():
             self.get_logger().warning("MOSS adapter worker did not stop before shutdown")
-        else:
-            self.annotation_store.close()
         return super().destroy_node()
 
 

@@ -100,6 +100,13 @@ class FakeMossRuntime:
                         "<|round_end|>"
                     ),
                 })
+                await websocket.send_json({
+                    "type": "output",
+                    "text": (
+                        "<|round_start|><|response|>赤い工具箱が机の中央に置かれた。"
+                        "<|round_end|>"
+                    ),
+                })
         return websocket
 
 
@@ -116,14 +123,12 @@ def _spin_until(
     raise AssertionError("timed out waiting for ROS pipeline")
 
 
-def test_compressed_ros_topic_to_moss_annotation_event(tmp_path) -> None:
+def test_compressed_ros_topic_to_moss_annotation_event() -> None:
     runtime = FakeMossRuntime()
     runtime.start()
-    database_path = tmp_path / "annotations.db"
     rclpy.init(args=[
         "--ros-args",
         "-p", f"runtime_url:=ws://127.0.0.1:{runtime.port}/v1/realtime",
-        "-p", f"database_path:={database_path}",
         "-p", "image_topic:=/perception/moss/image/compressed",
         "-p", "sample_fps:=30.0",
     ])
@@ -133,6 +138,7 @@ def test_compressed_ros_topic_to_moss_annotation_event(tmp_path) -> None:
     executor.add_node(adapter)
     executor.add_node(driver)
     received_events: list[EnvironmentEvent] = []
+    received_annotations: list[EnvironmentEvent] = []
     change_pub = driver.create_publisher(
         EnvironmentChange,
         "/environment/change",
@@ -147,6 +153,12 @@ def test_compressed_ros_topic_to_moss_annotation_event(tmp_path) -> None:
         EnvironmentEvent,
         "/environment/event",
         received_events.append,
+        10,
+    )
+    annotation_sub = driver.create_subscription(
+        EnvironmentEvent,
+        "/environment/annotation",
+        received_annotations.append,
         10,
     )
 
@@ -172,12 +184,18 @@ def test_compressed_ros_topic_to_moss_annotation_event(tmp_path) -> None:
         image_pub.publish(image)
         _spin_until(executor, runtime.frame_received.is_set)
         _spin_until(executor, lambda: len(received_events) == 1)
+        _spin_until(executor, lambda: len(received_annotations) == 2)
 
         assert runtime.frame_bytes == bytes(image.data)
         assert received_events[0].episode_id == "compressed-e2e"
         assert received_events[0].text == "赤い工具箱が机に置かれた。"
+        assert [annotation.text for annotation in received_annotations] == [
+            "赤い工具箱が机に置かれた。",
+            "赤い工具箱が机の中央に置かれた。",
+        ]
     finally:
         driver.destroy_subscription(event_sub)
+        driver.destroy_subscription(annotation_sub)
         executor.remove_node(adapter)
         executor.remove_node(driver)
         adapter.destroy_node()

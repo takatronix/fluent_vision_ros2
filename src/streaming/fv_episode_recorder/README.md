@@ -7,13 +7,14 @@ architecture:
   `started` / `ended` lifecycle on `/environment/change`.
 - `moss_realtime_adapter` continuously sends timestamped frames at 1 FPS to
   the official MOSS-VL-Realtime `/v1/realtime` WebSocket service. It filters
-  control tokens, commits complete non-silence rounds, and publishes the first
-  semantic annotation on `/environment/event`.
+  control tokens and publishes complete non-silence rounds on
+  `/environment/annotation`. The first round is also published on
+  `/environment/event` for live dialogue steering.
 - After episode end, later complete non-silence rounds can dynamically correct
-  the same annotation. Corrections do not publish another event; ownership
-  closes when a new anomaly episode starts.
-- `episode_search` provides `/episode/search` using SQLite FTS5 `trigram` over
-  MOSS annotation text only. It does not index raw anomaly lifecycle events.
+  the same Episode Recorder marker. Corrections do not publish another dialogue
+  event; ownership closes when a new anomaly episode starts.
+- The recorder itself provides `/episode/search` over semantic environment
+  markers. It does not index raw anomaly lifecycle events.
 
 The ASPA defaults subscribe directly to the D555 compressed relay
 `/aspa/restamped/color_compressed` once, in the detector. It decodes the
@@ -24,9 +25,10 @@ or raw-image stream. The configured detector model is
 `/home/aspa/.aspa/models/visual-condition-multihead.onnx`; the canonical node
 fails startup when the model or ONNX runtime cannot be loaded.
 
-Annotations default to the writable `~/.aspa/episodes/annotations.db` (or
-`FV_EPISODE_OUTPUT_DIR`). All recorder/search processes use SQLite WAL,
-`busy_timeout`, and bounded write retry against that one database.
+Environment changes are interval markers inside the currently active recording
+episode. The anomaly lifecycle ID is stored as a marker attribute and MOSS text
+becomes the marker description. If no recording is active, no annotation is
+persisted. There is no parallel annotation database.
 
 Run the complete package path through the system launcher, using
 `perception_episode_recorder.launch.py` as the package-level launch include.
