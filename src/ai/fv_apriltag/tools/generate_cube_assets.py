@@ -237,16 +237,34 @@ def _render_text_mask(
     img = Image.new('L', (w_px, h_px), color=255)
     draw = ImageDraw.Draw(img)
     line_h_px = h_px // max(1, len(lines))
+    # ~0.4mm outline each side: keeps every stroke printable (>= 2
+    # nozzle widths) — the raw glyph core alone slices to broken lines
+    stroke = max(1, int(round(0.4 * px_per_mm)))
     for i, line in enumerate(lines):
-        font = _font_for_box(line, w_px - 4, line_h_px - 2)
+        font = _font_for_box(line, w_px - 4 - 2 * stroke,
+                             line_h_px - 2 - 2 * stroke)
         bbox = font.getbbox(line)
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
         x = (w_px - tw) // 2 - bbox[0]
         y = i * line_h_px + (line_h_px - th) // 2 - bbox[1]
-        draw.text((x, y), line, fill=0, font=font)
+        draw.text((x, y), line, fill=0, font=font,
+                  stroke_width=stroke, stroke_fill=0)
     arr = np.array(img)
-    return arr < 128
+    # 160 not 128: keep the anti-aliased edge with the ink, not the
+    # background — thresholding at 128 shaves strokes below nozzle width
+    ink = arr < 160
+    # Quantize to ~0.5mm cells. Raw antialiased rows almost never repeat
+    # exactly, so _mask_to_rects would emit one hairline strip per
+    # scanline — the slicer walls each strip separately and the label
+    # prints as shredded outlines. Coarse cells keep every feature at
+    # least one nozzle-safe cell tall and let runs merge vertically.
+    k = max(1, int(round(px_per_mm * 0.5)))
+    if k > 1:
+        h2, w2 = (ink.shape[0] // k) * k, (ink.shape[1] // k) * k
+        cover = ink[:h2, :w2].reshape(h2 // k, k, w2 // k, k).mean(axis=(1, 3))
+        return cover >= 0.35
+    return ink
 
 
 def _mask_to_rects(

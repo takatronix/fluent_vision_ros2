@@ -562,113 +562,113 @@ solid fv_tag_peg_50
   facet normal -1.000000 0.000000 0.000000
     outer loop
       vertex 18.800000 0.000000 4.000000
+      vertex 18.800000 -30.000000 4.000000
       vertex 18.800000 0.000000 14.000000
-      vertex 18.800000 30.000000 4.000000
     endloop
   endfacet
-  facet normal 1.000000 0.000000 0.000000
+  facet normal 1.000000 0.000000 -0.000000
     outer loop
       vertex 22.800000 0.000000 4.000000
-      vertex 22.800000 30.000000 4.000000
       vertex 22.800000 0.000000 14.000000
+      vertex 22.800000 -30.000000 4.000000
     endloop
   endfacet
   facet normal 0.000000 0.000000 -1.000000
     outer loop
       vertex 18.800000 0.000000 4.000000
-      vertex 18.800000 30.000000 4.000000
-      vertex 22.800000 30.000000 4.000000
+      vertex 22.800000 -30.000000 4.000000
+      vertex 18.800000 -30.000000 4.000000
     endloop
   endfacet
   facet normal 0.000000 0.000000 -1.000000
     outer loop
       vertex 18.800000 0.000000 4.000000
-      vertex 22.800000 30.000000 4.000000
       vertex 22.800000 0.000000 4.000000
+      vertex 22.800000 -30.000000 4.000000
     endloop
   endfacet
-  facet normal 0.000000 -1.000000 0.000000
-    outer loop
-      vertex 18.800000 0.000000 4.000000
-      vertex 22.800000 0.000000 4.000000
-      vertex 22.800000 0.000000 14.000000
-    endloop
-  endfacet
-  facet normal 0.000000 -1.000000 0.000000
+  facet normal 0.000000 1.000000 0.000000
     outer loop
       vertex 18.800000 0.000000 4.000000
       vertex 22.800000 0.000000 14.000000
-      vertex 18.800000 0.000000 14.000000
+      vertex 22.800000 0.000000 4.000000
     endloop
   endfacet
-  facet normal -0.000000 0.316228 0.948683
+  facet normal 0.000000 1.000000 0.000000
     outer loop
+      vertex 18.800000 0.000000 4.000000
       vertex 18.800000 0.000000 14.000000
       vertex 22.800000 0.000000 14.000000
-      vertex 22.800000 30.000000 4.000000
     endloop
   endfacet
-  facet normal 0.000000 0.316228 0.948683
+  facet normal 0.000000 -0.316228 0.948683
     outer loop
       vertex 18.800000 0.000000 14.000000
-      vertex 22.800000 30.000000 4.000000
-      vertex 18.800000 30.000000 4.000000
+      vertex 22.800000 -30.000000 4.000000
+      vertex 22.800000 0.000000 14.000000
+    endloop
+  endfacet
+  facet normal 0.000000 -0.316228 0.948683
+    outer loop
+      vertex 18.800000 0.000000 14.000000
+      vertex 18.800000 -30.000000 4.000000
+      vertex 22.800000 -30.000000 4.000000
     endloop
   endfacet
   facet normal -1.000000 0.000000 0.000000
     outer loop
       vertex 36.800000 0.000000 4.000000
+      vertex 36.800000 -30.000000 4.000000
       vertex 36.800000 0.000000 14.000000
-      vertex 36.800000 30.000000 4.000000
     endloop
   endfacet
-  facet normal 1.000000 0.000000 0.000000
+  facet normal 1.000000 0.000000 -0.000000
     outer loop
       vertex 40.800000 0.000000 4.000000
-      vertex 40.800000 30.000000 4.000000
       vertex 40.800000 0.000000 14.000000
+      vertex 40.800000 -30.000000 4.000000
     endloop
   endfacet
   facet normal 0.000000 0.000000 -1.000000
     outer loop
       vertex 36.800000 0.000000 4.000000
-      vertex 36.800000 30.000000 4.000000
-      vertex 40.800000 30.000000 4.000000
+      vertex 40.800000 -30.000000 4.000000
+      vertex 36.800000 -30.000000 4.000000
     endloop
   endfacet
   facet normal 0.000000 0.000000 -1.000000
     outer loop
       vertex 36.800000 0.000000 4.000000
-      vertex 40.800000 30.000000 4.000000
       vertex 40.800000 0.000000 4.000000
+      vertex 40.800000 -30.000000 4.000000
     endloop
   endfacet
-  facet normal 0.000000 -1.000000 0.000000
-    outer loop
-      vertex 36.800000 0.000000 4.000000
-      vertex 40.800000 0.000000 4.000000
-      vertex 40.800000 0.000000 14.000000
-    endloop
-  endfacet
-  facet normal 0.000000 -1.000000 0.000000
+  facet normal 0.000000 1.000000 0.000000
     outer loop
       vertex 36.800000 0.000000 4.000000
       vertex 40.800000 0.000000 14.000000
-      vertex 36.800000 0.000000 14.000000
+      vertex 40.800000 0.000000 4.000000
     endloop
   endfacet
-  facet normal -0.000000 0.316228 0.948683
+  facet normal 0.000000 1.000000 0.000000
     outer loop
+      vertex 36.800000 0.000000 4.000000
       vertex 36.800000 0.000000 14.000000
       vertex 40.800000 0.000000 14.000000
-      vertex 40.800000 30.000000 4.000000
     endloop
   endfacet
-  facet normal 0.000000 0.316228 0.948683
+  facet normal 0.000000 -0.316228 0.948683
     outer loop
       vertex 36.800000 0.000000 14.000000
-      vertex 40.800000 30.000000 4.000000
-      vertex 36.800000 30.000000 4.000000
+      vertex 40.800000 -30.000000 4.000000
+      vertex 40.800000 0.000000 14.000000
+    endloop
+  endfacet
+  facet normal 0.000000 -0.316228 0.948683
+    outer loop
+      vertex 36.800000 0.000000 14.000000
+      vertex 36.800000 -30.000000 4.000000
+      vertex 40.800000 -30.000000 4.000000
     endloop
   endfacet
   facet normal 0.000000 0.000000 -1.000000
