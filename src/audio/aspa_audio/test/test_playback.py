@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -373,6 +374,16 @@ def test_agent_flush_never_matches_system_audio_left_on_device():
     assert not tracker.matches("system", "other-system")
 
 
+def test_audio_launch_treats_all_three_nodes_as_one_failure_domain():
+    launch_file = Path(__file__).resolve().parents[1] / "launch" / "aspa_audio.launch.py"
+    source = launch_file.read_text(encoding="utf-8")
+
+    assert source.count("on_exit=EmitEvent(") == 3
+    assert source.count("event=Shutdown(") == 3
+    for executable in ("audio_capture", "playback_controller", "audio_output"):
+        assert f'executable="{executable}"' in source
+
+
 def test_controller_flushes_acknowledged_agent_device_buffer_but_not_system():
     pytest.importorskip("rclpy")
     from aspa_audio.playback_controller import PlaybackControllerNode
@@ -426,6 +437,106 @@ def test_controller_flushes_acknowledged_agent_device_buffer_but_not_system():
         target_kind="agent",
     )
     assert system_client.calls == 0
+
+
+def test_controller_fails_closed_when_output_flush_service_disappears():
+    pytest.importorskip("rclpy")
+    from aspa_audio.playback_controller import PlaybackControllerNode
+
+    class FlushClient:
+        @staticmethod
+        def service_is_ready():
+            return False
+
+    class Context:
+        stopped = False
+
+        def try_shutdown(self):
+            self.stopped = True
+
+    class Logger:
+        messages = []
+
+        def fatal(self, message):
+            self.messages.append(message)
+
+    class Harness:
+        _fail_output_path = PlaybackControllerNode._fail_output_path
+
+    controller = Harness()
+    controller._output_pending = {}
+    controller._suppressed_output_acks = set()
+    controller._device_buffer = DeviceBufferTracker()
+    controller._device_buffer.note_chunk("agent", "agent-0-old")
+    controller._flush_pending = False
+    controller._flush_request = None
+    controller._flush = FlushClient()
+    controller._fatal_output_error = None
+    controller.context = Context()
+    controller.get_logger = lambda: Logger()
+
+    with pytest.raises(RuntimeError, match="flush is unavailable"):
+        PlaybackControllerNode._flush_device(
+            controller,
+            account_ack=False,
+            target_kind="agent",
+        )
+
+    assert controller.context.stopped
+    assert controller._fatal_output_error is not None
+
+
+def test_controller_fails_closed_when_output_flush_request_fails():
+    pytest.importorskip("rclpy")
+    from aspa_audio.playback_controller import (
+        PlaybackControllerNode,
+        _FlushRequest,
+    )
+
+    class FailedFuture:
+        @staticmethod
+        def result():
+            raise RuntimeError("device output stopped")
+
+        def add_done_callback(self, callback):
+            callback(self)
+
+    class FlushClient:
+        @staticmethod
+        def call_async(_request):
+            return FailedFuture()
+
+    class Context:
+        stopped = False
+
+        def try_shutdown(self):
+            self.stopped = True
+
+    class Logger:
+        def fatal(self, _message):
+            pass
+
+    class Harness:
+        _fail_output_path = PlaybackControllerNode._fail_output_path
+        _maybe_finish_flush = PlaybackControllerNode._maybe_finish_flush
+
+    controller = Harness()
+    controller._flush_request = _FlushRequest(
+        target_kind="agent",
+        target_utterance_id=None,
+        keys=set(),
+    )
+    controller._flush_pending = True
+    controller._flush = FlushClient()
+    controller._device_buffer = DeviceBufferTracker()
+    controller._fatal_output_error = None
+    controller.context = Context()
+    controller.get_logger = lambda: Logger()
+
+    PlaybackControllerNode._maybe_start_flush(controller)
+
+    assert controller.context.stopped
+    assert str(controller._fatal_output_error).endswith("device output stopped")
 
 
 def test_accepted_ack_paces_output_without_advancing_played_position():

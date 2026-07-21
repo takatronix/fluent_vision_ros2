@@ -2,7 +2,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, EmitEvent
+from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -35,6 +36,9 @@ def generate_launch_description():
                 "ASPA_AUDIO_CAPTURE_CHUNK_FRAMES": capture_chunk_frames,
                 "ASPA_AUDIO_CAPTURE_QUEUE_CHUNKS": capture_queue_chunks,
             },
+            on_exit=EmitEvent(
+                event=Shutdown(reason="ASPA audio capture exited")
+            ),
         ),
         Node(
             package="aspa_audio",
@@ -47,6 +51,9 @@ def generate_launch_description():
                 },
             ],
             output="screen",
+            on_exit=EmitEvent(
+                event=Shutdown(reason="ASPA playback controller exited")
+            ),
         ),
         Node(
             package="aspa_audio",
@@ -58,5 +65,8 @@ def generate_launch_description():
                 "ASPA_AUDIO_OUTPUT_CHANNELS": output_channels,
                 "ASPA_AUDIO_OUTPUT_BUFFER_MS": output_buffer_ms,
             },
+            on_exit=EmitEvent(
+                event=Shutdown(reason="ASPA audio output exited")
+            ),
         ),
     ])

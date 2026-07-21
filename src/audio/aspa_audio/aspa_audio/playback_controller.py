@@ -84,6 +84,7 @@ class PlaybackControllerNode(Node):
         self._device_buffer = DeviceBufferTracker()
         self._flush_pending = False
         self._flush_request: _FlushRequest | None = None
+        self._fatal_output_error: RuntimeError | None = None
         self._browser_boot_id = str(uuid.uuid4())
         self._browser_serial = 0
         self._browser_playout_epoch = 0
@@ -449,8 +450,7 @@ class PlaybackControllerNode(Node):
         if self._flush_pending:
             return
         if not self._flush.service_is_ready():
-            self.get_logger().error("/audio/output/flush is unavailable")
-            return
+            raise self._fail_output_path("/audio/output/flush is unavailable")
         self._flush_pending = True
         self._flush_request = _FlushRequest(
             target_kind=target_kind,
@@ -480,12 +480,20 @@ class PlaybackControllerNode(Node):
                     request.target_kind, request.target_utterance_id
                 )
             except Exception as exc:  # ROS service boundary.
-                self.get_logger().error(f"/audio/output/flush failed: {exc}")
+                self._fail_output_path(f"/audio/output/flush failed: {exc}")
             finally:
                 request.service_done = True
                 self._maybe_finish_flush()
 
         future.add_done_callback(finish_flush)
+
+    def _fail_output_path(self, message: str) -> RuntimeError:
+        error = RuntimeError(message)
+        if self._fatal_output_error is None:
+            self._fatal_output_error = error
+            self.get_logger().fatal(message)
+            self.context.try_shutdown()
+        return self._fatal_output_error
 
     def _maybe_finish_flush(self) -> None:
         request = self._flush_request
@@ -575,5 +583,8 @@ def main(args=None) -> None:
     try:
         rclpy.spin(node)
     finally:
+        fatal_output_error = node._fatal_output_error
         node.destroy_node()
-        rclpy.shutdown()
+        node.context.try_shutdown()
+    if fatal_output_error is not None:
+        raise fatal_output_error

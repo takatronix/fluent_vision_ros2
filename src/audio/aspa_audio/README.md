@@ -10,11 +10,19 @@ ROS 2 owns both physical audio devices and the robot's single playback stream.
   GStreamer resampling/volume conversion, and publishes only
   `/audio/output/frame`.
 - `audio_output` is a Rust/CPAL device node. It subscribes only to
-  `/audio/output/frame` and provides `/audio/output/flush`. On
+  `/audio/output/frame` and provides the keyed `/audio/output/flush` service.
+  Keys not observed before a flush become one-shot tombstones, so a service
+  request that overtakes its DDS frame still rejects the late stale PCM. On
   `/audio/output/drained`, `accepted` is only a flow-control acknowledgement;
   `drained` or `flushed` reports the frames that reached CPAL's predicted
   device playback timestamp. A flush closes and recreates the CPAL stream so
   samples already handed to the host buffer are discarded.
+
+The launch file treats capture, controller, and output as one failure domain.
+If any node exits, the launch shuts down all three. In particular, an
+unavailable or failed flush is fatal to the playback controller; the stack does
+not continue the audio path after it can no longer invalidate stale physical
+playback.
 
 Launch with the default CPAL devices:
 
