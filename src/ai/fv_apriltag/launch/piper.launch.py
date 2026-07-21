@@ -33,7 +33,10 @@ def generate_launch_description():
             'quad_sigma': 0.0,
             'refine_edges': 1,
             'decode_sharpening': 0.25,
-            'default_tag_size': 0.050,
+            # Legacy cube IDs overlap today's field allocations. This
+            # profile explicitly opts into its homogeneous 40mm black edge;
+            # generic/field launches must not copy this override.
+            'tag_size': 0.040,
             'min_decision_margin': 50.0,
             'publish_annotated': True,
             'tag_frame_prefix': 'd405_tag',

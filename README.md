@@ -234,6 +234,14 @@ The pipeline editor reads, writes, and visualises exactly this format — no hid
 
 </details>
 
+`fv_apriltag` resolves each ID's physical black-edge size from
+`src/ai/fv_apriltag/config/tag_registry.yaml` (nominal `tag_mm` × 0.8). A
+positive `tag_size` parameter is an explicit homogeneous-size override;
+unknown or reserved IDs without a size do not produce a pose or TF.
+The legacy cube launch profiles set that override to 40 mm because their old
+IDs overlap the current field allocations; generic field use does not fall
+back to legacy meanings.
+
 <details>
 <summary><b>📷 Sensors (<code>src/sensors/</code>)</b></summary>
 

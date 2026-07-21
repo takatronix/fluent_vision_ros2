@@ -9,30 +9,28 @@ detection, publishes:
 """
 from __future__ import annotations
 
+from collections import deque
 import json
 import math
 import time
-from collections import deque
-from typing import Deque, Dict, Optional
+from typing import Deque, Optional
 
+from ament_index_python.packages import get_package_share_directory
+from apriltag_msgs.msg import AprilTagDetection, AprilTagDetectionArray
+from apriltag_msgs.msg import Point as ATPoint
 import cv2
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Pose, PoseArray, TransformStamped
 import numpy as np
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-
-from sensor_msgs.msg import CompressedImage
-
-from apriltag_msgs.msg import AprilTagDetection, AprilTagDetectionArray, Point as ATPoint
-from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, PoseArray, TransformStamped
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
 
-# Imported above (CompressedImage already in scope via sensor_msgs.msg).
+from .tag_registry import TagRegistryError, TagSizeRegistry, TagSizeResolver
 
 
 def _rotation_matrix_to_quaternion(R: np.ndarray) -> tuple:
@@ -75,9 +73,11 @@ class ApriltagNode(Node):
         self.declare_parameter('quad_sigma', 0.0)
         self.declare_parameter('refine_edges', 1)
         self.declare_parameter('decode_sharpening', 0.25)
-        self.declare_parameter('default_tag_size', 0.050)
-        # Per-ID tag size override: flat list [id, size, id, size, ...]
-        # Empty list = use default for all detected IDs.
+        # Runtime source of truth is config/tag_registry.yaml. A positive
+        # tag_size is an explicit homogeneous black-edge override.
+        self.declare_parameter('tag_registry', '')
+        self.declare_parameter('tag_size', 0.0)
+        # Optional per-ID black-edge override: [id, metres, id, metres, ...].
         self.declare_parameter('tag_sizes', [])
         self.declare_parameter('min_decision_margin', 50.0)
         self.declare_parameter('publish_annotated', True)
@@ -99,9 +99,6 @@ class ApriltagNode(Node):
         self.min_decision_margin = float(
             self.get_parameter('min_decision_margin').value
         )
-        self.default_tag_size = float(
-            self.get_parameter('default_tag_size').value
-        )
         self.publish_annotated = bool(
             self.get_parameter('publish_annotated').value
         )
@@ -112,9 +109,33 @@ class ApriltagNode(Node):
         self.enabled = bool(self.get_parameter('enabled').value)
         self.add_on_set_parameters_callback(self._on_param_update)
 
-        self._tag_sizes = self._parse_tag_sizes(
-            self.get_parameter('tag_sizes').value
-        )
+        registry_path = self.get_parameter(
+            'tag_registry'
+        ).get_parameter_value().string_value
+        if not registry_path:
+            registry_path = str(
+                get_package_share_directory('fv_apriltag')
+                + '/config/tag_registry.yaml'
+            )
+        try:
+            registry = TagSizeRegistry.from_file(registry_path)
+            if registry.family != self.family:
+                raise TagRegistryError(
+                    f'registry family {registry.family!r} does not match '
+                    f'detector family {self.family!r}'
+                )
+            self._tag_size_resolver = TagSizeResolver.create(
+                registry=registry,
+                single_size_m=self.get_parameter('tag_size').value,
+                per_id_raw=self.get_parameter('tag_sizes').value,
+            )
+            self._pose_reference_size = (
+                self._tag_size_resolver.reference_size()
+            )
+        except TagRegistryError as exc:
+            self.get_logger().fatal(f'unsafe AprilTag size config: {exc}')
+            raise RuntimeError('invalid AprilTag size configuration') from exc
+        self._missing_size_ids = set()
 
         try:
             from pupil_apriltags import Detector
@@ -223,27 +244,23 @@ class ApriltagNode(Node):
 
         self.get_logger().info(
             f'apriltag_node started family={self.family} '
-            f'default_tag_size={self.default_tag_size}m '
-            f'tag_sizes={self._tag_sizes} '
+            f'tag_size_mode={self._tag_size_resolver.mode_description()} '
+            f'tag_registry={registry_path} '
+            f'pose_reference_size={self._pose_reference_size}m '
             f'frame_prefix={self.tag_frame_prefix}'
         )
 
-    @staticmethod
-    def _parse_tag_sizes(raw) -> Dict[int, float]:
-        result: Dict[int, float] = {}
-        if not raw:
-            return result
-        if len(raw) % 2 != 0:
-            return result
-        for i in range(0, len(raw), 2):
-            try:
-                result[int(raw[i])] = float(raw[i + 1])
-            except (TypeError, ValueError):
-                continue
-        return result
+    def _tag_size_for(self, tag_id: int) -> Optional[float]:
+        return self._tag_size_resolver.size_for(tag_id)
 
-    def _tag_size_for(self, tag_id: int) -> float:
-        return self._tag_sizes.get(tag_id, self.default_tag_size)
+    def _warn_missing_size(self, tag_id: int) -> None:
+        if tag_id in self._missing_size_ids:
+            return
+        self._missing_size_ids.add(tag_id)
+        self.get_logger().warning(
+            f'tag ID {tag_id} has no physical size in the active registry; '
+            'suppressing detection, pose, and TF'
+        )
 
     def _on_depth_info(self, msg: CameraInfo) -> None:
         if self._depth_K is None:
@@ -290,6 +307,11 @@ class ApriltagNode(Node):
     def _on_param_update(self, params):
         from rcl_interfaces.msg import SetParametersResult
         for p in params:
+            if p.name in ('family', 'tag_registry', 'tag_size', 'tag_sizes'):
+                return SetParametersResult(
+                    successful=False,
+                    reason=f'{p.name} is startup-only; restart the profile',
+                )
             if p.name == 'enabled':
                 new_enabled = bool(p.value)
                 if new_enabled != self.enabled:
@@ -334,15 +356,15 @@ class ApriltagNode(Node):
             float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
         )
 
-        # pupil-apriltags accepts a single tag_size per call. To handle
-        # per-ID sizes, we detect with default_tag_size then recompute pose
-        # for IDs that have a different configured size.
+        # pupil-apriltags accepts one tag_size per call. Rotation is size
+        # invariant and translation is linear in tag_size, so estimate at a
+        # validated reference size and rescale per ID below.
         t_detect_start = time.perf_counter()
         detections = self._detector.detect(
             gray,
             estimate_tag_pose=True,
             camera_params=camera_params,
-            tag_size=self.default_tag_size,
+            tag_size=self._pose_reference_size,
         )
         detect_ms = (time.perf_counter() - t_detect_start) * 1000.0
 
@@ -357,17 +379,17 @@ class ApriltagNode(Node):
             if det.decision_margin < self.min_decision_margin:
                 continue
 
-            tag_size = self._tag_size_for(int(det.tag_id))
-            if abs(tag_size - self.default_tag_size) > 1e-9:
-                # Rescale translation: pose_t is linear in tag_size.
-                scale = tag_size / self.default_tag_size
-                pose_t = det.pose_t * scale
-            else:
-                pose_t = det.pose_t
+            tag_id = int(det.tag_id)
+            tag_size = self._tag_size_for(tag_id)
+            if tag_size is None:
+                self._warn_missing_size(tag_id)
+                continue
+            scale = tag_size / self._pose_reference_size
+            pose_t = det.pose_t * scale
 
             atd = AprilTagDetection()
             atd.family = self.family
-            atd.id = int(det.tag_id)
+            atd.id = tag_id
             atd.hamming = int(det.hamming)
             atd.goodness = 0.0
             atd.decision_margin = float(det.decision_margin)
@@ -400,7 +422,7 @@ class ApriltagNode(Node):
                 tf = TransformStamped()
                 tf.header.stamp = msg.header.stamp
                 tf.header.frame_id = self._cam_info.header.frame_id
-                tf.child_frame_id = f'{self.tag_frame_prefix}{int(det.tag_id)}'
+                tf.child_frame_id = f'{self.tag_frame_prefix}{tag_id}'
                 tf.transform.translation.x = float(pose_t[0])
                 tf.transform.translation.y = float(pose_t[1])
                 tf.transform.translation.z = float(pose_t[2])
@@ -506,17 +528,25 @@ class ApriltagNode(Node):
             if det.decision_margin < self.min_decision_margin:
                 continue
             corners = det.corners.astype(int)
+            tag_size = self._tag_size_for(int(det.tag_id))
+            edge_color = (0, 255, 0) if tag_size is not None else (0, 0, 255)
             for i in range(4):
                 p0 = tuple(corners[i])
                 p1 = tuple(corners[(i + 1) % 4])
-                cv2.line(bgr, p0, p1, (0, 255, 0), 2)
+                cv2.line(bgr, p0, p1, edge_color, 2)
             cx, cy = int(det.center[0]), int(det.center[1])
             cv2.circle(bgr, (cx, cy), 4, (0, 0, 255), -1)
 
-            pnp_z = float(det.pose_t[2]) if det.pose_t is not None else 0.0
+            pnp_z = 0.0
+            if tag_size is not None and det.pose_t is not None:
+                pnp_z = float(
+                    det.pose_t[2] * tag_size / self._pose_reference_size
+                )
             depth_z = self._sample_depth_at(cx, cy)
 
             lines = [f'id={det.tag_id}']
+            if tag_size is None:
+                lines.append('SIZE UNKNOWN - NO POSE')
             if depth_z is not None:
                 lines.append(f'd={depth_z * 100:.1f}cm')
                 if pnp_z > 0.01:

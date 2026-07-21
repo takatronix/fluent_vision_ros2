@@ -24,7 +24,10 @@ def generate_launch_description():
             'family': 'tag36h11',
             'nthreads': 2,
             'quad_decimate': 2.0,
-            'default_tag_size': 0.050,
+            # This legacy cube profile is a controlled homogeneous 40mm
+            # black-edge environment. Without this explicit override, IDs
+            # 21-38 correctly mean 150mm field tags in the active registry.
+            'tag_size': 0.040,
             'min_decision_margin': 50.0,
             'publish_annotated': True,
             'tag_frame_prefix': 'arm_tag',
@@ -49,7 +52,8 @@ def generate_launch_description():
             'family': 'tag36h11',
             'nthreads': 2,
             'quad_decimate': 2.0,
-            'default_tag_size': 0.050,
+            # Same legacy cube-kit contract as the arm camera above.
+            'tag_size': 0.040,
             'min_decision_margin': 50.0,
             'publish_annotated': True,
             'tag_frame_prefix': 'side_tag',
