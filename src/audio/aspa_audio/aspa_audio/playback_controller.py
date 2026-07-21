@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from array import array
+import base64
 from dataclasses import dataclass
+import json
+import uuid
 
 import rclpy
 from rclpy.node import Node
@@ -81,6 +84,10 @@ class PlaybackControllerNode(Node):
         self._device_buffer = DeviceBufferTracker()
         self._flush_pending = False
         self._flush_request: _FlushRequest | None = None
+        self._browser_boot_id = str(uuid.uuid4())
+        self._browser_serial = 0
+        self._browser_playout_epoch = 0
+        self._browser_invalidated_kinds: tuple[str, ...] = ()
 
         qos = QoSProfile(
             depth=10,
@@ -90,6 +97,15 @@ class PlaybackControllerNode(Node):
         )
         self._output_pub = self.create_publisher(AudioFrame, "/audio/output/frame", qos)
         self._event_pub = self.create_publisher(String, "/audio/playback/event", qos)
+        browser_qos = QoSProfile(
+            depth=256,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self._browser_pub = self.create_publisher(
+            String, "/audio/browser/projection", browser_qos
+        )
         self._flush = self.create_client(Trigger, "/audio/output/flush")
         self.create_subscription(
             AudioFrame, "/audio/agent/frame", lambda msg: self._on_frame("agent", msg), qos
@@ -195,14 +211,20 @@ class PlaybackControllerNode(Node):
         if control.action == "pause":
             events = self._machine.pause_agent()
             self._flush_device(account_ack=True, target_kind="agent")
+            fallback = PlaybackEvent("agent_paused", "agent", "", 0, 0)
+            invalidated_kind = "agent"
         elif control.action == "resume":
             events = self._machine.resume_agent()
+            fallback = PlaybackEvent("agent_resumed", "agent", "", 0, 0)
+            invalidated_kind = None
         elif control.action == "discard":
             self._minimum_agent_epoch = int(control.floor_epoch)
             events = self._machine.discard_agent(
                 control.release_hold, control.utterance_id
             )
             self._flush_device(account_ack=False, target_kind="agent")
+            fallback = PlaybackEvent("agent_discarded", "agent", "", 0, 0)
+            invalidated_kind = "agent"
         else:
             events = self._machine.abort_system(
                 control.utterance_id,
@@ -213,7 +235,15 @@ class PlaybackControllerNode(Node):
                 target_kind="system",
                 target_utterance_id=control.utterance_id,
             )
-        self._publish_events(events)
+            fallback = PlaybackEvent(
+                "system_aborted", "system", control.utterance_id, 0, 0
+            )
+            invalidated_kind = "system"
+        self._publish_events(
+            events,
+            fallback_event=fallback,
+            force_invalidated_kind=invalidated_kind,
+        )
 
     def _on_output_drained(self, msg: String) -> None:
         try:
@@ -335,6 +365,7 @@ class PlaybackControllerNode(Node):
             self._output_inflight_kind = chunk.kind
             self._device_buffer.note_chunk(chunk.kind, chunk.utterance_id)
             self._output_pub.publish(msg)
+            self._publish_browser_frame(chunk)
         self._publish_events(events)
 
     def _flush_device(
@@ -410,9 +441,79 @@ class PlaybackControllerNode(Node):
         self._flush_request = None
         self._flush_pending = False
 
-    def _publish_events(self, events: tuple[PlaybackEvent, ...]) -> None:
+    def _publish_events(
+        self,
+        events: tuple[PlaybackEvent, ...],
+        *,
+        fallback_event: PlaybackEvent | None = None,
+        force_invalidated_kind: str | None = None,
+    ) -> None:
+        invalidated_kinds = {
+            "agent" if event.event in {"agent_paused", "agent_discarded"}
+            else "system"
+            for event in events
+            if event.event in {"agent_paused", "agent_discarded", "system_aborted"}
+        }
+        if force_invalidated_kind is not None:
+            invalidated_kinds.add(force_invalidated_kind)
+        if invalidated_kinds:
+            self._browser_playout_epoch += 1
+            self._browser_invalidated_kinds = tuple(sorted(invalidated_kinds))
         for event in events:
             self._event_pub.publish(String(data=event.to_json()))
+            self._publish_browser_event(event)
+        if (
+            fallback_event is not None
+            and not any(event.event == fallback_event.event for event in events)
+        ):
+            self._publish_browser_event(fallback_event)
+
+    def _publish_browser_event(self, event: PlaybackEvent) -> None:
+        self._publish_browser_projection(
+            {
+                "packet_type": "state",
+                "event": event.event,
+                "kind": event.kind,
+                "utterance_id": event.utterance_id,
+                "played_frames": event.played_frames,
+                "total_frames": event.total_frames,
+            }
+        )
+
+    def _publish_browser_frame(self, chunk) -> None:
+        self._publish_browser_projection(
+            {
+                "packet_type": "frame",
+                "kind": chunk.kind,
+                "utterance_id": chunk.utterance_id,
+                "seq": chunk.seq,
+                "sample_index": chunk.sample_index,
+                "frame_count": chunk.frame_count,
+                "encoding": "PCM16LE",
+                "sample_rate_hz": chunk.sample_rate_hz,
+                "channels": chunk.channels,
+                "bit_depth": chunk.bit_depth,
+                "layout": "interleaved",
+                "final": chunk.final,
+                "data": base64.b64encode(chunk.data).decode("ascii"),
+            }
+        )
+
+    def _publish_browser_projection(self, packet: dict) -> None:
+        self._browser_serial += 1
+        payload = {
+            "type": "audio_projection",
+            "protocol_version": 1,
+            "controller_boot_id": self._browser_boot_id,
+            "serial": self._browser_serial,
+            "playout_epoch": self._browser_playout_epoch,
+            "invalidated_kinds": list(self._browser_invalidated_kinds),
+            "agent_paused": self._machine.agent_pause_requested,
+            **packet,
+        }
+        self._browser_pub.publish(
+            String(data=json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        )
 
 
 def main(args=None) -> None:

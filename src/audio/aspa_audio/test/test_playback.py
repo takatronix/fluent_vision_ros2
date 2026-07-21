@@ -566,3 +566,119 @@ def test_targeted_system_abort_preserves_other_system_and_its_hold():
     ] == [
         "agent_resumed"
     ]
+
+
+def test_browser_projection_orders_frames_and_invalidating_state() -> None:
+    pytest.importorskip("rclpy")
+    import json
+
+    from aspa_audio.playback_controller import PlaybackControllerNode
+
+    class Publisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(message)
+
+    class Harness:
+        _publish_browser_projection = (
+            PlaybackControllerNode._publish_browser_projection
+        )
+        _publish_browser_frame = PlaybackControllerNode._publish_browser_frame
+
+    controller = Harness()
+    controller._browser_boot_id = "boot-a"
+    controller._browser_serial = 0
+    controller._browser_playout_epoch = 0
+    controller._browser_invalidated_kinds = ()
+    controller._machine = SimpleNamespace(agent_pause_requested=False)
+    controller._browser_pub = Publisher()
+    controller._event_pub = Publisher()
+
+    controller._publish_browser_frame(SimpleNamespace(
+        kind="agent",
+        utterance_id="agent-0-test",
+        seq=0,
+        sample_index=0,
+        frame_count=2,
+        sample_rate_hz=16_000,
+        channels=1,
+        bit_depth=16,
+        final=False,
+        data=b"\x00\x00" * 2,
+    ))
+    PlaybackControllerNode._publish_events(
+        controller,
+        (
+            PlaybackEvent("agent_paused", "agent", "agent-0-test", 2, 8),
+            PlaybackEvent("agent_resumed", "agent", "agent-0-test", 2, 8),
+        ),
+    )
+    controller._publish_browser_frame(SimpleNamespace(
+        kind="agent",
+        utterance_id="agent-0-test",
+        seq=1,
+        sample_index=2,
+        frame_count=2,
+        sample_rate_hz=16_000,
+        channels=1,
+        bit_depth=16,
+        final=False,
+        data=b"\x00\x00" * 2,
+    ))
+
+    packets = [json.loads(message.data) for message in controller._browser_pub.messages]
+    assert [packet["serial"] for packet in packets] == [1, 2, 3, 4]
+    assert [packet["playout_epoch"] for packet in packets] == [0, 1, 1, 1]
+    assert [packet["packet_type"] for packet in packets] == [
+        "frame", "state", "state", "frame"
+    ]
+    assert packets[0]["kind"] == "agent"
+    assert packets[0]["controller_boot_id"] == "boot-a"
+    assert packets[0]["protocol_version"] == 1
+    assert packets[1]["invalidated_kinds"] == ["agent"]
+    assert packets[1]["agent_paused"] is False
+
+
+def test_browser_projection_invalidates_even_when_playback_control_is_a_noop() -> None:
+    pytest.importorskip("rclpy")
+    import json
+
+    from aspa_audio.playback_controller import PlaybackControllerNode
+
+    class Publisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(message)
+
+    class Harness:
+        _publish_browser_projection = (
+            PlaybackControllerNode._publish_browser_projection
+        )
+        _publish_browser_event = PlaybackControllerNode._publish_browser_event
+
+    controller = Harness()
+    controller._browser_boot_id = "boot-a"
+    controller._browser_serial = 0
+    controller._browser_playout_epoch = 0
+    controller._browser_invalidated_kinds = ()
+    controller._machine = SimpleNamespace(agent_pause_requested=True)
+    controller._browser_pub = Publisher()
+    controller._event_pub = Publisher()
+
+    PlaybackControllerNode._publish_events(
+        controller,
+        (),
+        fallback_event=PlaybackEvent("agent_paused", "agent", "", 0, 0),
+        force_invalidated_kind="agent",
+    )
+
+    assert controller._event_pub.messages == []
+    packet = json.loads(controller._browser_pub.messages[0].data)
+    assert packet["event"] == "agent_paused"
+    assert packet["playout_epoch"] == 1
+    assert packet["invalidated_kinds"] == ["agent"]
+    assert packet["agent_paused"] is True
