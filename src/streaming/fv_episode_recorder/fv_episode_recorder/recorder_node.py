@@ -30,7 +30,7 @@ except ImportError:
     raise
 
 from .active_lock import ActiveLock
-from .api_server import build_app
+from .api_server import build_app, start_episode, stop_episode
 from .bag_recorder import BagRecorder
 from .event_bridge import EventMarkerBridge
 from .camera_writer import CameraWriterPool
@@ -72,6 +72,7 @@ class FVEpisodeRecorderNode(Node):
         )
         self.declare_parameter("episode_search_service", "/episode/search")
         self.declare_parameter("environment_annotation_enabled", True)
+        self.declare_parameter("environment_auto_record_profile", "")
 
         self.output_dir = Path(self.get_parameter("output_dir").value)
         self.profiles_dir = Path(self.get_parameter("profiles_dir").value)
@@ -90,6 +91,9 @@ class FVEpisodeRecorderNode(Node):
         )
         self.environment_annotation_enabled = bool(
             self.get_parameter("environment_annotation_enabled").value
+        )
+        self.environment_auto_record_profile = str(
+            self.get_parameter("environment_auto_record_profile").value
         )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -242,9 +246,6 @@ def main(args=None):
     # to 0 fps under MultiThreadedExecutor).
     executor = SingleThreadedExecutor()
     executor.add_node(node)
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
-    spin_thread.start()
-
     # aiohttp loop in main thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -255,6 +256,20 @@ def main(args=None):
                     retention_runner=node.retention_runner,
                     depth_pool=node.depth_pool,
                     get_profile=node.get_profile)
+    node.environment_annotation_bridge.bind_lifecycle(
+        loop,
+        start_episode=lambda request: start_episode(app, request),
+        stop_episode=lambda episode_id, request: stop_episode(
+            app, episode_id, request
+        ),
+        profiles_dir=node.profiles_dir,
+        auto_profile_override=node.environment_auto_record_profile,
+    )
+
+    # Start ROS dispatch only after callbacks can hand events to the aiohttp
+    # loop. Events arriving before run_forever() are queued thread-safely.
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
     # First mux discovery sweep happens on the 2s timer; trigger one now so
     # the very first POST /episodes already has a snapshot if publishers
     # came up before us.
