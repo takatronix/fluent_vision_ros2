@@ -27,7 +27,10 @@ def test_barge_in_pauses_then_resumes_at_same_offset():
     machine.enqueue(utterance("agent", "a"))
     first, events = machine.next_chunk()
     assert first.sample_index == 0
-    assert [event.event for event in events] == ["agent_started"]
+    assert events == ()
+    assert [event.event for event in machine.output_accepted("a", 0)] == [
+        "agent_started"
+    ]
     machine.output_drained("a", 0, 2, False)
     paused = machine.pause_agent()
     assert paused[0].played_frames == 2
@@ -49,6 +52,19 @@ def test_confirmed_barge_in_discards_paused_and_queued_agent_audio():
     assert machine.next_chunk()[0] is None
 
 
+def test_floor_discard_preserves_new_agent_pcm_that_arrived_first():
+    machine = PlaybackMachine(chunk_frames=2)
+    machine.enqueue(utterance("agent", "agent-0-old"))
+    machine.enqueue(utterance("agent", "agent-1-new"))
+    machine.next_chunk()
+
+    events = machine.discard_agent("user", minimum_agent_epoch=1)
+
+    assert [event.utterance_id for event in events] == ["agent-0-old"]
+    next_chunk, _ = machine.next_chunk()
+    assert next_chunk.utterance_id == "agent-1-new"
+
+
 def test_system_preempts_agent_but_only_abort_resumes_old_pcm():
     machine = PlaybackMachine(chunk_frames=8)
     machine.enqueue(utterance("agent", "agent"))
@@ -66,11 +82,28 @@ def test_system_preempts_agent_but_only_abort_resumes_old_pcm():
     assert [event.event for event in events] == ["agent_paused"]
     chunk, events = machine.next_chunk()
     assert chunk.kind == "system"
-    assert events[0].event == "system_started"
+    assert events == ()
+    assert machine.output_accepted("system", 0)[0].event == "system_started"
     abort_events = machine.abort_system("system", release_hold=True)
     assert [event.event for event in abort_events] == ["system_aborted", "agent_resumed"]
     chunk, _ = machine.next_chunk()
     assert chunk.kind == "agent"
+
+
+def test_system_reservation_pauses_before_pcm_is_ready_and_is_idempotent():
+    machine = PlaybackMachine(chunk_frames=2)
+    machine.enqueue(utterance("agent", "agent"))
+    machine.next_chunk()
+
+    events = machine.reserve_system("system")
+
+    assert [event.event for event in events] == ["agent_paused"]
+    assert machine.reserve_system("system") == ()
+    assert machine.next_chunk()[0] is None
+    assert [
+        event.event
+        for event in machine.abort_system("system", release_hold=True)
+    ] == ["agent_resumed"]
 
 
 def test_system_success_then_discard_never_resumes_old_agent_pcm():
@@ -189,6 +222,19 @@ def test_flush_before_ack_accounts_partial_heard_audio_then_resumes_there():
     machine.resume_agent()
     resumed, _ = machine.next_chunk()
     assert resumed.sample_index == 1
+
+
+def test_resume_before_flush_ack_uses_the_late_physical_playback_offset():
+    machine = PlaybackMachine(chunk_frames=4)
+    machine.enqueue(utterance("agent", "agent", frames=8))
+    machine.next_chunk()
+    machine.pause_agent()
+    machine.resume_agent()
+
+    machine.output_drained("agent", 0, 2, False, "flushed")
+
+    resumed, _ = machine.next_chunk()
+    assert resumed.sample_index == 2
 
 
 def test_ack_before_flush_and_flush_before_ack_produce_same_resume_offset():
@@ -392,6 +438,11 @@ def test_accepted_ack_paces_output_without_advancing_played_position():
     class Machine:
         def __init__(self):
             self.calls = []
+            self.accepted_calls = []
+
+        def output_accepted(self, *args):
+            self.accepted_calls.append(args)
+            return ()
 
         def output_drained(self, *args):
             self.calls.append(args)
@@ -437,6 +488,7 @@ def test_accepted_ack_paces_output_without_advancing_played_position():
 
     assert controller._output_inflight is None
     assert controller._output_pending[(expected.utterance_id, expected.seq)].accepted
+    assert controller._machine.accepted_calls == [(expected.utterance_id, 0)]
     assert controller._machine.calls == []
 
     PlaybackControllerNode._on_output_drained(
@@ -566,6 +618,17 @@ def test_targeted_system_abort_preserves_other_system_and_its_hold():
     ] == [
         "agent_resumed"
     ]
+
+
+def test_system_abort_tombstone_drops_cross_topic_late_pcm():
+    machine = PlaybackMachine(chunk_frames=2)
+
+    assert machine.abort_system("system-late", release_hold=True) == ()
+    events = machine.enqueue(utterance("system", "system-late", frames=2))
+
+    assert [event.event for event in events] == ["system_aborted"]
+    assert not machine.agent_pause_requested
+    assert machine.next_chunk()[0] is None
 
 
 def test_browser_projection_orders_frames_and_invalidating_state() -> None:

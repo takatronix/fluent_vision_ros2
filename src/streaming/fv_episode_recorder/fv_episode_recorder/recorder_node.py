@@ -21,6 +21,8 @@ from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool
 
 try:
     from aiohttp import web
@@ -128,6 +130,14 @@ class FVEpisodeRecorderNode(Node):
             annotation_topic=self.environment_annotation_topic,
             search_service=self.episode_search_service,
             enabled=self.environment_annotation_enabled,
+        )
+        ready_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._ready_pub = self.create_publisher(
+            Bool, "/episode/recorder/ready", ready_qos
         )
         # Track mux source (teleop vs VLA + controller name) so the play
         # modal can label each recording without having to decode the bag.
@@ -284,6 +294,7 @@ def main(args=None):
     loop.run_until_complete(site.start())
 
     node.get_logger().info(f"aiohttp listening on http://{node.host}:{node.port}")
+    node._ready_pub.publish(Bool(data=True))
 
     # Background retention loop: ticks every policy.interval_s (default 300s).
     # No-op when policy.enabled is False (no episode_recorder.retention block

@@ -12,9 +12,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
 
 from fluent_dialogue_dora_interfaces.msg import AudioFrame
+from fluent_dialogue_dora_interfaces.srv import FlushAudio
 
 from .contracts import OutputDrained, PlaybackControl, PlaybackEvent
 from .gstreamer_pcm import GStreamerPcmConverter
@@ -106,7 +106,7 @@ class PlaybackControllerNode(Node):
         self._browser_pub = self.create_publisher(
             String, "/audio/browser/projection", browser_qos
         )
-        self._flush = self.create_client(Trigger, "/audio/output/flush")
+        self._flush = self.create_client(FlushAudio, "/audio/output/flush")
         self.create_subscription(
             AudioFrame, "/audio/agent/frame", lambda msg: self._on_frame("agent", msg), qos
         )
@@ -128,7 +128,25 @@ class PlaybackControllerNode(Node):
                     f"minimum floor is {self._minimum_agent_epoch}"
                 )
                 return
+            if kind == "system" and self._machine.system_is_aborted(msg.stream_id):
+                self._assemblies.pop((kind, msg.stream_id), None)
+                self.get_logger().warn(
+                    f"dropping PCM for aborted SYSTEM utterance {msg.stream_id!r}"
+                )
+                return
+            first_system_frame = (
+                kind == "system"
+                and msg.seq == 0
+                and (kind, msg.stream_id) not in self._assemblies
+            )
             item = self._assemble(kind, msg)
+            if first_system_frame:
+                reserve_events = self._machine.reserve_system(msg.stream_id)
+                if any(
+                    event.event == "agent_paused" for event in reserve_events
+                ):
+                    self._flush_device(account_ack=True, target_kind="agent")
+                self._publish_events(reserve_events)
             if item is None:
                 return
             converted = self._converter.convert(
@@ -146,12 +164,18 @@ class PlaybackControllerNode(Node):
                 channels=self._converter.output_channels,
                 bit_depth=16,
             )
-            events = self._machine.enqueue(ready)
-            if kind == "system" and any(event.event == "agent_paused" for event in events):
-                self._flush_device(account_ack=True, target_kind="agent")
-            self._publish_events(events)
+            self._publish_events(self._machine.enqueue(ready))
         except Exception as exc:  # ROS boundary: reject malformed audio visibly.
             self.get_logger().error(f"rejecting {kind} audio frame: {exc}")
+            if kind == "system" and msg.stream_id:
+                self._assemblies.pop((kind, msg.stream_id), None)
+                self._publish_events(
+                    self._machine.abort_system(msg.stream_id, release_hold=True),
+                    fallback_event=PlaybackEvent(
+                        "system_aborted", "system", msg.stream_id, 0, 0
+                    ),
+                    force_invalidated_kind="system",
+                )
 
     def _assemble(self, kind: str, msg: AudioFrame) -> Utterance | None:
         if msg.encoding != "PCM16LE" or msg.layout != "interleaved":
@@ -219,13 +243,26 @@ class PlaybackControllerNode(Node):
             invalidated_kind = None
         elif control.action == "discard":
             self._minimum_agent_epoch = int(control.floor_epoch)
+            for key in tuple(self._assemblies):
+                if (
+                    key[0] == "agent"
+                    and self._agent_epoch(key[1]) < self._minimum_agent_epoch
+                ):
+                    del self._assemblies[key]
             events = self._machine.discard_agent(
-                control.release_hold, control.utterance_id
+                control.release_hold,
+                control.utterance_id,
+                minimum_agent_epoch=self._minimum_agent_epoch,
             )
-            self._flush_device(account_ack=False, target_kind="agent")
+            self._flush_device(
+                account_ack=False,
+                target_kind="agent",
+                minimum_agent_epoch=self._minimum_agent_epoch,
+            )
             fallback = PlaybackEvent("agent_discarded", "agent", "", 0, 0)
             invalidated_kind = "agent"
         else:
+            self._assemblies.pop(("system", control.utterance_id), None)
             events = self._machine.abort_system(
                 control.utterance_id,
                 release_hold=control.release_hold == "system",
@@ -262,12 +299,22 @@ class PlaybackControllerNode(Node):
                 ):
                     raise ValueError("accepted ack does not match the complete chunk")
                 pending.accepted = True
+                if ack.seq == 0 and key not in self._suppressed_output_acks:
+                    self._publish_events(
+                        self._machine.output_accepted(ack.utterance_id, ack.seq)
+                    )
                 if not expected.final and self._inflight_key() == key:
                     self._output_inflight = None
                     self._output_inflight_kind = None
                 self._maybe_start_flush()
                 return
-            if not pending.accepted:
+            terminal_before_start = (
+                not pending.accepted
+                and ack.status == "flushed"
+                and ack.frame_count == 0
+                and not ack.final
+            )
+            if not pending.accepted and not terminal_before_start:
                 raise ValueError("terminal output ack arrived before accepted ack")
             if ack.status == "drained" and ack != expected:
                 raise ValueError("drained ack does not match the complete pending chunk")
@@ -374,18 +421,26 @@ class PlaybackControllerNode(Node):
         account_ack: bool,
         target_kind: str,
         target_utterance_id: str | None = None,
+        minimum_agent_epoch: int | None = None,
     ) -> None:
+        def is_target(utterance_id: str) -> bool:
+            if target_utterance_id is not None and utterance_id != target_utterance_id:
+                return False
+            if target_kind == "agent" and minimum_agent_epoch is not None:
+                return self._agent_epoch(utterance_id) < minimum_agent_epoch
+            return True
+
         matching_keys = {
             key
             for key, pending in self._output_pending.items()
             if should_flush_output(pending.kind, target_kind)
-            and (
-                target_utterance_id is None
-                or pending.expected.utterance_id == target_utterance_id
-            )
+            and is_target(pending.expected.utterance_id)
         }
         device_matches = self._device_buffer.matches(
             target_kind, target_utterance_id
+        ) and (
+            self._device_buffer.utterance_id is not None
+            and is_target(self._device_buffer.utterance_id)
         )
         if not matching_keys and not device_matches:
             return
@@ -408,14 +463,12 @@ class PlaybackControllerNode(Node):
         request = self._flush_request
         if request is None or request.service_started:
             return
-        if any(
-            not self._output_pending[key].accepted
-            for key in request.keys
-            if key in self._output_pending
-        ):
-            return
         request.service_started = True
-        future = self._flush.call_async(Trigger.Request())
+        ordered_keys = sorted(request.keys)
+        flush_request = FlushAudio.Request()
+        flush_request.utterance_ids = [key[0] for key in ordered_keys]
+        flush_request.seqs = [key[1] for key in ordered_keys]
+        future = self._flush.call_async(flush_request)
 
         def finish_flush(done) -> None:
             try:

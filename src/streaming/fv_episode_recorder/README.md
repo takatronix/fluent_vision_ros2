@@ -3,8 +3,11 @@
 The package also owns the dialogue perception path defined by the ASPA
 architecture:
 
-- `video_anomaly_detector` publishes deterministic anomaly episode
-  `started` / `ended` lifecycle on `/environment/change`.
+- `video_anomaly_detector` publishes deterministic `started` / `ended`
+  lifecycle on `/environment/change`. Its current executable is a strict alias
+  of the single-frame visual-condition model (rain, fog, soiling, blur,
+  exposure, and similar labels), not a temporal scene-change detector. Person
+  entry and object motion therefore remain an implementation gap.
 - `moss_realtime_adapter` continuously sends timestamped frames at 1 FPS to
   the official MOSS-VL-Realtime `/v1/realtime` WebSocket service. It filters
   control tokens and publishes complete non-silence rounds on
@@ -23,12 +26,17 @@ package-internal `/perception/moss/image/compressed` topic. The MOSS adapter
 forwards those JPEG/PNG bytes without a duplicate high-rate camera subscription
 or raw-image stream. The configured detector model is
 `/home/aspa/.aspa/models/visual-condition-multihead.onnx`; the canonical node
-fails startup when the model or ONNX runtime cannot be loaded.
+fails startup when the model or ONNX runtime cannot be loaded. The custom ONNX
+artifact is not distributed from this repository yet, so a fresh checkout is
+not self-contained.
 
 Environment changes are interval markers inside the currently active recording
 episode. The anomaly lifecycle ID is stored as a marker attribute and MOSS text
-becomes the marker description. If no recording is active, no annotation is
-persisted. There is no parallel annotation database.
+becomes the marker description. If no recording is active at anomaly start,
+the recorder starts one and stops only that recorder-owned episode after all
+overlapping anomaly markers end. It never auto-stops a manual recording or a
+replacement recording created after manual stop. There is no parallel
+annotation database.
 
 Run the complete package path through the system launcher, using
 `perception_episode_recorder.launch.py` as the package-level launch include.

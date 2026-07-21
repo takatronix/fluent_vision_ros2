@@ -5,6 +5,17 @@ ROS 2 process, and publishes PCM16LE to `/audio/agent/frame` or
 `/audio/system/frame`. There is no `Speak` service and no VOICEVOX Engine HTTP
 process.
 
+Synthesis is serialized because the native backend is blocking. Pending SYSTEM
+requests take priority over pending agent requests. `/audio/playback/control`
+advances the accepted agent floor on `discard`, removes queued stale agent work,
+and suppresses an obsolete result if native synthesis was already running.
+
+Every syntactically valid request terminates on `/aspa/tts/result` with strict JSON fields
+`kind`, `utterance_id`, and `status` (`completed`, `failed`, or `cancelled`). A
+`failed` result also carries `error`. `completed` means synthesis finished and
+the PCM frame was published; it does not mean that the speaker played the frame.
+Actual playback completion remains `/audio/playback/event` authority.
+
 The request is a `std_msgs/String` containing exactly:
 
 ```json

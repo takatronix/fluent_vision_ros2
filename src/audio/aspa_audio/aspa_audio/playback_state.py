@@ -9,6 +9,9 @@ from typing import Deque, Literal
 from .contracts import PlaybackEvent, PlaybackHold, PlaybackKind
 
 
+_MAX_ABORTED_SYSTEM_IDS = 64
+
+
 def should_flush_output(inflight_kind: str | None, target_kind: str) -> bool:
     if target_kind not in {"agent", "system"}:
         raise ValueError("flush target must be agent or system")
@@ -26,6 +29,7 @@ class Utterance:
     offset_bytes: int = 0
     played_offset_frames: int = 0
     started: bool = False
+    start_confirmed: bool = False
 
     def __post_init__(self) -> None:
         if not self.utterance_id:
@@ -119,6 +123,8 @@ class PlaybackMachine:
         self.paused_agent: Utterance | None = None
         self._user_hold = False
         self._system_holds: set[str] = set()
+        self._aborted_system_ids: set[str] = set()
+        self._aborted_system_order: Deque[str] = deque()
         self.awaiting_drain: dict[str, Utterance] = {}
 
     @property
@@ -128,14 +134,30 @@ class PlaybackMachine:
     def enqueue(self, utterance: Utterance) -> tuple[PlaybackEvent, ...]:
         events: list[PlaybackEvent] = []
         if utterance.kind == "system":
-            self._system_holds.add(utterance.utterance_id)
-            events.extend(self._pause_active_agent())
+            if utterance.utterance_id in self._aborted_system_ids:
+                return (self._event("system_aborted", utterance),)
+            events.extend(self.reserve_system(utterance.utterance_id))
             self.system_queue.append(utterance)
         elif utterance.kind == "cue":
             self.cue_queue.append(utterance)
         else:
             self.agent_queue.append(utterance)
         return tuple(events)
+
+    def reserve_system(self, utterance_id: str) -> tuple[PlaybackEvent, ...]:
+        """Establish SYSTEM priority before assembly or PCM conversion."""
+        if not utterance_id:
+            raise ValueError("system reservation requires utterance_id")
+        if (
+            utterance_id in self._aborted_system_ids
+            or utterance_id in self._system_holds
+        ):
+            return ()
+        self._system_holds.add(utterance_id)
+        return tuple(self._pause_active_agent())
+
+    def system_is_aborted(self, utterance_id: str) -> bool:
+        return utterance_id in self._aborted_system_ids
 
     def pause_agent(self) -> tuple[PlaybackEvent, ...]:
         self._user_hold = True
@@ -156,6 +178,7 @@ class PlaybackMachine:
         self,
         release_hold: PlaybackHold,
         utterance_id: str | None = None,
+        minimum_agent_epoch: int | None = None,
     ) -> tuple[PlaybackEvent, ...]:
         if release_hold not in {"user", "system"}:
             raise ValueError("release_hold must be user or system")
@@ -163,30 +186,61 @@ class PlaybackMachine:
             raise ValueError("system hold release requires utterance_id")
         if release_hold == "user" and utterance_id is not None:
             raise ValueError("user hold release must not specify utterance_id")
+        if minimum_agent_epoch is not None and minimum_agent_epoch < 0:
+            raise ValueError("minimum_agent_epoch must be non-negative")
+
+        def stale(item: Utterance) -> bool:
+            if minimum_agent_epoch is None:
+                return True
+            parts = item.utterance_id.split("-", 2)
+            if len(parts) != 3 or parts[0] != "agent":
+                raise ValueError(
+                    "agent utterance_id must be agent-<floor_epoch>-<id>"
+                )
+            try:
+                epoch = int(parts[1])
+            except ValueError as exc:
+                raise ValueError("agent utterance_id floor epoch is invalid") from exc
+            return epoch < minimum_agent_epoch
+
         discarded: list[Utterance] = []
-        if self.active is not None and self.active.kind == "agent":
+        if (
+            self.active is not None
+            and self.active.kind == "agent"
+            and stale(self.active)
+        ):
             discarded.append(self.active)
             self.active = None
-        if self.paused_agent is not None:
+        if self.paused_agent is not None and stale(self.paused_agent):
             discarded.append(self.paused_agent)
             self.paused_agent = None
-        discarded.extend(self.agent_queue)
-        self.agent_queue.clear()
+        kept_agents: Deque[Utterance] = deque()
+        while self.agent_queue:
+            item = self.agent_queue.popleft()
+            (discarded if stale(item) else kept_agents).append(item)
+        self.agent_queue = kept_agents
         for drain_utterance_id, item in tuple(self.awaiting_drain.items()):
-            if item.kind == "agent":
+            if item.kind == "agent" and stale(item):
                 discarded.append(item)
                 del self.awaiting_drain[drain_utterance_id]
         if release_hold == "user":
             self._user_hold = False
         else:
             self._system_holds.discard(utterance_id)
-        return tuple(self._event("agent_discarded", item) for item in discarded)
+        events = [self._event("agent_discarded", item) for item in discarded]
+        if not self.agent_pause_requested and self.paused_agent is not None:
+            paused = self.paused_agent
+            self.paused_agent = None
+            self.agent_queue.appendleft(paused)
+            events.append(self._event("agent_resumed", paused))
+        return tuple(events)
 
     def abort_system(
         self, utterance_id: str, *, release_hold: bool = False
     ) -> tuple[PlaybackEvent, ...]:
         if not utterance_id:
             raise ValueError("system abort requires utterance_id")
+        self._remember_aborted_system(utterance_id)
         events: list[PlaybackEvent] = []
         if (
             self.active is not None
@@ -217,8 +271,16 @@ class PlaybackMachine:
             events.append(self._event("agent_resumed", paused))
         return tuple(events)
 
+    def _remember_aborted_system(self, utterance_id: str) -> None:
+        if utterance_id in self._aborted_system_ids:
+            return
+        if len(self._aborted_system_order) >= _MAX_ABORTED_SYSTEM_IDS:
+            oldest = self._aborted_system_order.popleft()
+            self._aborted_system_ids.discard(oldest)
+        self._aborted_system_ids.add(utterance_id)
+        self._aborted_system_order.append(utterance_id)
+
     def next_chunk(self) -> tuple[PlaybackChunk | None, tuple[PlaybackEvent, ...]]:
-        events: list[PlaybackEvent] = []
         if self.active is None:
             self.active = self._select_next()
         item = self.active
@@ -226,7 +288,6 @@ class PlaybackMachine:
             return None, ()
         if not item.started:
             item.started = True
-            events.append(self._event(f"{item.kind}_started", item))
 
         start = item.offset_bytes
         chunk_bytes = self.chunk_frames * item.bytes_per_frame
@@ -250,7 +311,16 @@ class PlaybackMachine:
         if final:
             self.awaiting_drain[item.utterance_id] = item
             self.active = None
-        return chunk, tuple(events)
+        return chunk, ()
+
+    def output_accepted(
+        self, utterance_id: str, seq: int
+    ) -> tuple[PlaybackEvent, ...]:
+        item = self._find_item(utterance_id)
+        if seq != 0 or item.start_confirmed:
+            return ()
+        item.start_confirmed = True
+        return (self._event(f"{item.kind}_started", item),)
 
     def output_drained(
         self,
@@ -267,7 +337,12 @@ class PlaybackMachine:
         item.played_offset_frames += frame_count
         if item.played_offset_frames > item.total_frames:
             raise ValueError("output ack exceeds utterance length")
-        if self.paused_agent is item:
+        # A false barge-in or aborted SYSTEM can queue the paused utterance for
+        # resume before the device's flush acknowledgement arrives.  Keep that
+        # queued resume point aligned with the samples that were actually heard.
+        if self.paused_agent is item or (
+            item.kind == "agent" and any(candidate is item for candidate in self.agent_queue)
+        ):
             item.offset_bytes = item.played_offset_frames * item.bytes_per_frame
         expected_final = item.played_offset_frames == item.total_frames
         if status == "drained" and final != expected_final:

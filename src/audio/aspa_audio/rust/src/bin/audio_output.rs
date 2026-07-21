@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
@@ -9,8 +9,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedStreamConfig};
 use futures::{FutureExt, StreamExt};
 use r2r::fluent_dialogue_dora_interfaces::msg::AudioFrame;
+use r2r::fluent_dialogue_dora_interfaces::srv::FlushAudio;
 use r2r::std_msgs::msg::String as StringMessage;
-use r2r::std_srvs::srv::Trigger;
 use r2r::{Context, Node, QosProfile};
 use serde::Serialize;
 use thiserror::Error;
@@ -63,20 +63,29 @@ struct OutputPacket {
 }
 
 impl OutputPacket {
-    fn ack_at_flush(&self, now: Instant) -> OutputAck {
+    fn acks_at_flush(&self, now: Instant) -> Vec<OutputAck> {
         let copied_frames = (self.cursor / self.channels) as u32;
         let played_frames =
             estimate_played_frames(self.playback_start, self.playback_end, copied_frames, now);
-        if played_frames >= self.ack.frame_count {
-            return self.ack.clone();
+        let mut acks = Vec::with_capacity(2);
+        if played_frames > 0 {
+            acks.push(OutputAck {
+                status: "accepted".to_owned(),
+                ..self.ack.clone()
+            });
         }
-        OutputAck {
+        if played_frames >= self.ack.frame_count {
+            acks.push(self.ack.clone());
+            return acks;
+        }
+        acks.push(OutputAck {
             utterance_id: self.ack.utterance_id.clone(),
             seq: self.ack.seq,
             frame_count: played_frames,
             is_final: false,
             status: "flushed".to_owned(),
-        }
+        });
+        acks
     }
 }
 
@@ -89,9 +98,9 @@ struct ScheduledAck {
 }
 
 impl ScheduledAck {
-    fn ack_at_flush(&self, now: Instant) -> OutputAck {
+    fn ack_at_flush(&self, now: Instant) -> Option<OutputAck> {
         if self.ack.status == "accepted" {
-            return self.ack.clone();
+            return (now >= self.playback_start).then(|| self.ack.clone());
         }
         let played_frames = estimate_played_frames(
             Some(self.playback_start),
@@ -100,15 +109,15 @@ impl ScheduledAck {
             now,
         );
         if played_frames >= self.ack.frame_count {
-            return self.ack.clone();
+            return Some(self.ack.clone());
         }
-        OutputAck {
+        Some(OutputAck {
             utterance_id: self.ack.utterance_id.clone(),
             seq: self.ack.seq,
             frame_count: played_frames,
             is_final: false,
             status: "flushed".to_owned(),
-        }
+        })
     }
 }
 
@@ -126,6 +135,7 @@ fn main() -> Result<(), OutputError> {
     let stream_error = Arc::new(Mutex::new(None::<String>));
     let (ack_sender, ack_receiver) = channel::<ScheduledAck>();
     let mut scheduled_acks = VecDeque::<ScheduledAck>::new();
+    let mut rejected_keys = HashSet::<(String, u64)>::new();
 
     let host = cpal::default_host();
     let device = select_device(&host)?;
@@ -151,7 +161,7 @@ fn main() -> Result<(), OutputError> {
     let drained =
         node.create_publisher::<StringMessage>("/audio/output/drained", QosProfile::default())?;
     let mut flush =
-        node.create_service::<Trigger::Service>("/audio/output/flush", QosProfile::default())?;
+        node.create_service::<FlushAudio::Service>("/audio/output/flush", QosProfile::default())?;
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
     ctrlc::set_handler(move || signal_running.store(false, Ordering::SeqCst))?;
@@ -160,11 +170,39 @@ fn main() -> Result<(), OutputError> {
         node.spin_once(Duration::from_millis(5));
         while let Some(Some(frame)) = frames.next().now_or_never() {
             validate_frame(&frame, ros_rate, ros_channels)?;
+            let key = (frame.stream_id.clone(), frame.seq);
+            if rejected_keys.remove(&key) {
+                publish_ack(
+                    &drained,
+                    OutputAck {
+                        utterance_id: frame.stream_id,
+                        seq: frame.seq,
+                        frame_count: 0,
+                        is_final: false,
+                        status: "flushed".to_owned(),
+                    },
+                )?;
+                continue;
+            }
             enqueue_frame(&packets, frame, max_samples)?;
         }
         collect_scheduled_acks(&ack_receiver, &mut scheduled_acks)?;
         publish_due_acks(&mut scheduled_acks, &drained, Instant::now())?;
         while let Some(Some(request)) = flush.next().now_or_never() {
+            if request.message.utterance_ids.len() != request.message.seqs.len() {
+                request.respond(FlushAudio::Response {
+                    success: false,
+                    message: "utterance_ids and seqs lengths differ".to_owned(),
+                })?;
+                continue;
+            }
+            let requested_keys = request
+                .message
+                .utterance_ids
+                .iter()
+                .cloned()
+                .zip(request.message.seqs.iter().copied())
+                .collect::<HashSet<_>>();
             collect_scheduled_acks(&ack_receiver, &mut scheduled_acks)?;
             publish_due_acks(&mut scheduled_acks, &drained, Instant::now())?;
             // Closing the CPAL stream is the only portable way to discard samples
@@ -175,17 +213,22 @@ fn main() -> Result<(), OutputError> {
                 let mut queue = packets.lock().expect("audio queue poisoned");
                 queue
                     .drain(..)
-                    .map(|packet| packet.ack_at_flush(now))
+                    .flat_map(|packet| packet.acks_at_flush(now))
                     .collect::<Vec<_>>()
             };
             // A callback can complete immediately before the queue lock above.
             collect_scheduled_acks(&ack_receiver, &mut scheduled_acks)?;
             let mut flushed = scheduled_acks
                 .drain(..)
-                .map(|scheduled| scheduled.ack_at_flush(now))
+                .filter_map(|scheduled| scheduled.ack_at_flush(now))
                 .collect::<Vec<_>>();
             // Completed packets precede packets that remained in the software queue.
             flushed.extend(queued);
+            let observed_keys = flushed
+                .iter()
+                .map(|ack| (ack.utterance_id.clone(), ack.seq))
+                .collect::<HashSet<_>>();
+            rejected_keys.extend(requested_keys.difference(&observed_keys).cloned());
             for ack in flushed {
                 publish_ack(&drained, ack)?;
             }
@@ -200,7 +243,7 @@ fn main() -> Result<(), OutputError> {
                 Arc::clone(&stream_error),
             )?;
             stream.play().map_err(OutputError::Start)?;
-            request.respond(Trigger::Response {
+            request.respond(FlushAudio::Response {
                 success: true,
                 message: "device buffer flushed".to_owned(),
             })?;
@@ -304,7 +347,7 @@ fn schedule_completed_packet(
     ack: OutputAck,
     playback_start: Instant,
     playback_end: Instant,
-    callback_now: Instant,
+    _callback_now: Instant,
 ) -> [ScheduledAck; 2] {
     let accepted = OutputAck {
         status: "accepted".to_owned(),
@@ -315,7 +358,10 @@ fn schedule_completed_packet(
             ack: accepted,
             playback_start,
             playback_end,
-            publish_after: callback_now,
+            // CPAL accepting a buffer is earlier than the first sample reaching
+            // the device.  The semantic `*_started` event must not lead the
+            // physical playback boundary used for interruption context.
+            publish_after: playback_start,
         },
         ScheduledAck {
             ack,
@@ -522,7 +568,7 @@ fn env_usize(name: &str, default: usize) -> Result<usize, OutputError> {
 mod tests {
     use super::{
         estimate_played_frames, requested_device_matches, schedule_completed_packet, take_due_acks,
-        OutputAck,
+        OutputAck, OutputPacket,
     };
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
@@ -583,12 +629,51 @@ mod tests {
         );
 
         assert_eq!(scheduled[0].ack.status, "accepted");
-        assert_eq!(scheduled[0].publish_after, now);
+        assert_eq!(scheduled[0].publish_after, playback_start);
         assert_eq!(scheduled[1].ack.status, "drained");
         assert_eq!(scheduled[1].publish_after, playback_end);
-        let corrected = scheduled[1].ack_at_flush(playback_start + Duration::from_millis(5));
+        assert!(scheduled[0].ack_at_flush(now).is_none());
+        let before_start = scheduled[1]
+            .ack_at_flush(now)
+            .expect("terminal flush acknowledgement is required");
+        assert_eq!(before_start.status, "flushed");
+        assert_eq!(before_start.frame_count, 0);
+        let corrected = scheduled[1]
+            .ack_at_flush(playback_start + Duration::from_millis(5))
+            .expect("terminal flush acknowledgement is required");
         assert_eq!(corrected.status, "flushed");
         assert_eq!(corrected.frame_count, 240);
+    }
+
+    #[test]
+    fn partial_packet_flush_reports_start_only_after_audio_became_audible() {
+        let playback_start = Instant::now() + Duration::from_millis(10);
+        let playback_end = playback_start + Duration::from_millis(4);
+        let packet = OutputPacket {
+            samples: vec![0; 8],
+            cursor: 4,
+            channels: 1,
+            playback_start: Some(playback_start),
+            playback_end: Some(playback_end),
+            ack: OutputAck {
+                utterance_id: "agent-0-partial".to_owned(),
+                seq: 0,
+                frame_count: 8,
+                is_final: false,
+                status: "drained".to_owned(),
+            },
+        };
+
+        let before = packet.acks_at_flush(playback_start - Duration::from_millis(1));
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].status, "flushed");
+        assert_eq!(before[0].frame_count, 0);
+
+        let after = packet.acks_at_flush(playback_start + Duration::from_millis(2));
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].status, "accepted");
+        assert_eq!(after[1].status, "flushed");
+        assert_eq!(after[1].frame_count, 2);
     }
 
     #[test]
@@ -610,7 +695,7 @@ mod tests {
         );
         let mut scheduled = VecDeque::from([first[1].clone(), first[0].clone()]);
 
-        let due = take_due_acks(&mut scheduled, now);
+        let due = take_due_acks(&mut scheduled, playback_start);
 
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].status, "accepted");

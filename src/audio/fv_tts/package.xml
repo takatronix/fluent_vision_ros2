@@ -11,7 +11,9 @@
   <build_depend>fluent_dialogue_dora_interfaces</build_depend>
   <exec_depend>fluent_dialogue_dora_interfaces</exec_depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>aspa_audio</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>
   <export><build_type>ament_cmake</build_type></export>

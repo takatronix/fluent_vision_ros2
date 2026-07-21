@@ -10,10 +10,8 @@
   <buildtool_depend>ament_cmake_python</buildtool_depend>
   <build_depend>fluent_dialogue_dora_interfaces</build_depend>
   <build_depend>std_msgs</build_depend>
-  <build_depend>std_srvs</build_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>std_srvs</exec_depend>
   <exec_depend>fluent_dialogue_dora_interfaces</exec_depend>
   <exec_depend>python3-gi</exec_depend>
   <exec_depend>gstreamer1.0-plugins-base</exec_depend>

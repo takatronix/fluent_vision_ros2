@@ -17,8 +17,9 @@ from aiohttp import ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsg
 from fv_episode_msgs.msg import EnvironmentChange, EnvironmentEvent
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image
+from std_msgs.msg import Bool
 
 from .moss_rounds import EpisodeRoundOwnership, MossRoundParser
 
@@ -65,6 +66,14 @@ class MossRealtimeAdapterNode(Node):
         self.event_pub = self.create_publisher(EnvironmentEvent, self.event_topic, 10)
         self.annotation_pub = self.create_publisher(
             EnvironmentEvent, self.annotation_topic, 10
+        )
+        ready_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.session_ready_pub = self.create_publisher(
+            Bool, "/aspa/perception/moss/session_ready", ready_qos
         )
         self.change_sub = self.create_subscription(
             EnvironmentChange,
@@ -224,6 +233,7 @@ class MossRealtimeAdapterNode(Node):
                     raise
                 except Exception as exc:
                     if not self._stop.is_set():
+                        self.session_ready_pub.publish(Bool(data=False))
                         self.get_logger().warning(f"MOSS runtime disconnected: {exc}")
                         await asyncio.sleep(1.0)
 
@@ -248,6 +258,7 @@ class MossRealtimeAdapterNode(Node):
                 raise ConnectionError(f"unexpected MOSS start response: {message.type}")
             payload = json.loads(message.data)
             if payload.get("type") == "ready":
+                self.session_ready_pub.publish(Bool(data=True))
                 self.get_logger().info("MOSS realtime session ready")
                 return
             if payload.get("type") == "error":
