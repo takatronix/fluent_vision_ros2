@@ -367,6 +367,29 @@ class FvLingbotDepthNode(Node):
     def _on_synced_static_intr(self, color_msg: Image, depth_msg: Image) -> None:
         self._on_synced(color_msg, depth_msg, None)
 
+    def _demanded(self) -> bool:
+        """Is anyone actually consuming the refined stream?
+
+        Demand-driven filter semantics (ASPA 2026-07-22): the node and the
+        loaded model stay resident so switching on is instant, but inference
+        only runs while something subscribes to an output. Wire it into the
+        pipeline and it takes effect; unwire it and the GPU work stops.
+
+        Without this the node burns a ViT-L inference on every D405 frame
+        forever, even when no subscriber exists -- which is what it did when
+        the selector gate was disabled to make it run at all.
+        """
+        pubs = [self.depth_pub, self.mask_pub]
+        if self.points_pub is not None:
+            pubs.append(self.points_pub)
+        for pub in pubs:
+            try:
+                if pub.get_subscription_count() > 0:
+                    return True
+            except Exception:       # noqa: BLE001 - never let a probe stop work
+                return True
+        return False
+
     def _on_synced(self, color_msg: Image, depth_msg: Image,
                    info_msg: Optional[CameraInfo]) -> None:
         capture = False
@@ -375,6 +398,14 @@ class FvLingbotDepthNode(Node):
                 if self._capture_pending <= 0:
                     return
                 capture = True
+        # A pending /capture request is an explicit one-shot demand, so it
+        # bypasses the subscriber check (the caller wants a single frame
+        # even with nothing subscribed).
+        if not capture and not self._demanded():
+            self.get_logger().debug(
+                'no subscriber on refined outputs - skipping inference',
+                throttle_duration_sec=30.0)
+            return
         start = time.perf_counter()
 
         try:
