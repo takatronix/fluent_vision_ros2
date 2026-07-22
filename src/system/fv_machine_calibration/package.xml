@@ -2,13 +2,19 @@
 <package format="3">
   <name>fv_machine_calibration</name>
   <version>0.1.0</version>
-  <description>Offline, review-first Fluent Vision machine calibration solver.</description>
+  <description>Fail-closed stationary-bracket hand-eye collection and offline solver.</description>
   <maintainer email="info@vegetalia.co.jp">Fluent Vision Team</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>apriltag_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
   <test_depend>ament_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>
   <export><build_type>ament_python</build_type></export>

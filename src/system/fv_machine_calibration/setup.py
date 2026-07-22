@@ -15,11 +15,12 @@ setup(
     zip_safe=True,
     maintainer="Fluent Vision Team",
     maintainer_email="info@vegetalia.co.jp",
-    description="Offline, review-first Fluent Vision machine calibration solver",
+    description="Stationary-bracket hand-eye collection and offline solver",
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
+            "fv_handeye_collect = fv_machine_calibration.collector_node:main",
             "fv_handeye_solve = fv_machine_calibration.cli:main",
         ],
     },

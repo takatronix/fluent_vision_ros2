@@ -22,6 +22,10 @@ class Pose:
     quaternion_xyzw: tuple[float, float, float, float]
 
     def matrix(self) -> np.ndarray:
+        if not all(math.isfinite(value) for value in (
+            *self.translation_m, *self.quaternion_xyzw
+        )):
+            raise CalibrationError("pose contains a non-finite value")
         qx, qy, qz, qw = self.quaternion_xyzw
         norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
         if abs(norm - 1.0) > 1e-3:
@@ -132,6 +136,7 @@ def parse_session(document: object, *, require_complete: bool = True) -> Session
         raise CalibrationError("samples must be a list")
     samples: list[Sample] = []
     stamps: set[int] = set()
+    previous_stamp: int | None = None
     for index, raw in enumerate(raw_samples):
         if not isinstance(raw, dict):
             raise CalibrationError(f"samples[{index}] must be an object")
@@ -143,7 +148,10 @@ def parse_session(document: object, *, require_complete: bool = True) -> Session
             raise CalibrationError(f"samples[{index}].image_stamp_ns is invalid")
         if stamp in stamps:
             raise CalibrationError("duplicate image timestamp in session")
+        if previous_stamp is not None and stamp <= previous_stamp:
+            raise CalibrationError("image timestamps in session must be strictly increasing")
         stamps.add(stamp)
+        previous_stamp = stamp
         margin = float(raw.get("decision_margin", 0.0))
         if not math.isfinite(margin) or margin < 50.0:
             raise CalibrationError(f"samples[{index}] decision margin is below 50")
