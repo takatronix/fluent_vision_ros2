@@ -5,12 +5,19 @@ ROS 2 owns both physical audio devices and the robot's single playback stream.
 - `audio_capture` is a Rust/CPAL input node. It publishes 16 kHz mono PCM16LE to
   `/audio/mic/frame` with `source_id=aspa_audio_capture` and
   `stream_id=audio/mic/main`.
-- `playback_controller` is the only long playback queue. It subscribes to
+- `playback_controller` is a Rust/GStreamer node and the only long playback
+  queue. It subscribes to
   `/audio/agent/frame`, `/audio/system/frame`, and `/audio/cue/frame`, performs
-  GStreamer resampling/volume conversion, and publishes only
-  `/audio/output/frame`.
+  GStreamer resampling/channel conversion, and publishes unscaled typed
+  `aspa_audio_interfaces/msg/PlaybackFrame` messages only on `/audio/play`.
+  The same stream is the browser playback source; there is no JSON projection
+  or compatibility output topic.
 - `audio_output` is a Rust/CPAL device node. It subscribes only to
-  `/audio/output/frame` and provides the keyed `/audio/output/flush` service.
+  `/audio/play`, subscribes to TRANSIENT_LOCAL `/audio/output/volume`
+  (`std_msgs/msg/Float32`, clamped to 0.0 through 1.0), and provides the typed
+  keyed `/audio/output/flush` service. Volume is applied to samples in the CPAL
+  device callback, so published PCM stays unscaled and a live volume change
+  affects samples that have not yet reached the device.
   Keys not observed before a flush become one-shot tombstones, so a service
   request that overtakes its DDS frame still rejects the late stale PCM. On
   `/audio/output/drained`, `accepted` is only a flow-control acknowledgement;
@@ -23,6 +30,12 @@ If any node exits, the launch shuts down all three. In particular, an
 unavailable or failed flush is fatal to the playback controller; the stack does
 not continue the audio path after it can no longer invalidate stale physical
 playback.
+The controller also exits non-zero if a chunk is not accepted within 5 seconds,
+if all acknowledgement/drain progress stops for 5 seconds, if a flush call does
+not return within 5 seconds, or if GStreamer conversion does not finish within
+10 seconds. Drain health is global rather than measured from each accepted
+chunk, so a healthy long utterance queued ahead of later chunks does not cause a
+false timeout.
 
 Launch with the default CPAL devices:
 
@@ -40,7 +53,25 @@ ros2 launch aspa_audio aspa_audio.launch.py \
 The production capture contract is 16 kHz, mono, PCM16LE. The output defaults
 to 48 kHz stereo PCM16LE. `audio_output` fails loudly when the selected device
 does not expose that exact CPAL configuration; all output resampling, channel
-mapping, and volume processing remains in the GStreamer playback controller.
+mapping remains in the GStreamer playback controller, while device gain belongs
+only to `audio_output`.
 Build prerequisites are Rust/Cargo, the CPAL system backend
 (for Linux, ALSA development headers), GStreamer 1.0 base plugins, ROS 2, and
-`fluent_dialogue_dora_interfaces` in the same colcon workspace or an underlay.
+`aspa_audio_interfaces` plus `fv_speech_interfaces` in the same
+colcon workspace or an underlay.
+
+Playback coordination uses typed messages throughout:
+
+- `/audio/playback/control`: `aspa_audio_interfaces/msg/PlaybackControl`
+- `/audio/playback/event`: `aspa_audio_interfaces/msg/PlaybackEvent`
+- `/audio/play`: `aspa_audio_interfaces/msg/PlaybackFrame`
+- `/audio/output/drained`: `aspa_audio_interfaces/msg/OutputDrained`
+- `/audio/output/flush`: `aspa_audio_interfaces/srv/FlushAudio`
+
+Every playback frame and event carries the controller's current
+`playout_generation` for its playback kind. Agent pause/discard advances only
+the Agent generation before publishing the event. Targeted SYSTEM abort uses
+the utterance ID as a bounded tombstone, so it cannot invalidate a different
+SYSTEM utterance when DDS topics are reordered. Initial values are wall-clock
+milliseconds, kept within JavaScript's safe integer range, so a controller-only
+restart cannot make a still-connected browser reject new PCM as stale.

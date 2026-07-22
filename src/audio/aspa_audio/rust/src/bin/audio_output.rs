@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::env;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -8,12 +8,20 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedStreamConfig};
 use futures::{FutureExt, StreamExt};
-use r2r::fluent_dialogue_dora_interfaces::msg::AudioFrame;
-use r2r::fluent_dialogue_dora_interfaces::srv::FlushAudio;
-use r2r::std_msgs::msg::String as StringMessage;
+use r2r::aspa_audio_interfaces::msg::{OutputDrained, PlaybackFrame};
+use r2r::aspa_audio_interfaces::srv::FlushAudio;
+use r2r::qos::{DurabilityPolicy, HistoryPolicy, ReliabilityPolicy};
+use r2r::std_msgs::msg::Float32;
 use r2r::{Context, Node, QosProfile};
-use serde::Serialize;
 use thiserror::Error;
+
+const KIND_AGENT: u8 = PlaybackFrame::AGENT as u8;
+const KIND_SYSTEM: u8 = PlaybackFrame::SYSTEM as u8;
+const KIND_CUE: u8 = PlaybackFrame::CUE as u8;
+const STATUS_ACCEPTED: u8 = OutputDrained::ACCEPTED as u8;
+const STATUS_DRAINED: u8 = OutputDrained::DRAINED as u8;
+const STATUS_FLUSHED: u8 = OutputDrained::FLUSHED as u8;
+const PLAYOUT_QOS_DEPTH: usize = 256;
 
 #[derive(Debug, Error)]
 enum OutputError {
@@ -35,22 +43,19 @@ enum OutputError {
     Overflow,
     #[error("ROS 2 error: {0}")]
     Ros(#[from] r2r::Error),
-    #[error("failed to serialize output acknowledgement: {0}")]
-    Serialize(#[from] serde_json::Error),
     #[error("invalid configuration: {0}")]
     Config(String),
     #[error("signal handler error: {0}")]
     Signal(#[from] ctrlc::Error),
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 struct OutputAck {
     utterance_id: String,
     seq: u64,
     frame_count: u32,
-    #[serde(rename = "final")]
     is_final: bool,
-    status: String,
+    status: u8,
 }
 
 struct OutputPacket {
@@ -70,7 +75,7 @@ impl OutputPacket {
         let mut acks = Vec::with_capacity(2);
         if played_frames > 0 {
             acks.push(OutputAck {
-                status: "accepted".to_owned(),
+                status: STATUS_ACCEPTED,
                 ..self.ack.clone()
             });
         }
@@ -83,7 +88,7 @@ impl OutputPacket {
             seq: self.ack.seq,
             frame_count: played_frames,
             is_final: false,
-            status: "flushed".to_owned(),
+            status: STATUS_FLUSHED,
         });
         acks
     }
@@ -99,7 +104,7 @@ struct ScheduledAck {
 
 impl ScheduledAck {
     fn ack_at_flush(&self, now: Instant) -> Option<OutputAck> {
-        if self.ack.status == "accepted" {
+        if self.ack.status == STATUS_ACCEPTED {
             return (now >= self.playback_start).then(|| self.ack.clone());
         }
         let played_frames = estimate_played_frames(
@@ -116,7 +121,7 @@ impl ScheduledAck {
             seq: self.ack.seq,
             frame_count: played_frames,
             is_final: false,
-            status: "flushed".to_owned(),
+            status: STATUS_FLUSHED,
         })
     }
 }
@@ -133,6 +138,7 @@ fn main() -> Result<(), OutputError> {
     let packets = Arc::new(Mutex::new(VecDeque::<OutputPacket>::new()));
     let stream_failed = Arc::new(AtomicBool::new(false));
     let stream_error = Arc::new(Mutex::new(None::<String>));
+    let output_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
     let (ack_sender, ack_receiver) = channel::<ScheduledAck>();
     let mut scheduled_acks = VecDeque::<ScheduledAck>::new();
     let mut rejected_keys = HashSet::<(String, u64)>::new();
@@ -150,6 +156,7 @@ fn main() -> Result<(), OutputError> {
         device_config,
         Arc::clone(&packets),
         ack_sender.clone(),
+        Arc::clone(&output_gain),
         Arc::clone(&stream_failed),
         Arc::clone(&stream_error),
     )?;
@@ -157,32 +164,61 @@ fn main() -> Result<(), OutputError> {
 
     let context = Context::create()?;
     let mut node = Node::create(context, "audio_output", "")?;
-    let mut frames = node.subscribe::<AudioFrame>("/audio/output/frame", QosProfile::default())?;
+    let playout_qos = QosProfile {
+        history: HistoryPolicy::KeepLast,
+        depth: PLAYOUT_QOS_DEPTH,
+        reliability: ReliabilityPolicy::Reliable,
+        durability: DurabilityPolicy::Volatile,
+        ..QosProfile::default()
+    };
+    let mut frames = node.subscribe::<PlaybackFrame>("/audio/play", playout_qos)?;
     let drained =
-        node.create_publisher::<StringMessage>("/audio/output/drained", QosProfile::default())?;
+        node.create_publisher::<OutputDrained>("/audio/output/drained", QosProfile::default())?;
     let mut flush =
         node.create_service::<FlushAudio::Service>("/audio/output/flush", QosProfile::default())?;
+    let volume_qos = QosProfile {
+        history: HistoryPolicy::KeepLast,
+        depth: 1,
+        reliability: ReliabilityPolicy::Reliable,
+        durability: DurabilityPolicy::TransientLocal,
+        ..QosProfile::default()
+    };
+    let mut volumes = node.subscribe::<Float32>("/audio/output/volume", volume_qos)?;
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
     ctrlc::set_handler(move || signal_running.store(false, Ordering::SeqCst))?;
 
     while running.load(Ordering::SeqCst) {
         node.spin_once(Duration::from_millis(5));
+        while let Some(Some(volume)) = volumes.next().now_or_never() {
+            if volume.data.is_finite() {
+                output_gain.store(volume.data.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+            } else {
+                eprintln!("ignoring non-finite /audio/output/volume value");
+            }
+        }
         while let Some(Some(frame)) = frames.next().now_or_never() {
-            validate_frame(&frame, ros_rate, ros_channels)?;
-            let key = (frame.stream_id.clone(), frame.seq);
+            let key = (frame.utterance_id.clone(), frame.seq);
             if rejected_keys.remove(&key) {
                 publish_ack(
                     &drained,
                     OutputAck {
-                        utterance_id: frame.stream_id,
+                        utterance_id: frame.utterance_id,
                         seq: frame.seq,
                         frame_count: 0,
                         is_final: false,
-                        status: "flushed".to_owned(),
+                        status: STATUS_FLUSHED,
                     },
                 )?;
                 continue;
+            }
+            if let Err(error) = validate_frame(&frame, ros_rate, ros_channels) {
+                eprintln!("rejecting invalid /audio/play frame {key:?}: {error}");
+                // /audio/play is an internal, trusted controller contract.  If
+                // this node silently drops a frame, playback_controller keeps
+                // that key in flight forever while both processes look alive.
+                // Exit instead; the launch contract shuts down the audio stack.
+                return Err(error);
             }
             enqueue_frame(&packets, frame, max_samples)?;
         }
@@ -239,6 +275,7 @@ fn main() -> Result<(), OutputError> {
                 device_config,
                 Arc::clone(&packets),
                 ack_sender.clone(),
+                Arc::clone(&output_gain),
                 Arc::clone(&stream_failed),
                 Arc::clone(&stream_error),
             )?;
@@ -267,6 +304,7 @@ fn build_native_stream(
     native: SupportedStreamConfig,
     packets: Arc<Mutex<VecDeque<OutputPacket>>>,
     ack_sender: Sender<ScheduledAck>,
+    output_gain: Arc<AtomicU32>,
     stream_failed: Arc<AtomicBool>,
     stream_error: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, OutputError> {
@@ -282,6 +320,7 @@ fn build_native_stream(
                     native.channels(),
                     &packets,
                     &ack_sender,
+                    &output_gain,
                 );
             },
             move |error| {
@@ -300,11 +339,13 @@ fn fill_device_buffer(
     channels: u16,
     packets: &Arc<Mutex<VecDeque<OutputPacket>>>,
     ack_sender: &Sender<ScheduledAck>,
+    output_gain: &Arc<AtomicU32>,
 ) {
     let callback_now = Instant::now();
     let timestamp = info.timestamp();
     let device_latency = timestamp.playback.duration_since(timestamp.callback);
     let buffer_playback_start = callback_now + device_latency;
+    let gain = f32::from_bits(output_gain.load(Ordering::Relaxed));
     let mut queue = packets.lock().expect("audio queue poisoned");
     let mut output_offset = 0;
     while output_offset < output.len() {
@@ -316,8 +357,12 @@ fn fill_device_buffer(
         };
         let available = packet.samples.len() - packet.cursor;
         let count = available.min(output.len() - output_offset);
-        output[output_offset..output_offset + count]
-            .copy_from_slice(&packet.samples[packet.cursor..packet.cursor + count]);
+        for (target, source) in output[output_offset..output_offset + count]
+            .iter_mut()
+            .zip(&packet.samples[packet.cursor..packet.cursor + count])
+        {
+            *target = scale_sample(*source, gain);
+        }
         let segment_start =
             buffer_playback_start + frames_duration(output_offset / channels as usize, sample_rate);
         output_offset += count;
@@ -350,7 +395,7 @@ fn schedule_completed_packet(
     _callback_now: Instant,
 ) -> [ScheduledAck; 2] {
     let accepted = OutputAck {
-        status: "accepted".to_owned(),
+        status: STATUS_ACCEPTED,
         ..ack.clone()
     };
     [
@@ -374,11 +419,11 @@ fn schedule_completed_packet(
 
 fn enqueue_frame(
     packets: &Arc<Mutex<VecDeque<OutputPacket>>>,
-    frame: AudioFrame,
+    frame: PlaybackFrame,
     max_samples: usize,
 ) -> Result<(), OutputError> {
     let samples = frame
-        .data
+        .pcm_s16le
         .chunks_exact(2)
         .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
@@ -397,11 +442,11 @@ fn enqueue_frame(
         playback_start: None,
         playback_end: None,
         ack: OutputAck {
-            utterance_id: frame.stream_id,
+            utterance_id: frame.utterance_id,
             seq: frame.seq,
             frame_count: frame.frame_count,
             is_final: frame.final_,
-            status: "drained".to_owned(),
+            status: STATUS_DRAINED,
         },
     });
     Ok(())
@@ -426,7 +471,7 @@ fn collect_scheduled_acks(
 
 fn publish_due_acks(
     scheduled: &mut VecDeque<ScheduledAck>,
-    publisher: &r2r::Publisher<StringMessage>,
+    publisher: &r2r::Publisher<OutputDrained>,
     now: Instant,
 ) -> Result<(), OutputError> {
     for ack in take_due_acks(scheduled, now) {
@@ -474,30 +519,36 @@ fn estimate_played_frames(
 }
 
 fn publish_ack(
-    publisher: &r2r::Publisher<StringMessage>,
+    publisher: &r2r::Publisher<OutputDrained>,
     ack: OutputAck,
 ) -> Result<(), OutputError> {
-    publisher.publish(&StringMessage {
-        data: serde_json::to_string(&ack)?,
+    publisher.publish(&OutputDrained {
+        utterance_id: ack.utterance_id,
+        seq: ack.seq,
+        frame_count: ack.frame_count,
+        final_: ack.is_final,
+        status: ack.status,
     })?;
     Ok(())
 }
 
-fn validate_frame(frame: &AudioFrame, rate: u32, channels: u16) -> Result<(), OutputError> {
-    if frame.stream_id.is_empty()
+fn validate_frame(frame: &PlaybackFrame, rate: u32, channels: u16) -> Result<(), OutputError> {
+    if !matches!(frame.kind, KIND_AGENT | KIND_SYSTEM | KIND_CUE)
+        || frame.utterance_id.is_empty()
         || frame.frame_count == 0
-        || frame.encoding != "PCM16LE"
-        || frame.layout != "interleaved"
-        || frame.bit_depth != 16
         || frame.sample_rate_hz != rate
         || frame.channels != channels as u32
-        || frame.data.len() != frame.frame_count as usize * channels as usize * 2
+        || frame.pcm_s16le.len() != frame.frame_count as usize * channels as usize * 2
     {
         return Err(OutputError::Config(
-            "/audio/output/frame format mismatch".to_owned(),
+            "/audio/play format mismatch".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn scale_sample(sample: i16, gain: f32) -> i16 {
+    (sample as f32 * gain).round() as i16
 }
 
 fn select_output_config(
@@ -567,9 +618,11 @@ fn env_usize(name: &str, default: usize) -> Result<usize, OutputError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_played_frames, requested_device_matches, schedule_completed_packet, take_due_acks,
-        OutputAck, OutputPacket,
+        estimate_played_frames, requested_device_matches, scale_sample, schedule_completed_packet,
+        take_due_acks, validate_frame, OutputAck, OutputPacket, KIND_AGENT, STATUS_ACCEPTED,
+        STATUS_DRAINED, STATUS_FLUSHED,
     };
+    use r2r::aspa_audio_interfaces::msg::PlaybackFrame;
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
@@ -585,6 +638,26 @@ mod tests {
             Some("alsa:aspa_usb_speaker"),
             "ASPA USB speaker (mono duplicated to FL/FR)",
         ));
+    }
+
+    #[test]
+    fn invalid_playout_frame_is_rejected_without_entering_the_device_queue() {
+        let mut frame = PlaybackFrame {
+            kind: KIND_AGENT,
+            utterance_id: "agent-0-invalid".to_owned(),
+            seq: 0,
+            sample_index: 0,
+            frame_count: 1,
+            sample_rate_hz: 48_000,
+            channels: 2,
+            pcm_s16le: vec![0; 4],
+            final_: true,
+            playout_generation: 0,
+        };
+        assert!(validate_frame(&frame, 48_000, 2).is_ok());
+        frame.frame_count = 0;
+        frame.pcm_s16le.clear();
+        assert!(validate_frame(&frame, 48_000, 2).is_err());
     }
 
     #[test]
@@ -621,27 +694,27 @@ mod tests {
                 seq: 0,
                 frame_count: 960,
                 is_final: false,
-                status: "drained".to_owned(),
+                status: STATUS_DRAINED,
             },
             playback_start,
             playback_end,
             now,
         );
 
-        assert_eq!(scheduled[0].ack.status, "accepted");
+        assert_eq!(scheduled[0].ack.status, STATUS_ACCEPTED);
         assert_eq!(scheduled[0].publish_after, playback_start);
-        assert_eq!(scheduled[1].ack.status, "drained");
+        assert_eq!(scheduled[1].ack.status, STATUS_DRAINED);
         assert_eq!(scheduled[1].publish_after, playback_end);
         assert!(scheduled[0].ack_at_flush(now).is_none());
         let before_start = scheduled[1]
             .ack_at_flush(now)
             .expect("terminal flush acknowledgement is required");
-        assert_eq!(before_start.status, "flushed");
+        assert_eq!(before_start.status, STATUS_FLUSHED);
         assert_eq!(before_start.frame_count, 0);
         let corrected = scheduled[1]
             .ack_at_flush(playback_start + Duration::from_millis(5))
             .expect("terminal flush acknowledgement is required");
-        assert_eq!(corrected.status, "flushed");
+        assert_eq!(corrected.status, STATUS_FLUSHED);
         assert_eq!(corrected.frame_count, 240);
     }
 
@@ -660,19 +733,19 @@ mod tests {
                 seq: 0,
                 frame_count: 8,
                 is_final: false,
-                status: "drained".to_owned(),
+                status: STATUS_DRAINED,
             },
         };
 
         let before = packet.acks_at_flush(playback_start - Duration::from_millis(1));
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].status, "flushed");
+        assert_eq!(before[0].status, STATUS_FLUSHED);
         assert_eq!(before[0].frame_count, 0);
 
         let after = packet.acks_at_flush(playback_start + Duration::from_millis(2));
         assert_eq!(after.len(), 2);
-        assert_eq!(after[0].status, "accepted");
-        assert_eq!(after[1].status, "flushed");
+        assert_eq!(after[0].status, STATUS_ACCEPTED);
+        assert_eq!(after[1].status, STATUS_FLUSHED);
         assert_eq!(after[1].frame_count, 2);
     }
 
@@ -687,7 +760,7 @@ mod tests {
                 seq: 0,
                 frame_count: 960,
                 is_final: false,
-                status: "drained".to_owned(),
+                status: STATUS_DRAINED,
             },
             playback_start,
             playback_end,
@@ -698,8 +771,16 @@ mod tests {
         let due = take_due_acks(&mut scheduled, playback_start);
 
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].status, "accepted");
+        assert_eq!(due[0].status, STATUS_ACCEPTED);
         assert_eq!(scheduled.len(), 1);
-        assert_eq!(scheduled[0].ack.status, "drained");
+        assert_eq!(scheduled[0].ack.status, STATUS_DRAINED);
+    }
+
+    #[test]
+    fn applies_output_gain_at_the_device_sample_boundary() {
+        assert_eq!(scale_sample(20_000, 1.0), 20_000);
+        assert_eq!(scale_sample(20_000, 0.5), 10_000);
+        assert_eq!(scale_sample(-20_000, 0.5), -10_000);
+        assert_eq!(scale_sample(i16::MAX, 0.0), 0);
     }
 }

@@ -3,13 +3,50 @@ from types import SimpleNamespace
 
 import pytest
 
-from aspa_audio.contracts import OutputDrained, PlaybackControl, PlaybackEvent
+from aspa_audio.contracts import (
+    MAX_SAFE_PLAYOUT_GENERATION,
+    OutputDrained,
+    PlaybackControl,
+    PlaybackEvent,
+    advance_playout_generation,
+    playout_generation_seed,
+)
 from aspa_audio.playback_state import (
     DeviceBufferTracker,
     PlaybackMachine,
     Utterance,
     should_flush_output,
 )
+
+class MutableMessage:
+    pass
+
+
+def drained_message(ack: OutputDrained) -> SimpleNamespace:
+    return SimpleNamespace(
+        utterance_id=ack.utterance_id,
+        seq=ack.seq,
+        frame_count=ack.frame_count,
+        final=ack.final,
+        status={"accepted": 1, "drained": 2, "flushed": 3}[ack.status],
+    )
+
+
+def test_playout_generation_seed_survives_controller_restart_and_is_js_safe():
+    first = playout_generation_seed(1_750_000_000_123_456_789)
+    restarted = playout_generation_seed(1_750_000_001_123_456_789)
+
+    assert first == 1_750_000_000_123
+    assert restarted > first
+    assert advance_playout_generation(restarted) == restarted + 1
+    assert restarted < MAX_SAFE_PLAYOUT_GENERATION
+
+
+def test_playout_generation_rejects_js_unsafe_values():
+    with pytest.raises(ValueError, match="JavaScript safe integer"):
+        advance_playout_generation(MAX_SAFE_PLAYOUT_GENERATION)
+    with pytest.raises(ValueError, match="JavaScript safe integer"):
+        playout_generation_seed((MAX_SAFE_PLAYOUT_GENERATION + 1) * 1_000_000)
 
 
 def utterance(kind: str, name: str, frames: int = 8) -> Utterance:
@@ -162,33 +199,95 @@ def test_system_discard_releases_requested_hold_with_agent_awaiting_drain():
     assert not machine.agent_pause_requested
 
 
-def test_json_contracts_are_strict():
-    assert PlaybackControl.from_json('{"action":"pause"}').action == "pause"
-    discard = PlaybackControl.from_json(
-        '{"action":"discard","floor_epoch":3,"release_hold":"user"}'
+def test_typed_contracts_are_strict():
+    pause = PlaybackControl.from_message(
+        SimpleNamespace(action=1, release_hold=0, minimum_agent_epoch=0, utterance_id="")
     )
-    assert discard.floor_epoch == 3
+    assert pause.action == "pause"
+    discard = PlaybackControl.from_message(
+        SimpleNamespace(action=3, release_hold=1, minimum_agent_epoch=3, utterance_id="")
+    )
+    assert discard.minimum_agent_epoch == 3
     assert discard.release_hold == "user"
-    system_discard = PlaybackControl.from_json(
-        '{"action":"discard","floor_epoch":4,"release_hold":"system",'
-        '"utterance_id":"system-1"}'
+    system_discard = PlaybackControl.from_message(
+        SimpleNamespace(
+            action=3,
+            release_hold=2,
+            minimum_agent_epoch=4,
+            utterance_id="system-1",
+        )
     )
     assert system_discard.utterance_id == "system-1"
-    abort = PlaybackControl.from_json(
-        '{"action":"system_abort","utterance_id":"system-2"}'
+    abort = PlaybackControl.from_message(
+        SimpleNamespace(
+            action=4,
+            release_hold=0,
+            minimum_agent_epoch=0,
+            utterance_id="system-2",
+        )
     )
     assert abort.utterance_id == "system-2"
-    releasing_abort = PlaybackControl.from_json(
-        '{"action":"system_abort","release_hold":"system",'
-        '"utterance_id":"system-3"}'
+    releasing_abort = PlaybackControl.from_message(
+        SimpleNamespace(
+            action=4,
+            release_hold=2,
+            minimum_agent_epoch=0,
+            utterance_id="system-3",
+        )
     )
     assert releasing_abort.release_hold == "system"
-    event = PlaybackEvent("agent_paused", "agent", "u", 2, 4)
-    assert PlaybackEvent.from_json(event.to_json()) == event
+    event = PlaybackEvent("agent_paused", "agent", "u", 2, 4, 7)
+    assert PlaybackEvent.from_message(event.to_message(MutableMessage)) == event
     ack = OutputDrained("u", 0, 20, True, "drained")
-    assert OutputDrained.from_json(ack.to_json()) == ack
+    assert OutputDrained.from_message(drained_message(ack)) == ack
     accepted = OutputDrained("u", 0, 20, False, "accepted")
-    assert OutputDrained.from_json(accepted.to_json()) == accepted
+    assert OutputDrained.from_message(drained_message(accepted)) == accepted
+
+
+@pytest.mark.parametrize(
+    ("factory", "match"),
+    [
+        (
+            lambda: PlaybackControl.from_message(
+                SimpleNamespace(
+                    action=0,
+                    release_hold=0,
+                    minimum_agent_epoch=0,
+                    utterance_id="",
+                )
+            ),
+            "playback action",
+        ),
+        (
+            lambda: PlaybackEvent.from_message(
+                SimpleNamespace(
+                    event=4,
+                    kind=0,
+                    utterance_id="u",
+                    played_frames=0,
+                    total_frames=0,
+                    playout_generation=0,
+                )
+            ),
+            "playback kind",
+        ),
+        (
+            lambda: OutputDrained.from_message(
+                SimpleNamespace(
+                    utterance_id="u",
+                    seq=0,
+                    frame_count=0,
+                    final=False,
+                    status=0,
+                )
+            ),
+            "output drained status",
+        ),
+    ],
+)
+def test_typed_contracts_reject_unknown_numeric_enums(factory, match):
+    with pytest.raises(ValueError, match=match):
+        factory()
 
 
 def test_ack_arriving_during_pause_advances_resume_position():
@@ -382,6 +481,16 @@ def test_audio_launch_treats_all_three_nodes_as_one_failure_domain():
     assert source.count("event=Shutdown(") == 3
     for executable in ("audio_capture", "playback_controller", "audio_output"):
         assert f'executable="{executable}"' in source
+
+
+def test_legacy_python_playback_controller_is_not_a_production_executable():
+    package_dir = Path(__file__).resolve().parents[1]
+    setup_source = (package_dir / "setup.py").read_text(encoding="utf-8")
+    cmake_source = (package_dir / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert "playback_controller = aspa_audio.playback_controller:main" not in setup_source
+    assert "scripts/playback_controller" not in cmake_source
+    assert "release/playback_controller" in cmake_source
 
 
 def test_controller_flushes_acknowledged_agent_device_buffer_but_not_system():
@@ -586,14 +695,14 @@ def test_accepted_ack_paces_output_without_advancing_played_position():
 
     PlaybackControllerNode._on_output_drained(
         controller,
-        SimpleNamespace(
-            data=OutputDrained(
+        drained_message(
+            OutputDrained(
                 expected.utterance_id,
                 expected.seq,
                 expected.frame_count,
                 expected.final,
                 "accepted",
-            ).to_json()
+            )
         ),
     )
 
@@ -603,7 +712,7 @@ def test_accepted_ack_paces_output_without_advancing_played_position():
     assert controller._machine.calls == []
 
     PlaybackControllerNode._on_output_drained(
-        controller, SimpleNamespace(data=expected.to_json())
+        controller, drained_message(expected)
     )
     assert controller._output_pending == {}
     assert controller._machine.calls == [
@@ -673,7 +782,7 @@ def test_flush_accounts_only_played_prefix_across_resident_chunks():
     ]
     for ack in terminal:
         PlaybackControllerNode._on_output_drained(
-            controller, SimpleNamespace(data=ack.to_json())
+            controller, drained_message(ack)
         )
 
     assert controller._output_pending == {}
@@ -742,10 +851,8 @@ def test_system_abort_tombstone_drops_cross_topic_late_pcm():
     assert machine.next_chunk()[0] is None
 
 
-def test_browser_projection_orders_frames_and_invalidating_state() -> None:
+def test_typed_playback_events_carry_monotonic_playout_generation() -> None:
     pytest.importorskip("rclpy")
-    import json
-
     from aspa_audio.playback_controller import PlaybackControllerNode
 
     class Publisher:
@@ -755,33 +862,10 @@ def test_browser_projection_orders_frames_and_invalidating_state() -> None:
         def publish(self, message):
             self.messages.append(message)
 
-    class Harness:
-        _publish_browser_projection = (
-            PlaybackControllerNode._publish_browser_projection
-        )
-        _publish_browser_frame = PlaybackControllerNode._publish_browser_frame
-
-    controller = Harness()
-    controller._browser_boot_id = "boot-a"
-    controller._browser_serial = 0
-    controller._browser_playout_epoch = 0
-    controller._browser_invalidated_kinds = ()
-    controller._machine = SimpleNamespace(agent_pause_requested=False)
-    controller._browser_pub = Publisher()
+    controller = SimpleNamespace()
+    controller._playout_generation = 0
     controller._event_pub = Publisher()
 
-    controller._publish_browser_frame(SimpleNamespace(
-        kind="agent",
-        utterance_id="agent-0-test",
-        seq=0,
-        sample_index=0,
-        frame_count=2,
-        sample_rate_hz=16_000,
-        channels=1,
-        bit_depth=16,
-        final=False,
-        data=b"\x00\x00" * 2,
-    ))
     PlaybackControllerNode._publish_events(
         controller,
         (
@@ -789,36 +873,21 @@ def test_browser_projection_orders_frames_and_invalidating_state() -> None:
             PlaybackEvent("agent_resumed", "agent", "agent-0-test", 2, 8),
         ),
     )
-    controller._publish_browser_frame(SimpleNamespace(
-        kind="agent",
-        utterance_id="agent-0-test",
-        seq=1,
-        sample_index=2,
-        frame_count=2,
-        sample_rate_hz=16_000,
-        channels=1,
-        bit_depth=16,
-        final=False,
-        data=b"\x00\x00" * 2,
-    ))
+    PlaybackControllerNode._publish_events(
+        controller,
+        (PlaybackEvent("system_aborted", "system", "system-1", 0, 8),),
+    )
 
-    packets = [json.loads(message.data) for message in controller._browser_pub.messages]
-    assert [packet["serial"] for packet in packets] == [1, 2, 3, 4]
-    assert [packet["playout_epoch"] for packet in packets] == [0, 1, 1, 1]
-    assert [packet["packet_type"] for packet in packets] == [
-        "frame", "state", "state", "frame"
+    assert [message.playout_generation for message in controller._event_pub.messages] == [
+        1,
+        1,
+        2,
     ]
-    assert packets[0]["kind"] == "agent"
-    assert packets[0]["controller_boot_id"] == "boot-a"
-    assert packets[0]["protocol_version"] == 1
-    assert packets[1]["invalidated_kinds"] == ["agent"]
-    assert packets[1]["agent_paused"] is False
+    assert [message.event for message in controller._event_pub.messages] == [4, 5, 10]
 
 
-def test_browser_projection_invalidates_even_when_playback_control_is_a_noop() -> None:
+def test_typed_fallback_event_invalidates_when_playback_control_is_a_noop() -> None:
     pytest.importorskip("rclpy")
-    import json
-
     from aspa_audio.playback_controller import PlaybackControllerNode
 
     class Publisher:
@@ -828,19 +897,8 @@ def test_browser_projection_invalidates_even_when_playback_control_is_a_noop() -
         def publish(self, message):
             self.messages.append(message)
 
-    class Harness:
-        _publish_browser_projection = (
-            PlaybackControllerNode._publish_browser_projection
-        )
-        _publish_browser_event = PlaybackControllerNode._publish_browser_event
-
-    controller = Harness()
-    controller._browser_boot_id = "boot-a"
-    controller._browser_serial = 0
-    controller._browser_playout_epoch = 0
-    controller._browser_invalidated_kinds = ()
-    controller._machine = SimpleNamespace(agent_pause_requested=True)
-    controller._browser_pub = Publisher()
+    controller = SimpleNamespace()
+    controller._playout_generation = 0
     controller._event_pub = Publisher()
 
     PlaybackControllerNode._publish_events(
@@ -850,9 +908,52 @@ def test_browser_projection_invalidates_even_when_playback_control_is_a_noop() -
         force_invalidated_kind="agent",
     )
 
-    assert controller._event_pub.messages == []
-    packet = json.loads(controller._browser_pub.messages[0].data)
-    assert packet["event"] == "agent_paused"
-    assert packet["playout_epoch"] == 1
-    assert packet["invalidated_kinds"] == ["agent"]
-    assert packet["agent_paused"] is True
+    assert len(controller._event_pub.messages) == 1
+    event = controller._event_pub.messages[0]
+    assert event.event == 4
+    assert event.playout_generation == 1
+
+
+def test_controller_publishes_unscaled_typed_playback_frame() -> None:
+    pytest.importorskip("rclpy")
+    from aspa_audio.playback_controller import PlaybackControllerNode
+
+    source = b"\xe8\x03\x18\xfc"
+    chunk = SimpleNamespace(
+        kind="cue",
+        utterance_id="cue-ready",
+        seq=0,
+        sample_index=0,
+        frame_count=2,
+        sample_rate_hz=48_000,
+        channels=1,
+        bit_depth=16,
+        final=True,
+        data=source,
+    )
+
+    class Publisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(message)
+
+    controller = SimpleNamespace(
+        _output_inflight=None,
+        _flush_pending=False,
+        _machine=SimpleNamespace(next_chunk=lambda: (chunk, ())),
+        _playout_generation=7,
+        _output_pending={},
+        _output_inflight_kind=None,
+        _device_buffer=DeviceBufferTracker(),
+        _output_pub=Publisher(),
+        _publish_events=lambda _events: None,
+    )
+
+    PlaybackControllerNode._pump(controller)
+
+    message = controller._output_pub.messages[0]
+    assert bytes(message.pcm_s16le) == source
+    assert message.kind == 3
+    assert message.playout_generation == 7

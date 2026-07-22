@@ -3,20 +3,30 @@
 from __future__ import annotations
 
 from array import array
-import base64
 from dataclasses import dataclass
-import json
-import uuid
+import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import String
 
-from fluent_dialogue_dora_interfaces.msg import AudioFrame
-from fluent_dialogue_dora_interfaces.srv import FlushAudio
+from aspa_audio_interfaces.msg import (
+    OutputDrained as OutputDrainedMessage,
+    PlaybackControl as PlaybackControlMessage,
+    PlaybackEvent as PlaybackEventMessage,
+    PlaybackFrame,
+)
+from aspa_audio_interfaces.srv import FlushAudio
+from fv_speech_interfaces.msg import AudioFrame
 
-from .contracts import OutputDrained, PlaybackControl, PlaybackEvent
+from .contracts import (
+    KIND_TO_CODE,
+    OutputDrained,
+    PlaybackControl,
+    PlaybackEvent,
+    advance_playout_generation,
+    playout_generation_seed,
+)
 from .gstreamer_pcm import GStreamerPcmConverter
 from .playback_state import (
     DeviceBufferTracker,
@@ -62,7 +72,6 @@ class PlaybackControllerNode(Node):
         self.declare_parameter("output_sample_rate_hz", 48000)
         self.declare_parameter("output_channels", 2)
         self.declare_parameter("chunk_ms", 20)
-        self.declare_parameter("volume", 1.0)
 
         rate = int(self.get_parameter("output_sample_rate_hz").value)
         channels = int(self.get_parameter("output_channels").value)
@@ -70,11 +79,7 @@ class PlaybackControllerNode(Node):
         if chunk_ms <= 0 or rate * chunk_ms % 1000:
             raise RuntimeError("chunk_ms must produce an integral output frame count")
         self._machine = PlaybackMachine(rate * chunk_ms // 1000)
-        self._converter = GStreamerPcmConverter(
-            rate,
-            channels,
-            float(self.get_parameter("volume").value),
-        )
+        self._converter = GStreamerPcmConverter(rate, channels)
         self._assemblies: dict[tuple[str, str], _Assembly] = {}
         self._minimum_agent_epoch = 0
         self._output_inflight: OutputDrained | None = None
@@ -85,10 +90,7 @@ class PlaybackControllerNode(Node):
         self._flush_pending = False
         self._flush_request: _FlushRequest | None = None
         self._fatal_output_error: RuntimeError | None = None
-        self._browser_boot_id = str(uuid.uuid4())
-        self._browser_serial = 0
-        self._browser_playout_epoch = 0
-        self._browser_invalidated_kinds: tuple[str, ...] = ()
+        self._playout_generation = playout_generation_seed(time.time_ns())
 
         qos = QoSProfile(
             depth=10,
@@ -96,16 +98,9 @@ class PlaybackControllerNode(Node):
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
         )
-        self._output_pub = self.create_publisher(AudioFrame, "/audio/output/frame", qos)
-        self._event_pub = self.create_publisher(String, "/audio/playback/event", qos)
-        browser_qos = QoSProfile(
-            depth=256,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-        )
-        self._browser_pub = self.create_publisher(
-            String, "/audio/browser/projection", browser_qos
+        self._output_pub = self.create_publisher(PlaybackFrame, "/audio/play", qos)
+        self._event_pub = self.create_publisher(
+            PlaybackEventMessage, "/audio/playback/event", qos
         )
         self._flush = self.create_client(FlushAudio, "/audio/output/flush")
         self.create_subscription(
@@ -117,8 +112,18 @@ class PlaybackControllerNode(Node):
         self.create_subscription(
             AudioFrame, "/audio/cue/frame", lambda msg: self._on_frame("cue", msg), qos
         )
-        self.create_subscription(String, "/audio/playback/control", self._on_control, qos)
-        self.create_subscription(String, "/audio/output/drained", self._on_output_drained, qos)
+        self.create_subscription(
+            PlaybackControlMessage,
+            "/audio/playback/control",
+            self._on_control,
+            qos,
+        )
+        self.create_subscription(
+            OutputDrainedMessage,
+            "/audio/output/drained",
+            self._on_output_drained,
+            qos,
+        )
         self.create_timer(chunk_ms / 1000.0, self._pump)
 
     def _on_frame(self, kind: str, msg: AudioFrame) -> None:
@@ -227,9 +232,9 @@ class PlaybackControllerNode(Node):
             bit_depth=assembly.bit_depth,
         )
 
-    def _on_control(self, msg: String) -> None:
+    def _on_control(self, msg: PlaybackControlMessage) -> None:
         try:
-            control = PlaybackControl.from_json(msg.data)
+            control = PlaybackControl.from_message(msg)
         except ValueError as exc:
             self.get_logger().error(str(exc))
             return
@@ -243,7 +248,9 @@ class PlaybackControllerNode(Node):
             fallback = PlaybackEvent("agent_resumed", "agent", "", 0, 0)
             invalidated_kind = None
         elif control.action == "discard":
-            self._minimum_agent_epoch = int(control.floor_epoch)
+            self._minimum_agent_epoch = max(
+                self._minimum_agent_epoch, control.minimum_agent_epoch
+            )
             for key in tuple(self._assemblies):
                 if (
                     key[0] == "agent"
@@ -283,9 +290,9 @@ class PlaybackControllerNode(Node):
             force_invalidated_kind=invalidated_kind,
         )
 
-    def _on_output_drained(self, msg: String) -> None:
+    def _on_output_drained(self, msg: OutputDrainedMessage) -> None:
         try:
-            ack = OutputDrained.from_json(msg.data)
+            ack = OutputDrained.from_message(msg)
             key = (ack.utterance_id, ack.seq)
             pending = self._output_pending.get(key)
             if pending is None:
@@ -383,21 +390,17 @@ class PlaybackControllerNode(Node):
             return
         chunk, events = self._machine.next_chunk()
         if chunk is not None:
-            msg = AudioFrame()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.source_id = "aspa_playback_controller"
-            msg.stream_id = chunk.utterance_id
+            msg = PlaybackFrame()
+            msg.kind = KIND_TO_CODE[chunk.kind]
+            msg.utterance_id = chunk.utterance_id
             msg.seq = chunk.seq
             msg.sample_index = chunk.sample_index
-            msg.capture_time_ns = 0
             msg.frame_count = chunk.frame_count
-            msg.encoding = "PCM16LE"
             msg.sample_rate_hz = chunk.sample_rate_hz
             msg.channels = chunk.channels
-            msg.bit_depth = chunk.bit_depth
-            msg.layout = "interleaved"
-            msg.data = array("B", chunk.data)
+            msg.pcm_s16le = array("B", chunk.data)
             msg.final = chunk.final
+            msg.playout_generation = self._playout_generation
             expected = OutputDrained(
                 utterance_id=chunk.utterance_id,
                 seq=chunk.seq,
@@ -413,7 +416,6 @@ class PlaybackControllerNode(Node):
             self._output_inflight_kind = chunk.kind
             self._device_buffer.note_chunk(chunk.kind, chunk.utterance_id)
             self._output_pub.publish(msg)
-            self._publish_browser_frame(chunk)
         self._publish_events(events)
 
     def _flush_device(
@@ -518,63 +520,22 @@ class PlaybackControllerNode(Node):
         if force_invalidated_kind is not None:
             invalidated_kinds.add(force_invalidated_kind)
         if invalidated_kinds:
-            self._browser_playout_epoch += 1
-            self._browser_invalidated_kinds = tuple(sorted(invalidated_kinds))
+            self._playout_generation = advance_playout_generation(
+                self._playout_generation
+            )
         for event in events:
-            self._event_pub.publish(String(data=event.to_json()))
-            self._publish_browser_event(event)
+            self._event_pub.publish(
+                event.to_message(PlaybackEventMessage, self._playout_generation)
+            )
         if (
             fallback_event is not None
             and not any(event.event == fallback_event.event for event in events)
         ):
-            self._publish_browser_event(fallback_event)
-
-    def _publish_browser_event(self, event: PlaybackEvent) -> None:
-        self._publish_browser_projection(
-            {
-                "packet_type": "state",
-                "event": event.event,
-                "kind": event.kind,
-                "utterance_id": event.utterance_id,
-                "played_frames": event.played_frames,
-                "total_frames": event.total_frames,
-            }
-        )
-
-    def _publish_browser_frame(self, chunk) -> None:
-        self._publish_browser_projection(
-            {
-                "packet_type": "frame",
-                "kind": chunk.kind,
-                "utterance_id": chunk.utterance_id,
-                "seq": chunk.seq,
-                "sample_index": chunk.sample_index,
-                "frame_count": chunk.frame_count,
-                "encoding": "PCM16LE",
-                "sample_rate_hz": chunk.sample_rate_hz,
-                "channels": chunk.channels,
-                "bit_depth": chunk.bit_depth,
-                "layout": "interleaved",
-                "final": chunk.final,
-                "data": base64.b64encode(chunk.data).decode("ascii"),
-            }
-        )
-
-    def _publish_browser_projection(self, packet: dict) -> None:
-        self._browser_serial += 1
-        payload = {
-            "type": "audio_projection",
-            "protocol_version": 1,
-            "controller_boot_id": self._browser_boot_id,
-            "serial": self._browser_serial,
-            "playout_epoch": self._browser_playout_epoch,
-            "invalidated_kinds": list(self._browser_invalidated_kinds),
-            "agent_paused": self._machine.agent_pause_requested,
-            **packet,
-        }
-        self._browser_pub.publish(
-            String(data=json.dumps(payload, separators=(",", ":"), sort_keys=True))
-        )
+            self._event_pub.publish(
+                fallback_event.to_message(
+                    PlaybackEventMessage, self._playout_generation
+                )
+            )
 
 
 def main(args=None) -> None:

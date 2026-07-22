@@ -1,0 +1,9 @@
+std_msgs/Header header
+string source_id
+string stream_id
+uint64 seq
+uint64 sample_index
+uint32 frame_count
+string state
+float32 speech_probability
+bool final

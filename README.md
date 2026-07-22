@@ -8,7 +8,7 @@
 [![ROS 2](https://img.shields.io/badge/ROS%202-Humble-22314E?logo=ros&logoColor=white)](https://docs.ros.org/en/humble/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20aarch64%20%7C%20x86__64-lightgrey)](#requirements)
-[![Language](https://img.shields.io/badge/C%2B%2B%20%2F%20Python-blue)](#)
+[![Language](https://img.shields.io/badge/C%2B%2B%20%2F%20Rust%20%2F%20Python-blue)](#)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
 <sub>RealSense · YOLOE · YOLO-seg · Depth Anything V3 · AprilTag · 3D OBB · FoundationPose bridge · MJPEG / WebSocket / RTMP streaming · Episode recording</sub>
@@ -262,7 +262,7 @@ The pipeline editor reads, writes, and visualises exactly this format — no hid
 <details>
 <summary><b>🔊 Audio (<code>src/audio/</code>)</b></summary>
 
-- `fv_audio` (capture), `fv_audio_output` (ALSA), `fv_audio_vad` (VAD / wakeword), `fv_tts` (Open JTalk / pyopenjtalk).
+- `aspa_audio` (Rust CPAL/GStreamer capture, playback arbitration, output), `fv_speech` (Rust Silero VAD, turn detector, Parakeet CUDA EP ASR), `fv_tts` (C++ official VOICEVOX Core C API).
 
 </details>
 

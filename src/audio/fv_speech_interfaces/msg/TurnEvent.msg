@@ -1,0 +1,10 @@
+std_msgs/Header header
+string session_id
+string user_turn_id
+string stream_id
+uint64 seq
+uint64 sample_index
+string state
+bool confidence_present
+float32 confidence
+bool final

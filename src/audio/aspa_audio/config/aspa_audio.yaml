@@ -3,4 +3,3 @@ playback_controller:
     output_sample_rate_hz: 48000
     output_channels: 2
     chunk_ms: 20
-    volume: 1.0

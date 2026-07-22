@@ -24,7 +24,4 @@ setup(
     maintainer_email="info@vegetalia.co.jp",
     description="CPAL ROS 2 audio I/O and single-stream GStreamer playback control",
     license="Apache-2.0",
-    entry_points={"console_scripts": [
-        "playback_controller = aspa_audio.playback_controller:main",
-    ]},
 )

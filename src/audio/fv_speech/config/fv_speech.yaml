@@ -1,0 +1,15 @@
+silero_vad:
+  ros__parameters:
+    model_path: ""
+    threshold: 0.5
+
+turn_detector:
+  ros__parameters:
+    session_id: "aspa-voice"
+    output_stream_id: "dialogue/turn/main"
+    end_silence_frames: 12000
+    turn_id_prefix: "user-turn"
+
+parakeet_asr:
+  ros__parameters:
+    history_frames: 32000

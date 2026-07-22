@@ -7,14 +7,21 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <buildtool_depend>ament_cmake_python</buildtool_depend>
-  <build_depend>fluent_dialogue_dora_interfaces</build_depend>
+  <build_depend>aspa_audio_interfaces</build_depend>
+  <build_depend>fv_speech_interfaces</build_depend>
+  <build_depend>libclang-dev</build_depend>
+  <build_depend>libasound2-dev</build_depend>
+  <build_depend>libgstreamer1.0-dev</build_depend>
+  <build_depend>libgstreamer-plugins-base1.0-dev</build_depend>
   <build_depend>std_msgs</build_depend>
-  <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>fluent_dialogue_dora_interfaces</exec_depend>
-  <exec_depend>python3-gi</exec_depend>
+  <exec_depend>aspa_audio_interfaces</exec_depend>
+  <exec_depend>fv_speech_interfaces</exec_depend>
+  <exec_depend>libasound2</exec_depend>
+  <exec_depend>libgstreamer1.0-0</exec_depend>
   <exec_depend>gstreamer1.0-plugins-base</exec_depend>
-  <test_depend>python3-pytest</test_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <export><build_type>ament_cmake</build_type></export>
 </package>

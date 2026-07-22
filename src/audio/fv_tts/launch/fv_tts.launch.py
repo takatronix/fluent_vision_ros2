@@ -2,7 +2,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, EmitEvent
+from launch.events import Shutdown
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -25,7 +26,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument("acceleration_mode", default_value="auto"),
         DeclareLaunchArgument("cpu_num_threads", default_value="0"),
-        DeclareLaunchArgument("style_id", default_value="3"),
+        DeclareLaunchArgument("style_id", default_value="30"),
+        DeclareLaunchArgument("synthesis_timeout_seconds", default_value="60.0"),
         Node(
             package="fv_tts",
             executable="fv_tts_node",
@@ -44,7 +46,14 @@ def generate_launch_description():
                     "style_id": ParameterValue(
                         LaunchConfiguration("style_id"), value_type=int
                     ),
+                    "synthesis_timeout_seconds": ParameterValue(
+                        LaunchConfiguration("synthesis_timeout_seconds"),
+                        value_type=float,
+                    ),
                 },
             ],
+            on_exit=EmitEvent(
+                event=Shutdown(reason="VOICEVOX TTS exited")
+            ),
         ),
     ])

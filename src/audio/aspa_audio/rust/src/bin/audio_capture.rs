@@ -10,7 +10,7 @@ use cpal::{
     Device, FromSample, Sample, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig,
     I24, U24,
 };
-use r2r::fluent_dialogue_dora_interfaces::msg::AudioFrame;
+use r2r::fv_speech_interfaces::msg::AudioFrame;
 use r2r::{Context, Node, QosProfile};
 use thiserror::Error;
 

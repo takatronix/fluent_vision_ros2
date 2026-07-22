@@ -1,0 +1,40 @@
+[package]
+name = "fv-speech-ros2"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+
+[[bin]]
+name = "silero_vad"
+path = "src/bin/silero_vad.rs"
+required-features = ["ros2"]
+
+[[bin]]
+name = "turn_detector"
+path = "src/bin/turn_detector.rs"
+required-features = ["ros2"]
+
+[[bin]]
+name = "parakeet_asr"
+path = "src/bin/parakeet_asr.rs"
+required-features = ["ros2"]
+
+[[bin]]
+name = "fv_speech_runtime_exec"
+path = "src/bin/fv_speech_runtime_exec.rs"
+
+[features]
+default = []
+ros2 = ["dep:r2r"]
+
+[dependencies]
+ctrlc = "3.5"
+futures = "0.3"
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "api-24", "cuda", "load-dynamic"] }
+parakeet-rs = { git = "https://github.com/altunenes/parakeet-rs.git", rev = "d317e75cc3adfc15cdeafe9d702a28b05d1006e4", default-features = false, features = ["cuda", "load-dynamic"] }
+r2r = { version = "0.9.5", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"

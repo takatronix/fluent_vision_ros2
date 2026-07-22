@@ -5,4 +5,5 @@ fv_tts:
     voice_model_path: ""
     acceleration_mode: "auto"
     cpu_num_threads: 0
-    style_id: 3
+    style_id: 30
+    synthesis_timeout_seconds: 60.0

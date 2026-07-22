@@ -1,0 +1,9 @@
+std_msgs/Header header
+string action
+string session_id
+string user_turn_id
+string stream_id
+uint64 seq
+uint64 start_sample_index
+uint64 stop_sample_index
+string reason

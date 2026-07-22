@@ -1,0 +1,14 @@
+std_msgs/Header header
+string source_id
+string stream_id
+uint64 seq
+uint64 sample_index
+uint64 capture_time_ns
+uint32 frame_count
+string encoding
+uint32 sample_rate_hz
+uint32 channels
+uint32 bit_depth
+string layout
+uint8[] data
+bool final

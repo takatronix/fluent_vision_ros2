@@ -1,0 +1,6 @@
+# Parallel keys already published to the output. Lengths must match.
+string[] utterance_ids
+uint64[] seqs
+---
+bool success
+string message

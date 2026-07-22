@@ -1,14 +1,12 @@
-"""GStreamer PCM shaping, resampling, and volume conversion."""
+"""GStreamer PCM shaping, resampling, and channel conversion."""
 
 from __future__ import annotations
 
 
 class GStreamerPcmConverter:
-    def __init__(self, output_rate_hz: int, output_channels: int, volume: float) -> None:
+    def __init__(self, output_rate_hz: int, output_channels: int) -> None:
         if output_rate_hz <= 0 or output_channels <= 0:
             raise ValueError("output format must be positive")
-        if not 0.0 <= volume <= 4.0:
-            raise ValueError("volume must be between 0.0 and 4.0")
         import gi
 
         gi.require_version("Gst", "1.0")
@@ -18,7 +16,6 @@ class GStreamerPcmConverter:
         self.Gst = Gst
         self.output_rate_hz = output_rate_hz
         self.output_channels = output_channels
-        self.volume = volume
 
     def convert(
         self,
@@ -43,7 +40,6 @@ class GStreamerPcmConverter:
             "appsrc name=src format=time ! "
             f"audio/x-raw,format=S16LE,rate={sample_rate_hz},channels={channels},layout=interleaved ! "
             "audioconvert ! audioresample ! "
-            f"volume volume={self.volume} ! "
             f"audio/x-raw,format=S16LE,rate={self.output_rate_hz},"
             f"channels={self.output_channels},layout=interleaved ! "
             "appsink name=sink sync=false"

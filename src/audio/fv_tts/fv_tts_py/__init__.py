@@ -1,1 +1,0 @@
-"""Native VOICEVOX TTS package."""
