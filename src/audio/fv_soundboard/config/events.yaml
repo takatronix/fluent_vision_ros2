@@ -11,7 +11,7 @@
 #   speak     : 既定で喋るか (false=音のみ。呼び出し側フラグで個別に上書き可)
 #   interrupt : 再生中の音を止めて即割込むか (停止/警告など緊急系)
 #   record    : episode_recorder に渡す意味マーカー名 (空=記録しない)
-#   category  : system | nav | harvest | interaction | health (UI/フィルタ用)
+#   category  : system | nav | harvest | interaction | health | safety (UI/フィルタ用)
 #   variants  : (任意) 種別マップ。variant名 → {sound?, say?}。
 #               入力 JSON に "variant":"grade_A" 等が来たときの解決:
 #                 sounds/<variants[v].sound>.wav → sounds/<sound>_<v>.wav → base sounds/<sound>.wav
@@ -326,3 +326,130 @@ events:
     interrupt: false
     record: comms_recovered
     category: health
+
+  # ── safety / sensors (距離・人感・LiDAR。既存 wav を流用) ───────────
+  # 発火は aspa_control_bridge が状態遷移時のみ /fv/event へ出す
+  # (帯に居続ける間は鳴らさない = 音の洪水を避ける)。
+  ultrasonic_warn:
+    sound: warning
+    say: "前方に障害物が近づいています"
+    speak: false
+    interrupt: false
+    record: ultrasonic_warn
+    category: safety
+  ultrasonic_stop:
+    sound: obstacle
+    say: "前方障害物のため前進を止めます"
+    speak: true
+    interrupt: true
+    record: ultrasonic_stop
+    category: safety
+  ultrasonic_clear:
+    sound: resume
+    say: ""
+    speak: false
+    interrupt: false
+    record: ultrasonic_clear
+    category: safety
+  ultrasonic_offline:
+    sound: sensor_lost
+    say: "前方超音波センサーが応答しません"
+    speak: true
+    interrupt: false
+    record: ultrasonic_offline
+    category: safety
+  ultrasonic_online:
+    sound: sensor_recovered
+    say: "前方超音波センサーが復帰しました"
+    speak: false
+    interrupt: false
+    record: ultrasonic_online
+    category: safety
+
+  # D405: 進行方向向きの安全 ToF (カメラ光軸)。グリッパ向きは使わない。
+  tof_warn:
+    sound: approach
+    say: "進行方向に障害物が近づいています"
+    speak: false
+    interrupt: false
+    record: tof_warn
+    category: safety
+  tof_stop:
+    sound: obstacle
+    say: "進行方向の障害物のため注意してください"
+    speak: true
+    interrupt: true
+    record: tof_stop
+    category: safety
+  tof_clear:
+    sound: resume
+    say: ""
+    speak: false
+    interrupt: false
+    record: tof_clear
+    category: safety
+  tof_offline:
+    sound: sensor_lost
+    say: "進行方向の距離センサーが応答しません"
+    speak: true
+    interrupt: false
+    record: tof_offline
+    category: safety
+  tof_online:
+    sound: sensor_recovered
+    say: "進行方向の距離センサーが復帰しました"
+    speak: false
+    interrupt: false
+    record: tof_online
+    category: safety
+
+  lidar_warn:
+    sound: warning
+    say: "周辺に障害物が近づいています"
+    speak: false
+    interrupt: false
+    record: lidar_warn
+    category: safety
+  lidar_stop:
+    sound: blocked
+    say: "周辺障害物のため停止します"
+    speak: true
+    interrupt: true
+    record: lidar_stop
+    category: safety
+  lidar_clear:
+    sound: resume
+    say: ""
+    speak: false
+    interrupt: false
+    record: lidar_clear
+    category: safety
+  lidar_offline:
+    sound: sensor_lost
+    say: "LiDARが応答しません"
+    speak: true
+    interrupt: false
+    record: lidar_offline
+    category: safety
+  lidar_online:
+    sound: sensor_recovered
+    say: "LiDARが復帰しました"
+    speak: false
+    interrupt: false
+    record: lidar_online
+    category: safety
+
+  motion_detected:
+    sound: attention
+    say: "周囲に人を検知しました"
+    speak: false
+    interrupt: false
+    record: motion_detected
+    category: safety
+  motion_cleared:
+    sound: notify
+    say: ""
+    speak: false
+    interrupt: false
+    record: motion_cleared
+    category: safety
