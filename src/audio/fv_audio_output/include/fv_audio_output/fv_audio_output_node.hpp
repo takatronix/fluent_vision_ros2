@@ -38,6 +38,11 @@ struct OutputConfig
   size_t qos_depth = 10;
   bool qos_reliable = true;
   bool drain_after_frame = false;
+  bool reconnect_enabled = true;
+  uint32_t reconnect_interval_ms = 1000;
+  std::string mixer_card;
+  std::string mixer_control = "PCM";
+  int32_t mixer_volume_percent = -1;  // -1 = leave the hardware mixer unchanged
 };
 
 // 再生キュー用の構造体（フレームデータとヘッダーをペアで保持）
@@ -58,6 +63,10 @@ private:
   void loadParameters();
   bool openDevice();
   void closeDevice();
+  void closeDeviceLocked();
+  bool applyMixerSettings();
+  bool deviceIsOpen();
+  bool waitForReconnect();
   void playbackThread();
   void handleFrame(const fv_audio::msg::AudioFrame::SharedPtr msg);
   void handleVolume(const std_msgs::msg::Float32::SharedPtr msg);
@@ -74,6 +83,7 @@ private:
 
   OutputConfig config_;
   snd_pcm_t * pcm_handle_ = nullptr;
+  std::mutex pcm_mutex_;
   size_t bytes_per_frame_ = 0;
 
   std::mutex queue_mutex_;

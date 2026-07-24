@@ -137,16 +137,25 @@ def main() -> int:
     # individuals apart; registry v2).
     make_sheet([(100, 'MOTHER STEM')] * 12, 50.0,
                out / 'sheet_mother_stem_id100_x12_50mm')
-    # Zone/nav markers, 100 mm, 2 per sheet. Duplicates of one ID are
-    # legitimate (several keep-out spots share the meaning).
-    make_sheet([(50, 'KEEP OUT')] * 2, 100.0,
-               out / 'sheet_keep_out_id050_x2_100mm')
-    make_sheet([(51, 'STOP'), (52, 'SLOW')], 100.0,
-               out / 'sheet_stop_slow_id051_052_100mm')
-    make_sheet([(20, 'DOCK'), (20, 'DOCK')], 100.0,
-               out / 'sheet_dock_id020_x2_100mm')
-    make_sheet([(30, 'ROW N'), (31, 'ROW S')], 100.0,
-               out / 'sheet_row_anchors_id030_031_100mm')
+    # Field markers are 150mm unified (registry 2026-07-21): one tag
+    # per A4 sheet. Print a sheet per installed spot (duplicates of one
+    # ID are legitimate — several keep-out spots share the meaning).
+    make_sheet([(20, 'DOCK')], 150.0,
+               out / 'sheet_dock_id020_150mm')
+    make_sheet([(50, 'KEEP OUT')], 150.0,
+               out / 'sheet_keep_out_id050_150mm')
+    make_sheet([(51, 'STOP')], 150.0,
+               out / 'sheet_stop_id051_150mm')
+    make_sheet([(52, 'SLOW')], 150.0,
+               out / 'sheet_slow_id052_150mm')
+    make_sheet([(30, 'ROW N')], 150.0,
+               out / 'sheet_row_anchor_id030_150mm')
+    make_sheet([(31, 'ROW S')], 150.0,
+               out / 'sheet_row_anchor_id031_150mm')
+    # localization anchors (registry 110-119): distinct id per point
+    for i, letter in enumerate('ABCD'):
+        make_sheet([(110 + i, f'ANCHOR {letter}')], 150.0,
+                   out / f'sheet_loc_anchor_id{110 + i}_150mm')
     return 0
 
 

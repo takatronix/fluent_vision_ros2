@@ -21,6 +21,10 @@ ros2 run fv_audio_output fv_audio_output_node --ros-args --params-file install/f
   バッファの半分、1は短い通知音を即時開始します。
 - `audio.drain_after_frame`: trueなら各AudioFrameを実デバイスが再生し終わるまで待ってから
   完了通知を出します。離散cue/TTS向けで、連続ストリームではfalseを使用します。
+- `audio.reconnect.enabled`, `audio.reconnect.interval_ms`: USBスピーカー切断時にALSAを
+  閉じて再接続を待ち、復帰後に未再生部分から再開します。起動時に機器がなくても待機します。
+- `audio.mixer.card`, `audio.mixer.control`, `audio.mixer.volume_percent`: USB再列挙で
+  ハードウェア音量が初期化される機器向けの復旧設定です。`volume_percent=-1`で無効です。
 - `queue.max_frames`: バッファに保持するフレーム数。溢れると古いフレームから破棄します。
 
 `fv_tts`と組み合わせる場合、`audio/output/frame`トピックを共有すればテキスト合成結果が自動で再生されます。

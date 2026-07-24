@@ -1,0 +1,63 @@
+# fv_apriltag cube kit manifest
+
+calibration_tag_id: 0
+
+[cube60_a]
+  cube_size_mm: 60.0
+  tag_size_mm:  50.0
+  top     -> id 300
+  front   -> id 301
+  right   -> id 302
+  back    -> id 303
+  left    -> id 304
+  bottom  -> id 305
+
+[cube60_b]
+  cube_size_mm: 60.0
+  tag_size_mm:  50.0
+  top     -> id 306
+  front   -> id 307
+  right   -> id 308
+  back    -> id 309
+  left    -> id 310
+  bottom  -> id 311
+
+[cube60_c]
+  cube_size_mm: 60.0
+  tag_size_mm:  50.0
+  top     -> id 312
+  front   -> id 313
+  right   -> id 314
+  back    -> id 315
+  left    -> id 316
+  bottom  -> id 317
+
+[cube100_a]
+  cube_size_mm: 100.0
+  tag_size_mm:  50.0
+  top     -> id 320
+  front   -> id 321
+  right   -> id 322
+  back    -> id 323
+  left    -> id 324
+  bottom  -> id 325
+
+[cube100_b]
+  cube_size_mm: 100.0
+  tag_size_mm:  50.0
+  top     -> id 326
+  front   -> id 327
+  right   -> id 328
+  back    -> id 329
+  left    -> id 330
+  bottom  -> id 331
+
+[cube100_c]
+  cube_size_mm: 100.0
+  tag_size_mm:  50.0
+  top     -> id 332
+  front   -> id 333
+  right   -> id 334
+  back    -> id 335
+  left    -> id 336
+  bottom  -> id 337

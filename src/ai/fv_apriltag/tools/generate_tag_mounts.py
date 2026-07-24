@@ -65,18 +65,21 @@ def _pyramid_down(cx: float, cy: float, half: float,
 
 def _wedge_x(x0: float, x1: float, y0: float, y1: float,
              z0: float, z1: float) -> List[Tri]:
-    """Right-triangle prism: full height at y0, tapering to z0 at y1.
-    Used as a gusset rib between plate back and stake."""
+    """Right-triangle prism: full height at y0, tapering to z0 at y1
+    (either y direction). Used as a gusset rib between plate and stake."""
     a0, b0 = (x0, y0, z0), (x0, y0, z1)
     c0 = (x0, y1, z0)
     a1, b1 = (x1, y0, z0), (x1, y0, z1)
     c1 = (x1, y1, z0)
-    return [
-        _tri(a0, b0, c0), _tri(a1, c1, b1),              # triangle ends
-        _tri(a0, c0, c1), _tri(a0, c1, a1),              # bottom
-        _tri(a0, a1, b1), _tri(a0, b1, b0),              # vertical face
-        _tri(b0, b1, c1), _tri(b0, c1, c0),              # hypotenuse face
+    tris = [
+        (a0, b0, c0), (a1, c1, b1),                      # triangle ends
+        (a0, c0, c1), (a0, c1, a1),                      # bottom
+        (a0, a1, b1), (a0, b1, b0),                      # vertical face
+        (b0, b1, c1), (b0, c1, c0),                      # hypotenuse face
     ]
+    if y1 < y0:                                          # keep normals outward
+        tris = [(v1, v3, v2) for v1, v2, v3 in tris]
+    return [_tri(*t) for t in tris]
 
 
 def _pocket_plate(w: float, h: float,
@@ -153,12 +156,14 @@ def generate_peg(paper_mm: float, stake_mm: float, out: Path) -> None:
              (cx - shaft / 2, -stake_mm, PLATE_T_MM),
              (cx + shaft / 2, -stake_mm, PLATE_T_MM)),
     ]
-    # gusset ribs where plate meets stake (stiffen against soil push)
+    # gusset ribs where plate meets stake (stiffen against soil push).
+    # They run DOWN the stake (−y): the +y side is the tag pocket face —
+    # ribs there would sit where the tag is pasted.
     rib = 30.0
     tris += _wedge_x(cx - shaft / 2, cx - shaft / 2 + 4.0,
-                     0, rib, PLATE_T_MM, PLATE_T_MM + 10.0)
+                     0, -rib, PLATE_T_MM, PLATE_T_MM + 10.0)
     tris += _wedge_x(cx + shaft / 2 - 4.0, cx + shaft / 2,
-                     0, rib, PLATE_T_MM, PLATE_T_MM + 10.0)
+                     0, -rib, PLATE_T_MM, PLATE_T_MM + 10.0)
     # press shoulder above the plate to push/hammer by palm
     tris += _box_triangles(cx - 20, plate, 0, cx + 20, plate + 12,
                            PLATE_T_MM + 4.0)
@@ -215,16 +220,18 @@ def generate_peg_two_piece(paper_mm: float, stake_mm: float,
     s += _box_triangles(0, t_len, 0, body_w, t_len + stake_mm, body_t)
     tip = 28.0
     y0 = t_len + stake_mm
+    # tip points +y here (one-piece peg tip points −y) — wind so
+    # normals face OUTWARD: bottom −z, top +z, sides away from centre.
     s += [
-        _tri((0, y0, 0), (body_w, y0, 0), (sx, y0 + tip, 0)),
-        _tri((0, y0, body_t), (sx, y0 + tip, body_t), (body_w, y0, body_t)),
-        _tri((0, y0, 0), (sx, y0 + tip, 0), (0, y0, body_t)),
-        _tri((0, y0, body_t), (sx, y0 + tip, 0), (sx, y0 + tip, body_t)),
-        _tri((body_w, y0, 0), (body_w, y0, body_t), (sx, y0 + tip, 0)),
-        _tri((body_w, y0, body_t), (sx, y0 + tip, body_t),
-             (sx, y0 + tip, 0)),
-        _tri((0, y0, 0), (0, y0, body_t), (body_w, y0, 0)),
-        _tri((body_w, y0, 0), (0, y0, body_t), (body_w, y0, body_t)),
+        _tri((0, y0, 0), (sx, y0 + tip, 0), (body_w, y0, 0)),
+        _tri((0, y0, body_t), (body_w, y0, body_t), (sx, y0 + tip, body_t)),
+        _tri((0, y0, 0), (0, y0, body_t), (sx, y0 + tip, 0)),
+        _tri((0, y0, body_t), (sx, y0 + tip, body_t), (sx, y0 + tip, 0)),
+        _tri((body_w, y0, 0), (sx, y0 + tip, 0), (body_w, y0, body_t)),
+        _tri((body_w, y0, body_t), (sx, y0 + tip, 0),
+             (sx, y0 + tip, body_t)),
+        _tri((0, y0, 0), (body_w, y0, 0), (0, y0, body_t)),
+        _tri((body_w, y0, 0), (body_w, y0, body_t), (0, y0, body_t)),
     ]
     write_stl_ascii(s, out_stake,
                     name=f'fv_tag_peg2_stake_{int(paper_mm)}')
@@ -299,10 +306,13 @@ def generate_flat_plate_3mf(tag_id: int, tag_mm: float, out_3mf: Path,
             dst += _box_triangles(x0, y0, 0.0,
                                   x0 + cell, y0 + cell, pat_t)
     white += _box_triangles(0, 0, pat_t, tag_mm, tag_mm, body_t - txt_t)
-    # back label band (flush inset): black text rects + white complement
-    band_h = 10.0
+    # back label band (flush inset): black text rects + white complement.
+    # Band scales with the plate so letters stay proportionate, and the
+    # mask renders at 100 DPI — at the old 50 DPI the thresholded glyph
+    # strokes came out around one nozzle width and sliced to broken text.
+    band_h = max(10.0, tag_mm * 0.12)
     band_y0 = (tag_mm - band_h) / 2.0
-    mask = _render_text_mask([label], tag_mm - 4.0, band_h)
+    mask = _render_text_mask([label], tag_mm - 4.0, band_h, dpi=100.0)
     ppm = mask.shape[1] / (tag_mm - 4.0)
     z0, z1 = body_t - txt_t, body_t
     white += _box_triangles(0, 0, z0, tag_mm, band_y0, z1)
@@ -310,11 +320,15 @@ def generate_flat_plate_3mf(tag_id: int, tag_mm: float, out_3mf: Path,
     white += _box_triangles(0, band_y0, z0, 2.0, band_y0 + band_h, z1)
     white += _box_triangles(tag_mm - 2.0, band_y0, z0,
                             tag_mm, band_y0 + band_h, z1)
+    # Inflate every rect a hair so same-colour neighbours OVERLAP:
+    # exactly-touching boxes stay separate volumes in the slicer (a
+    # wall around each), overlapping ones union into solid glyphs.
+    eps = 0.06
     for inverted, dst in ((False, black), (True, white)):
         for c0, r0, c1, r1 in _mask_to_rects(mask, inverted=inverted):
             dst += _box_triangles(
-                2.0 + c0 / ppm, band_y0 + band_h - r1 / ppm, z0,
-                2.0 + c1 / ppm, band_y0 + band_h - r0 / ppm, z1)
+                2.0 + c0 / ppm - eps, band_y0 + band_h - r1 / ppm - eps, z0,
+                2.0 + c1 / ppm + eps, band_y0 + band_h - r0 / ppm + eps, z1)
     write_cube_plates_3mf(out_3mf, [('flat', tag_id, white, black, [])],
                           cube_label=f'flat_id{tag_id:03d}',
                           plate_size_mm=tag_mm)

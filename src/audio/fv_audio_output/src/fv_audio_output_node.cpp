@@ -1,6 +1,7 @@
 #include "fv_audio_output/fv_audio_output_node.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -26,7 +27,13 @@ FvAudioOutputNode::FvAudioOutputNode()
   }
 
   if (!openDevice()) {
-    throw std::runtime_error("Failed to open ALSA playback device");
+    if (!config_.reconnect_enabled) {
+      throw std::runtime_error("Failed to open ALSA playback device");
+    }
+    RCLCPP_WARN(
+      this->get_logger(),
+      "ALSA playback device is unavailable at startup; retrying every %u ms",
+      config_.reconnect_interval_ms);
   }
 
   // QoS は fv_tts 側と合わせ、reliable/best_effort をパラメータで切り替える。
@@ -97,6 +104,8 @@ void FvAudioOutputNode::loadParameters()
   const bool default_qos_reliable = config_.qos_reliable;
   const uint32_t default_start_threshold_frames = config_.start_threshold_frames;
   const bool default_drain_after_frame = config_.drain_after_frame;
+  const bool default_reconnect_enabled = config_.reconnect_enabled;
+  const uint32_t default_reconnect_interval_ms = config_.reconnect_interval_ms;
 
   this->declare_parameter("audio.device_id", config_.device_id);
   this->declare_parameter("audio.volume_topic", config_.volume_topic);
@@ -109,6 +118,12 @@ void FvAudioOutputNode::loadParameters()
   this->declare_parameter<int>(
     "audio.start_threshold_frames", static_cast<int>(default_start_threshold_frames));
   this->declare_parameter<bool>("audio.drain_after_frame", default_drain_after_frame);
+  this->declare_parameter<bool>("audio.reconnect.enabled", default_reconnect_enabled);
+  this->declare_parameter<int>(
+    "audio.reconnect.interval_ms", static_cast<int>(default_reconnect_interval_ms));
+  this->declare_parameter("audio.mixer.card", config_.mixer_card);
+  this->declare_parameter("audio.mixer.control", config_.mixer_control);
+  this->declare_parameter<int>("audio.mixer.volume_percent", config_.mixer_volume_percent);
   this->declare_parameter<int>("audio.qos.depth", static_cast<int>(default_qos_depth));
   this->declare_parameter<bool>("audio.qos.reliable", default_qos_reliable);
 
@@ -141,6 +156,29 @@ void FvAudioOutputNode::loadParameters()
   config_.start_threshold_frames = static_cast<uint32_t>(
     std::max<int64_t>(0, start_threshold_param));
   config_.drain_after_frame = this->get_parameter("audio.drain_after_frame").as_bool();
+  config_.reconnect_enabled = this->get_parameter("audio.reconnect.enabled").as_bool();
+  const int64_t reconnect_interval_param =
+    this->get_parameter("audio.reconnect.interval_ms").as_int();
+  config_.reconnect_interval_ms = static_cast<uint32_t>(
+    std::clamp<int64_t>(reconnect_interval_param, 100, 60000));
+  if (reconnect_interval_param != static_cast<int64_t>(config_.reconnect_interval_ms)) {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "audio.reconnect.interval_ms must be between 100 and 60000; using %u",
+      config_.reconnect_interval_ms);
+  }
+  config_.mixer_card = this->get_parameter("audio.mixer.card").as_string();
+  config_.mixer_control = this->get_parameter("audio.mixer.control").as_string();
+  const int64_t mixer_volume_param =
+    this->get_parameter("audio.mixer.volume_percent").as_int();
+  config_.mixer_volume_percent = static_cast<int32_t>(
+    std::clamp<int64_t>(mixer_volume_param, -1, 100));
+  if (mixer_volume_param != config_.mixer_volume_percent) {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "audio.mixer.volume_percent must be between -1 and 100; using %d",
+      config_.mixer_volume_percent);
+  }
 
   const int64_t qos_depth_param = this->get_parameter("audio.qos.depth").as_int();
   if (qos_depth_param <= 0) {
@@ -155,22 +193,33 @@ void FvAudioOutputNode::loadParameters()
 
   RCLCPP_INFO(this->get_logger(),
     "Output config: device=%s volume=%.2f rate=%uHz channels=%u bits=%u queue=%zu "
-    "chunk=%ums start_threshold=%u drain_after_frame=%s qos_depth=%zu reliable=%s",
+    "chunk=%ums start_threshold=%u drain_after_frame=%s qos_depth=%zu reliable=%s "
+    "reconnect=%s/%ums mixer=%s/%s/%d%%",
     config_.device_id.c_str(), config_.volume, config_.sample_rate,
     config_.channels, config_.bit_depth,
     config_.max_queue_frames, config_.chunk_duration_ms, config_.start_threshold_frames,
     config_.drain_after_frame ? "true" : "false", config_.qos_depth,
-    config_.qos_reliable ? "true" : "false");
+    config_.qos_reliable ? "true" : "false",
+    config_.reconnect_enabled ? "true" : "false", config_.reconnect_interval_ms,
+    config_.mixer_card.empty() ? "disabled" : config_.mixer_card.c_str(),
+    config_.mixer_control.c_str(), config_.mixer_volume_percent);
 }
 
 bool FvAudioOutputNode::openDevice()
 {
-  closeDevice();
+  std::lock_guard<std::mutex> lock(pcm_mutex_);
+  closeDeviceLocked();
+
+  // USB audio devices commonly reset their hardware mixer on re-enumeration.
+  // Restore it before opening PCM so the first recovered cue is audible.
+  applyMixerSettings();
 
   snd_pcm_t * handle = nullptr;
   int err = snd_pcm_open(&handle, config_.device_id.c_str(), SND_PCM_STREAM_PLAYBACK, 0);
   if (err < 0) {
-    RCLCPP_ERROR(this->get_logger(), "snd_pcm_open failed: %s", snd_strerror(err));
+    RCLCPP_ERROR_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "snd_pcm_open failed for %s: %s", config_.device_id.c_str(), snd_strerror(err));
     return false;
   }
 
@@ -296,16 +345,106 @@ bool FvAudioOutputNode::openDevice()
   }
 
   pcm_handle_ = handle;
+  RCLCPP_INFO(this->get_logger(), "ALSA playback device ready: %s", config_.device_id.c_str());
   return true;
 }
 
 void FvAudioOutputNode::closeDevice()
+{
+  std::lock_guard<std::mutex> lock(pcm_mutex_);
+  closeDeviceLocked();
+}
+
+void FvAudioOutputNode::closeDeviceLocked()
 {
   if (pcm_handle_) {
     snd_pcm_drop(pcm_handle_);
     snd_pcm_close(pcm_handle_);
     pcm_handle_ = nullptr;
   }
+}
+
+bool FvAudioOutputNode::applyMixerSettings()
+{
+  if (config_.mixer_card.empty() || config_.mixer_volume_percent < 0) {
+    return true;
+  }
+
+  snd_mixer_t * mixer = nullptr;
+  int err = snd_mixer_open(&mixer, 0);
+  if (err >= 0) {
+    err = snd_mixer_attach(mixer, config_.mixer_card.c_str());
+  }
+  if (err >= 0) {
+    err = snd_mixer_selem_register(mixer, nullptr, nullptr);
+  }
+  if (err >= 0) {
+    err = snd_mixer_load(mixer);
+  }
+  if (err < 0) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "Cannot open ALSA mixer %s: %s", config_.mixer_card.c_str(), snd_strerror(err));
+    if (mixer) {
+      snd_mixer_close(mixer);
+    }
+    return false;
+  }
+
+  snd_mixer_selem_id_t * sid = nullptr;
+  snd_mixer_selem_id_alloca(&sid);
+  snd_mixer_selem_id_set_index(sid, 0);
+  snd_mixer_selem_id_set_name(sid, config_.mixer_control.c_str());
+  snd_mixer_elem_t * elem = snd_mixer_find_selem(mixer, sid);
+  if (!elem || !snd_mixer_selem_has_playback_volume(elem)) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "ALSA mixer control not found: %s/%s",
+      config_.mixer_card.c_str(), config_.mixer_control.c_str());
+    snd_mixer_close(mixer);
+    return false;
+  }
+
+  long volume_min = 0;
+  long volume_max = 0;
+  snd_mixer_selem_get_playback_volume_range(elem, &volume_min, &volume_max);
+  const long volume = volume_min +
+    ((volume_max - volume_min) * config_.mixer_volume_percent) / 100;
+  err = snd_mixer_selem_set_playback_volume_all(elem, volume);
+  if (err >= 0 && snd_mixer_selem_has_playback_switch(elem)) {
+    err = snd_mixer_selem_set_playback_switch_all(elem, 1);
+  }
+  snd_mixer_close(mixer);
+
+  if (err < 0) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "Failed to restore ALSA mixer %s/%s: %s",
+      config_.mixer_card.c_str(), config_.mixer_control.c_str(), snd_strerror(err));
+    return false;
+  }
+
+  RCLCPP_INFO(
+    this->get_logger(), "ALSA mixer restored: %s/%s=%d%%",
+    config_.mixer_card.c_str(), config_.mixer_control.c_str(),
+    config_.mixer_volume_percent);
+  return true;
+}
+
+bool FvAudioOutputNode::deviceIsOpen()
+{
+  std::lock_guard<std::mutex> lock(pcm_mutex_);
+  return pcm_handle_ != nullptr;
+}
+
+bool FvAudioOutputNode::waitForReconnect()
+{
+  std::unique_lock<std::mutex> lock(queue_mutex_);
+  queue_cv_.wait_for(
+    lock, std::chrono::milliseconds(config_.reconnect_interval_ms), [this]() {
+      return !running_.load() || pause_requested_.load();
+    });
+  return running_.load();
 }
 
 void FvAudioOutputNode::handleFrame(const fv_audio::msg::AudioFrame::SharedPtr msg)
@@ -396,9 +535,15 @@ void FvAudioOutputNode::handleStop(const std_msgs::msg::Empty::SharedPtr /*msg*/
   }
 
   // ALSA バッファをドロップ（即座に停止）
-  if (pcm_handle_) {
-    snd_pcm_drop(pcm_handle_);
-    snd_pcm_prepare(pcm_handle_);
+  {
+    std::lock_guard<std::mutex> lock(pcm_mutex_);
+    if (pcm_handle_) {
+      const int drop_result = snd_pcm_drop(pcm_handle_);
+      const int prepare_result = snd_pcm_prepare(pcm_handle_);
+      if (drop_result < 0 || prepare_result < 0) {
+        closeDeviceLocked();
+      }
+    }
   }
 
   // 停止フラグをリセット
@@ -476,8 +621,18 @@ void FvAudioOutputNode::playbackThread()
   const size_t chunk_samples = std::max<size_t>(1, static_cast<size_t>(chunk_samples_u64));
   const size_t chunk_bytes = chunk_samples * bytes_per_frame_;
 
-  rclcpp::Rate idle_rate(50);
   while (running_.load()) {
+    if (!deviceIsOpen()) {
+      if (!openDevice()) {
+        if (config_.reconnect_enabled) {
+          waitForReconnect();
+        } else {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        continue;
+      }
+    }
+
     // 一時停止中なら待機
     if (is_paused_.load()) {
       std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -490,9 +645,15 @@ void FvAudioOutputNode::playbackThread()
     // 一時停止リクエストがあれば即座に停止
     if (pause_requested_.load()) {
       // ALSAバッファをドロップして即座に停止
-      if (pcm_handle_) {
-        snd_pcm_drop(pcm_handle_);
-        snd_pcm_prepare(pcm_handle_);
+      {
+        std::lock_guard<std::mutex> lock(pcm_mutex_);
+        if (pcm_handle_) {
+          const int drop_result = snd_pcm_drop(pcm_handle_);
+          const int prepare_result = snd_pcm_prepare(pcm_handle_);
+          if (drop_result < 0 || prepare_result < 0) {
+            closeDeviceLocked();
+          }
+        }
       }
       is_paused_.store(true);
       pause_requested_.store(false);
@@ -516,15 +677,6 @@ void FvAudioOutputNode::playbackThread()
     }
 
     if (has_frame && !queued_frame.data.empty()) {
-      if (!pcm_handle_) {
-        if (!openDevice()) {
-          RCLCPP_ERROR_THROTTLE(
-            this->get_logger(), *this->get_clock(), 2000,
-            "ALSA device unavailable, dropping frame");
-          continue;
-        }
-      }
-
       const float master_volume = volume_.load();
       if (master_volume < 1.0F) {
         applyVolumeScale(queued_frame.data, master_volume);
@@ -542,50 +694,105 @@ void FvAudioOutputNode::playbackThread()
           break;
         }
 
+        if (!deviceIsOpen()) {
+          if (!config_.reconnect_enabled) {
+            interrupted = true;
+            break;
+          }
+          if (!openDevice()) {
+            waitForReconnect();
+            continue;
+          }
+        }
+
         // 今回書き込むバイト数（最大chunk_bytes）
         size_t write_bytes = std::min(chunk_bytes, total_bytes - bytes_written);
         size_t write_frames = write_bytes / bytes_per_frame_;
 
-        snd_pcm_sframes_t result = snd_pcm_writei(
-          pcm_handle_,
-          data_ptr + bytes_written,
-          write_frames);
+        snd_pcm_sframes_t result = -ENODEV;
+        {
+          std::lock_guard<std::mutex> lock(pcm_mutex_);
+          if (pcm_handle_) {
+            result = snd_pcm_writei(
+              pcm_handle_, data_ptr + bytes_written, write_frames);
+          }
+        }
 
         if (result == -EPIPE) {
           RCLCPP_WARN(this->get_logger(), "XRUN detected, preparing device");
-          snd_pcm_prepare(pcm_handle_);
-          continue;
+          int prepare_result = -ENODEV;
+          {
+            std::lock_guard<std::mutex> lock(pcm_mutex_);
+            if (pcm_handle_) {
+              prepare_result = snd_pcm_prepare(pcm_handle_);
+            }
+          }
+          if (prepare_result >= 0) {
+            continue;
+          }
+          result = prepare_result;
         } else if (result == -EAGAIN) {
           // バッファがいっぱい、少し待つ
           std::this_thread::sleep_for(std::chrono::microseconds(500));
           continue;
-        } else if (result < 0) {
-          RCLCPP_ERROR(this->get_logger(), "snd_pcm_writei failed: %s", snd_strerror(result));
-          snd_pcm_prepare(pcm_handle_);
-          break;
+        } else if (result == -EINTR) {
+          continue;
         }
 
+        if (result < 0) {
+          RCLCPP_ERROR(this->get_logger(), "snd_pcm_writei failed: %s", snd_strerror(result));
+          closeDevice();
+          if (!config_.reconnect_enabled) {
+            interrupted = true;
+            break;
+          }
+          waitForReconnect();
+          continue;
+        }
+
+        if (result == 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(500));
+          continue;
+        }
         bytes_written += static_cast<size_t>(result) * bytes_per_frame_;
       }
 
       if (interrupted) {
         // 中断時: ALSAバッファをドロップして即停止
+        std::lock_guard<std::mutex> lock(pcm_mutex_);
         if (pcm_handle_) {
-          snd_pcm_drop(pcm_handle_);
-          snd_pcm_prepare(pcm_handle_);
+          const int drop_result = snd_pcm_drop(pcm_handle_);
+          const int prepare_result = snd_pcm_prepare(pcm_handle_);
+          if (drop_result < 0 || prepare_result < 0) {
+            closeDeviceLocked();
+          }
         }
         RCLCPP_INFO(this->get_logger(), "Playback interrupted, dropped remaining audio");
-      } else if (bytes_written > 0) {
+      } else if (bytes_written == total_bytes) {
         // Discrete cues can be shorter than the ALSA buffer. Optionally wait
         // until the hardware has consumed the complete frame before reporting
         // completion or accepting an interrupting cue.
-        if (config_.drain_after_frame && pcm_handle_) {
-          const int drain_result = snd_pcm_drain(pcm_handle_);
+        if (config_.drain_after_frame) {
+          int drain_result = 0;
+          int prepare_result = 0;
+          {
+            std::lock_guard<std::mutex> lock(pcm_mutex_);
+            if (pcm_handle_) {
+              drain_result = snd_pcm_drain(pcm_handle_);
+              if (drain_result >= 0) {
+                prepare_result = snd_pcm_prepare(pcm_handle_);
+              }
+              if (drain_result < 0 || prepare_result < 0) {
+                closeDeviceLocked();
+              }
+            } else {
+              drain_result = -ENODEV;
+            }
+          }
           if (drain_result < 0) {
             RCLCPP_WARN(
               this->get_logger(), "snd_pcm_drain failed: %s", snd_strerror(drain_result));
           }
-          const int prepare_result = snd_pcm_prepare(pcm_handle_);
           if (prepare_result < 0) {
             RCLCPP_ERROR(
               this->get_logger(), "snd_pcm_prepare after drain failed: %s",
@@ -601,15 +808,21 @@ void FvAudioOutputNode::playbackThread()
       }
     } else {
       // キューが空の場合のみ、残りのALSAバッファを再生完了待ち
-      if (pcm_handle_) {
-        snd_pcm_state_t state = snd_pcm_state(pcm_handle_);
-        if (state == SND_PCM_STATE_RUNNING) {
-          // まだ再生中なら少し待つ
-          idle_rate.sleep();
-          continue;
+      bool disconnected = false;
+      {
+        std::lock_guard<std::mutex> lock(pcm_mutex_);
+        if (pcm_handle_) {
+          const snd_pcm_state_t state = snd_pcm_state(pcm_handle_);
+          disconnected = state == SND_PCM_STATE_DISCONNECTED;
+          if (disconnected) {
+            closeDeviceLocked();
+          }
         }
       }
-      idle_rate.sleep();
+      if (disconnected) {
+        RCLCPP_WARN(this->get_logger(), "ALSA device disconnected; waiting for USB recovery");
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
   }
 }
