@@ -16,9 +16,11 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
-from fluent_dialogue_dora_interfaces.msg import AudioFrame
+from fv_speech_interfaces.msg import AudioFrame
 
+from .contracts import SoundSettings
 from .event_registry import EventRegistry
+from .wav_pcm import load_wav
 
 
 @dataclass(frozen=True)
@@ -31,27 +33,6 @@ class SayRequest:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
 
 
-@dataclass(frozen=True)
-class WavPcm:
-    data: bytes
-    sample_rate_hz: int
-    channels: int
-
-
-def load_wav(path: str) -> WavPcm:
-    with wave.open(path, "rb") as wav:
-        if wav.getcomptype() != "NONE":
-            raise ValueError(f"cue WAV must be uncompressed PCM: {path}")
-        if wav.getsampwidth() != 2:
-            raise ValueError(f"cue WAV must be PCM16: {path}")
-        channels = wav.getnchannels()
-        sample_rate_hz = wav.getframerate()
-        data = wav.readframes(wav.getnframes())
-    if channels <= 0 or sample_rate_hz <= 0 or not data:
-        raise ValueError(f"cue WAV is empty or has invalid format: {path}")
-    return WavPcm(data=data, sample_rate_hz=sample_rate_hz, channels=channels)
-
-
 class SoundboardNode(Node):
     def __init__(self) -> None:
         super().__init__("fv_soundboard")
@@ -62,6 +43,7 @@ class SoundboardNode(Node):
             str(self.get_parameter("registry_file").value),
             str(self.get_parameter("sounds_dir").value),
         )
+        self._settings = SoundSettings(True, frozenset())
 
         qos = QoSProfile(
             depth=10,
@@ -73,20 +55,56 @@ class SoundboardNode(Node):
         self._cue_pub = self.create_publisher(AudioFrame, "/audio/cue/frame", qos)
         self._marker_pub = self.create_publisher(String, "/fv/event/active", qos)
         self.create_subscription(String, "/fv/event", self._on_event, qos)
+        self.create_subscription(String, "/fv/sound/play", self._on_preview, qos)
+        settings_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.create_subscription(
+            String, "/fv/sound/settings", self._on_settings, settings_qos
+        )
         self.get_logger().info(
             f"fv_soundboard ready: {len(self._registry)} fixed events"
         )
 
-    def _on_event(self, msg: String) -> None:
+    def _on_settings(self, msg: String) -> None:
         try:
-            event = self._registry.resolve(msg.data)
+            settings = SoundSettings.from_json(msg.data)
+        except ValueError as exc:
+            self.get_logger().error(str(exc))
+            return
+        self._settings = settings
+        self.get_logger().info(
+            "sound settings applied: robot=%s disabled=%d"
+            % (
+                "on" if settings.robot_enabled else "off",
+                len(settings.disabled_events),
+            )
+        )
+
+    def _on_event(self, msg: String) -> None:
+        self._handle_event(msg.data, preview=False)
+
+    def _on_preview(self, msg: String) -> None:
+        self._handle_event(msg.data, preview=True)
+
+    def _handle_event(self, payload: str, *, preview: bool) -> None:
+        try:
+            event = self._registry.resolve(payload)
         except ValueError as exc:
             self.get_logger().error(str(exc))
             return
 
         suffix = uuid.uuid4().hex
-        if event.record:
+        if not preview and event.record:
             self._marker_pub.publish(String(data=event.record))
+        settings = self._settings
+        if not preview and (
+            not settings.robot_enabled or event.name in settings.disabled_events
+        ):
+            return
         if event.sound_path:
             try:
                 audio = load_wav(event.sound_path)

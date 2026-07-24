@@ -8,7 +8,7 @@
   <license>MIT</license>
   <buildtool_depend>ament_python</buildtool_depend>
   <exec_depend>ament_index_python</exec_depend>
-  <exec_depend>fluent_dialogue_dora_interfaces</exec_depend>
+  <exec_depend>fv_speech_interfaces</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
