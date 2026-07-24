@@ -1,0 +1,26 @@
+[package]
+name = "fv-video-event-describer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+
+[[bin]]
+name = "video_event_describer"
+path = "src/bin/video_event_describer.rs"
+required-features = ["ros2"]
+
+[features]
+default = []
+ros2 = ["dep:ctrlc", "dep:futures", "dep:r2r"]
+
+[dependencies]
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde_json = "1.0"
+ureq = { version = "=3.1.4", default-features = false, features = ["json"] }
+uuid = { version = "1.16", features = ["v4"] }
+
+ctrlc = { version = "3.5", optional = true }
+futures = { version = "0.3", optional = true }
+r2r = { version = "0.9.5", optional = true }

@@ -21,8 +21,6 @@ from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool
 
 try:
     from aiohttp import web
@@ -32,12 +30,11 @@ except ImportError:
     raise
 
 from .active_lock import ActiveLock
-from .api_server import build_app, start_episode, stop_episode
+from .api_server import build_app
 from .bag_recorder import BagRecorder
 from .event_bridge import EventMarkerBridge
 from .camera_writer import CameraWriterPool
 from .depth_republisher import DepthRepublisherPool
-from .environment_annotation_bridge import EnvironmentAnnotationBridge
 from .episode_store import EpisodeStore
 from .marker_manager import MarkerManager
 from .mux_tracker import MuxTracker
@@ -68,13 +65,6 @@ class FVEpisodeRecorderNode(Node):
         # re-published by fv_soundboard on this topic become episode markers.
         self.declare_parameter("event_active_topic", "/fv/event/active")
         self.declare_parameter("event_marker_enabled", True)
-        self.declare_parameter("environment_change_topic", "/environment/change")
-        self.declare_parameter(
-            "environment_annotation_topic", "/environment/annotation"
-        )
-        self.declare_parameter("episode_search_service", "/episode/search")
-        self.declare_parameter("environment_annotation_enabled", True)
-        self.declare_parameter("environment_auto_record_profile", "")
 
         self.output_dir = Path(self.get_parameter("output_dir").value)
         self.profiles_dir = Path(self.get_parameter("profiles_dir").value)
@@ -82,21 +72,6 @@ class FVEpisodeRecorderNode(Node):
         self.host = str(self.get_parameter("host").value)
         self.event_active_topic = str(self.get_parameter("event_active_topic").value)
         self.event_marker_enabled = bool(self.get_parameter("event_marker_enabled").value)
-        self.environment_change_topic = str(
-            self.get_parameter("environment_change_topic").value
-        )
-        self.environment_annotation_topic = str(
-            self.get_parameter("environment_annotation_topic").value
-        )
-        self.episode_search_service = str(
-            self.get_parameter("episode_search_service").value
-        )
-        self.environment_annotation_enabled = bool(
-            self.get_parameter("environment_annotation_enabled").value
-        )
-        self.environment_auto_record_profile = str(
-            self.get_parameter("environment_auto_record_profile").value
-        )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.store = EpisodeStore(self.output_dir)
@@ -121,23 +96,6 @@ class FVEpisodeRecorderNode(Node):
             self, self.store, self.marker_manager,
             topic=self.event_active_topic,
             enabled=self.event_marker_enabled,
-        )
-        self.environment_annotation_bridge = EnvironmentAnnotationBridge(
-            self,
-            self.store,
-            self.marker_manager,
-            change_topic=self.environment_change_topic,
-            annotation_topic=self.environment_annotation_topic,
-            search_service=self.episode_search_service,
-            enabled=self.environment_annotation_enabled,
-        )
-        ready_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        self._ready_pub = self.create_publisher(
-            Bool, "/episode/recorder/ready", ready_qos
         )
         # Track mux source (teleop vs VLA + controller name) so the play
         # modal can label each recording without having to decode the bag.
@@ -256,6 +214,9 @@ def main(args=None):
     # to 0 fps under MultiThreadedExecutor).
     executor = SingleThreadedExecutor()
     executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+
     # aiohttp loop in main thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -266,20 +227,6 @@ def main(args=None):
                     retention_runner=node.retention_runner,
                     depth_pool=node.depth_pool,
                     get_profile=node.get_profile)
-    node.environment_annotation_bridge.bind_lifecycle(
-        loop,
-        start_episode=lambda request: start_episode(app, request),
-        stop_episode=lambda episode_id, request: stop_episode(
-            app, episode_id, request
-        ),
-        profiles_dir=node.profiles_dir,
-        auto_profile_override=node.environment_auto_record_profile,
-    )
-
-    # Start ROS dispatch only after callbacks can hand events to the aiohttp
-    # loop. Events arriving before run_forever() are queued thread-safely.
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
-    spin_thread.start()
     # First mux discovery sweep happens on the 2s timer; trigger one now so
     # the very first POST /episodes already has a snapshot if publishers
     # came up before us.
@@ -294,7 +241,6 @@ def main(args=None):
     loop.run_until_complete(site.start())
 
     node.get_logger().info(f"aiohttp listening on http://{node.host}:{node.port}")
-    node._ready_pub.publish(Bool(data=True))
 
     # Background retention loop: ticks every policy.interval_s (default 300s).
     # No-op when policy.enabled is False (no episode_recorder.retention block

@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-
-set -euo pipefail
-
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export PYTHONPATH="${ROOT}/src/streaming/fv_episode_recorder${PYTHONPATH:+:${PYTHONPATH}}"
-exec python3 -m fv_episode_recorder.moss_runtime "$@"

@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>fv_video_event_describer</name>
+  <version>0.1.0</version>
+  <description>Rust 1 FPS video event segmentation and Qwen3-VL description node.</description>
+  <maintainer email="dev@fluentvision.io">FluentVision</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>fv_episode_msgs</build_depend>
+  <build_depend>libclang-dev</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <exec_depend>fv_episode_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export><build_type>ament_cmake</build_type></export>
+</package>

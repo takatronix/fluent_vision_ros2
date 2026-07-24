@@ -1,4 +1,0 @@
-string query
-uint32 limit
----
-string[] texts

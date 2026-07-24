@@ -14,7 +14,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   msg/EnvironmentChange.msg
   msg/EnvironmentEvent.msg
   msg/EpisodeMarker.msg
-  srv/EpisodeSearch.srv
   DEPENDENCIES std_msgs builtin_interfaces
 )
 

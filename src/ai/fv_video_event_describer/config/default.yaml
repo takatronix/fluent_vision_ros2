@@ -1,0 +1,16 @@
+video_event_describer:
+  ros__parameters:
+    image_topic: "/aspa/restamped/color_compressed"
+    change_topic: "/environment/change"
+    annotation_topic: "/environment/annotation"
+    sample_fps: 1.0
+    window_seconds: 32
+    start_changed_ratio: 0.03
+    stop_changed_ratio: 0.01
+    stable_frames: 2
+    vlm_url: "http://127.0.0.1:18082/v1/chat/completions"
+    vlm_model: "qwen3-vl-4b"
+    vlm_timeout_seconds: 120.0
+    recorder_api_url: "http://127.0.0.1:7798/api/v1"
+    recorder_profile: "aspa_dev"
+    recorder_timeout_seconds: 2.0

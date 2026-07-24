@@ -13,10 +13,11 @@ Other endpoints (markers, replay, export, disk, retention) land in later steps.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 from aiohttp import web
 
@@ -24,6 +25,7 @@ from .active_lock import ActiveLock
 from .batch_runner import BatchConfig, BatchRunner
 from .replay_runner import ReplayRunner
 from .bag_recorder import BagRecorder
+from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeMeta, EpisodeStore, new_episode_id, utc_now_iso
 from .marker_manager import MarkerManager
 from .preflight import run_preflight
@@ -36,19 +38,30 @@ from .schemas import (
     StopEpisodeResponse,
 )
 
-if TYPE_CHECKING:
-    from .camera_writer import CameraWriterPool
-
 LOG = logging.getLogger("fv_episode_recorder.api")
 
 
-class EpisodeLifecycleError(RuntimeError):
-    """A lifecycle failure that can be projected onto an HTTP response."""
+def resolve_environment() -> str:
+    """Resolve the runtime environment for the replay safety gate (REP-02).
 
-    def __init__(self, status: int, payload: dict[str, Any]):
-        super().__init__(str(payload.get("detail") or payload.get("error") or payload))
-        self.status = status
-        self.payload = payload
+    Order: explicit ASPA_ENVIRONMENT wins, else derived from ASPA_PROFILE,
+    else "unknown". Fail-closed — callers treat "unknown" like "real".
+    """
+    env = os.environ.get("ASPA_ENVIRONMENT")
+    if env:
+        return env
+    profile = os.environ.get("ASPA_PROFILE")
+    if profile:
+        if profile.endswith("_real"):
+            return "real"
+        if profile.endswith("_sim"):
+            return "sim"
+        if profile == "aspa_replay":
+            return "replay"
+        if profile == "aspa_dev":
+            return "dev"
+        return "unknown"
+    return "unknown"
 
 
 @web.middleware
@@ -324,16 +337,29 @@ async def _delete_marker(request: web.Request) -> web.Response:
     return web.json_response({"error": "not_found"}, status=404)
 
 
-async def start_episode(app, req: StartEpisodeRequest) -> StartEpisodeResponse:
-    """Start an episode through the canonical recorder lifecycle."""
-    store: EpisodeStore = app["store"]
+async def _start_episode(request: web.Request) -> web.Response:
+    try:
+        raw = await request.json()
+        req = StartEpisodeRequest(**raw)
+    except Exception as exc:
+        return web.json_response({"error": "invalid_request", "detail": str(exc)}, status=400)
+
+    store: EpisodeStore = request.app["store"]
     if store.active is not None:
-        raise EpisodeLifecycleError(
-            409,
-            {
-                "error": "conflict",
-                "detail": f"episode {store.active.episode_id} is already active",
-            },
+        return web.json_response(
+            {"error": "conflict", "detail": f"episode {store.active.episode_id} is already active"},
+            status=409,
+        )
+
+    # Refuse recording while a replay is running — the reverse of the guard in
+    # _replay_start — so the two runners don't fight over /tf and joint_cmd
+    # topics (and so we don't accidentally record the replayed bag).
+    replay: ReplayRunner = request.app["replay_runner"]
+    if replay.is_running():
+        return web.json_response(
+            {"error": "replay_active",
+             "detail": "stop the active replay before starting a recording"},
+            status=409,
         )
 
     ep_id = new_episode_id()
@@ -341,7 +367,7 @@ async def start_episode(app, req: StartEpisodeRequest) -> StartEpisodeResponse:
 
     # Step 4: profile-driven topic + camera discovery (override > profile auto)
     from .topic_discovery import discover_cameras, discover_topics
-    get_profile = app.get("get_profile")
+    get_profile = request.app.get("get_profile")
     profile_dict = get_profile(req.profile) if callable(get_profile) else {}
 
     if req.record_topics_override:
@@ -384,18 +410,15 @@ async def start_episode(app, req: StartEpisodeRequest) -> StartEpisodeResponse:
     )
     if not preflight["passed"]:
         LOG.warning("episode rejected by preflight: %s", preflight.get("blockers"))
-        raise EpisodeLifecycleError(
-            503,
-            {
-                "error": "disk_preflight_failed",
-                "preflight": preflight,
-                "code": "EPISODE_DISK_PREFLIGHT_FAILED",
-            },
+        return web.json_response(
+            {"error": "disk_preflight_failed", "preflight": preflight,
+             "code": "EPISODE_DISK_PREFLIGHT_FAILED"},
+            status=503,
         )
 
     # Snapshot mux state so the recording is labeled VLA vs teleop without
     # having to decode the bag.
-    mux_tracker = app.get("mux_tracker")
+    mux_tracker = request.app.get("mux_tracker")
     controller_at_start = mux_tracker.snapshot() if mux_tracker is not None else None
 
     meta = EpisodeMeta(
@@ -418,39 +441,36 @@ async def start_episode(app, req: StartEpisodeRequest) -> StartEpisodeResponse:
     try:
         ep_dir = store.start_episode(meta)
     except RuntimeError as exc:
-        raise EpisodeLifecycleError(
-            409, {"error": "conflict", "detail": str(exc)}
-        ) from exc
+        return web.json_response({"error": "conflict", "detail": str(exc)}, status=409)
 
-    bag_started = False
-    cameras_started: list[dict] = []
-    # Preserve the existing HTTP contract: lock, bag, and camera start are
-    # best-effort. Depth was already fail-loud; only that failure rolls back
-    # the active episode and any resources created before it.
-    active_lock: Optional[ActiveLock] = app.get("active_lock")
+    # Step 6: acquire active lock
+    active_lock: Optional[ActiveLock] = request.app.get("active_lock")
     if active_lock is not None:
         try:
             active_lock.acquire(ep_id, ep_dir)
         except Exception as exc:
             LOG.warning("active lock acquire failed: %s", exc)
 
-    depth_pool = app.get("depth_pool")
-    depth_cams = [
-        c for c in cameras_resolved
-        if isinstance(c, dict) and (c.get("kind") or "").lower() == "depth"
-    ]
+    # Step 2a: start depth republishers BEFORE bag recorder so the compressed
+    # topics have publishers before rosbag2 subscribes. Each depth camera
+    # gets an in-process Image → CompressedImage relay (PNG-compressed,
+    # lossless). Fail-loud: a republisher spawn failure aborts the episode.
+    depth_pool = request.app.get("depth_pool")
+    depth_cams = [c for c in cameras_resolved
+                  if isinstance(c, dict) and (c.get("kind") or "").lower() == "depth"]
     if depth_cams and depth_pool is not None:
         try:
             depth_pool.start_all(depth_cams)
         except Exception as exc:
             LOG.error("depth republisher start failed: %s", exc)
-            _rollback_episode_start(app, ep_id)
-            raise EpisodeLifecycleError(
-                500,
+            return web.json_response(
                 {"error": "depth_republisher_failed", "detail": str(exc)},
-            ) from exc
+                status=500,
+            )
 
-    bag_recorder: BagRecorder = app["bag_recorder"]
+    # Step 2: start bag recorder if topics provided and record_bag=true
+    bag_recorder: BagRecorder = request.app["bag_recorder"]
+    bag_started = False
     if req.record_bag and bag_topics:
         if not BagRecorder.available():
             LOG.warning("ros2 not available, skipping bag record")
@@ -460,13 +480,16 @@ async def start_episode(app, req: StartEpisodeRequest) -> StartEpisodeResponse:
                 bag_started = True
             except Exception as exc:
                 LOG.error("bag recorder start failed: %s", exc)
+                # Don't fail the whole episode; record meta and continue.
 
-    camera_pool: CameraWriterPool = app["camera_pool"]
+    # Step 3+4: start camera writers (resolved from override or profile).
+    # kind=depth entries are skipped here — they're bagged via the
+    # republisher, not written to disk as a separate mp4/png stream.
+    camera_pool: CameraWriterPool = request.app["camera_pool"]
+    cameras_started: list[dict] = []
     if cameras_resolved:
         try:
-            cameras_started = camera_pool.start_all(
-                ep_dir, cameras_resolved, fps=req.fps
-            )
+            cameras_started = camera_pool.start_all(ep_dir, cameras_resolved, fps=req.fps)
             meta.cameras = cameras_started
             store._write_meta(ep_dir, meta)  # noqa: SLF001
         except Exception as exc:
@@ -478,140 +501,64 @@ async def start_episode(app, req: StartEpisodeRequest) -> StartEpisodeResponse:
         bag_path=str((ep_dir / "bag").resolve()),
         meta_path=str((ep_dir / "meta.json").resolve()),
         recorded_topics_resolved=meta.recorded_topics,
-        preflight={
-            **preflight,
-            "bag_started": bag_started,
-            "cameras_started": [c["name"] for c in cameras_started],
-        },
+        preflight={**preflight, "bag_started": bag_started,
+                   "cameras_started": [c["name"] for c in cameras_started]},
     )
     LOG.info("episode started: %s task=%s profile=%s bag_topics=%d bag_started=%s",
              ep_id, req.task_description, req.profile, len(bag_topics), bag_started)
-    return resp
-
-
-def _rollback_episode_start(app, episode_id: str) -> None:
-    """Best-effort rollback after EpisodeStore has made an episode active."""
-    camera_pool = app.get("camera_pool")
-    if camera_pool is not None:
-        try:
-            camera_pool.stop_all()
-        except Exception as exc:
-            LOG.warning("camera rollback failed: %s", exc)
-
-    bag_recorder = app.get("bag_recorder")
-    if bag_recorder is not None:
-        try:
-            bag_recorder.abort()
-        except Exception as exc:
-            LOG.warning("bag rollback failed: %s", exc)
-
-    depth_pool = app.get("depth_pool")
-    if depth_pool is not None:
-        try:
-            depth_pool.stop_all()
-        except Exception as exc:
-            LOG.warning("depth rollback failed: %s", exc)
-
-    marker_manager = app.get("marker_manager")
-    if marker_manager is not None:
-        try:
-            marker_manager.flush(episode_id)
-        except Exception as exc:
-            LOG.warning("marker rollback failed: %s", exc)
-
-    store: EpisodeStore = app["store"]
-    if store.active is not None and store.active.episode_id == episode_id:
-        try:
-            store.stop_active("abort")
-        except Exception as exc:
-            LOG.warning("episode rollback finalize failed: %s", exc)
-
-    active_lock = app.get("active_lock")
-    if active_lock is not None and store.active is None:
-        try:
-            active_lock.release()
-        except Exception as exc:
-            LOG.warning("active lock rollback failed: %s", exc)
-    elif active_lock is not None:
-        LOG.error(
-            "active lock retained because episode rollback did not clear %s",
-            store.active.episode_id,
-        )
-
-
-async def _start_episode(request: web.Request) -> web.Response:
-    try:
-        req = StartEpisodeRequest(**(await request.json()))
-    except Exception as exc:
-        return web.json_response(
-            {"error": "invalid_request", "detail": str(exc)}, status=400
-        )
-    try:
-        resp = await start_episode(request.app, req)
-    except EpisodeLifecycleError as exc:
-        return web.json_response(exc.payload, status=exc.status)
     return web.json_response(resp.model_dump(), status=201)
 
 
-async def stop_episode(
-    app, episode_id: str, req: StopEpisodeRequest
-) -> StopEpisodeResponse:
-    """Stop an episode while completing every cleanup stage best-effort."""
-    store: EpisodeStore = app["store"]
+async def _stop_episode(request: web.Request) -> web.Response:
+    episode_id = request.match_info["episode_id"]
+    try:
+        raw = await request.json()
+        req = StopEpisodeRequest(**raw)
+    except Exception as exc:
+        return web.json_response({"error": "invalid_request", "detail": str(exc)}, status=400)
+
+    store: EpisodeStore = request.app["store"]
     if store.active is None:
-        raise EpisodeLifecycleError(409, {"error": "no_active_episode"})
+        return web.json_response({"error": "no_active_episode"}, status=409)
     if store.active.episode_id != episode_id:
-        raise EpisodeLifecycleError(
-            409,
-            {
-                "error": "episode_mismatch",
-                "detail": (
-                    f"active is {store.active.episode_id}, requested {episode_id}"
-                ),
-            },
+        return web.json_response(
+            {"error": "episode_mismatch",
+             "detail": f"active is {store.active.episode_id}, requested {episode_id}"},
+            status=409,
         )
 
-    cleanup_errors: list[str] = []
-
-    # Stop bag first so metadata.yaml is flushed before final meta write.
-    bag_recorder: BagRecorder = app["bag_recorder"]
+    # Step 2: stop bag recorder first so metadata.yaml is flushed before meta write
+    bag_recorder: BagRecorder = request.app["bag_recorder"]
     bag_summary: dict = {"size_bytes": 0, "split_count": 0}
-    try:
-        if bag_recorder.active:
-            bag_summary = bag_recorder.stop(timeout_s=10.0)
-        elif req.outcome == "discard":
-            bag_recorder.abort()
-    except Exception as exc:
-        cleanup_errors.append(f"bag: {exc}")
-        LOG.warning("bag stop failed for %s: %s", episode_id, exc)
-        try:
-            bag_recorder.abort()
-        except Exception as abort_exc:
-            cleanup_errors.append(f"bag_abort: {abort_exc}")
-            LOG.warning("bag abort failed for %s: %s", episode_id, abort_exc)
+    if bag_recorder.active:
+        bag_summary = bag_recorder.stop(timeout_s=10.0)
+    elif req.outcome == "discard":
+        bag_recorder.abort()
 
-    depth_pool = app.get("depth_pool")
+    # Step 2b: stop depth republishers AFTER bag (so any in-flight compressed
+    # frames make it into the bag's final flush). The republisher pool
+    # returns per-camera frame counts which we hand to camera_pool so the
+    # depth placeholder summaries carry a real frame_count (without this
+    # the play modal shows '0 frames' even though the bag has them).
+    depth_pool = request.app.get("depth_pool")
     depth_frame_counts: dict[str, int] = {}
     if depth_pool is not None:
         try:
             depth_frame_counts = depth_pool.stop_all() or {}
         except Exception as exc:
-            cleanup_errors.append(f"depth: {exc}")
             LOG.warning("depth republisher stop failed: %s", exc)
-    camera_pool: CameraWriterPool = app["camera_pool"]
+    camera_pool: CameraWriterPool = request.app["camera_pool"]
     if depth_frame_counts:
         try:
             camera_pool.apply_depth_frame_counts(depth_frame_counts)
         except Exception as exc:
-            cleanup_errors.append(f"depth_frame_counts: {exc}")
             LOG.warning("depth frame_count apply failed: %s", exc)
 
-    camera_summaries: list[dict] = []
-    try:
-        camera_summaries = camera_pool.stop_all()
-    except Exception as exc:
-        cleanup_errors.append(f"camera: {exc}")
-        LOG.warning("camera stop failed for %s: %s", episode_id, exc)
+    # Step 3: stop camera writers, gather frame_count summaries. Called
+    # unconditionally because depth_bag placeholders also need to flush —
+    # a depth-only episode has no mp4 writers so is_active() is False but
+    # the placeholders must still come out for the play modal.
+    camera_summaries: list[dict] = camera_pool.stop_all()
     frame_count_per_camera: dict[str, int] = {}
     video_size_bytes = 0
     for cs in camera_summaries:
@@ -619,70 +566,39 @@ async def stop_episode(
         for seg in cs.get("segments", []):
             video_size_bytes += int(seg.get("size_bytes", 0))
 
-    mm: MarkerManager = app["marker_manager"]
-    pending_markers: list[dict] = []
-    try:
-        pending_markers = mm.flush(episode_id)
-    except Exception as exc:
-        cleanup_errors.append(f"markers: {exc}")
-        LOG.warning("marker flush failed for %s: %s", episode_id, exc)
+    # Flush markers (Phase 2) from in-memory manager into meta.json
+    mm: MarkerManager = request.app["marker_manager"]
+    pending_markers = mm.flush(episode_id)
 
-    # Put summaries and markers on the active meta before stop_active writes
-    # the canonical final meta.json. This keeps marker persistence inside the
-    # store finalization step instead of relying on a second write afterwards.
-    try:
-        active_meta = store.active
-        if active_meta is not None:
-            active_meta.bag_split_count = int(bag_summary.get("split_count", 0))
-            if camera_summaries:
-                active_meta.cameras = camera_summaries
-            if pending_markers:
-                active_meta.markers = pending_markers
-                variants = _collect_detected_variants(pending_markers)
-                if variants:
-                    active_meta.detected_variants = variants
-            mux_tracker = app.get("mux_tracker")
-            if mux_tracker is not None:
-                active_meta.controller_at_end = mux_tracker.snapshot()
-    except Exception as exc:
-        cleanup_errors.append(f"meta: {exc}")
-        LOG.warning("final meta preparation failed for %s: %s", episode_id, exc)
-
-    meta = None
-    ep_dir = None
-    try:
-        meta, ep_dir = store.stop_active(req.outcome)
-    except Exception as exc:
-        cleanup_errors.append(f"store: {exc}")
-        LOG.error("episode finalize failed for %s: %s", episode_id, exc)
-
-    # An active store must retain its lock. If finalization failed before the
-    # store cleared active state, keeping the lock prevents a second recorder
-    # lifecycle from being admitted over partially-cleaned resources.
-    active_lock: Optional[ActiveLock] = app.get("active_lock")
-    if active_lock is not None and store.active is None:
-        try:
-            active_lock.release()
-        except Exception as exc:
-            cleanup_errors.append(f"lock: {exc}")
-            LOG.warning("active lock release failed: %s", exc)
-    elif active_lock is not None:
-        cleanup_errors.append("lock retained: store is still active")
-        LOG.error("active lock retained for unfinished episode %s", episode_id)
-
-    if meta is None or ep_dir is None:
-        raise EpisodeLifecycleError(
-            500,
-            {
-                "error": "episode_finalize_failed",
-                "detail": "; ".join(cleanup_errors),
-            },
-        )
+    meta, ep_dir = store.stop_active(req.outcome)
+    # Update meta with bag size + split_count + camera summaries + markers
+    meta.bag_split_count = int(bag_summary.get("split_count", 0))
+    if camera_summaries:
+        meta.cameras = camera_summaries
+    if pending_markers:
+        meta.markers = pending_markers
+        # Roll up detected object variants/grades (Event Bus `detect` markers)
+        # to an episode-level list so the training-data query "which grades did
+        # this run touch?" doesn't have to scan every marker's attributes.
+        variants = _collect_detected_variants(pending_markers)
+        if variants:
+            meta.detected_variants = variants
+    # Snapshot mux state at stop — used by the UI to tell operator-after-
+    # the-fact whether THIS run was VLA (with which controller) or teleop.
+    mux_tracker = request.app.get("mux_tracker")
+    if mux_tracker is not None:
+        meta.controller_at_end = mux_tracker.snapshot()
+    store._write_meta(ep_dir, meta)  # noqa: SLF001 — local helper, store is single owner
 
     # If discard, blow away the dir entirely
     if req.outcome == "discard":
         shutil.rmtree(ep_dir, ignore_errors=True)
         LOG.info("episode discarded and dir removed: %s", episode_id)
+
+    # Step 6: release active lock
+    active_lock: Optional[ActiveLock] = request.app.get("active_lock")
+    if active_lock is not None:
+        active_lock.release()
 
     resp = StopEpisodeResponse(
         episode_id=meta.episode_id,
@@ -698,28 +614,6 @@ async def stop_episode(
         episode_id, req.outcome, resp.duration_s,
         resp.bag_size_bytes, resp.video_size_bytes, frame_count_per_camera,
     )
-    if cleanup_errors:
-        LOG.warning(
-            "episode %s finalized with cleanup errors: %s",
-            episode_id,
-            "; ".join(cleanup_errors),
-        )
-    return resp
-
-
-async def _stop_episode(request: web.Request) -> web.Response:
-    try:
-        req = StopEpisodeRequest(**(await request.json()))
-    except Exception as exc:
-        return web.json_response(
-            {"error": "invalid_request", "detail": str(exc)}, status=400
-        )
-    try:
-        resp = await stop_episode(
-            request.app, request.match_info["episode_id"], req
-        )
-    except EpisodeLifecycleError as exc:
-        return web.json_response(exc.payload, status=exc.status)
     return web.json_response(resp.model_dump(), status=200)
 
 
@@ -1336,29 +1230,41 @@ async def _batch_start(request: web.Request) -> web.Response:
             status=409,
         )
 
+    # Run the existing start/stop handlers in-process — keeps a single
+    # code path (preflight, profile resolution, mux snapshot, lock).
+    # aiohttp doesn't have a public sub-request API; a tiny shim is
+    # enough since both handlers only use `request.json()`, `request.app`,
+    # and `request.match_info`.
     async def _start(body: dict) -> dict:
-        try:
-            return (await start_episode(
-                request.app, StartEpisodeRequest(**body)
-            )).model_dump()
-        except EpisodeLifecycleError as exc:
-            import json as _json
-            detail = _json.dumps(exc.payload)[:200]
-            raise RuntimeError(
-                f"start_episode HTTP {exc.status}: {detail}"
-            ) from exc
+        class _Shim:
+            def __init__(self, parent, payload):
+                self.app = parent.app
+                self.match_info = {}
+                self._payload = payload
+            async def json(self):
+                return self._payload
+            @property
+            def query(self):
+                return {}
+        resp = await _start_episode(_Shim(request, body))  # type: ignore[arg-type]
+        if resp.status >= 400:
+            raise RuntimeError(f"start_episode HTTP {resp.status}: {resp.body.decode('utf-8', 'replace')[:200]}")
+        import json as _json
+        return _json.loads(resp.body)
 
     async def _stop(ep_id: str, outcome: str) -> dict:
-        try:
-            return (await stop_episode(
-                request.app, ep_id, StopEpisodeRequest(outcome=outcome)
-            )).model_dump()
-        except EpisodeLifecycleError as exc:
-            import json as _json
-            detail = _json.dumps(exc.payload)[:200]
-            raise RuntimeError(
-                f"stop_episode HTTP {exc.status}: {detail}"
-            ) from exc
+        class _Shim:
+            def __init__(self, parent, ep, payload):
+                self.app = parent.app
+                self.match_info = {"episode_id": ep}
+                self._payload = payload
+            async def json(self):
+                return self._payload
+        resp = await _stop_episode(_Shim(request, ep_id, {"outcome": outcome}))  # type: ignore[arg-type]
+        if resp.status >= 400:
+            raise RuntimeError(f"stop_episode HTTP {resp.status}: {resp.body.decode('utf-8', 'replace')[:200]}")
+        import json as _json
+        return _json.loads(resp.body)
 
     state = await runner.start(cfg, _start, _stop)
     return web.json_response(state.to_dict(), status=202)
@@ -1455,6 +1361,24 @@ async def _replay_start(request: web.Request) -> web.Response:
     person/home_pose/e-stop precheck + ack token before real-hardware mode.
     """
     from datetime import datetime, timezone
+
+    # REP-02 real-environment gate (fail-closed). Bag replay republishes
+    # /cmd_vel, /cmd_vel_nav, /odom straight to the motor driver, so it is
+    # forbidden on real hardware and on any environment we cannot identify.
+    # ASPA_ALLOW_REPLAY=1 is a bench-testing escape hatch that bypasses the
+    # gate ONLY when the environment is "unknown" — never when it is "real".
+    environment = resolve_environment()
+    if environment == "real" or (
+        environment == "unknown" and os.environ.get("ASPA_ALLOW_REPLAY") != "1"
+    ):
+        LOG.warning("replay refused: forbidden environment %r (REP-02)", environment)
+        return web.json_response(
+            {"error": "replay_forbidden",
+             "environment": environment,
+             "detail": "ROS bag replay is forbidden outside sim/replay environments (REP-02)"},
+            status=403,
+        )
+
     store: EpisodeStore = request.app["store"]
     episode_id = request.match_info["episode_id"]
     found = store.get_episode(episode_id)
