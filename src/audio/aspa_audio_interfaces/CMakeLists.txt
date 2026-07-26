@@ -9,6 +9,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   msg/PlaybackControl.msg
   msg/PlaybackEvent.msg
   msg/PlaybackFrame.msg
+  msg/SpeechMark.msg
+  msg/SynthesizedSpeech.msg
   srv/FlushAudio.srv
 )
 

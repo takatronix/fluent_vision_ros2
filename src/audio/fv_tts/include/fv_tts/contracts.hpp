@@ -14,6 +14,25 @@ struct SayRequest {
   std::string text;
 };
 
+struct SynthesisMark {
+  std::uint64_t source_start;
+  std::uint64_t source_end;
+  std::string surface;
+  std::string pronunciation;
+  std::uint64_t mora_start;
+  std::uint64_t mora_end;
+  std::uint64_t start_frame;
+  std::uint64_t end_frame;
+
+  bool operator==(const SynthesisMark &other) const {
+    return source_start == other.source_start &&
+           source_end == other.source_end && surface == other.surface &&
+           pronunciation == other.pronunciation &&
+           mora_start == other.mora_start && mora_end == other.mora_end &&
+           start_frame == other.start_frame && end_frame == other.end_frame;
+  }
+};
+
 struct TtsSettings {
   std::uint32_t style_id;
 };

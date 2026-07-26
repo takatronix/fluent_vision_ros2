@@ -24,6 +24,9 @@ SynthesizedAudio make_audio(std::uint8_t seed, std::size_t frames = 8) {
   audio.sample_rate_hz = 24000;
   audio.channels = 1;
   audio.bit_depth = 16;
+  audio.marks = {
+      SynthesisMark{0, 1, "あ", "ア", 0, 1, 0,
+                    static_cast<std::uint64_t>(frames)}};
   return audio;
 }
 
@@ -69,6 +72,7 @@ TEST(SynthesisCache, StoresAndReturnsTheSameAudio) {
   EXPECT_EQ(hit->pcm, audio.pcm);
   EXPECT_EQ(hit->sample_rate_hz, audio.sample_rate_hz);
   EXPECT_EQ(hit->channels, audio.channels);
+  EXPECT_EQ(hit->marks, audio.marks);
   EXPECT_EQ(cache.hits(), 1U);
   EXPECT_EQ(cache.misses(), 1U);
 }

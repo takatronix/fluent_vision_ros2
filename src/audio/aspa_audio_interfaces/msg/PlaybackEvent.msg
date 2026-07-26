@@ -19,4 +19,7 @@ uint8 kind
 string utterance_id
 uint64 played_frames
 uint64 total_frames
+bool source_position_valid
+uint64 played_source_characters
+uint64 total_source_characters
 uint64 playout_generation

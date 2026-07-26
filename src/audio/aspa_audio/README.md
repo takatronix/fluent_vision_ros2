@@ -82,6 +82,9 @@ colcon workspace or an underlay.
 
 Playback coordination uses typed messages throughout:
 
+- `/audio/agent/frame`: `aspa_audio_interfaces/msg/SynthesizedSpeech`
+- `/audio/system/frame`: `aspa_audio_interfaces/msg/SynthesizedSpeech`
+- `/audio/cue/frame`: `fv_speech_interfaces/msg/AudioFrame`
 - `/audio/playback/control`: `aspa_audio_interfaces/msg/PlaybackControl`
 - `/audio/playback/event`: `aspa_audio_interfaces/msg/PlaybackEvent`
 - `/audio/play`: `aspa_audio_interfaces/msg/PlaybackFrame`
@@ -98,3 +101,9 @@ the utterance ID as a bounded tombstone, so it cannot invalidate a different
 SYSTEM utterance when DDS topics are reordered. Initial values are wall-clock
 milliseconds, kept within JavaScript's safe integer range, so a controller-only
 restart cannot make a still-connected browser reject new PCM as stale.
+
+Agent and SYSTEM speech arrive as one complete PCM payload with source
+alignment marks. GStreamer performs sample-rate and channel conversion; the
+controller scales mark frame offsets with the same rate ratio and ties-to-even
+rounding. Agent `PlaybackEvent` reports only source spans whose ending frame
+has physically drained. Cue audio has no source-text position.

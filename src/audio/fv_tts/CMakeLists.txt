@@ -9,14 +9,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(ament_cmake REQUIRED)
 find_package(aspa_audio_interfaces REQUIRED)
-find_package(fv_speech_interfaces REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 
-# voicevox_core is an official, pinned external binary installed by
-# scripts/setup-voicevox-core.  An explicit cache value wins, followed by the
+# voicevox_core is the pinned ASPA source-alignment build installed by
+# scripts/setup-voicevox-core. An explicit cache value wins, followed by the
 # setup script's environment/default locations and then normal system paths.
 set(VOICEVOX_CORE_ROOT "" CACHE PATH "Root containing voicevox_core include/ and lib/")
 set(_voicevox_core_hints "")
@@ -49,9 +48,25 @@ if(NOT VOICEVOX_CORE_INCLUDE_DIR OR NOT VOICEVOX_CORE_LIBRARY)
     "configure with -DVOICEVOX_CORE_ROOT=/path/to/voicevox_core.")
 endif()
 get_filename_component(VOICEVOX_CORE_LIBRARY_DIR "${VOICEVOX_CORE_LIBRARY}" DIRECTORY)
+include(CheckCXXSymbolExists)
+set(CMAKE_REQUIRED_INCLUDES "${VOICEVOX_CORE_INCLUDE_DIR}")
+set(CMAKE_REQUIRED_LIBRARIES "${VOICEVOX_CORE_LIBRARY}")
+check_cxx_symbol_exists(
+  voicevox_open_jtalk_rc_analyze_with_source_map
+  "voicevox_core.h"
+  VOICEVOX_CORE_HAS_SOURCE_MAP
+)
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_REQUIRED_LIBRARIES)
+if(NOT VOICEVOX_CORE_HAS_SOURCE_MAP)
+  message(FATAL_ERROR
+    "voicevox_core does not provide the required ASPA source-map API. "
+    "Run scripts/setup-voicevox-core and rebuild fv_tts.")
+endif()
 
 add_library(fv_tts_core STATIC
   src/contracts.cpp
+  src/source_alignment.cpp
   src/synthesis_cache.cpp
   src/synthesis_scheduler.cpp
   src/synthesis_watchdog.cpp
@@ -74,7 +89,6 @@ add_executable(fv_tts_node src/tts_node.cpp)
 target_link_libraries(fv_tts_node fv_tts_core "${VOICEVOX_CORE_LIBRARY}")
 ament_target_dependencies(fv_tts_node
   aspa_audio_interfaces
-  fv_speech_interfaces
   rclcpp
   std_msgs
   std_srvs
@@ -100,6 +114,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_fv_tts_core
     test/test_contracts.cpp
+    test/test_source_alignment.cpp
     test/test_synthesis_cache.cpp
     test/test_synthesis_scheduler.cpp
     test/test_synthesis_watchdog.cpp

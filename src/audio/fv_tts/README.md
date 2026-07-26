@@ -1,9 +1,17 @@
 # fv_tts
 
-`fv_tts` is an `rclcpp` node that calls the official VOICEVOX Core 0.16.4 C
-API in-process. It subscribes to `/aspa/tts/say` and publishes PCM16LE to
-`/audio/agent/frame` or `/audio/system/frame`; no Python runtime and no
-VOICEVOX Engine HTTP process are involved.
+`fv_tts` is an `rclcpp` node that calls a pinned VOICEVOX Core 0.16.4 C API
+extension in-process. The extension preserves the source Unicode-character
+range that produced each mora. It subscribes to `/aspa/tts/say` and publishes
+`aspa_audio_interfaces/msg/SynthesizedSpeech` to `/audio/agent/frame` or
+`/audio/system/frame`; no Python runtime and no VOICEVOX Engine HTTP process
+are involved.
+
+Each `SynthesizedSpeech` atomically contains PCM16LE and `SpeechMark[]`.
+The marks carry source-character, mora, and synthesized-frame ranges. The
+AudioQuery duration must exactly match the resulting PCM length; a missing or
+inconsistent mapping fails synthesis instead of estimating a character
+position.
 
 Native synthesis is serialized. Pending SYSTEM requests overtake pending agent
 requests. Typed `aspa_audio_interfaces/msg/PlaybackControl` messages on
@@ -46,8 +54,8 @@ TRANSIENT_LOCAL on `/aspa/tts/voices`:
 {"version":1,"current_style_id":30,"voices":[{"id":30,"speaker":"No.7","style":"アナウンス","label":"No.7 / アナウンス"}]}
 ```
 
-Install the pinned Linux arm64 C API, ONNX Runtime, Open JTalk dictionary, and
-talk models before building:
+Build the pinned Linux arm64 C API extension and install the accepted ONNX
+Runtime, Open JTalk dictionary, and talk models before building:
 
 ```bash
 scripts/setup-voicevox-core

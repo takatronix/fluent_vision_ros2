@@ -22,6 +22,7 @@ struct SynthesizedAudio {
   std::uint32_t sample_rate_hz;
   std::uint32_t channels;
   std::uint32_t bit_depth{16};
+  std::vector<SynthesisMark> marks;
 };
 
 enum class SubmitStatus { kAccepted, kStale, kCancelled };

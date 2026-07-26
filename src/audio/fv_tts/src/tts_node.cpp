@@ -1,5 +1,6 @@
 #include <aspa_audio_interfaces/msg/playback_control.hpp>
-#include <fv_speech_interfaces/msg/audio_frame.hpp>
+#include <aspa_audio_interfaces/msg/speech_mark.hpp>
+#include <aspa_audio_interfaces/msg/synthesized_speech.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -27,7 +28,8 @@ namespace fv_tts {
 namespace {
 
 using PlaybackControl = aspa_audio_interfaces::msg::PlaybackControl;
-using AudioFrame = fv_speech_interfaces::msg::AudioFrame;
+using SpeechMark = aspa_audio_interfaces::msg::SpeechMark;
+using SynthesizedSpeech = aspa_audio_interfaces::msg::SynthesizedSpeech;
 using String = std_msgs::msg::String;
 
 void validate_playback_control(const PlaybackControl &control) {
@@ -174,8 +176,10 @@ class FvTtsNode final : public rclcpp::Node {
     const auto qos = rclcpp::QoS(rclcpp::KeepLast(10))
                          .reliable()
                          .durability_volatile();
-    agent_pub_ = create_publisher<AudioFrame>("/audio/agent/frame", qos);
-    system_pub_ = create_publisher<AudioFrame>("/audio/system/frame", qos);
+    agent_pub_ =
+        create_publisher<SynthesizedSpeech>("/audio/agent/frame", qos);
+    system_pub_ =
+        create_publisher<SynthesizedSpeech>("/audio/system/frame", qos);
     result_pub_ = create_publisher<String>("/aspa/tts/result", qos);
 
     scheduler_ = std::make_unique<SynthesisScheduler>(
@@ -370,30 +374,33 @@ class FvTtsNode final : public rclcpp::Node {
             0U) {
       throw std::runtime_error("VOICEVOX returned empty or malformed audio");
     }
-    const auto frame_count =
-        audio.pcm.size() / (static_cast<std::size_t>(audio.channels) * 2U);
-    if (frame_count > std::numeric_limits<std::uint32_t>::max()) {
-      throw std::runtime_error("VOICEVOX audio exceeds AudioFrame capacity");
+    if (audio.marks.empty()) {
+      throw std::runtime_error(
+          "VOICEVOX returned audio without source alignment");
     }
 
-    AudioFrame message;
-    message.header.stamp = get_clock()->now();
-    message.source_id = "fv_tts";
-    message.stream_id = request.utterance_id;
-    message.seq = 0;
-    message.sample_index = 0;
-    message.capture_time_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
-    message.frame_count = static_cast<std::uint32_t>(frame_count);
-    message.encoding = "PCM16LE";
+    SynthesizedSpeech message;
+    message.kind = request.kind == SpeechKind::kAgent
+                       ? SynthesizedSpeech::AGENT
+                       : SynthesizedSpeech::SYSTEM;
+    message.utterance_id = request.utterance_id;
     message.sample_rate_hz = audio.sample_rate_hz;
     message.channels = audio.channels;
     message.bit_depth = audio.bit_depth;
-    message.layout = "interleaved";
-    message.data = audio.pcm;
-    message.final = true;
+    message.pcm_s16le = audio.pcm;
+    message.marks.reserve(audio.marks.size());
+    for (const auto &mark : audio.marks) {
+      SpeechMark output;
+      output.source_start = mark.source_start;
+      output.source_end = mark.source_end;
+      output.surface = mark.surface;
+      output.pronunciation = mark.pronunciation;
+      output.mora_start = mark.mora_start;
+      output.mora_end = mark.mora_end;
+      output.start_frame = mark.start_frame;
+      output.end_frame = mark.end_frame;
+      message.marks.push_back(std::move(output));
+    }
 
     if (request.kind == SpeechKind::kAgent) {
       agent_pub_->publish(message);
@@ -432,8 +439,8 @@ class FvTtsNode final : public rclcpp::Node {
   std::thread warmup_thread_;
   std::atomic<bool> warmup_stop_{false};
   SynthesisTimeout synthesis_timeout_{60.0};
-  rclcpp::Publisher<AudioFrame>::SharedPtr agent_pub_;
-  rclcpp::Publisher<AudioFrame>::SharedPtr system_pub_;
+  rclcpp::Publisher<SynthesizedSpeech>::SharedPtr agent_pub_;
+  rclcpp::Publisher<SynthesizedSpeech>::SharedPtr system_pub_;
   rclcpp::Publisher<String>::SharedPtr result_pub_;
   rclcpp::Publisher<String>::SharedPtr voices_pub_;
   rclcpp::Subscription<String>::SharedPtr say_subscription_;

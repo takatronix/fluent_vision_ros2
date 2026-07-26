@@ -14,7 +14,7 @@ namespace {
 constexpr std::array<char, 4> kMagic{'F', 'V', 'T', 'C'};
 // 形式を変えたら上げる。古いファイルは decode が弾いて miss になるだけで、
 // 消さなくても害はない (予算超過で古い順に落ちる)。
-constexpr std::uint32_t kFormatVersion = 1;
+constexpr std::uint32_t kFormatVersion = 2;
 constexpr const char *kSuffix = ".fvtc";
 
 std::uint64_t fnv1a64(const std::string &value, std::uint64_t seed) {
@@ -153,7 +153,12 @@ std::vector<std::uint8_t> SynthesisCache::encode(const std::string &identity,
                                                  const std::string &text,
                                                  const SynthesizedAudio &audio) {
   std::vector<std::uint8_t> blob;
-  blob.reserve(64 + identity.size() + text.size() + audio.pcm.size());
+  std::size_t mark_bytes = 0;
+  for (const auto &mark : audio.marks) {
+    mark_bytes += 64 + mark.surface.size() + mark.pronunciation.size();
+  }
+  blob.reserve(72 + identity.size() + text.size() + audio.pcm.size() +
+               mark_bytes);
   blob.insert(blob.end(), kMagic.begin(), kMagic.end());
   append_u32(blob, kFormatVersion);
   append_u32(blob, style_id);
@@ -163,8 +168,22 @@ std::vector<std::uint8_t> SynthesisCache::encode(const std::string &identity,
   append_u64(blob, static_cast<std::uint64_t>(identity.size()));
   append_u64(blob, static_cast<std::uint64_t>(text.size()));
   append_u64(blob, static_cast<std::uint64_t>(audio.pcm.size()));
+  append_u64(blob, static_cast<std::uint64_t>(audio.marks.size()));
   blob.insert(blob.end(), identity.begin(), identity.end());
   blob.insert(blob.end(), text.begin(), text.end());
+  for (const auto &mark : audio.marks) {
+    append_u64(blob, mark.source_start);
+    append_u64(blob, mark.source_end);
+    append_u64(blob, mark.mora_start);
+    append_u64(blob, mark.mora_end);
+    append_u64(blob, mark.start_frame);
+    append_u64(blob, mark.end_frame);
+    append_u64(blob, static_cast<std::uint64_t>(mark.surface.size()));
+    append_u64(blob, static_cast<std::uint64_t>(mark.pronunciation.size()));
+    blob.insert(blob.end(), mark.surface.begin(), mark.surface.end());
+    blob.insert(blob.end(), mark.pronunciation.begin(),
+                mark.pronunciation.end());
+  }
   blob.insert(blob.end(), audio.pcm.begin(), audio.pcm.end());
   return blob;
 }
@@ -183,6 +202,7 @@ std::optional<SynthesizedAudio> SynthesisCache::decode(
   std::uint64_t identity_length = 0;
   std::uint64_t text_length = 0;
   std::uint64_t pcm_length = 0;
+  std::uint64_t mark_count = 0;
   if (!read_u32(blob, offset, format) || format != kFormatVersion ||
       !read_u32(blob, offset, stored_style) ||
       !read_u32(blob, offset, audio.sample_rate_hz) ||
@@ -190,7 +210,8 @@ std::optional<SynthesizedAudio> SynthesisCache::decode(
       !read_u32(blob, offset, audio.bit_depth) ||
       !read_u64(blob, offset, identity_length) ||
       !read_u64(blob, offset, text_length) ||
-      !read_u64(blob, offset, pcm_length)) {
+      !read_u64(blob, offset, pcm_length) ||
+      !read_u64(blob, offset, mark_count)) {
     return std::nullopt;
   }
   std::string stored_identity;
@@ -204,12 +225,51 @@ std::optional<SynthesizedAudio> SynthesisCache::decode(
       stored_text != text) {
     return std::nullopt;
   }
+  if (mark_count == 0 || mark_count > blob.size() / 64U) {
+    return std::nullopt;
+  }
+  audio.marks.reserve(static_cast<std::size_t>(mark_count));
+  for (std::uint64_t index = 0; index < mark_count; ++index) {
+    SynthesisMark mark{};
+    std::uint64_t surface_length = 0;
+    std::uint64_t pronunciation_length = 0;
+    if (!read_u64(blob, offset, mark.source_start) ||
+        !read_u64(blob, offset, mark.source_end) ||
+        !read_u64(blob, offset, mark.mora_start) ||
+        !read_u64(blob, offset, mark.mora_end) ||
+        !read_u64(blob, offset, mark.start_frame) ||
+        !read_u64(blob, offset, mark.end_frame) ||
+        !read_u64(blob, offset, surface_length) ||
+        !read_u64(blob, offset, pronunciation_length) ||
+        !read_bytes(blob, offset, surface_length, mark.surface) ||
+        !read_bytes(blob, offset, pronunciation_length, mark.pronunciation)) {
+      return std::nullopt;
+    }
+    const auto previous_source_end =
+        audio.marks.empty() ? 0 : audio.marks.back().source_end;
+    const auto previous_mora_end =
+        audio.marks.empty() ? 0 : audio.marks.back().mora_end;
+    if (mark.source_start != previous_source_end ||
+        mark.source_end <= mark.source_start ||
+        mark.mora_start != previous_mora_end ||
+        mark.mora_end < mark.mora_start ||
+        mark.start_frame > mark.end_frame || mark.surface.empty() ||
+        mark.pronunciation.empty()) {
+      return std::nullopt;
+    }
+    audio.marks.push_back(std::move(mark));
+  }
   if (pcm_length > blob.size() - offset) {
     return std::nullopt;
   }
   if (audio.channels == 0 || audio.sample_rate_hz == 0 ||
       audio.bit_depth != 16 || pcm_length == 0 ||
       pcm_length % (static_cast<std::uint64_t>(audio.channels) * 2ULL) != 0) {
+    return std::nullopt;
+  }
+  const auto total_frames =
+      pcm_length / (static_cast<std::uint64_t>(audio.channels) * 2ULL);
+  if (audio.marks.back().end_frame > total_frames) {
     return std::nullopt;
   }
   audio.pcm.assign(blob.begin() + static_cast<std::ptrdiff_t>(offset),

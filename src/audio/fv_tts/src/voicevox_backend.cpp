@@ -17,6 +17,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "fv_tts/source_alignment.hpp"
+
 namespace fv_tts {
 namespace {
 
@@ -199,7 +201,8 @@ struct VoicevoxCoreBackend::Impl {
     // 合成結果の同一性。エンジン版数・ONNX Runtime・モデル群のどれかが
     // 変われば同じ文字列でも別の音になりうる。モデルはバージョン付きの
     // ディレクトリに入るので、パスの一覧を identity に含めれば足りる。
-    identity_ = std::string(voicevox_get_version()) + "|" + runtime.string();
+    identity_ = std::string(voicevox_get_version()) +
+                "|aspa-source-map-v1|" + runtime.string();
     for (const auto &path : model_paths) {
       identity_ += "|" + path.string();
     }
@@ -350,9 +353,37 @@ struct VoicevoxCoreBackend::Impl {
 
   SynthesizedAudio synthesize(const std::string &text) {
     std::lock_guard<std::mutex> lock(style_mutex_);
+    char *raw_analysis = nullptr;
+    check_result(voicevox_open_jtalk_rc_analyze_with_source_map(
+                     open_jtalk_.get(), text.c_str(), &raw_analysis),
+                 "failed to analyze VOICEVOX source alignment");
+    JsonPtr analysis_json(raw_analysis);
+
+    nlohmann::json analysis;
+    try {
+      analysis = nlohmann::json::parse(analysis_json.get());
+    } catch (const nlohmann::json::exception &error) {
+      throw std::runtime_error(
+          "VOICEVOX returned invalid source alignment JSON: " +
+          std::string(error.what()));
+    }
+    if (!analysis.is_object() || !analysis.contains("accent_phrases") ||
+        !analysis.contains("source_spans")) {
+      throw std::runtime_error(
+          "VOICEVOX source alignment JSON is missing required fields");
+    }
+
+    const auto accent_phrases = analysis.at("accent_phrases").dump();
+    char *raw_predicted_phrases = nullptr;
+    check_result(voicevox_synthesizer_replace_mora_data(
+                     synthesizer_.get(), accent_phrases.c_str(), style_id_,
+                     &raw_predicted_phrases),
+                 "failed to predict VOICEVOX mora data");
+    JsonPtr predicted_phrases(raw_predicted_phrases);
+
     char *raw_query = nullptr;
-    check_result(voicevox_synthesizer_create_audio_query(
-                     synthesizer_.get(), text.c_str(), style_id_, &raw_query),
+    check_result(voicevox_audio_query_create_from_accent_phrases(
+                     predicted_phrases.get(), &raw_query),
                  "failed to create VOICEVOX audio query");
     JsonPtr query(raw_query);
 
@@ -368,8 +399,21 @@ struct VoicevoxCoreBackend::Impl {
         wav_length > std::numeric_limits<std::size_t>::max()) {
       throw std::runtime_error("VOICEVOX returned empty or malformed audio");
     }
-    return decode_pcm16_wav(std::vector<std::uint8_t>(
+    auto audio = decode_pcm16_wav(std::vector<std::uint8_t>(
         wav.get(), wav.get() + static_cast<std::size_t>(wav_length)));
+    const auto frame_bytes = static_cast<std::uint64_t>(audio.channels) * 2ULL;
+    const auto total_frames = audio.pcm.size() / frame_bytes;
+    nlohmann::json query_value;
+    try {
+      query_value = nlohmann::json::parse(query.get());
+    } catch (const nlohmann::json::exception &error) {
+      throw std::runtime_error("VOICEVOX returned invalid AudioQuery JSON: " +
+                               std::string(error.what()));
+    }
+    audio.marks = build_synthesis_marks(
+        text, analysis.at("source_spans"), query_value,
+        static_cast<std::uint64_t>(total_frames));
+    return audio;
   }
 
   std::string identity_;
@@ -461,7 +505,7 @@ SynthesizedAudio decode_pcm16_wav(const std::vector<std::uint8_t> &wav) {
   return SynthesizedAudio{
       std::vector<std::uint8_t>(wav.begin() + static_cast<std::ptrdiff_t>(data_offset),
                                 wav.begin() + static_cast<std::ptrdiff_t>(data_offset + data_size)),
-      sample_rate, channels, bit_depth};
+      sample_rate, channels, bit_depth, {}};
 }
 
 }  // namespace fv_tts

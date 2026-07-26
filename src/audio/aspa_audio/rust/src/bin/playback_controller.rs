@@ -13,7 +13,8 @@ use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSrc};
 use r2r::aspa_audio_interfaces::msg::{
     OutputDrained as OutputDrainedMessage, PlaybackControl as PlaybackControlMessage,
-    PlaybackEvent as PlaybackEventMessage, PlaybackFrame,
+    PlaybackEvent as PlaybackEventMessage, PlaybackFrame, SpeechMark as SpeechMarkMessage,
+    SynthesizedSpeech as SynthesizedSpeechMessage,
 };
 use r2r::aspa_audio_interfaces::srv::FlushAudio;
 use r2r::fv_speech_interfaces::msg::AudioFrame;
@@ -126,6 +127,9 @@ struct PlaybackEvent {
     utterance_id: String,
     played_frames: u64,
     total_frames: u64,
+    source_position_valid: bool,
+    played_source_characters: u64,
+    total_source_characters: u64,
 }
 
 impl PlaybackEvent {
@@ -136,6 +140,9 @@ impl PlaybackEvent {
             utterance_id: utterance_id.into(),
             played_frames: 0,
             total_frames: 0,
+            source_position_valid: false,
+            played_source_characters: 0,
+            total_source_characters: 0,
         }
     }
 
@@ -146,6 +153,9 @@ impl PlaybackEvent {
             utterance_id: self.utterance_id.clone(),
             played_frames: self.played_frames,
             total_frames: self.total_frames,
+            source_position_valid: self.source_position_valid,
+            played_source_characters: self.played_source_characters,
+            total_source_characters: self.total_source_characters,
             playout_generation,
         }
     }
@@ -159,6 +169,7 @@ struct Utterance {
     sample_rate_hz: u32,
     channels: u32,
     bit_depth: u32,
+    marks: Vec<SpeechMarkMessage>,
     offset_bytes: usize,
     played_offset_frames: u64,
     started: bool,
@@ -173,6 +184,7 @@ impl Utterance {
         sample_rate_hz: u32,
         channels: u32,
         bit_depth: u32,
+        marks: Vec<SpeechMarkMessage>,
     ) -> Result<Self, String> {
         if utterance_id.is_empty() {
             return Err("utterance_id must not be empty".to_owned());
@@ -187,6 +199,14 @@ impl Utterance {
         if !pcm.len().is_multiple_of(bytes_per_frame) {
             return Err("PCM payload is not aligned to audio frames".to_owned());
         }
+        let total_frames = (pcm.len() / bytes_per_frame) as u64;
+        if kind == Kind::Cue {
+            if !marks.is_empty() {
+                return Err("cue playback must not contain speech alignment".to_owned());
+            }
+        } else {
+            validate_speech_marks(&marks, total_frames)?;
+        }
         Ok(Self {
             kind,
             utterance_id,
@@ -194,6 +214,7 @@ impl Utterance {
             sample_rate_hz,
             channels,
             bit_depth,
+            marks,
             offset_bytes: 0,
             played_offset_frames: 0,
             started: false,
@@ -208,6 +229,54 @@ impl Utterance {
     fn total_frames(&self) -> u64 {
         (self.pcm.len() / self.bytes_per_frame()) as u64
     }
+
+    fn source_position(&self) -> (bool, u64, u64) {
+        if self.kind != Kind::Agent || self.marks.is_empty() {
+            return (false, 0, 0);
+        }
+        let played = self
+            .marks
+            .iter()
+            .take_while(|mark| mark.end_frame <= self.played_offset_frames)
+            .last()
+            .map_or(0, |mark| mark.source_end);
+        let total = self
+            .marks
+            .last()
+            .expect("non-empty alignment was checked")
+            .source_end;
+        (true, played, total)
+    }
+}
+
+fn validate_speech_marks(marks: &[SpeechMarkMessage], total_frames: u64) -> Result<(), String> {
+    if marks.is_empty() {
+        return Err("speech playback requires source alignment".to_owned());
+    }
+    let mut source_cursor = 0;
+    let mut mora_cursor = 0;
+    let mut previous_start_frame = 0;
+    let mut previous_end_frame = 0;
+    for mark in marks {
+        if mark.source_start != source_cursor
+            || mark.source_end <= mark.source_start
+            || mark.mora_start != mora_cursor
+            || mark.mora_end < mark.mora_start
+            || mark.start_frame > mark.end_frame
+            || mark.start_frame < previous_start_frame
+            || mark.end_frame < previous_end_frame
+            || mark.end_frame > total_frames
+            || mark.surface.is_empty()
+            || mark.pronunciation.is_empty()
+        {
+            return Err("speech source alignment is malformed".to_owned());
+        }
+        source_cursor = mark.source_end;
+        mora_cursor = mark.mora_end;
+        previous_start_frame = mark.start_frame;
+        previous_end_frame = mark.end_frame;
+    }
+    Ok(())
 }
 
 type UtteranceRef = Rc<RefCell<Utterance>>;
@@ -670,12 +739,17 @@ impl PlaybackMachine {
 
     fn event(name: EventName, item: &UtteranceRef) -> PlaybackEvent {
         let item = item.borrow();
+        let (source_position_valid, played_source_characters, total_source_characters) =
+            item.source_position();
         PlaybackEvent {
             name,
             kind: item.kind,
             utterance_id: item.utterance_id.clone(),
             played_frames: item.played_offset_frames,
             total_frames: item.total_frames(),
+            source_position_valid,
+            played_source_characters,
+            total_source_characters,
         }
     }
 }
@@ -846,6 +920,37 @@ impl PcmConverter {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(format!("cannot stop GStreamer PCM pipeline: {error}")),
         }
+    }
+
+    fn scale_marks(
+        &self,
+        marks: &[SpeechMarkMessage],
+        input_rate_hz: u32,
+        input_total_frames: u64,
+        output_total_frames: u64,
+    ) -> Result<Vec<SpeechMarkMessage>, String> {
+        validate_speech_marks(marks, input_total_frames)?;
+        marks
+            .iter()
+            .map(|mark| {
+                let mut scaled = mark.clone();
+                scaled.start_frame = u64::try_from(round_ratio_ties_even(
+                    u128::from(mark.start_frame) * u128::from(self.output_rate_hz),
+                    u128::from(input_rate_hz),
+                )?)
+                .map_err(|_| "scaled speech mark exceeds uint64".to_owned())?;
+                scaled.end_frame = u64::try_from(round_ratio_ties_even(
+                    u128::from(mark.end_frame) * u128::from(self.output_rate_hz),
+                    u128::from(input_rate_hz),
+                )?)
+                .map_err(|_| "scaled speech mark exceeds uint64".to_owned())?;
+                Ok(scaled)
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .and_then(|scaled| {
+                validate_speech_marks(&scaled, output_total_frames)?;
+                Ok(scaled)
+            })
     }
 }
 
@@ -1092,32 +1197,54 @@ impl PlaybackController {
         })
     }
 
-    fn on_frame(&mut self, kind: Kind, message: AudioFrame) -> Result<Vec<Effect>, String> {
-        if kind == Kind::Agent && agent_epoch(&message.stream_id)? < self.minimum_agent_epoch {
+    fn on_speech(
+        &mut self,
+        kind: Kind,
+        message: SynthesizedSpeechMessage,
+    ) -> Result<Vec<Effect>, String> {
+        if kind == Kind::Cue {
+            return Err("SynthesizedSpeech cannot carry cue audio".to_owned());
+        }
+        let expected_kind = match kind {
+            Kind::Agent => SynthesizedSpeechMessage::AGENT as u8,
+            Kind::System => SynthesizedSpeechMessage::SYSTEM as u8,
+            Kind::Cue => unreachable!("checked above"),
+        };
+        if message.kind != expected_kind {
+            return Err("SynthesizedSpeech kind does not match its topic".to_owned());
+        }
+        if message.utterance_id.is_empty() {
+            return Err("SynthesizedSpeech utterance_id must not be empty".to_owned());
+        }
+        if kind == Kind::Agent && agent_epoch(&message.utterance_id)? < self.minimum_agent_epoch {
             eprintln!(
                 "dropping stale agent PCM {:?}; minimum floor is {}",
-                message.stream_id, self.minimum_agent_epoch
+                message.utterance_id, self.minimum_agent_epoch
             );
             return Ok(Vec::new());
         }
-        if kind == Kind::System && self.machine.system_is_aborted(&message.stream_id) {
-            self.assemblies.remove(&(kind, message.stream_id.clone()));
+        if kind == Kind::System && self.machine.system_is_aborted(&message.utterance_id) {
             eprintln!(
                 "dropping PCM for aborted SYSTEM utterance {:?}",
-                message.stream_id
+                message.utterance_id
             );
             return Ok(Vec::new());
         }
-        let first_system_frame = kind == Kind::System
-            && message.seq == 0
-            && !self
-                .assemblies
-                .contains_key(&(kind, message.stream_id.clone()));
-        let stream_id = message.stream_id.clone();
-        let item = self.assemble(kind, message)?;
+        if message.sample_rate_hz == 0 || message.channels == 0 || message.bit_depth != 16 {
+            return Err("SynthesizedSpeech requires positive rate/channels and PCM16".to_owned());
+        }
+        let bytes_per_frame = message.channels as usize * 2;
+        if message.pcm_s16le.is_empty() || !message.pcm_s16le.len().is_multiple_of(bytes_per_frame)
+        {
+            return Err("SynthesizedSpeech PCM is empty or not frame aligned".to_owned());
+        }
+        let input_total_frames = u64::try_from(message.pcm_s16le.len() / bytes_per_frame)
+            .map_err(|_| "SynthesizedSpeech frame count exceeds uint64".to_owned())?;
+        validate_speech_marks(&message.marks, input_total_frames)?;
+
         let mut effects = Vec::new();
-        if first_system_frame {
-            let reserve_events = self.machine.reserve_system(&stream_id)?;
+        if kind == Kind::System {
+            let reserve_events = self.machine.reserve_system(&message.utterance_id)?;
             if reserve_events
                 .iter()
                 .any(|event| event.name == EventName::AgentPaused)
@@ -1128,26 +1255,43 @@ impl PlaybackController {
             }
             effects.extend(self.publish_events(reserve_events, None, None)?);
         }
-        let Some(item) = item else {
-            return Ok(effects);
-        };
-        let converted = self.converter.convert(
-            &item.pcm,
-            item.sample_rate_hz,
-            item.channels,
-            item.bit_depth,
-            "PCM16LE",
-        );
-        let converted = match converted {
-            Ok(converted) => converted,
+        let prepared = (|| -> Result<Utterance, String> {
+            let converted = self.converter.convert(
+                &message.pcm_s16le,
+                message.sample_rate_hz,
+                message.channels,
+                message.bit_depth,
+                "PCM16LE",
+            )?;
+            let output_total_frames =
+                u64::try_from(converted.len() / (self.converter.output_channels as usize * 2))
+                    .map_err(|_| "converted speech frame count exceeds uint64".to_owned())?;
+            let marks = self.converter.scale_marks(
+                &message.marks,
+                message.sample_rate_hz,
+                input_total_frames,
+                output_total_frames,
+            )?;
+            Utterance::new(
+                kind,
+                message.utterance_id.clone(),
+                converted,
+                self.converter.output_rate_hz,
+                self.converter.output_channels,
+                16,
+                marks,
+            )
+        })();
+        let ready = match prepared {
+            Ok(ready) => ready,
             Err(error) if kind == Kind::System => {
                 eprintln!("rejecting system audio conversion: {error}");
-                let abort_events = self.machine.abort_system(&item.utterance_id, true)?;
+                let abort_events = self.machine.abort_system(&message.utterance_id, true)?;
                 effects.extend(self.publish_events(
                     abort_events,
                     Some(PlaybackEvent::fallback(
                         EventName::SystemAborted,
-                        &item.utterance_id,
+                        &message.utterance_id,
                     )),
                     None,
                 )?);
@@ -1155,24 +1299,40 @@ impl PlaybackController {
             }
             Err(error) => return Err(error),
         };
-        let ready = Utterance::new(
-            item.kind,
-            item.utterance_id,
-            converted,
-            self.converter.output_rate_hz,
-            self.converter.output_channels,
-            16,
-        )?;
         let events = self.machine.enqueue(ready)?;
         effects.extend(self.publish_events(events, None, None)?);
         Ok(effects)
     }
 
-    fn reject_frame(&mut self, kind: Kind, utterance_id: &str) -> Result<Vec<Effect>, String> {
+    fn on_cue_frame(&mut self, message: AudioFrame) -> Result<Vec<Effect>, String> {
+        let item = self.assemble_cue(message)?;
+        let Some(item) = item else {
+            return Ok(Vec::new());
+        };
+        let converted = self.converter.convert(
+            &item.pcm,
+            item.sample_rate_hz,
+            item.channels,
+            item.bit_depth,
+            "PCM16LE",
+        )?;
+        let ready = Utterance::new(
+            Kind::Cue,
+            item.utterance_id,
+            converted,
+            self.converter.output_rate_hz,
+            self.converter.output_channels,
+            16,
+            Vec::new(),
+        )?;
+        let events = self.machine.enqueue(ready)?;
+        self.publish_events(events, None, None)
+    }
+
+    fn reject_speech(&mut self, kind: Kind, utterance_id: &str) -> Result<Vec<Effect>, String> {
         if utterance_id.is_empty() {
             return Ok(Vec::new());
         }
-        self.assemblies.remove(&(kind, utterance_id.to_owned()));
         if kind != Kind::System {
             return Ok(Vec::new());
         }
@@ -1187,7 +1347,14 @@ impl PlaybackController {
         )
     }
 
-    fn assemble(&mut self, kind: Kind, message: AudioFrame) -> Result<Option<Utterance>, String> {
+    fn reject_cue_frame(&mut self, utterance_id: &str) {
+        if !utterance_id.is_empty() {
+            self.assemblies
+                .remove(&(Kind::Cue, utterance_id.to_owned()));
+        }
+    }
+
+    fn assemble_cue(&mut self, message: AudioFrame) -> Result<Option<Utterance>, String> {
         if message.encoding != "PCM16LE" || message.layout != "interleaved" {
             return Err("audio must be PCM16LE/interleaved".to_owned());
         }
@@ -1209,7 +1376,7 @@ impl PlaybackController {
         if expected_bytes != payload_bytes {
             return Err("AudioFrame frame_count does not match payload".to_owned());
         }
-        let key = (kind, message.stream_id.clone());
+        let key = (Kind::Cue, message.stream_id.clone());
         if !self.assemblies.contains_key(&key) {
             if message.seq != 0 {
                 return Err("utterance must begin at seq=0".to_owned());
@@ -1256,12 +1423,13 @@ impl PlaybackController {
         }
         let assembly = self.assemblies.remove(&key).expect("assembly exists");
         Utterance::new(
-            kind,
+            Kind::Cue,
             message.stream_id,
             assembly.data,
             assembly.sample_rate_hz,
             assembly.channels,
             assembly.bit_depth,
+            Vec::new(),
         )
         .map(Some)
     }
@@ -1638,19 +1806,19 @@ impl PlaybackController {
     }
 }
 
-fn process_audio_frame(
+fn process_speech(
     controller: &mut PlaybackController,
     kind: Kind,
-    message: AudioFrame,
+    message: SynthesizedSpeechMessage,
 ) -> Result<Vec<Effect>, String> {
-    let utterance_id = message.stream_id.clone();
-    match controller.on_frame(kind, message) {
+    let utterance_id = message.utterance_id.clone();
+    match controller.on_speech(kind, message) {
         Ok(effects) => Ok(effects),
         Err(error) => {
-            eprintln!("rejecting {kind:?} audio frame: {error}");
+            eprintln!("rejecting {kind:?} synthesized speech: {error}");
             let effects =
                 controller
-                    .reject_frame(kind, &utterance_id)
+                    .reject_speech(kind, &utterance_id)
                     .map_err(|cleanup_error| {
                         format!(
                     "cannot contain rejected {kind:?} utterance {utterance_id:?}: {cleanup_error}"
@@ -1662,6 +1830,21 @@ fn process_audio_frame(
                 ));
             }
             Ok(effects)
+        }
+    }
+}
+
+fn process_cue_frame(
+    controller: &mut PlaybackController,
+    message: AudioFrame,
+) -> Result<Vec<Effect>, String> {
+    let utterance_id = message.stream_id.clone();
+    match controller.on_cue_frame(message) {
+        Ok(effects) => Ok(effects),
+        Err(error) => {
+            eprintln!("rejecting CUE audio frame: {error}");
+            controller.reject_cue_frame(&utterance_id);
+            Ok(Vec::new())
         }
     }
 }
@@ -1768,9 +1951,9 @@ fn main() -> Result<(), ControllerError> {
     let control_qos = reliable_volatile_qos(CONTROL_QOS_DEPTH);
     let playout_qos = reliable_volatile_qos(PLAYOUT_QOS_DEPTH);
     let mut agent_frames =
-        node.subscribe::<AudioFrame>("/audio/agent/frame", control_qos.clone())?;
+        node.subscribe::<SynthesizedSpeechMessage>("/audio/agent/frame", control_qos.clone())?;
     let mut system_frames =
-        node.subscribe::<AudioFrame>("/audio/system/frame", control_qos.clone())?;
+        node.subscribe::<SynthesizedSpeechMessage>("/audio/system/frame", control_qos.clone())?;
     let mut cue_frames = node.subscribe::<AudioFrame>("/audio/cue/frame", control_qos.clone())?;
     let mut controls =
         node.subscribe::<PlaybackControlMessage>("/audio/playback/control", control_qos.clone())?;
@@ -1855,19 +2038,18 @@ fn main() -> Result<(), ControllerError> {
         }
         for message in take_ready_bounded(&mut system_frames, SYSTEM_MESSAGES_PER_TICK) {
             pending_effects.extend(
-                process_audio_frame(&mut controller, Kind::System, message)
+                process_speech(&mut controller, Kind::System, message)
                     .map_err(ControllerError::Invariant)?,
             );
         }
         for message in take_ready_bounded(&mut cue_frames, CUE_MESSAGES_PER_TICK) {
             pending_effects.extend(
-                process_audio_frame(&mut controller, Kind::Cue, message)
-                    .map_err(ControllerError::Invariant)?,
+                process_cue_frame(&mut controller, message).map_err(ControllerError::Invariant)?,
             );
         }
         for message in take_ready_bounded(&mut agent_frames, AGENT_MESSAGES_PER_TICK) {
             pending_effects.extend(
-                process_audio_frame(&mut controller, Kind::Agent, message)
+                process_speech(&mut controller, Kind::Agent, message)
                     .map_err(ControllerError::Output)?,
             );
         }
@@ -1922,8 +2104,35 @@ fn positive_u32_parameter(node: &Node, name: &str, default: i64) -> Result<u32, 
 mod tests {
     use super::*;
 
+    fn speech_marks(frames: usize) -> Vec<SpeechMarkMessage> {
+        vec![SpeechMarkMessage {
+            source_start: 0,
+            source_end: 1,
+            surface: "あ".to_owned(),
+            pronunciation: "ア".to_owned(),
+            mora_start: 0,
+            mora_end: 1,
+            start_frame: 0,
+            end_frame: frames as u64,
+        }]
+    }
+
     fn utterance(kind: Kind, name: &str, frames: usize) -> Utterance {
-        Utterance::new(kind, name.to_owned(), vec![0; frames * 2], 16_000, 1, 16).unwrap()
+        let marks = if kind == Kind::Cue {
+            Vec::new()
+        } else {
+            speech_marks(frames)
+        };
+        Utterance::new(
+            kind,
+            name.to_owned(),
+            vec![0; frames * 2],
+            16_000,
+            1,
+            16,
+            marks,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1944,6 +2153,52 @@ mod tests {
         assert!(machine.next_chunk().unwrap().is_none());
         machine.resume_agent();
         assert_eq!(machine.next_chunk().unwrap().unwrap().sample_index, 2);
+    }
+
+    #[test]
+    fn agent_event_reports_only_fully_played_source_spans() {
+        let marks = vec![
+            SpeechMarkMessage {
+                source_start: 0,
+                source_end: 2,
+                surface: "今日".to_owned(),
+                pronunciation: "キョー".to_owned(),
+                mora_start: 0,
+                mora_end: 2,
+                start_frame: 1,
+                end_frame: 4,
+            },
+            SpeechMarkMessage {
+                source_start: 2,
+                source_end: 3,
+                surface: "は".to_owned(),
+                pronunciation: "ワ".to_owned(),
+                mora_start: 2,
+                mora_end: 3,
+                start_frame: 4,
+                end_frame: 7,
+            },
+        ];
+        let item = Rc::new(RefCell::new(
+            Utterance::new(
+                Kind::Agent,
+                "agent-0-aligned".to_owned(),
+                vec![0; 8 * 2],
+                16_000,
+                1,
+                16,
+                marks,
+            )
+            .unwrap(),
+        ));
+        item.borrow_mut().played_offset_frames = 3;
+        let first = PlaybackMachine::event(EventName::AgentPaused, &item);
+        assert_eq!(first.played_source_characters, 0);
+        assert_eq!(first.total_source_characters, 3);
+        item.borrow_mut().played_offset_frames = 4;
+        let second = PlaybackMachine::event(EventName::AgentPaused, &item);
+        assert_eq!(second.played_source_characters, 2);
+        assert!(second.source_position_valid);
     }
 
     #[test]
@@ -2171,6 +2426,27 @@ mod tests {
         }
     }
 
+    fn input_speech(
+        kind: Kind,
+        utterance_id: &str,
+        frame_count: usize,
+    ) -> SynthesizedSpeechMessage {
+        let kind_code = match kind {
+            Kind::Agent => SynthesizedSpeechMessage::AGENT as u8,
+            Kind::System => SynthesizedSpeechMessage::SYSTEM as u8,
+            Kind::Cue => panic!("cue uses AudioFrame"),
+        };
+        SynthesizedSpeechMessage {
+            kind: kind_code,
+            utterance_id: utterance_id.to_owned(),
+            sample_rate_hz: 16_000,
+            channels: 1,
+            bit_depth: 16,
+            pcm_s16le: vec![0; frame_count * 2],
+            marks: speech_marks(frame_count),
+        }
+    }
+
     fn output_ack(
         utterance_id: &str,
         seq: u64,
@@ -2214,29 +2490,29 @@ mod tests {
     }
 
     #[test]
-    fn malformed_input_is_contained_and_a_stream_id_can_restart_at_seq_zero() {
+    fn malformed_cue_input_is_contained_and_a_stream_id_can_restart_at_seq_zero() {
         let mut controller = PlaybackController::new(16_000, 1, 1).unwrap();
-        assert!(process_audio_frame(
-            &mut controller,
-            Kind::Agent,
-            input_frame("agent-0-bad", 0, 2, false),
-        )
-        .unwrap()
-        .is_empty());
+        assert!(
+            process_cue_frame(&mut controller, input_frame("cue-bad", 0, 2, false))
+                .unwrap()
+                .is_empty()
+        );
         assert!(controller
             .assemblies
-            .contains_key(&(Kind::Agent, "agent-0-bad".to_owned())));
+            .contains_key(&(Kind::Cue, "cue-bad".to_owned())));
 
-        let mut invalid = input_frame("agent-0-bad", 1, 1, true);
+        let mut invalid = input_frame("cue-bad", 1, 1, true);
         invalid.bit_depth = 8;
-        assert!(process_audio_frame(&mut controller, Kind::Agent, invalid).is_err());
+        assert!(process_cue_frame(&mut controller, invalid)
+            .unwrap()
+            .is_empty());
         assert!(!controller
             .assemblies
-            .contains_key(&(Kind::Agent, "agent-0-bad".to_owned())));
+            .contains_key(&(Kind::Cue, "cue-bad".to_owned())));
         assert!(controller.pump().unwrap().is_empty());
 
         let restarted = controller
-            .assemble(Kind::Agent, input_frame("agent-0-bad", 0, 16, true))
+            .assemble_cue(input_frame("cue-bad", 0, 16, true))
             .unwrap()
             .expect("the restarted utterance must assemble");
         assert_eq!(restarted.total_frames(), 16);
@@ -2245,38 +2521,30 @@ mod tests {
     #[test]
     fn zero_frame_input_never_reaches_the_output_boundary() {
         let mut controller = PlaybackController::new(16_000, 1, 1).unwrap();
-        let effects = process_audio_frame(
-            &mut controller,
-            Kind::Cue,
-            input_frame("cue-empty", 0, 0, true),
-        );
+        let effects = process_cue_frame(&mut controller, input_frame("cue-empty", 0, 0, true));
         assert!(effects.unwrap().is_empty());
         assert!(controller.pump().unwrap().is_empty());
-        assert!(
-            Utterance::new(Kind::Cue, "cue-empty".to_owned(), Vec::new(), 16_000, 1, 16).is_err()
-        );
+        assert!(Utterance::new(
+            Kind::Cue,
+            "cue-empty".to_owned(),
+            Vec::new(),
+            16_000,
+            1,
+            16,
+            Vec::new(),
+        )
+        .is_err());
     }
 
     #[test]
-    fn malformed_system_pcm_aborts_and_releases_its_hold() {
+    fn malformed_system_speech_is_tombstoned_without_leaking_a_hold() {
         let mut controller = PlaybackController::new(16_000, 1, 1).unwrap();
-        process_audio_frame(
-            &mut controller,
-            Kind::System,
-            input_frame("system-bad", 0, 2, false),
-        )
-        .unwrap();
-        assert!(controller.machine.agent_pause_requested());
-
-        let mut invalid = input_frame("system-bad", 1, 2, true);
-        invalid.sample_rate_hz = 0;
-        let effects = process_audio_frame(&mut controller, Kind::System, invalid).unwrap();
+        let mut invalid = input_speech(Kind::System, "system-bad", 2);
+        invalid.bit_depth = 8;
+        let effects = process_speech(&mut controller, Kind::System, invalid).unwrap();
 
         assert!(!controller.machine.agent_pause_requested());
         assert!(controller.machine.system_is_aborted("system-bad"));
-        assert!(!controller
-            .assemblies
-            .contains_key(&(Kind::System, "system-bad".to_owned())));
         assert!(effects.into_iter().any(|effect| matches!(
             effect,
             Effect::Event(message)
@@ -2295,10 +2563,10 @@ mod tests {
             ))
             .unwrap();
 
-        let effects = process_audio_frame(
+        let effects = process_speech(
             &mut controller,
             Kind::System,
-            input_frame("system-late", 0, 16, true),
+            input_speech(Kind::System, "system-late", 16),
         )
         .unwrap();
 

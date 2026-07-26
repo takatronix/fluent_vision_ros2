@@ -8,7 +8,6 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <depend>aspa_audio_interfaces</depend>
-  <depend>fv_speech_interfaces</depend>
   <depend>nlohmann_json</depend>
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
