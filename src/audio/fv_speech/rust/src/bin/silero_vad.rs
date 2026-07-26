@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let threshold = node.get_parameter::<f64>("threshold").unwrap_or(0.5) as f32;
     let mut vad = SileroVad::load(&PathBuf::from(&model_path), threshold)?;
     let mut validator = AudioValidator::default();
-    let qos = speech_qos(100);
+    let qos = speech_qos(256);
     let mut audio = node.subscribe::<AudioFrame>("/audio/mic/frame", qos.clone())?;
     let publisher = node.create_publisher::<VoiceActivity>("/dialogue/vad/activity", qos)?;
     let mut base_sample_index = None;

@@ -7,3 +7,8 @@ fv_tts:
     cpu_num_threads: 0
     style_id: 30
     synthesis_timeout_seconds: 60.0
+    # 合成結果の再利用。cache_directory が空なら永続層なし (プロセス内のみ)。
+    cache_directory: ""
+    cache_memory_entries: 64
+    cache_disk_budget_mb: 256
+    cache_warmup_file: ""

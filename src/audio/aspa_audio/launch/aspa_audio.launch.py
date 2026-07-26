@@ -18,15 +18,17 @@ def generate_launch_description():
     output_rate = LaunchConfiguration("output_rate")
     output_channels = LaunchConfiguration("output_channels")
     output_buffer_ms = LaunchConfiguration("output_buffer_ms")
+    aec_stream_delay_ms = LaunchConfiguration("aec_stream_delay_ms")
 
     return LaunchDescription([
         DeclareLaunchArgument("capture_device", default_value="default"),
         DeclareLaunchArgument("capture_chunk_frames", default_value="160"),
-        DeclareLaunchArgument("capture_queue_chunks", default_value="8"),
+        DeclareLaunchArgument("capture_queue_chunks", default_value="64"),
         DeclareLaunchArgument("output_device", default_value="default"),
         DeclareLaunchArgument("output_rate", default_value="48000"),
         DeclareLaunchArgument("output_channels", default_value="2"),
         DeclareLaunchArgument("output_buffer_ms", default_value="80"),
+        DeclareLaunchArgument("aec_stream_delay_ms", default_value="40"),
         Node(
             package="aspa_audio",
             executable="audio_capture",
@@ -38,6 +40,19 @@ def generate_launch_description():
             },
             on_exit=EmitEvent(
                 event=Shutdown(reason="ASPA audio capture exited")
+            ),
+        ),
+        Node(
+            package="aspa_audio",
+            executable="audio_aec",
+            output="screen",
+            additional_env={
+                "ASPA_AUDIO_AEC_STREAM_DELAY_MS": aec_stream_delay_ms,
+                "ASPA_AUDIO_AEC_FAR_SAMPLE_RATE": output_rate,
+                "ASPA_AUDIO_AEC_FAR_CHANNELS": output_channels,
+            },
+            on_exit=EmitEvent(
+                event=Shutdown(reason="ASPA WebRTC AEC exited")
             ),
         ),
         Node(

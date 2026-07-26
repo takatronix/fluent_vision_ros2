@@ -10,6 +10,10 @@ name = "audio_capture"
 path = "src/bin/audio_capture.rs"
 
 [[bin]]
+name = "audio_aec"
+path = "src/bin/audio_aec.rs"
+
+[[bin]]
 name = "audio_output"
 path = "src/bin/audio_output.rs"
 
@@ -25,3 +29,5 @@ gstreamer = "0.25.2"
 gstreamer-app = "0.25.2"
 r2r = "0.9.5"
 thiserror = "2.0"
+webrtc-audio-processing = { version = "~2.1", features = ["bundled"] }
+webrtc-audio-processing-config = "2.1"

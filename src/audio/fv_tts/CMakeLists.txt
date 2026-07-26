@@ -52,6 +52,7 @@ get_filename_component(VOICEVOX_CORE_LIBRARY_DIR "${VOICEVOX_CORE_LIBRARY}" DIRE
 
 add_library(fv_tts_core STATIC
   src/contracts.cpp
+  src/synthesis_cache.cpp
   src/synthesis_scheduler.cpp
   src/synthesis_watchdog.cpp
   src/voicevox_backend.cpp
@@ -99,6 +100,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_fv_tts_core
     test/test_contracts.cpp
+    test/test_synthesis_cache.cpp
     test/test_synthesis_scheduler.cpp
     test/test_synthesis_watchdog.cpp
   )

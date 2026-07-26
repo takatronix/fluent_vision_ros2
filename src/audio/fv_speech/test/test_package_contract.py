@@ -111,3 +111,11 @@ def test_rust_ros_types_use_fv_speech_interfaces_only():
     assert "RuntimeManifest::load_verified" in rust_sources
     assert "ort::ep::TensorRT" not in rust_sources
     assert 'provider != "cuda"' in rust_sources
+
+
+def test_silero_vad_queue_matches_the_audio_publisher_history():
+    source = (
+        PACKAGE_DIR / "rust" / "src" / "bin" / "silero_vad.rs"
+    ).read_text(encoding="utf-8")
+
+    assert "speech_qos(256)" in source

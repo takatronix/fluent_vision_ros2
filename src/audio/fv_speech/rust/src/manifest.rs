@@ -16,6 +16,7 @@ pub const EXPECTED_GOLDEN_TEXT: &str =
     "うちの中学は弁当性で持っていけない場合は五十円の学校販売のパンを買う";
 pub const EXPECTED_GOLDEN_WAV_SHA256: &str =
     "460bd8dccb0d2a5f4e29c628f837be4082d13defc64c3fc21dd1b6bb0e119095";
+pub const EXPECTED_CUDA_TOOLKIT_VERSION: &str = "13.2";
 const EXPECTED_RUNTIME_DEPENDENCIES: [&str; 14] = [
     "libcudnn.so.9",
     "libcudnn_adv.so.9",
@@ -56,6 +57,8 @@ pub struct VerificationReceipt {
     pub nsys_report: PathBuf,
     pub probe_log: PathBuf,
     pub nvidia_driver_version: String,
+    pub cuda_toolkit_version: String,
+    pub cuda_compiler_version: String,
     pub runtime_dependencies: BTreeMap<String, PathBuf>,
     pub expected_text_sha256: String,
     pub artifacts_sha256: BTreeMap<String, String>,
@@ -115,7 +118,7 @@ impl RuntimeManifest {
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.schema_version != 6
+        if self.schema_version != 7
             || self.provider != "cuda"
             || self.precision != "fp32"
             || self.tf32
@@ -132,6 +135,8 @@ impl RuntimeManifest {
             || self.verification.cuda_kernel_rows == 0
             || self.verification.expected_text_sha256 != EXPECTED_GOLDEN_TEXT_SHA256
             || self.verification.nvidia_driver_version.is_empty()
+            || self.verification.cuda_toolkit_version != EXPECTED_CUDA_TOOLKIT_VERSION
+            || !is_pinned_cuda_compiler(&self.verification.cuda_compiler_version)
             || self.verification.runtime_dependencies.len() != EXPECTED_RUNTIME_DEPENDENCIES.len()
             || self
                 .verification
@@ -270,13 +275,13 @@ impl RuntimeManifest {
             })?;
             if canonical != *path {
                 return Err(ManifestError::Contract(format!(
-                    "schema 6 artifact path is not canonical: {}",
+                    "schema 7 artifact path is not canonical: {}",
                     path.display()
                 )));
             }
             if !canonical.starts_with(&root) {
                 return Err(ManifestError::Contract(format!(
-                    "schema 6 artifact is outside the persistent runtime generation: {}",
+                    "schema 7 artifact is outside the persistent runtime generation: {}",
                     path.display()
                 )));
             }
@@ -469,6 +474,20 @@ fn current_nvidia_driver_version() -> Result<String, ManifestError> {
     Ok(version)
 }
 
+fn is_pinned_cuda_compiler(version: &str) -> bool {
+    let mut components = version.split('.');
+    matches!(
+        (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ),
+        (Some("13"), Some("2"), Some(patch), None)
+            if !patch.is_empty() && patch.bytes().all(|value| value.is_ascii_digit())
+    )
+}
+
 fn sha256_file(path: &Path) -> Result<String, ManifestError> {
     let mut source = File::open(path).map_err(|source| ManifestError::Read {
         path: path.to_path_buf(),
@@ -630,7 +649,7 @@ mod tests {
                 .collect();
             let golden_sha256 = sha256_file(&golden_wav).expect("hash golden fixture");
             let manifest = RuntimeManifest {
-                schema_version: 6,
+                schema_version: 7,
                 provider: "cuda".to_owned(),
                 precision: "fp32".to_owned(),
                 tf32: false,
@@ -651,6 +670,8 @@ mod tests {
                     nsys_report,
                     probe_log,
                     nvidia_driver_version: "test-driver".to_owned(),
+                    cuda_toolkit_version: EXPECTED_CUDA_TOOLKIT_VERSION.to_owned(),
+                    cuda_compiler_version: "13.2.78".to_owned(),
                     runtime_dependencies,
                     expected_text_sha256: EXPECTED_GOLDEN_TEXT_SHA256.to_owned(),
                     artifacts_sha256,
@@ -697,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_6_probe_log_proves_cuda_tf32_off_and_exact_parity() {
+    fn schema_7_probe_log_proves_cuda_tf32_off_and_exact_parity() {
         let log = format!(
             "CUDA_EP_COMPILED=true\nEXECUTION_PROVIDER=cuda\nTF32_ENABLED=false\nPARAKEET_RS_TEXT={EXPECTED_GOLDEN_TEXT}\nPARITY_OK=true\nWARM_PARITY_OK=true\n"
         );
@@ -708,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_6_fixture_accepts_only_the_pinned_profile() {
+    fn schema_7_fixture_accepts_only_the_pinned_profile() {
         let fixture = ManifestFixture::new();
         fixture.validate_all().expect("accept pinned fixture");
 
@@ -725,13 +746,19 @@ mod tests {
         let mut tf32 = fixture.manifest.clone();
         tf32.tf32 = true;
         invalid.push(tf32);
+        let mut cuda_toolkit = fixture.manifest.clone();
+        cuda_toolkit.verification.cuda_toolkit_version = "13.1".to_owned();
+        invalid.push(cuda_toolkit);
+        let mut cuda_compiler = fixture.manifest.clone();
+        cuda_compiler.verification.cuda_compiler_version = "13.2.invalid".to_owned();
+        invalid.push(cuda_compiler);
         for manifest in invalid {
             assert!(manifest.validate().is_err());
         }
     }
 
     #[test]
-    fn schema_6_fixture_rejects_runtime_substitution_and_tensorrt() {
+    fn schema_7_fixture_rejects_runtime_substitution_and_tensorrt() {
         let fixture = ManifestFixture::new();
         let mut substituted = fixture.manifest.clone();
         substituted.runtime_library_dirs.swap(0, 1);
@@ -748,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_6_fixture_rejects_driver_artifact_probe_and_ownership_tampering() {
+    fn schema_7_fixture_rejects_driver_artifact_probe_and_ownership_tampering() {
         let fixture = ManifestFixture::new();
         assert!(
             fixture

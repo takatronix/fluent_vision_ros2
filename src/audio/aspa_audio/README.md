@@ -2,9 +2,24 @@
 
 ROS 2 owns both physical audio devices and the robot's single playback stream.
 
-- `audio_capture` is a Rust/CPAL input node. It publishes 16 kHz mono PCM16LE to
-  `/audio/mic/frame` with `source_id=aspa_audio_capture` and
-  `stream_id=audio/mic/main`.
+- `audio_capture` uses Rust/CPAL only to acquire the device's native PCM. Every
+  input buffer then passes through the required persistent GStreamer
+  `audioconvert ! audioresample` pipeline before the node publishes 16 kHz mono
+  PCM16LE to `/audio/mic/raw` with `source_id=aspa_audio_capture` and
+  `stream_id=audio/mic/raw`. There is no custom microphone resampler or conversion
+  fallback; a GStreamer construction, negotiation, conversion, or streaming
+  failure stops the capture process. The bounded 64-chunk handoff queue absorbs
+  the observed GStreamer startup burst; exhausting it during steady operation is
+  still fatal.
+- `audio_aec` is the mandatory WebRTC AEC3 boundary between raw capture and
+  speech processing. It consumes `/audio/mic/raw` and the volume-scaled,
+  callback-timed `/audio/output/render_reference`, converts the render reference
+  through persistent GStreamer `audioconvert ! audioresample`, applies the
+  accepted 40 ms render delay, and publishes 16 kHz mono PCM16LE to
+  `/audio/mic/frame` with
+  `source_id=aspa_audio_aec` and `stream_id=audio/mic/main`. A missing,
+  discontinuous, malformed, or overrun render reference is fatal; raw microphone
+  PCM is never passed through as an implicit fallback.
 - `playback_controller` is a Rust/GStreamer node and the only long playback
   queue. It subscribes to
   `/audio/agent/frame`, `/audio/system/frame`, and `/audio/cue/frame`, performs
@@ -18,6 +33,10 @@ ROS 2 owns both physical audio devices and the robot's single playback stream.
   keyed `/audio/output/flush` service. Volume is applied to samples in the CPAL
   device callback, so published PCM stays unscaled and a live volume change
   affects samples that have not yet reached the device.
+  The same callback publishes the exact scaled PCM handed to CPAL as the AEC
+  render reference. A device-buffer flush terminates that reference generation,
+  causing `audio_aec` to clear its queued reference and reset WebRTC AEC3 before
+  accepting the replacement stream.
   Keys not observed before a flush become one-shot tombstones, so a service
   request that overtakes its DDS frame still rejects the late stale PCM. On
   `/audio/output/drained`, `accepted` is only a flow-control acknowledgement;
@@ -25,8 +44,8 @@ ROS 2 owns both physical audio devices and the robot's single playback stream.
   device playback timestamp. A flush closes and recreates the CPAL stream so
   samples already handed to the host buffer are discarded.
 
-The launch file treats capture, controller, and output as one failure domain.
-If any node exits, the launch shuts down all three. In particular, an
+The launch file treats capture, AEC, controller, and output as one failure domain.
+If any node exits, the launch shuts down all four. In particular, an
 unavailable or failed flush is fatal to the playback controller; the stack does
 not continue the audio path after it can no longer invalidate stale physical
 playback.
@@ -47,7 +66,8 @@ Select exact CPAL device names when needed:
 
 ```bash
 ros2 launch aspa_audio aspa_audio.launch.py \
-  capture_device:='USB Microphone' output_device:='USB Speaker'
+  capture_device:='USB Microphone' output_device:='USB Speaker' \
+  aec_stream_delay_ms:=40
 ```
 
 The production capture contract is 16 kHz, mono, PCM16LE. The output defaults
@@ -55,7 +75,7 @@ to 48 kHz stereo PCM16LE. `audio_output` fails loudly when the selected device
 does not expose that exact CPAL configuration; all output resampling, channel
 mapping remains in the GStreamer playback controller, while device gain belongs
 only to `audio_output`.
-Build prerequisites are Rust/Cargo, the CPAL system backend
+Build prerequisites are Rust/Cargo, Meson, the CPAL system backend
 (for Linux, ALSA development headers), GStreamer 1.0 base plugins, ROS 2, and
 `aspa_audio_interfaces` plus `fv_speech_interfaces` in the same
 colcon workspace or an underlay.
@@ -65,6 +85,9 @@ Playback coordination uses typed messages throughout:
 - `/audio/playback/control`: `aspa_audio_interfaces/msg/PlaybackControl`
 - `/audio/playback/event`: `aspa_audio_interfaces/msg/PlaybackEvent`
 - `/audio/play`: `aspa_audio_interfaces/msg/PlaybackFrame`
+- `/audio/mic/raw`: `fv_speech_interfaces/msg/AudioFrame`
+- `/audio/output/render_reference`: `fv_speech_interfaces/msg/AudioFrame`
+- `/audio/mic/frame`: `fv_speech_interfaces/msg/AudioFrame`
 - `/audio/output/drained`: `aspa_audio_interfaces/msg/OutputDrained`
 - `/audio/output/flush`: `aspa_audio_interfaces/srv/FlushAudio`
 

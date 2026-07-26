@@ -33,6 +33,7 @@ const CUE_MESSAGES_PER_TICK: usize = 8;
 const AGENT_MESSAGES_PER_TICK: usize = 8;
 const CONTROL_QOS_DEPTH: usize = 10;
 const PLAYOUT_QOS_DEPTH: usize = 256;
+const PLAYBACK_PREFILL_CHUNKS: usize = 3;
 const OUTPUT_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 const PCM_CONVERSION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1022,14 +1023,14 @@ struct PlaybackController {
     converter: PcmConverter,
     assemblies: HashMap<(Kind, String), Assembly>,
     minimum_agent_epoch: u64,
-    output_inflight: Option<OutputAck>,
-    output_inflight_kind: Option<Kind>,
     output_pending: HashMap<OutputKey, PendingOutput>,
     last_output_progress_at: Option<Instant>,
     suppressed_output_acks: HashSet<OutputKey>,
     device_buffer: DeviceBufferTracker,
     flush_request: Option<FlushState>,
     playout_generations: PlayoutGenerations,
+    chunk_period: Duration,
+    next_send_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1078,8 +1079,6 @@ impl PlaybackController {
             converter: PcmConverter::new(output_rate_hz, output_channels)?,
             assemblies: HashMap::new(),
             minimum_agent_epoch: 0,
-            output_inflight: None,
-            output_inflight_kind: None,
             output_pending: HashMap::new(),
             last_output_progress_at: None,
             suppressed_output_acks: HashSet::new(),
@@ -1088,6 +1087,8 @@ impl PlaybackController {
             playout_generations: PlayoutGenerations::seeded(playout_generation_seed(
                 SystemTime::now(),
             )?),
+            chunk_period: Duration::from_millis(u64::from(chunk_ms)),
+            next_send_deadline: None,
         })
     }
 
@@ -1365,10 +1366,6 @@ impl PlaybackController {
             } else {
                 Vec::new()
             };
-            if !expected.is_final && self.inflight_key().as_ref() == Some(&key) {
-                self.output_inflight = None;
-                self.output_inflight_kind = None;
-            }
             return self.publish_events(events, None, None);
         }
         let terminal_before_start = !pending.accepted
@@ -1390,10 +1387,6 @@ impl PlaybackController {
         self.device_buffer
             .note_ack(&ack.utterance_id, ack.is_final, ack.status);
         self.output_pending.remove(&key);
-        if self.inflight_key().as_ref() == Some(&key) {
-            self.output_inflight = None;
-            self.output_inflight_kind = None;
-        }
 
         let belongs_to_flush = self
             .flush_request
@@ -1435,11 +1428,25 @@ impl PlaybackController {
     }
 
     fn pump(&mut self) -> Result<Vec<Effect>, String> {
-        if self.output_inflight.is_some() || self.flush_request.is_some() {
+        self.pump_at(Instant::now())
+    }
+
+    fn pump_at(&mut self, now: Instant) -> Result<Vec<Effect>, String> {
+        if self.flush_request.is_some() {
             return Ok(Vec::new());
         }
+        let initial_prefill = self.next_send_deadline.is_none();
+        let send_limit = match self.next_send_deadline {
+            None => PLAYBACK_PREFILL_CHUNKS,
+            Some(deadline) if now >= deadline => 1,
+            Some(_) => return Ok(Vec::new()),
+        };
         let mut effects = Vec::new();
-        if let Some(chunk) = self.machine.next_chunk()? {
+        for _ in 0..send_limit {
+            let Some(chunk) = self.machine.next_chunk()? else {
+                self.next_send_deadline = None;
+                break;
+            };
             let expected = OutputAck {
                 utterance_id: chunk.utterance_id.clone(),
                 seq: chunk.seq,
@@ -1451,11 +1458,10 @@ impl PlaybackController {
             if self.output_pending.contains_key(&key) {
                 return Err(format!("duplicate pending output chunk: {key:?}"));
             }
-            let now = Instant::now();
             self.output_pending.insert(
                 key,
                 PendingOutput {
-                    expected: expected.clone(),
+                    expected,
                     kind: chunk.kind,
                     accepted: false,
                     last_progress_at: now,
@@ -1464,8 +1470,6 @@ impl PlaybackController {
             if self.last_output_progress_at.is_none() {
                 self.last_output_progress_at = Some(now);
             }
-            self.output_inflight = Some(expected);
-            self.output_inflight_kind = Some(chunk.kind);
             self.device_buffer
                 .note_chunk(chunk.kind, &chunk.utterance_id);
             effects.push(Effect::Frame(PlaybackFrame {
@@ -1480,6 +1484,22 @@ impl PlaybackController {
                 final_: chunk.is_final,
                 playout_generation: self.playout_generations.get(chunk.kind),
             }));
+        }
+        if !effects.is_empty() {
+            if initial_prefill {
+                if effects.len() == PLAYBACK_PREFILL_CHUNKS {
+                    self.next_send_deadline = Some(
+                        now.checked_add(self.chunk_period)
+                            .ok_or_else(|| "playback pacing deadline overflowed".to_owned())?,
+                    );
+                }
+            } else {
+                let deadline = self
+                    .next_send_deadline
+                    .expect("a periodic send has a deadline");
+                self.next_send_deadline =
+                    Some(next_periodic_deadline(deadline, now, self.chunk_period)?);
+            }
         }
         Ok(effects)
     }
@@ -1544,6 +1564,9 @@ impl PlaybackController {
         if matching_keys.is_empty() && !device_matches {
             return Ok(None);
         }
+        // A flush invalidates any queued timing credit. The next playable audio starts
+        // with a fresh prefill instead of inheriting a stale pre-flush deadline.
+        self.next_send_deadline = None;
         if !account_ack {
             self.suppressed_output_acks
                 .extend(matching_keys.iter().cloned());
@@ -1580,12 +1603,6 @@ impl PlaybackController {
         {
             self.flush_request = None;
         }
-    }
-
-    fn inflight_key(&self) -> Option<OutputKey> {
-        self.output_inflight
-            .as_ref()
-            .map(|ack| (ack.utterance_id.clone(), ack.seq))
     }
 
     fn publish_events(
@@ -1687,6 +1704,29 @@ fn advance_playout_generation(current: u64) -> Result<u64, String> {
 
 fn elapsed_exceeds(started: Instant, now: Instant, timeout: Duration) -> bool {
     now.saturating_duration_since(started) > timeout
+}
+
+fn next_periodic_deadline(
+    previous_deadline: Instant,
+    now: Instant,
+    period: Duration,
+) -> Result<Instant, String> {
+    if period.is_zero() {
+        return Err("playback pacing period must be positive".to_owned());
+    }
+    let elapsed_periods =
+        now.saturating_duration_since(previous_deadline).as_nanos() / period.as_nanos();
+    let periods_to_advance = elapsed_periods
+        .checked_add(1)
+        .ok_or_else(|| "playback pacing period count overflowed".to_owned())?;
+    let periods_to_advance = u32::try_from(periods_to_advance)
+        .map_err(|_| "playback pacing delay exceeds the supported range".to_owned())?;
+    let advance = period
+        .checked_mul(periods_to_advance)
+        .ok_or_else(|| "playback pacing duration overflowed".to_owned())?;
+    previous_deadline
+        .checked_add(advance)
+        .ok_or_else(|| "playback pacing deadline overflowed".to_owned())
 }
 
 type FlushFuture = Pin<Box<dyn Future<Output = r2r::Result<FlushAudio::Response>>>>;
@@ -2157,13 +2197,20 @@ mod tests {
     }
 
     fn frame_effect(effects: Vec<Effect>) -> PlaybackFrame {
+        frame_effects(effects)
+            .into_iter()
+            .next()
+            .expect("a playback frame effect is required")
+    }
+
+    fn frame_effects(effects: Vec<Effect>) -> Vec<PlaybackFrame> {
         effects
             .into_iter()
-            .find_map(|effect| match effect {
+            .filter_map(|effect| match effect {
                 Effect::Frame(frame) => Some(frame),
                 Effect::Event(_) | Effect::Flush(_) => None,
             })
-            .expect("a playback frame effect is required")
+            .collect()
     }
 
     #[test]
@@ -2278,6 +2325,65 @@ mod tests {
     }
 
     #[test]
+    fn playback_prefills_then_sends_on_fixed_deadlines_without_waiting_for_ack() {
+        let mut controller = PlaybackController::new(16_000, 1, 1).unwrap();
+        controller
+            .machine
+            .enqueue(utterance(Kind::Agent, "agent-0-paced", 80))
+            .unwrap();
+        let started = Instant::now();
+
+        let prefill = frame_effects(controller.pump_at(started).unwrap());
+        assert_eq!(
+            prefill.iter().map(|frame| frame.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(controller.output_pending.len(), 3);
+        assert!(controller
+            .pump_at(started + Duration::from_micros(999))
+            .unwrap()
+            .is_empty());
+
+        let fourth = frame_effect(
+            controller
+                .pump_at(started + Duration::from_millis(1))
+                .unwrap(),
+        );
+        assert_eq!(fourth.seq, 3);
+        assert_eq!(controller.output_pending.len(), 4);
+    }
+
+    #[test]
+    fn late_pacer_tick_preserves_the_deadline_grid_without_bursting() {
+        let mut controller = PlaybackController::new(16_000, 1, 1).unwrap();
+        controller
+            .machine
+            .enqueue(utterance(Kind::Agent, "agent-0-late", 80))
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            frame_effects(controller.pump_at(started).unwrap()).len(),
+            PLAYBACK_PREFILL_CHUNKS
+        );
+
+        let late = started + Duration::from_millis(4);
+        assert_eq!(frame_effect(controller.pump_at(late).unwrap()).seq, 3);
+        assert!(controller
+            .pump_at(late + Duration::from_micros(999))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            frame_effect(
+                controller
+                    .pump_at(started + Duration::from_millis(5))
+                    .unwrap()
+            )
+            .seq,
+            4
+        );
+    }
+
+    #[test]
     fn missing_output_ack_becomes_a_fatal_health_error() {
         let mut controller = PlaybackController::new(16_000, 1, 1).unwrap();
         controller
@@ -2373,16 +2479,18 @@ mod tests {
             .enqueue(utterance(Kind::Agent, "agent-0-flush", 32))
             .unwrap();
 
-        let first = frame_effect(controller.pump().unwrap());
+        let frames = frame_effects(controller.pump().unwrap());
+        assert_eq!(frames.len(), 2);
+        let first = &frames[0];
         assert_eq!((first.seq, first.frame_count, first.final_), (0, 16, false));
-        controller
-            .on_output_drained(output_ack("agent-0-flush", 0, 16, false, STATUS_ACCEPTED))
-            .unwrap();
-        let second = frame_effect(controller.pump().unwrap());
+        let second = &frames[1];
         assert_eq!(
             (second.seq, second.frame_count, second.final_),
             (1, 16, true)
         );
+        controller
+            .on_output_drained(output_ack("agent-0-flush", 0, 16, false, STATUS_ACCEPTED))
+            .unwrap();
 
         let pause = controller
             .on_control(control(

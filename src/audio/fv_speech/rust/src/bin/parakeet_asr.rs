@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{FutureExt, StreamExt};
 use fv_speech_ros2::asr::{AsrRuntime, BufferedAudio, InferenceCommand};
@@ -15,6 +15,8 @@ use fv_speech_ros2::{INPUT_SOURCE_ID, INPUT_STREAM_ID, TRANSCRIPT_STREAM_ID};
 use r2r::fv_speech_interfaces::msg::{AsrControl, AudioFrame, Transcript};
 use r2r::std_msgs::msg::Bool;
 use r2r::{Context, Node};
+
+const READY_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = std::env::var_os("ASPA_PARAKEET_RUNTIME_MANIFEST")
@@ -52,6 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut runtime = AsrRuntime::new(INPUT_STREAM_ID.to_owned(), history_frames as u64)?;
     let mut validator = AudioValidator::default();
     let mut inference_ready = false;
+    let mut next_ready_heartbeat = Instant::now();
     let mut transcript_seq = 0_u64;
     eprintln!(
         "parakeet_asr loading pinned CUDA model from {}",
@@ -90,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         inference_ready = true;
                         ready.publish(&Bool { data: true })?;
+                        next_ready_heartbeat = Instant::now() + READY_HEARTBEAT_INTERVAL;
                         eprintln!("parakeet_asr CUDA ready: chunk_samples={chunk_samples}");
                     }
                     Ok(event @ (InferenceEvent::Partial { .. } | InferenceEvent::Final { .. })) => {
@@ -109,6 +113,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            let now = Instant::now();
+            if ready_heartbeat_due(inference_ready, now, next_ready_heartbeat) {
+                ready.publish(&Bool { data: true })?;
+                next_ready_heartbeat = now + READY_HEARTBEAT_INTERVAL;
+            }
         }
         Ok(())
     })();
@@ -119,6 +128,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_result?;
     join_result?;
     Ok(())
+}
+
+fn ready_heartbeat_due(inference_ready: bool, now: Instant, next: Instant) -> bool {
+    inference_ready && now >= next
 }
 
 fn handle_audio(
@@ -221,4 +234,23 @@ fn publish_transcript(
     })?;
     *transcript_seq += 1;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::ready_heartbeat_due;
+
+    #[test]
+    fn readiness_heartbeat_requires_a_ready_runtime_and_elapsed_deadline() {
+        let now = Instant::now();
+        assert!(!ready_heartbeat_due(false, now, now));
+        assert!(!ready_heartbeat_due(
+            true,
+            now,
+            now + Duration::from_millis(1)
+        ));
+        assert!(ready_heartbeat_due(true, now, now));
+    }
 }

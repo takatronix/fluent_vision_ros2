@@ -41,6 +41,7 @@ add_custom_target(aspa_audio_rust ALL
 )
 install(PROGRAMS
   ${CARGO_TARGET_DIR}/release/audio_capture
+  ${CARGO_TARGET_DIR}/release/audio_aec
   ${CARGO_TARGET_DIR}/release/audio_output
   ${CARGO_TARGET_DIR}/release/playback_controller
   DESTINATION lib/${PROJECT_NAME}

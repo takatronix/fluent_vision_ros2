@@ -28,6 +28,12 @@ def generate_launch_description():
         DeclareLaunchArgument("cpu_num_threads", default_value="0"),
         DeclareLaunchArgument("style_id", default_value="30"),
         DeclareLaunchArgument("synthesis_timeout_seconds", default_value="60.0"),
+        # 合成結果の再利用。既定は無効で、置き場所は配備側が決める。
+        DeclareLaunchArgument("cache_directory", default_value=""),
+        DeclareLaunchArgument("cache_memory_entries", default_value="64"),
+        DeclareLaunchArgument("cache_disk_budget_mb", default_value="256"),
+        # 起動後に先に合成しておく文の一覧 (1行1発話、'#' 始まりはコメント)
+        DeclareLaunchArgument("cache_warmup_file", default_value=""),
         Node(
             package="fv_tts",
             executable="fv_tts_node",
@@ -50,6 +56,14 @@ def generate_launch_description():
                         LaunchConfiguration("synthesis_timeout_seconds"),
                         value_type=float,
                     ),
+                    "cache_directory": LaunchConfiguration("cache_directory"),
+                    "cache_memory_entries": ParameterValue(
+                        LaunchConfiguration("cache_memory_entries"), value_type=int
+                    ),
+                    "cache_disk_budget_mb": ParameterValue(
+                        LaunchConfiguration("cache_disk_budget_mb"), value_type=int
+                    ),
+                    "cache_warmup_file": LaunchConfiguration("cache_warmup_file"),
                 },
             ],
             on_exit=EmitEvent(

@@ -1,15 +1,20 @@
 use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{
+    channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedStreamConfig};
+use cpal::{
+    BufferSize, Device, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedStreamConfig,
+};
 use futures::{FutureExt, StreamExt};
 use r2r::aspa_audio_interfaces::msg::{OutputDrained, PlaybackFrame};
 use r2r::aspa_audio_interfaces::srv::FlushAudio;
+use r2r::fv_speech_interfaces::msg::AudioFrame;
 use r2r::qos::{DurabilityPolicy, HistoryPolicy, ReliabilityPolicy};
 use r2r::std_msgs::msg::Float32;
 use r2r::{Context, Node, QosProfile};
@@ -22,6 +27,9 @@ const STATUS_ACCEPTED: u8 = OutputDrained::ACCEPTED as u8;
 const STATUS_DRAINED: u8 = OutputDrained::DRAINED as u8;
 const STATUS_FLUSHED: u8 = OutputDrained::FLUSHED as u8;
 const PLAYOUT_QOS_DEPTH: usize = 256;
+const RENDER_SOURCE_ID: &str = "aspa_audio_output";
+const RENDER_STREAM_ID: &str = "audio/render_reference/main";
+const RENDER_TOPIC: &str = "/audio/output/render_reference";
 
 #[derive(Debug, Error)]
 enum OutputError {
@@ -65,6 +73,17 @@ struct OutputPacket {
     playback_start: Option<Instant>,
     playback_end: Option<Instant>,
     ack: OutputAck,
+}
+
+struct RenderReferencePacket {
+    samples: Vec<i16>,
+    playback_time_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ClockAnchor {
+    instant: Instant,
+    unix_time_ns: u64,
 }
 
 impl OutputPacket {
@@ -130,7 +149,9 @@ fn main() -> Result<(), OutputError> {
     let ros_rate = env_u32("ASPA_AUDIO_OUTPUT_RATE", 48_000)?;
     let ros_channels = env_u16("ASPA_AUDIO_OUTPUT_CHANNELS", 2)?;
     let max_buffer_ms = env_usize("ASPA_AUDIO_OUTPUT_BUFFER_MS", 80)?;
-    if ros_rate == 0 || ros_channels == 0 || max_buffer_ms == 0 {
+    let buffer_frames = env_optional_u32("ASPA_AUDIO_OUTPUT_BUFFER_FRAMES")?;
+    let render_queue_chunks = env_usize("ASPA_AUDIO_RENDER_REFERENCE_QUEUE_CHUNKS", 64)?;
+    if ros_rate == 0 || ros_channels == 0 || max_buffer_ms == 0 || render_queue_chunks == 0 {
         return Err(OutputError::Config(
             "numeric values must be positive".to_owned(),
         ));
@@ -140,8 +161,14 @@ fn main() -> Result<(), OutputError> {
     let stream_error = Arc::new(Mutex::new(None::<String>));
     let output_gain = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
     let (ack_sender, ack_receiver) = channel::<ScheduledAck>();
+    let (render_sender, render_receiver) =
+        sync_channel::<RenderReferencePacket>(render_queue_chunks);
     let mut scheduled_acks = VecDeque::<ScheduledAck>::new();
     let mut rejected_keys = HashSet::<(String, u64)>::new();
+    let clock_anchor = ClockAnchor {
+        instant: Instant::now(),
+        unix_time_ns: unix_time_ns()?,
+    };
 
     let host = cpal::default_host();
     let device = select_device(&host)?;
@@ -154,13 +181,15 @@ fn main() -> Result<(), OutputError> {
     let mut stream = build_native_stream(
         &device,
         device_config,
+        buffer_frames,
         Arc::clone(&packets),
         ack_sender.clone(),
+        render_sender.clone(),
+        clock_anchor,
         Arc::clone(&output_gain),
         Arc::clone(&stream_failed),
         Arc::clone(&stream_error),
     )?;
-    stream.play().map_err(OutputError::Start)?;
 
     let context = Context::create()?;
     let mut node = Node::create(context, "audio_output", "")?;
@@ -171,9 +200,11 @@ fn main() -> Result<(), OutputError> {
         durability: DurabilityPolicy::Volatile,
         ..QosProfile::default()
     };
-    let mut frames = node.subscribe::<PlaybackFrame>("/audio/play", playout_qos)?;
+    let mut frames = node.subscribe::<PlaybackFrame>("/audio/play", playout_qos.clone())?;
     let drained =
         node.create_publisher::<OutputDrained>("/audio/output/drained", QosProfile::default())?;
+    let render_reference =
+        node.create_publisher::<AudioFrame>(RENDER_TOPIC, playout_qos.clone())?;
     let mut flush =
         node.create_service::<FlushAudio::Service>("/audio/output/flush", QosProfile::default())?;
     let volume_qos = QosProfile {
@@ -184,12 +215,23 @@ fn main() -> Result<(), OutputError> {
         ..QosProfile::default()
     };
     let mut volumes = node.subscribe::<Float32>("/audio/output/volume", volume_qos)?;
+    stream.play().map_err(OutputError::Start)?;
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
     ctrlc::set_handler(move || signal_running.store(false, Ordering::SeqCst))?;
+    let mut render_seq = 0_u64;
+    let mut render_sample_index = 0_u64;
 
     while running.load(Ordering::SeqCst) {
         node.spin_once(Duration::from_millis(5));
+        publish_render_reference(
+            &render_receiver,
+            &render_reference,
+            ros_rate,
+            ros_channels,
+            &mut render_seq,
+            &mut render_sample_index,
+        )?;
         while let Some(Some(volume)) = volumes.next().now_or_never() {
             if volume.data.is_finite() {
                 output_gain.store(volume.data.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
@@ -245,6 +287,18 @@ fn main() -> Result<(), OutputError> {
             // already handed to the host buffer instead of merely pausing them.
             let now = Instant::now();
             drop(stream);
+            discard_render_reference(&render_receiver)?;
+            render_reference.publish(&render_reference_message(
+                Vec::new(),
+                render_seq,
+                render_sample_index,
+                unix_time_ns()?,
+                ros_rate,
+                ros_channels,
+                true,
+            ))?;
+            render_seq = 0;
+            render_sample_index = 0;
             let queued = {
                 let mut queue = packets.lock().expect("audio queue poisoned");
                 queue
@@ -273,8 +327,11 @@ fn main() -> Result<(), OutputError> {
             stream = build_native_stream(
                 &device,
                 device_config,
+                buffer_frames,
                 Arc::clone(&packets),
                 ack_sender.clone(),
+                render_sender.clone(),
+                clock_anchor,
                 Arc::clone(&output_gain),
                 Arc::clone(&stream_failed),
                 Arc::clone(&stream_error),
@@ -296,19 +353,42 @@ fn main() -> Result<(), OutputError> {
             return Err(OutputError::Stream(error));
         }
     }
+    discard_render_reference(&render_receiver)?;
+    render_reference.publish(&render_reference_message(
+        Vec::new(),
+        render_seq,
+        render_sample_index,
+        unix_time_ns()?,
+        ros_rate,
+        ros_channels,
+        true,
+    ))?;
     Ok(())
 }
 
 fn build_native_stream(
     device: &Device,
     native: SupportedStreamConfig,
+    buffer_frames: Option<u32>,
     packets: Arc<Mutex<VecDeque<OutputPacket>>>,
     ack_sender: Sender<ScheduledAck>,
+    render_sender: SyncSender<RenderReferencePacket>,
+    clock_anchor: ClockAnchor,
     output_gain: Arc<AtomicU32>,
     stream_failed: Arc<AtomicBool>,
     stream_error: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, OutputError> {
-    let config: StreamConfig = native.into();
+    let mut config: StreamConfig = native.into();
+    if let Some(buffer_frames) = buffer_frames {
+        config.buffer_size = BufferSize::Fixed(buffer_frames);
+        eprintln!(
+            "audio_output requested callback period: {} frames ({:.1} ms)",
+            buffer_frames,
+            buffer_frames as f64 * 1_000.0 / native.sample_rate() as f64
+        );
+    }
+    let callback_stream_failed = Arc::clone(&stream_failed);
+    let callback_stream_error = Arc::clone(&stream_error);
     device
         .build_output_stream(
             config,
@@ -320,12 +400,16 @@ fn build_native_stream(
                     native.channels(),
                     &packets,
                     &ack_sender,
+                    &render_sender,
+                    clock_anchor,
                     &output_gain,
+                    &callback_stream_failed,
+                    &callback_stream_error,
                 );
             },
             move |error| {
-                stream_failed.store(true, Ordering::SeqCst);
                 *stream_error.lock().expect("error mutex poisoned") = Some(error.to_string());
+                stream_failed.store(true, Ordering::SeqCst);
             },
             None,
         )
@@ -339,7 +423,11 @@ fn fill_device_buffer(
     channels: u16,
     packets: &Arc<Mutex<VecDeque<OutputPacket>>>,
     ack_sender: &Sender<ScheduledAck>,
+    render_sender: &SyncSender<RenderReferencePacket>,
+    clock_anchor: ClockAnchor,
     output_gain: &Arc<AtomicU32>,
+    stream_failed: &Arc<AtomicBool>,
+    stream_error: &Arc<Mutex<Option<String>>>,
 ) {
     let callback_now = Instant::now();
     let timestamp = info.timestamp();
@@ -386,6 +474,164 @@ fn fill_device_buffer(
             }
         }
     }
+    if output.len() % channels as usize != 0 {
+        mark_stream_failed(
+            "CPAL output callback returned a partial interleaved frame".to_owned(),
+            stream_failed,
+            stream_error,
+        );
+        return;
+    }
+    let playback_time_ns = match instant_to_unix_ns(clock_anchor, buffer_playback_start) {
+        Ok(value) => value,
+        Err(error) => {
+            mark_stream_failed(error, stream_failed, stream_error);
+            return;
+        }
+    };
+    let packet = RenderReferencePacket {
+        samples: output.to_vec(),
+        playback_time_ns,
+    };
+    if let Err(error) = render_sender.try_send(packet) {
+        let message = match error {
+            TrySendError::Full(_) => "render-reference callback queue overflowed",
+            TrySendError::Disconnected(_) => "render-reference receiver disconnected",
+        };
+        mark_stream_failed(message.to_owned(), stream_failed, stream_error);
+    }
+}
+
+fn publish_render_reference(
+    receiver: &Receiver<RenderReferencePacket>,
+    publisher: &r2r::Publisher<AudioFrame>,
+    sample_rate_hz: u32,
+    channels: u16,
+    seq: &mut u64,
+    sample_index: &mut u64,
+) -> Result<(), OutputError> {
+    loop {
+        match receiver.try_recv() {
+            Ok(packet) => {
+                if packet.samples.is_empty() || packet.samples.len() % channels as usize != 0 {
+                    return Err(OutputError::Stream(
+                        "render-reference packet violates the interleaved PCM contract".to_owned(),
+                    ));
+                }
+                let frame_count = packet.samples.len() / channels as usize;
+                publisher.publish(&render_reference_message(
+                    packet.samples,
+                    *seq,
+                    *sample_index,
+                    packet.playback_time_ns,
+                    sample_rate_hz,
+                    channels,
+                    false,
+                ))?;
+                *seq = seq
+                    .checked_add(1)
+                    .ok_or_else(|| OutputError::Stream("render sequence overflow".to_owned()))?;
+                *sample_index = sample_index
+                    .checked_add(frame_count as u64)
+                    .ok_or_else(|| {
+                        OutputError::Stream("render sample index overflow".to_owned())
+                    })?;
+            }
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => {
+                return Err(OutputError::Stream(
+                    "render-reference callback channel disconnected".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
+fn discard_render_reference(receiver: &Receiver<RenderReferencePacket>) -> Result<(), OutputError> {
+    loop {
+        match receiver.try_recv() {
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => {
+                return Err(OutputError::Stream(
+                    "render-reference callback channel disconnected".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
+fn render_reference_message(
+    samples: Vec<i16>,
+    seq: u64,
+    sample_index: u64,
+    playback_time_ns: u64,
+    sample_rate_hz: u32,
+    channels: u16,
+    final_marker: bool,
+) -> AudioFrame {
+    let data = samples
+        .into_iter()
+        .flat_map(i16::to_le_bytes)
+        .collect::<Vec<_>>();
+    AudioFrame {
+        header: r2r::std_msgs::msg::Header {
+            stamp: r2r::builtin_interfaces::msg::Time {
+                sec: (playback_time_ns / 1_000_000_000) as i32,
+                nanosec: (playback_time_ns % 1_000_000_000) as u32,
+            },
+            frame_id: String::new(),
+        },
+        source_id: RENDER_SOURCE_ID.to_owned(),
+        stream_id: RENDER_STREAM_ID.to_owned(),
+        seq,
+        sample_index,
+        capture_time_ns: playback_time_ns,
+        frame_count: if final_marker {
+            0
+        } else {
+            (data.len() / (channels as usize * 2)) as u32
+        },
+        encoding: "PCM16LE".to_owned(),
+        sample_rate_hz,
+        channels: channels as u32,
+        bit_depth: 16,
+        layout: "interleaved".to_owned(),
+        data,
+        final_: final_marker,
+    }
+}
+
+fn mark_stream_failed(
+    error: String,
+    stream_failed: &Arc<AtomicBool>,
+    stream_error: &Arc<Mutex<Option<String>>>,
+) {
+    if !stream_failed.swap(true, Ordering::SeqCst) {
+        *stream_error.lock().expect("error mutex poisoned") = Some(error);
+    }
+}
+
+fn instant_to_unix_ns(anchor: ClockAnchor, instant: Instant) -> Result<u64, String> {
+    let elapsed = instant
+        .checked_duration_since(anchor.instant)
+        .ok_or_else(|| "CPAL playback timestamp predates the output clock anchor".to_owned())?;
+    let elapsed_ns = u64::try_from(elapsed.as_nanos())
+        .map_err(|_| "CPAL playback timestamp exceeds the ROS nanosecond range".to_owned())?;
+    anchor
+        .unix_time_ns
+        .checked_add(elapsed_ns)
+        .ok_or_else(|| "CPAL playback timestamp overflowed".to_owned())
+}
+
+fn unix_time_ns() -> Result<u64, OutputError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            OutputError::Stream(format!("system clock predates UNIX epoch: {error}"))
+        })?;
+    u64::try_from(duration.as_nanos())
+        .map_err(|_| OutputError::Stream("system clock exceeds ROS nanosecond range".to_owned()))
 }
 
 fn schedule_completed_packet(
@@ -615,12 +861,24 @@ fn env_usize(name: &str, default: usize) -> Result<usize, OutputError> {
     })
 }
 
+fn env_optional_u32(name: &str) -> Result<Option<u32>, OutputError> {
+    env::var(name).map_or(Ok(None), |value| {
+        value
+            .parse()
+            .ok()
+            .filter(|parsed| *parsed > 0)
+            .map(Some)
+            .ok_or_else(|| OutputError::Config(name.to_owned()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_played_frames, requested_device_matches, scale_sample, schedule_completed_packet,
-        take_due_acks, validate_frame, OutputAck, OutputPacket, KIND_AGENT, STATUS_ACCEPTED,
-        STATUS_DRAINED, STATUS_FLUSHED,
+        estimate_played_frames, render_reference_message, requested_device_matches, scale_sample,
+        schedule_completed_packet, take_due_acks, validate_frame, OutputAck, OutputPacket,
+        KIND_AGENT, RENDER_SOURCE_ID, RENDER_STREAM_ID, STATUS_ACCEPTED, STATUS_DRAINED,
+        STATUS_FLUSHED,
     };
     use r2r::aspa_audio_interfaces::msg::PlaybackFrame;
     use std::collections::VecDeque;
@@ -782,5 +1040,20 @@ mod tests {
         assert_eq!(scale_sample(20_000, 0.5), 10_000);
         assert_eq!(scale_sample(-20_000, 0.5), -10_000);
         assert_eq!(scale_sample(i16::MAX, 0.0), 0);
+    }
+
+    #[test]
+    fn render_reference_uses_the_callback_pcm_contract() {
+        let message = render_reference_message(vec![10, 20, 30, 40], 7, 960, 123, 48_000, 2, false);
+        assert_eq!(message.source_id, RENDER_SOURCE_ID);
+        assert_eq!(message.stream_id, RENDER_STREAM_ID);
+        assert_eq!(message.seq, 7);
+        assert_eq!(message.sample_index, 960);
+        assert_eq!(message.capture_time_ns, 123);
+        assert_eq!(message.frame_count, 2);
+        assert_eq!(message.sample_rate_hz, 48_000);
+        assert_eq!(message.channels, 2);
+        assert_eq!(message.data.len(), 8);
+        assert!(!message.final_);
     }
 }

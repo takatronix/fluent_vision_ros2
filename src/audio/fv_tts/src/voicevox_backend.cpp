@@ -196,6 +196,14 @@ struct VoicevoxCoreBackend::Impl {
       }
     }
 
+    // 合成結果の同一性。エンジン版数・ONNX Runtime・モデル群のどれかが
+    // 変われば同じ文字列でも別の音になりうる。モデルはバージョン付きの
+    // ディレクトリに入るので、パスの一覧を identity に含めれば足りる。
+    identity_ = std::string(voicevox_get_version()) + "|" + runtime.string();
+    for (const auto &path : model_paths) {
+      identity_ += "|" + path.string();
+    }
+
     const auto acceleration = lower_ascii(config.acceleration_mode);
     VoicevoxAccelerationMode acceleration_mode;
     if (acceleration == "auto") {
@@ -364,6 +372,7 @@ struct VoicevoxCoreBackend::Impl {
         wav.get(), wav.get() + static_cast<std::size_t>(wav_length)));
   }
 
+  std::string identity_;
   const VoicevoxOnnxruntime *onnxruntime_{nullptr};
   OpenJtalkPtr open_jtalk_;
   SynthesizerPtr synthesizer_;
@@ -393,6 +402,10 @@ bool VoicevoxCoreBackend::set_style_id(std::uint32_t style_id) {
 
 SynthesizedAudio VoicevoxCoreBackend::synthesize(const std::string &text) {
   return impl_->synthesize(text);
+}
+
+const std::string &VoicevoxCoreBackend::identity() const {
+  return impl_->identity_;
 }
 
 SynthesizedAudio decode_pcm16_wav(const std::vector<std::uint8_t> &wav) {

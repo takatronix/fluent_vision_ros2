@@ -9,7 +9,7 @@ does not own dialogue state, an LLM client, TTS, or physical audio I/O.
 
 - subscribes: `/audio/mic/frame` (`fv_speech_interfaces/msg/AudioFrame`)
 - publishes: `/dialogue/vad/activity` (`fv_speech_interfaces/msg/VoiceActivity`)
-- accepts only 16 kHz mono PCM16LE from `aspa_audio_capture`
+- accepts only WebRTC AEC3-cleaned 16 kHz mono PCM16LE from `aspa_audio_aec`
 - loads the packaged `models/silero_vad_16k_op15.onnx` and verifies its SHA-256
 
 ### `turn_detector`
@@ -21,12 +21,15 @@ does not own dialogue state, an LLM client, TTS, or physical audio I/O.
 ### `parakeet_asr`
 
 - subscribes: `/audio/mic/frame`
+- accepts only WebRTC AEC3-cleaned PCM from `aspa_audio_aec`; raw capture is not
+  a valid ASR input
 - subscribes: `/dialogue/asr/control` (`fv_speech_interfaces/msg/AsrControl`)
 - publishes: `/dialogue/asr/transcript` (`fv_speech_interfaces/msg/Transcript`)
 - publishes transient-local readiness on `/dialogue/asr/ready`
 - validates and loads the pinned CUDA runtime manifest supplied through
   `ASPA_PARAKEET_RUNTIME_MANIFEST`
-- requires a schema 6 verification receipt that binds the model, CUDA runtime,
+- requires a schema 7 verification receipt that binds the driver, CUDA toolkit,
+  nvcc build, model, CUDA runtime,
   exact Japanese golden WAV/transcript, probe log, and Nsight CUDA-kernel report
   by SHA-256; older receipts are rejected by the production path
 - rechecks the receipt log for CUDA EP, TF32-off, exact cold parity, and warm

@@ -13,6 +13,7 @@
   <build_depend>libasound2-dev</build_depend>
   <build_depend>libgstreamer1.0-dev</build_depend>
   <build_depend>libgstreamer-plugins-base1.0-dev</build_depend>
+  <build_depend>meson</build_depend>
   <build_depend>std_msgs</build_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>aspa_audio_interfaces</exec_depend>
