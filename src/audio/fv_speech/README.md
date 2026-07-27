@@ -9,7 +9,7 @@ does not own dialogue state, an LLM client, TTS, or physical audio I/O.
 
 - subscribes: `/audio/mic/frame` (`fv_speech_interfaces/msg/AudioFrame`)
 - publishes: `/dialogue/vad/activity` (`fv_speech_interfaces/msg/VoiceActivity`)
-- accepts only WebRTC AEC3-cleaned 16 kHz mono PCM16LE from `aspa_audio_aec`
+- accepts only WebRTC AEC3-cleaned 16 kHz mono PCM16LE from `fv_audio_aec`
 - loads the packaged `models/silero_vad_16k_op15.onnx` and verifies its SHA-256
 
 ### `turn_detector`
@@ -21,7 +21,7 @@ does not own dialogue state, an LLM client, TTS, or physical audio I/O.
 ### `parakeet_asr`
 
 - subscribes: `/audio/mic/frame`
-- accepts only WebRTC AEC3-cleaned PCM from `aspa_audio_aec`; raw capture is not
+- accepts only WebRTC AEC3-cleaned PCM from `fv_audio_aec`; raw capture is not
   a valid ASR input
 - subscribes: `/dialogue/asr/control` (`fv_speech_interfaces/msg/AsrControl`)
 - publishes: `/dialogue/asr/transcript` (`fv_speech_interfaces/msg/Transcript`)

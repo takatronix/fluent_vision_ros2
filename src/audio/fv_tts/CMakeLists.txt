@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(ament_cmake REQUIRED)
-find_package(aspa_audio_interfaces REQUIRED)
+find_package(fv_audio_interfaces REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
@@ -88,7 +88,7 @@ target_compile_options(fv_tts_core PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(fv_tts_node src/tts_node.cpp)
 target_link_libraries(fv_tts_node fv_tts_core "${VOICEVOX_CORE_LIBRARY}")
 ament_target_dependencies(fv_tts_node
-  aspa_audio_interfaces
+  fv_audio_interfaces
   rclcpp
   std_msgs
   std_srvs

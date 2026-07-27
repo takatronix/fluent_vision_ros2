@@ -1,6 +1,0 @@
-string target_identifier
-int32 target_index
-bool restart
----
-bool success
-string message

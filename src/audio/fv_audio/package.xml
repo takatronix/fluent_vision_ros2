@@ -2,33 +2,27 @@
 <package format="3">
   <name>fv_audio</name>
   <version>0.1.0</version>
-  <description>Audio capture and streaming node for FluentVision ROS2.</description>
-  <maintainer email="maintainer@example.com">Fluent Robotics</maintainer>
-  <license>MIT</license>
+  <description>FV CPAL device discovery, capture/output, AEC, and playback control.</description>
+  <maintainer email="info@vegetalia.co.jp">ASPA Team</maintainer>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-
-  <build_depend>rclcpp</build_depend>
+  <build_depend>fv_audio_interfaces</build_depend>
+  <build_depend>fv_speech_interfaces</build_depend>
+  <build_depend>libclang-dev</build_depend>
+  <build_depend>libasound2-dev</build_depend>
+  <build_depend>libgstreamer1.0-dev</build_depend>
+  <build_depend>libgstreamer-plugins-base1.0-dev</build_depend>
+  <build_depend>meson</build_depend>
   <build_depend>std_msgs</build_depend>
-  <build_depend>std_srvs</build_depend>
-  <build_depend>diagnostic_msgs</build_depend>
-  <build_depend>builtin_interfaces</build_depend>
-  <build_depend>rosidl_default_generators</build_depend>
-
-  <exec_depend>rclcpp</exec_depend>
-  <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>std_srvs</exec_depend>
-  <exec_depend>diagnostic_msgs</exec_depend>
-  <exec_depend>builtin_interfaces</exec_depend>
-  <exec_depend>rosidl_default_runtime</exec_depend>
-
-  <depend>pkg-config</depend>
-  <depend>libasound2-dev</depend>
-
-  <member_of_group>rosidl_interface_packages</member_of_group>
-
-  <export>
-    <build_type>ament_cmake</build_type>
-  </export>
+  <exec_depend>fv_audio_interfaces</exec_depend>
+  <exec_depend>fv_speech_interfaces</exec_depend>
+  <exec_depend>libasound2</exec_depend>
+  <exec_depend>libgstreamer1.0-0</exec_depend>
+  <exec_depend>gstreamer1.0-plugins-base</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
 </package>

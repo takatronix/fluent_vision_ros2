@@ -1,8 +1,0 @@
-# Request: play an audio file through the output device
-string file_path         # Absolute path to WAV file
-float32 volume_scale     # Volume multiplier (0.0-1.0), default 1.0
-bool interrupt           # If true, clear queue and play immediately
----
-# Response
-bool success
-string message           # Error message if success is false

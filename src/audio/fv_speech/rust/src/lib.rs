@@ -7,7 +7,7 @@ pub mod ros;
 pub mod turn;
 pub mod vad;
 
-pub const INPUT_SOURCE_ID: &str = "aspa_audio_aec";
+pub const INPUT_SOURCE_ID: &str = "fv_audio_aec";
 pub const INPUT_STREAM_ID: &str = "audio/mic/main";
 pub const VAD_SOURCE_ID: &str = "aspa_silero_vad";
 pub const VAD_STREAM_ID: &str = "dialogue/vad/main";

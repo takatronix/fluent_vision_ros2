@@ -5,7 +5,7 @@
 - SYSTEM 発話: `/aspa/tts/say`
 - cue PCM: `/audio/cue/frame`
 
-物理デバイスへは接続しません。両出力は `aspa_audio/playback_controller` が単一の再生ストリームへ統合します。
+物理デバイスへは接続しません。両出力は `fv_audio/playback_controller` が単一の再生ストリームへ統合します。
 `/fv/event` は bare 名または `{"event":"name"}` のみを受け付け、発話文や cue の入力時上書きはできません。
 通常イベントは音の有効設定にかかわらず先に `/fv/event/active` へ記録されます。
 `/fv/sound/settings` は TRANSIENT_LOCAL な次の共有設定を受け付けます。

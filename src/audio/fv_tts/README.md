@@ -3,7 +3,7 @@
 `fv_tts` is an `rclcpp` node that calls a pinned VOICEVOX Core 0.16.4 C API
 extension in-process. The extension preserves the source Unicode-character
 range that produced each mora. It subscribes to `/aspa/tts/say` and publishes
-`aspa_audio_interfaces/msg/SynthesizedSpeech` to `/audio/agent/frame` or
+`fv_audio_interfaces/msg/SynthesizedSpeech` to `/audio/agent/frame` or
 `/audio/system/frame`; no Python runtime and no VOICEVOX Engine HTTP process
 are involved.
 
@@ -14,7 +14,7 @@ inconsistent mapping fails synthesis instead of estimating a character
 position.
 
 Native synthesis is serialized. Pending SYSTEM requests overtake pending agent
-requests. Typed `aspa_audio_interfaces/msg/PlaybackControl` messages on
+requests. Typed `fv_audio_interfaces/msg/PlaybackControl` messages on
 `/audio/playback/control` advance the agent floor on `DISCARD`, cancel queued
 stale work, and suppress PCM from native work that became stale while it was
 running. A targeted SYSTEM abort is remembered briefly so cross-topic

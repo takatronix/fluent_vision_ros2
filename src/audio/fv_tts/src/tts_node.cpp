@@ -1,6 +1,6 @@
-#include <aspa_audio_interfaces/msg/playback_control.hpp>
-#include <aspa_audio_interfaces/msg/speech_mark.hpp>
-#include <aspa_audio_interfaces/msg/synthesized_speech.hpp>
+#include <fv_audio_interfaces/msg/playback_control.hpp>
+#include <fv_audio_interfaces/msg/speech_mark.hpp>
+#include <fv_audio_interfaces/msg/synthesized_speech.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -27,9 +27,9 @@
 namespace fv_tts {
 namespace {
 
-using PlaybackControl = aspa_audio_interfaces::msg::PlaybackControl;
-using SpeechMark = aspa_audio_interfaces::msg::SpeechMark;
-using SynthesizedSpeech = aspa_audio_interfaces::msg::SynthesizedSpeech;
+using PlaybackControl = fv_audio_interfaces::msg::PlaybackControl;
+using SpeechMark = fv_audio_interfaces::msg::SpeechMark;
+using SynthesizedSpeech = fv_audio_interfaces::msg::SynthesizedSpeech;
 using String = std_msgs::msg::String;
 
 void validate_playback_control(const PlaybackControl &control) {

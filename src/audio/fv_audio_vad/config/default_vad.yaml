@@ -1,6 +1,0 @@
-fv_audio_vad_node:
-  ros__parameters:
-    vad:
-      threshold: 0.05
-      release_ms: 200
-      min_active_ms: 100

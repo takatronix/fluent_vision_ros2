@@ -270,7 +270,7 @@ back to legacy meanings.
 <details>
 <summary><b>🔊 Audio (<code>src/audio/</code>)</b></summary>
 
-- `aspa_audio` (Rust CPAL/GStreamer capture, playback arbitration, output), `fv_speech` (Rust Silero VAD, turn detector, Parakeet CUDA EP ASR), `fv_tts` (C++ official VOICEVOX Core C API).
+- `fv_audio` (Rust CPAL/GStreamer capture, playback arbitration, output), `fv_speech` (Rust Silero VAD, turn detector, Parakeet CUDA EP ASR), `fv_tts` (C++ official VOICEVOX Core C API).
 
 </details>
 
@@ -386,7 +386,7 @@ PRs and issues are very welcome — bug reports, new AI nodes, pipeline examples
 3. Run `colcon build --packages-select <changed>` and any package-local tests before opening the PR.
 4. **No silent fallbacks** — don't paper over missing TFs / timestamps / sensor data with stale or zero values. Fail closed and warn.
 
-Coding conventions live in [`CLAUDECODE_RULES.md`](CLAUDECODE_RULES.md) and [`CPP_CODING_RULES.md`](CPP_CODING_RULES.md). Per-package design notes live alongside the package (e.g. [`src/audio/fv_audio/DESIGN.md`](src/audio/fv_audio/DESIGN.md)).
+Coding conventions live in [`CLAUDECODE_RULES.md`](CLAUDECODE_RULES.md) and [`CPP_CODING_RULES.md`](CPP_CODING_RULES.md). Per-package design notes live alongside the package (e.g. [`src/audio/fv_audio/README.md`](src/audio/fv_audio/README.md)).
 
 ---
 

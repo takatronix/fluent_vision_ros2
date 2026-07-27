@@ -1,5 +1,0 @@
-string command   # start | stop
-string file_path
----
-bool success
-string message
