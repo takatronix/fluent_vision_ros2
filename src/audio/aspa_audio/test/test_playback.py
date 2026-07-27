@@ -473,12 +473,13 @@ def test_agent_flush_never_matches_system_audio_left_on_device():
     assert not tracker.matches("system", "other-system")
 
 
-def test_audio_launch_treats_capture_aec_playback_and_output_as_one_failure_domain():
+def test_audio_launch_gives_each_native_node_an_independent_recovery_domain():
     launch_file = Path(__file__).resolve().parents[1] / "launch" / "aspa_audio.launch.py"
     source = launch_file.read_text(encoding="utf-8")
 
-    assert source.count("on_exit=EmitEvent(") == 4
-    assert source.count("event=Shutdown(") == 4
+    assert source.count("respawn=True") == 4
+    assert source.count("respawn_delay=2.0") == 4
+    assert "on_exit=EmitEvent(" not in source
     for executable in (
         "audio_capture",
         "audio_aec",

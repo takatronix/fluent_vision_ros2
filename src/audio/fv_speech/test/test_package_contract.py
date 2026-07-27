@@ -78,13 +78,9 @@ def test_launch_owns_three_nodes_and_packaged_model():
     assert '.env("ORT_DYLIB_PATH"' in wrapper
     assert '.env("LD_LIBRARY_PATH"' in wrapper
     assert ".exec()" in wrapper
-    assert launch.count("on_exit=EmitEvent(") == 3
-    for reason in (
-        "Parakeet CUDA ASR exited",
-        "Silero VAD exited",
-        "Turn detector exited",
-    ):
-        assert f'event=Shutdown(reason="{reason}")' in launch
+    assert launch.count("respawn=True") == 3
+    assert launch.count("respawn_delay=2.0") == 3
+    assert "on_exit=EmitEvent(" not in launch
 
     model = PACKAGE_DIR / "models" / "silero_vad_16k_op15.onnx"
     assert sha256(model.read_bytes()).hexdigest() == EXPECTED_MODEL_SHA256

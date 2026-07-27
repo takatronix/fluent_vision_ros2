@@ -2,8 +2,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, EmitEvent
-from launch.events import Shutdown
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -39,6 +38,8 @@ def generate_launch_description():
             executable="fv_tts_node",
             name="fv_tts",
             output="screen",
+            respawn=True,
+            respawn_delay=2.0,
             parameters=[
                 os.path.join(share, "config", "default.yaml"),
                 {
@@ -66,8 +67,5 @@ def generate_launch_description():
                     "cache_warmup_file": LaunchConfiguration("cache_warmup_file"),
                 },
             ],
-            on_exit=EmitEvent(
-                event=Shutdown(reason="VOICEVOX TTS exited")
-            ),
         ),
     ])

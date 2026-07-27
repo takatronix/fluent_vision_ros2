@@ -17,6 +17,8 @@ def generate_launch_description() -> LaunchDescription:
             executable="fv_soundboard_node",
             name="fv_soundboard",
             output="screen",
+            respawn=True,
+            respawn_delay=2.0,
             parameters=[{
                 "registry_file": LaunchConfiguration("registry_file"),
                 "sounds_dir": LaunchConfiguration("sounds_dir"),

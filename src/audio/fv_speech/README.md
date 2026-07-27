@@ -70,6 +70,11 @@ The launch file starts `parakeet_asr` and `silero_vad` through
 bound artifact before setting `ORT_DYLIB_PATH` and `LD_LIBRARY_PATH` only for
 the selected child process. Direct launch therefore uses the same CUDA/cuDNN
 runtime as `start-stack` without polluting the rest of the process tree.
+ASR, VAD, and the turn detector are separate launch recovery domains. A fatal
+contract error still terminates the affected executable and readiness remains
+false; the launch owner waits two seconds before recreating only that process.
+This permits an operator-requested component restart without relaxing the
+runtime or input validation.
 Nsight and benchmark working profiles remain under `/tmp`; `--verify` copies
 the verified runtime, model, golden WAV, and receipt into the persistent data
 root before atomically publishing `runtime.json`.

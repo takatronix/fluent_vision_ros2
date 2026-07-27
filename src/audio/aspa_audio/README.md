@@ -44,11 +44,17 @@ ROS 2 owns both physical audio devices and the robot's single playback stream.
   device playback timestamp. A flush closes and recreates the CPAL stream so
   samples already handed to the host buffer are discarded.
 
-The launch file treats capture, AEC, controller, and output as one failure domain.
-If any node exits, the launch shuts down all four. In particular, an
-unavailable or failed flush is fatal to the playback controller; the stack does
-not continue the audio path after it can no longer invalidate stale physical
-playback.
+The launch file keeps capture, AEC, controller, and output as separate recovery
+domains. Each node exits on a contract failure and the launch owner respawns
+that exact executable after two seconds; it never substitutes raw capture for
+AEC output or bypasses playback invalidation. Live UI reports both the process
+and ROS-node state and can request the same exact-process restart. If the launch
+owner itself is absent, an individual restart fails instead of starting an
+unowned process.
+
+An unavailable or failed flush remains fatal to the playback controller. During
+its restart window, playback readiness is false and no other component assumes
+that stale physical playback was invalidated.
 The controller also exits non-zero if a chunk is not accepted within 5 seconds,
 if all acknowledgement/drain progress stops for 5 seconds, if a flush call does
 not return within 5 seconds, or if GStreamer conversion does not finish within

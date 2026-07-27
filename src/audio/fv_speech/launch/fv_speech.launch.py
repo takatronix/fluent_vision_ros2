@@ -2,8 +2,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, EmitEvent, OpaqueFunction
-from launch.events import Shutdown
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -35,9 +34,8 @@ def _speech_nodes(context, *, share):
             parameters=[config],
             additional_env=runtime_env,
             output="screen",
-            on_exit=EmitEvent(
-                event=Shutdown(reason="Parakeet CUDA ASR exited")
-            ),
+            respawn=True,
+            respawn_delay=2.0,
         ),
         Node(
             package="fv_speech",
@@ -46,18 +44,16 @@ def _speech_nodes(context, *, share):
             parameters=[config, {"model_path": silero_model}],
             additional_env=runtime_env,
             output="screen",
-            on_exit=EmitEvent(
-                event=Shutdown(reason="Silero VAD exited")
-            ),
+            respawn=True,
+            respawn_delay=2.0,
         ),
         Node(
             package="fv_speech",
             executable="turn_detector",
             parameters=[config],
             output="screen",
-            on_exit=EmitEvent(
-                event=Shutdown(reason="Turn detector exited")
-            ),
+            respawn=True,
+            respawn_delay=2.0,
         ),
     ]
 

@@ -4,15 +4,16 @@ from pathlib import Path
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 
 
-def test_launch_shuts_down_when_native_tts_exits():
+def test_launch_respawns_native_tts_as_its_own_recovery_domain():
     source = (PACKAGE_DIR / "launch" / "fv_tts.launch.py").read_text(
         encoding="utf-8"
     )
 
     assert source.count('package="fv_tts"') == 1
     assert source.count('executable="fv_tts_node"') == 1
-    assert source.count("on_exit=EmitEvent(") == 1
-    assert 'event=Shutdown(reason="VOICEVOX TTS exited")' in source
+    assert source.count("respawn=True") == 1
+    assert source.count("respawn_delay=2.0") == 1
+    assert "on_exit=EmitEvent(" not in source
 
 
 def test_synthesis_timeout_is_configured_and_forwarded_as_float():
