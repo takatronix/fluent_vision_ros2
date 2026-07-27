@@ -243,6 +243,13 @@ events:
     interrupt: false
     record: notify
     category: interaction
+  wake_ack:
+    sound: notify
+    say: ""
+    speak: false
+    interrupt: false
+    record: wake_ack
+    category: interaction
   warning:
     sound: warning
     say: "注意してください"

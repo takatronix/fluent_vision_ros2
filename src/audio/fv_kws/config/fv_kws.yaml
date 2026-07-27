@@ -1,0 +1,6 @@
+fv_kws:
+  ros__parameters:
+    runtime_manifest: ""
+    end_silence_samples: 3072
+    pre_roll_samples: 2048
+    max_candidate_samples: 48128

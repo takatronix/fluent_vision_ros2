@@ -95,10 +95,15 @@ def test_launch_owns_three_nodes_and_packaged_model():
 
 
 def test_rust_ros_types_use_fv_speech_interfaces_only():
+    library = (PACKAGE_DIR / "rust" / "src" / "lib.rs").read_text(
+        encoding="utf-8"
+    )
     rust_sources = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (PACKAGE_DIR / "rust" / "src").rglob("*.rs")
     )
+    assert 'INPUT_SOURCE_ID: &str = "fv_audio_aec"' in library
+    assert 'INPUT_STREAM_ID: &str = "audio/mic/main"' in library
     assert "r2r::fv_speech_interfaces::msg" in rust_sources
     assert "fluent_dialogue_dora_interfaces" not in rust_sources
     assert "aspa_dialogue_ros2" not in rust_sources

@@ -11,6 +11,7 @@ set(message_files
   "msg/Transcript.msg"
   "msg/TurnEvent.msg"
   "msg/VoiceActivity.msg"
+  "msg/WakeWord.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
