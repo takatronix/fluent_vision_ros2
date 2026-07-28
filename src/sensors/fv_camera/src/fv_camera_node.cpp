@@ -120,6 +120,22 @@ void FVUSBCameraNode::loadParameters()
         this->declare_parameter("camera.exposure", -1);
     camera_config_.rotate_180 =
         this->declare_parameter("camera.rotate_180", false);
+    // camera.rotation: degrees clockwise (0/90/180/270). rotate_180 (legacy
+    // bool) folds in additively so existing configs keep working.
+    {
+        int rot = static_cast<int>(
+            this->declare_parameter("camera.rotation", 0));
+        if (camera_config_.rotate_180) rot += 180;
+        rot %= 360;
+        if (rot < 0) rot += 360;
+        if (rot % 90 != 0) {
+            RCLCPP_WARN(this->get_logger(),
+                        "camera.rotation must be a multiple of 90 (got %d); "
+                        "using 0", rot);
+            rot = 0;
+        }
+        camera_config_.rotation = rot;
+    }
     
     // Stream settings
     stream_config_.color_enabled = 
@@ -465,9 +481,19 @@ void FVUSBCameraNode::processingLoop()
         }
         empty_frame_streak = 0;
 
-        // Apply 180-degree rotation for physically inverted mounts.
-        if (camera_config_.rotate_180) {
-            cv::rotate(frame, frame, cv::ROTATE_180);
+        // Apply mount-correction rotation (degrees clockwise).
+        switch (camera_config_.rotation) {
+            case 90:
+                cv::rotate(frame, frame, cv::ROTATE_90_CLOCKWISE);
+                break;
+            case 180:
+                cv::rotate(frame, frame, cv::ROTATE_180);
+                break;
+            case 270:
+                cv::rotate(frame, frame, cv::ROTATE_90_COUNTERCLOCKWISE);
+                break;
+            default:
+                break;
         }
 
         // Update frame
@@ -596,6 +622,11 @@ void FVUSBCameraNode::updateCameraInfo()
     camera_info_msg_.header.frame_id = tf_config_.optical_frame;
     camera_info_msg_.width = camera_.get(cv::CAP_PROP_FRAME_WIDTH);
     camera_info_msg_.height = camera_.get(cv::CAP_PROP_FRAME_HEIGHT);
+    // camera_info must describe the published (rotated) image, not the
+    // sensor readout — 90/270 swap the dimensions.
+    if (camera_config_.rotation == 90 || camera_config_.rotation == 270) {
+        std::swap(camera_info_msg_.width, camera_info_msg_.height);
+    }
     
     // Camera matrix — use parameter overrides when provided, otherwise fall
     // back to image-center principal point and 1000 px focal length.
