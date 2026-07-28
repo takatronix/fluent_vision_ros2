@@ -453,3 +453,20 @@ events:
     interrupt: false
     record: motion_cleared
     category: safety
+
+  # カメラの人認識 (aspa person_node)。motion_detected (人感センサー) とは
+  # 別イベント — 出どころが違えば台詞も記録マーカーも分ける。
+  person_detected:
+    sound: attention
+    say: "カメラに人を検知しました"
+    speak: true
+    interrupt: false
+    record: person_detected
+    category: safety
+  person_lost:
+    sound: ""
+    say: ""
+    speak: false
+    interrupt: false
+    record: person_lost
+    category: safety
