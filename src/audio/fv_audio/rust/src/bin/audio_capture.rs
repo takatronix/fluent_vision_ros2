@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread::{self, Thread};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
@@ -13,7 +13,10 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
 use r2r::fv_speech_interfaces::msg::AudioFrame;
+use r2r::qos::{DurabilityPolicy, HistoryPolicy, ReliabilityPolicy};
 use r2r::{Context, Node, QosProfile};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
 use thiserror::Error;
 
 const SOURCE_ID: &str = "fv_audio_capture";
@@ -21,6 +24,9 @@ const STREAM_ID: &str = "audio/mic/raw";
 const OUTPUT_TOPIC: &str = "/audio/mic/raw";
 const ROS_SAMPLE_RATE: u32 = 16_000;
 const ROS_CHANNELS: u16 = 1;
+const AUDIO_QOS_DEPTH: usize = 256;
+const DEFAULT_PREBUFFER_CHUNKS: usize = 4;
+const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Error)]
 enum CaptureError {
@@ -40,6 +46,8 @@ enum CaptureError {
     Start(#[source] cpal::Error),
     #[error("capture callback queue overflowed")]
     Overflow,
+    #[error("capture input produced no complete frame for 500 ms")]
+    Stall,
     #[error("CPAL input stream failed: {0}")]
     Stream(String),
     #[error("GStreamer input conversion failed: {0}")]
@@ -52,8 +60,7 @@ enum CaptureError {
     Signal(#[from] ctrlc::Error),
 }
 
-enum CaptureMessage {
-    Data(Vec<u8>),
+enum CaptureFailure {
     CpalError(String),
     GStreamerError(String),
 }
@@ -125,7 +132,9 @@ impl CapturePipeline {
         input_rate: u32,
         input_channels: u16,
         chunk_bytes: usize,
-        sender: SyncSender<CaptureMessage>,
+        mut producer: HeapProd<u8>,
+        consumer_thread: Thread,
+        failure_sender: SyncSender<CaptureFailure>,
         overflowed: Arc<AtomicBool>,
         failed: Arc<AtomicBool>,
     ) -> Result<Self, CaptureError> {
@@ -135,7 +144,8 @@ impl CapturePipeline {
              audio/x-raw,format={},rate={input_rate},channels={input_channels},layout=interleaved ! \
              audioconvert ! audioresample ! \
              audio/x-raw,format=S16LE,rate={ROS_SAMPLE_RATE},channels={ROS_CHANNELS},layout=interleaved ! \
-             appsink name=sink sync=false",
+             audiobuffersplit output-buffer-size={chunk_bytes} strict-buffer-size=true ! \
+             appsink name=sink sync=false max-buffers=2 drop=false",
             <T as GStreamerPcmSample>::FORMAT
         );
         let pipeline = gst::parse::launch(&description)
@@ -174,10 +184,6 @@ impl CapturePipeline {
             })?;
 
         sink.set_wait_on_eos(false);
-        let pending_capacity = chunk_bytes
-            .checked_mul(2)
-            .ok_or_else(|| CaptureError::Config("capture pending size overflowed".to_owned()))?;
-        let mut pending = VecDeque::<u8>::with_capacity(pending_capacity);
         sink.set_callbacks(
             AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -192,29 +198,34 @@ impl CapturePipeline {
                         let mapped = buffer.map_readable().map_err(|error| {
                             format!("cannot map converted input buffer: {error}")
                         })?;
-                        pending.extend(mapped.as_slice());
-                        while pending.len() >= chunk_bytes {
-                            let chunk = pending.drain(..chunk_bytes).collect::<Vec<_>>();
-                            sender
-                                .try_send(CaptureMessage::Data(chunk))
-                                .map_err(|error| match error {
-                                    TrySendError::Full(_) => {
-                                        overflowed.store(true, Ordering::SeqCst);
-                                        "converted input queue overflowed".to_owned()
-                                    }
-                                    TrySendError::Disconnected(_) => {
-                                        "converted input receiver disconnected".to_owned()
-                                    }
-                                })?;
+                        if mapped.len() != chunk_bytes {
+                            return Err(format!(
+                                "converted input chunk violates contract: expected {chunk_bytes} bytes, got {}",
+                                mapped.len()
+                            ));
                         }
+                        if producer.vacant_len() < chunk_bytes {
+                            overflowed.store(true, Ordering::SeqCst);
+                            return Err("converted input SPSC ring overflowed".to_owned());
+                        }
+                        let written = producer.push_slice(mapped.as_slice());
+                        if written != chunk_bytes {
+                            overflowed.store(true, Ordering::SeqCst);
+                            return Err(format!(
+                                "converted input SPSC ring accepted {written}/{chunk_bytes} bytes"
+                            ));
+                        }
+                        consumer_thread.unpark();
                         Ok(())
                     })();
                     match result {
                         Ok(()) => Ok(gst::FlowSuccess::Ok),
                         Err(error) => {
                             eprintln!("audio_capture GStreamer callback failed: {error}");
-                            let _ = sender.try_send(CaptureMessage::GStreamerError(error));
+                            let _ = failure_sender
+                                .try_send(CaptureFailure::GStreamerError(error));
                             failed.store(true, Ordering::SeqCst);
+                            consumer_thread.unpark();
                             Err(gst::FlowError::Error)
                         }
                     }
@@ -298,19 +309,44 @@ fn validate_converted_caps(sample: &gst::Sample) -> Result<(), String> {
 fn main() -> Result<(), CaptureError> {
     let chunk_frames = env_usize("FV_AUDIO_CAPTURE_CHUNK_FRAMES", 160)?;
     let queue_capacity = env_usize("FV_AUDIO_CAPTURE_QUEUE_CHUNKS", 8)?;
+    let prebuffer_chunks = env_usize(
+        "FV_AUDIO_CAPTURE_PREBUFFER_CHUNKS",
+        DEFAULT_PREBUFFER_CHUNKS,
+    )?;
     let buffer_frames = env_optional_u32("FV_AUDIO_CAPTURE_BUFFER_FRAMES")?;
-    if chunk_frames == 0 || queue_capacity == 0 {
+    if chunk_frames == 0 || queue_capacity == 0 || prebuffer_chunks == 0 {
         return Err(CaptureError::Config(
             "numeric values must be positive".to_owned(),
         ));
+    }
+    if prebuffer_chunks > queue_capacity {
+        return Err(CaptureError::Config(format!(
+            "FV_AUDIO_CAPTURE_PREBUFFER_CHUNKS ({prebuffer_chunks}) exceeds FV_AUDIO_CAPTURE_QUEUE_CHUNKS ({queue_capacity})"
+        )));
     }
     let chunk_bytes = chunk_frames
         .checked_mul(ROS_CHANNELS as usize)
         .and_then(|frames| frames.checked_mul(std::mem::size_of::<i16>()))
         .ok_or_else(|| CaptureError::Config("capture chunk size overflowed".to_owned()))?;
+    let ring_bytes = queue_capacity
+        .checked_mul(chunk_bytes)
+        .ok_or_else(|| CaptureError::Config("capture ring size overflowed".to_owned()))?;
+    let prebuffer_bytes = prebuffer_chunks
+        .checked_mul(chunk_bytes)
+        .ok_or_else(|| CaptureError::Config("capture prebuffer size overflowed".to_owned()))?;
+    let chunk_period_ns = (chunk_frames as u64)
+        .checked_mul(1_000_000_000)
+        .ok_or_else(|| CaptureError::Config("capture chunk period overflowed".to_owned()))?
+        / u64::from(ROS_SAMPLE_RATE);
+    if chunk_period_ns == 0 {
+        return Err(CaptureError::Config(
+            "capture chunk period rounded to zero".to_owned(),
+        ));
+    }
+    let chunk_period = Duration::from_nanos(chunk_period_ns);
     let context = Context::create()?;
     let mut node = Node::create(context, "audio_capture", "")?;
-    let publisher = node.create_publisher::<AudioFrame>(OUTPUT_TOPIC, QosProfile::default())?;
+    let publisher = node.create_publisher::<AudioFrame>(OUTPUT_TOPIC, audio_qos())?;
 
     let host = cpal::default_host();
     let device = select_device(&host)?;
@@ -325,16 +361,21 @@ fn main() -> Result<(), CaptureError> {
         native_format, native_rate, native_channels, ROS_SAMPLE_RATE
     );
 
-    let (sender, receiver) = sync_channel(queue_capacity);
+    let ring = HeapRb::<u8>::new(ring_bytes);
+    let (producer, mut consumer) = ring.split();
+    let (failure_sender, failure_receiver) = sync_channel(4);
     let overflowed = Arc::new(AtomicBool::new(false));
     let cpal_failed = Arc::new(AtomicBool::new(false));
     let gstreamer_failed = Arc::new(AtomicBool::new(false));
+    let publisher_thread = thread::current();
     let (stream, converter) = build_native_stream(
         &device,
         native,
         buffer_frames,
         chunk_bytes,
-        sender,
+        producer,
+        publisher_thread.clone(),
+        failure_sender,
         Arc::clone(&overflowed),
         Arc::clone(&cpal_failed),
         Arc::clone(&gstreamer_failed),
@@ -343,38 +384,47 @@ fn main() -> Result<(), CaptureError> {
 
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
-    ctrlc::set_handler(move || signal_running.store(false, Ordering::SeqCst))?;
+    ctrlc::set_handler(move || {
+        signal_running.store(false, Ordering::SeqCst);
+        publisher_thread.unpark();
+    })?;
+
+    eprintln!(
+        "audio_capture SPSC ring: {queue_capacity} chunks / {ring_bytes} bytes; prebuffer={prebuffer_chunks} chunks; publish period={:.1} ms",
+        chunk_period.as_secs_f64() * 1_000.0
+    );
 
     let mut seq = 0_u64;
     let mut sample_index = 0_u64;
-    while running.load(Ordering::SeqCst) {
-        node.spin_once(Duration::from_millis(5));
-        if overflowed.load(Ordering::SeqCst) {
-            return Err(CaptureError::Overflow);
-        }
-        drain_capture(
-            &receiver,
-            &publisher,
-            chunk_frames,
-            chunk_bytes,
-            &mut seq,
-            &mut sample_index,
-        )?;
-        converter.check_error()?;
-        if gstreamer_failed.load(Ordering::SeqCst) {
-            return Err(CaptureError::GStreamer(
-                "unknown input conversion callback failure".to_owned(),
-            ));
-        }
-        if cpal_failed.load(Ordering::SeqCst) {
-            return Err(CaptureError::Stream(
-                "unknown CPAL callback failure".to_owned(),
-            ));
-        }
-    }
+    publish_capture(
+        &mut consumer,
+        &failure_receiver,
+        &publisher,
+        &converter,
+        &running,
+        &overflowed,
+        &cpal_failed,
+        &gstreamer_failed,
+        prebuffer_bytes,
+        chunk_frames,
+        chunk_bytes,
+        chunk_period,
+        &mut seq,
+        &mut sample_index,
+    )?;
     converter.stop()?;
     publisher.publish(&audio_message(Vec::new(), seq, sample_index, true))?;
     Ok(())
+}
+
+fn audio_qos() -> QosProfile {
+    QosProfile {
+        history: HistoryPolicy::KeepLast,
+        depth: AUDIO_QOS_DEPTH,
+        reliability: ReliabilityPolicy::Reliable,
+        durability: DurabilityPolicy::Volatile,
+        ..QosProfile::default()
+    }
 }
 
 fn build_native_stream(
@@ -382,7 +432,9 @@ fn build_native_stream(
     native: SupportedStreamConfig,
     buffer_frames: Option<u32>,
     chunk_bytes: usize,
-    sender: SyncSender<CaptureMessage>,
+    producer: HeapProd<u8>,
+    consumer_thread: Thread,
+    failure_sender: SyncSender<CaptureFailure>,
     overflowed: Arc<AtomicBool>,
     cpal_failed: Arc<AtomicBool>,
     gstreamer_failed: Arc<AtomicBool>,
@@ -407,7 +459,9 @@ fn build_native_stream(
                 native_rate,
                 native_channels,
                 chunk_bytes,
-                sender,
+                producer,
+                consumer_thread,
+                failure_sender,
                 overflowed,
                 cpal_failed,
                 gstreamer_failed,
@@ -438,7 +492,9 @@ fn build_typed_stream<T>(
     native_rate: u32,
     native_channels: u16,
     chunk_bytes: usize,
-    sender: SyncSender<CaptureMessage>,
+    producer: HeapProd<u8>,
+    consumer_thread: Thread,
+    failure_sender: SyncSender<CaptureFailure>,
     overflowed: Arc<AtomicBool>,
     cpal_failed: Arc<AtomicBool>,
     gstreamer_failed: Arc<AtomicBool>,
@@ -450,12 +506,16 @@ where
         native_rate,
         native_channels,
         chunk_bytes,
-        sender.clone(),
+        producer,
+        consumer_thread.clone(),
+        failure_sender.clone(),
         Arc::clone(&overflowed),
         Arc::clone(&gstreamer_failed),
     )?;
     let source = converter.source.clone();
-    let error_sender = sender.clone();
+    let error_sender = failure_sender.clone();
+    let input_thread = consumer_thread.clone();
+    let error_thread = consumer_thread;
     let conversion_failed = Arc::clone(&gstreamer_failed);
     let mut input_frame_index = 0_u64;
     let stream = device
@@ -470,13 +530,15 @@ where
                     &mut input_frame_index,
                 ) {
                     eprintln!("audio_capture GStreamer appsrc failed: {error}");
-                    let _ = sender.try_send(CaptureMessage::GStreamerError(error));
+                    let _ = failure_sender.try_send(CaptureFailure::GStreamerError(error));
                     conversion_failed.store(true, Ordering::SeqCst);
+                    input_thread.unpark();
                 }
             },
             move |error| {
-                let _ = error_sender.try_send(CaptureMessage::CpalError(error.to_string()));
+                let _ = error_sender.try_send(CaptureFailure::CpalError(error.to_string()));
                 cpal_failed.store(true, Ordering::SeqCst);
+                error_thread.unpark();
             },
             None,
         )
@@ -516,39 +578,190 @@ fn push_native_input<T: GStreamerPcmSample>(
     Ok(())
 }
 
-fn drain_capture(
-    receiver: &Receiver<CaptureMessage>,
+#[allow(clippy::too_many_arguments)]
+fn publish_capture(
+    consumer: &mut HeapCons<u8>,
+    failure_receiver: &Receiver<CaptureFailure>,
     publisher: &r2r::Publisher<AudioFrame>,
+    converter: &CapturePipeline,
+    running: &AtomicBool,
+    overflowed: &AtomicBool,
+    cpal_failed: &AtomicBool,
+    gstreamer_failed: &AtomicBool,
+    prebuffer_bytes: usize,
     chunk_frames: usize,
     chunk_bytes: usize,
+    chunk_period: Duration,
     seq: &mut u64,
     sample_index: &mut u64,
 ) -> Result<(), CaptureError> {
-    loop {
-        match receiver.try_recv() {
-            Ok(CaptureMessage::Data(data)) => {
-                if data.len() != chunk_bytes {
-                    return Err(CaptureError::GStreamer(format!(
-                        "converted input chunk violates ROS contract: expected {chunk_bytes} bytes, got {}",
-                        data.len()
-                    )));
-                }
-                publisher.publish(&audio_message(data, *seq, *sample_index, false))?;
-                *seq += 1;
-                *sample_index += chunk_frames as u64;
-            }
-            Ok(CaptureMessage::CpalError(error)) => return Err(CaptureError::Stream(error)),
-            Ok(CaptureMessage::GStreamerError(error)) => {
-                return Err(CaptureError::GStreamer(error))
-            }
-            Err(TryRecvError::Empty) => return Ok(()),
-            Err(TryRecvError::Disconnected) => {
-                return Err(CaptureError::Stream(
-                    "capture channel disconnected".to_owned(),
-                ))
-            }
-        }
+    if !wait_for_ring_bytes(
+        consumer,
+        prebuffer_bytes,
+        failure_receiver,
+        converter,
+        running,
+        overflowed,
+        cpal_failed,
+        gstreamer_failed,
+    )? {
+        return Ok(());
     }
+
+    let mut message = audio_message(vec![0_u8; chunk_bytes], *seq, *sample_index, false);
+    let mut next_deadline = Instant::now();
+    while running.load(Ordering::SeqCst) {
+        if !wait_for_ring_bytes(
+            consumer,
+            chunk_bytes,
+            failure_receiver,
+            converter,
+            running,
+            overflowed,
+            cpal_failed,
+            gstreamer_failed,
+        )? {
+            break;
+        }
+
+        let now = Instant::now();
+        if now.saturating_duration_since(next_deadline) > chunk_period {
+            eprintln!(
+                "audio_capture publisher missed its deadline by {:.1} ms; pacing clock resynchronized",
+                now.saturating_duration_since(next_deadline).as_secs_f64() * 1_000.0
+            );
+            next_deadline = now;
+        }
+        if !wait_until(
+            next_deadline,
+            failure_receiver,
+            converter,
+            running,
+            overflowed,
+            cpal_failed,
+            gstreamer_failed,
+        )? {
+            break;
+        }
+
+        let read = consumer.pop_slice(&mut message.data);
+        if read != chunk_bytes {
+            return Err(CaptureError::GStreamer(format!(
+                "capture SPSC ring returned {read}/{chunk_bytes} bytes"
+            )));
+        }
+        stamp_audio_message(&mut message, *seq, *sample_index);
+        publisher.publish(&message)?;
+        *seq += 1;
+        *sample_index += chunk_frames as u64;
+        next_deadline += chunk_period;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_ring_bytes(
+    consumer: &HeapCons<u8>,
+    required_bytes: usize,
+    failure_receiver: &Receiver<CaptureFailure>,
+    converter: &CapturePipeline,
+    running: &AtomicBool,
+    overflowed: &AtomicBool,
+    cpal_failed: &AtomicBool,
+    gstreamer_failed: &AtomicBool,
+) -> Result<bool, CaptureError> {
+    let deadline = Instant::now() + CAPTURE_STALL_TIMEOUT;
+    loop {
+        check_capture_state(
+            failure_receiver,
+            converter,
+            overflowed,
+            cpal_failed,
+            gstreamer_failed,
+        )?;
+        if !running.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        if consumer.occupied_len() >= required_bytes {
+            return Ok(true);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(CaptureError::Stall);
+        }
+        thread::park_timeout((deadline - now).min(Duration::from_millis(50)));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_until(
+    deadline: Instant,
+    failure_receiver: &Receiver<CaptureFailure>,
+    converter: &CapturePipeline,
+    running: &AtomicBool,
+    overflowed: &AtomicBool,
+    cpal_failed: &AtomicBool,
+    gstreamer_failed: &AtomicBool,
+) -> Result<bool, CaptureError> {
+    loop {
+        check_capture_state(
+            failure_receiver,
+            converter,
+            overflowed,
+            cpal_failed,
+            gstreamer_failed,
+        )?;
+        if !running.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(true);
+        }
+        thread::park_timeout(deadline - now);
+    }
+}
+
+fn check_capture_state(
+    failure_receiver: &Receiver<CaptureFailure>,
+    converter: &CapturePipeline,
+    overflowed: &AtomicBool,
+    cpal_failed: &AtomicBool,
+    gstreamer_failed: &AtomicBool,
+) -> Result<(), CaptureError> {
+    if overflowed.load(Ordering::SeqCst) {
+        return Err(CaptureError::Overflow);
+    }
+    match failure_receiver.try_recv() {
+        Ok(CaptureFailure::CpalError(error)) => return Err(CaptureError::Stream(error)),
+        Ok(CaptureFailure::GStreamerError(error)) => {
+            return Err(CaptureError::GStreamer(error));
+        }
+        Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+    }
+    converter.check_error()?;
+    if gstreamer_failed.load(Ordering::SeqCst) {
+        return Err(CaptureError::GStreamer(
+            "unknown input conversion callback failure".to_owned(),
+        ));
+    }
+    if cpal_failed.load(Ordering::SeqCst) {
+        return Err(CaptureError::Stream(
+            "unknown CPAL callback failure".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn stamp_audio_message(message: &mut AudioFrame, seq: u64, sample_index: u64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    message.header.stamp.sec = now.as_secs() as i32;
+    message.header.stamp.nanosec = now.subsec_nanos();
+    message.seq = seq;
+    message.sample_index = sample_index;
+    message.capture_time_ns = now.as_nanos() as u64;
 }
 
 fn audio_message(data: Vec<u8>, seq: u64, sample_index: u64, final_marker: bool) -> AudioFrame {
@@ -630,10 +843,14 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::sync_channel;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use ringbuf::traits::{Consumer, Observer, Split};
+    use ringbuf::HeapRb;
 
     use super::{
-        push_native_input, requested_device_matches, CaptureMessage, CapturePipeline,
+        push_native_input, requested_device_matches, CaptureFailure, CapturePipeline,
         ROS_SAMPLE_RATE,
     };
 
@@ -651,12 +868,18 @@ mod tests {
 
     #[test]
     fn gstreamer_converts_48k_stereo_f32_to_16k_mono_pcm16le() {
-        let (sender, receiver) = sync_channel(64);
+        let chunk_bytes = ROS_SAMPLE_RATE as usize / 100 * 2;
+        let expected_bytes = ROS_SAMPLE_RATE as usize / 50 * 2;
+        let ring = HeapRb::<u8>::new(chunk_bytes * 64);
+        let (producer, mut consumer) = ring.split();
+        let (failure_sender, failure_receiver) = sync_channel(4);
         let pipeline = CapturePipeline::new::<f32>(
             48_000,
             2,
-            ROS_SAMPLE_RATE as usize / 100 * 2,
-            sender,
+            chunk_bytes,
+            producer,
+            thread::current(),
+            failure_sender,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
@@ -668,22 +891,27 @@ mod tests {
                 .expect("GStreamer must accept consecutive native DJI-format input");
         }
 
-        let mut converted = Vec::new();
-        while converted.len() < ROS_SAMPLE_RATE as usize / 50 * 2 {
-            let message = receiver
-                .recv_timeout(Duration::from_secs(2))
-                .expect("GStreamer must emit converted input");
-            match message {
-                CaptureMessage::Data(data) => converted.extend(data),
-                CaptureMessage::CpalError(error) => {
-                    panic!("CPAL unexpectedly failed: {error}")
-                }
-                CaptureMessage::GStreamerError(error) => {
-                    panic!("GStreamer conversion unexpectedly failed: {error}")
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while consumer.occupied_len() < expected_bytes {
+            if let Ok(failure) = failure_receiver.try_recv() {
+                match failure {
+                    CaptureFailure::CpalError(error) => {
+                        panic!("CPAL unexpectedly failed: {error}")
+                    }
+                    CaptureFailure::GStreamerError(error) => {
+                        panic!("GStreamer conversion unexpectedly failed: {error}")
+                    }
                 }
             }
+            assert!(
+                Instant::now() < deadline,
+                "GStreamer must emit converted input into the SPSC ring"
+            );
+            thread::park_timeout(Duration::from_millis(10));
         }
-        assert!(converted.len() >= ROS_SAMPLE_RATE as usize / 50 * 2);
+
+        let mut converted = vec![0_u8; expected_bytes];
+        assert_eq!(consumer.pop_slice(&mut converted), expected_bytes);
         assert!(converted
             .chunks_exact(2)
             .any(|sample| i16::from_le_bytes([sample[0], sample[1]]) != 0));

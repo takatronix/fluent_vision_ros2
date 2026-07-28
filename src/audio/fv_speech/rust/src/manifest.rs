@@ -17,14 +17,12 @@ pub const EXPECTED_GOLDEN_TEXT: &str =
 pub const EXPECTED_GOLDEN_WAV_SHA256: &str =
     "460bd8dccb0d2a5f4e29c628f837be4082d13defc64c3fc21dd1b6bb0e119095";
 pub const EXPECTED_CUDA_TOOLKIT_VERSION: &str = "13.2";
-const EXPECTED_RUNTIME_DEPENDENCIES: [&str; 14] = [
+const EXPECTED_RUNTIME_DEPENDENCIES: [&str; 12] = [
     "libcudnn.so.9",
     "libcudnn_adv.so.9",
     "libcudnn_cnn.so.9",
     "libcudnn_engines_precompiled.so.9",
     "libcudnn_engines_runtime_compiled.so.9",
-    "libcudnn_engines_tensor_ir.so.9",
-    "libcudnn_ext.so.9",
     "libcudnn_graph.so.9",
     "libcudnn_heuristic.so.9",
     "libcudnn_ops.so.9",

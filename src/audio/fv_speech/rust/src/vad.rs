@@ -54,7 +54,15 @@ impl SileroVad {
         if actual != EXPECTED_MODEL_SHA256 {
             return Err(VadError::ModelHash(actual));
         }
-        let session = Session::builder()?.commit_from_file(path)?;
+        // Silero runs one tiny 32 ms recurrent window at a time. ORT's
+        // automatic intra-op pool fans each inference out across the host
+        // cores, which costs more scheduling/coordination CPU than the model
+        // work itself on Thor. Keep this session single-threaded; Parakeet's
+        // separate CUDA session is unaffected.
+        let session = Session::builder()?
+            .with_intra_threads(1)
+            .map_err(|error| VadError::Ort(error.into()))?
+            .commit_from_file(path)?;
         let inputs = session
             .inputs()
             .iter()
@@ -82,6 +90,15 @@ impl SileroVad {
 
     pub fn threshold(&self) -> f32 {
         self.threshold
+    }
+
+    /// Drops recurrent and buffered state after an upstream audio clock jump.
+    /// The loaded session is retained, so resynchronization is inexpensive.
+    pub fn reset(&mut self) {
+        self.state.fill(0.0);
+        self.context.fill(0.0);
+        self.buffer.clear();
+        self.next_window_start = 0;
     }
 
     pub fn push_i16(&mut self, samples: &[i16]) -> Result<Vec<VadResult>, VadError> {

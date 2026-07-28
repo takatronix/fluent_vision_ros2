@@ -1,16 +1,18 @@
 use std::collections::VecDeque;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::{FutureExt, Stream, StreamExt};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
+use r2r::fv_audio_interfaces::msg::PlaybackEvent;
 use r2r::fv_speech_interfaces::msg::AudioFrame;
 use r2r::qos::{DurabilityPolicy, HistoryPolicy, ReliabilityPolicy};
+use r2r::std_msgs::msg::String as StringMessage;
 use r2r::{Context, Node, QosProfile};
 use thiserror::Error;
 use webrtc_audio_processing::Processor;
@@ -25,12 +27,77 @@ const OUTPUT_STREAM_ID: &str = "audio/mic/main";
 const RAW_TOPIC: &str = "/audio/mic/raw";
 const RENDER_TOPIC: &str = "/audio/output/render_reference";
 const OUTPUT_TOPIC: &str = "/audio/mic/frame";
+const PLAYBACK_EVENT_TOPIC: &str = "/audio/playback/event";
+const STATUS_TOPIC: &str = "/audio/aec/status";
 const AEC_SAMPLE_RATE_HZ: u32 = 16_000;
 const AEC_CHANNELS: u32 = 1;
 const FRAME_SAMPLES: usize = AEC_SAMPLE_RATE_HZ as usize / 100;
 const AUDIO_QOS_DEPTH: usize = 256;
 const FAR_MESSAGES_PER_TICK: usize = 16;
 const NEAR_MESSAGES_PER_TICK: usize = 32;
+const CONTROL_QOS_DEPTH: usize = 10;
+const AEC_TAIL_MS: usize = 500;
+const FAR_WAIT_MS: usize = 80;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AecMode {
+    Bypass,
+    Active,
+    Tail,
+    Degraded,
+}
+
+impl AecMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bypass => "bypass",
+            Self::Active => "active",
+            Self::Tail => "tail",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+#[derive(Default)]
+struct PlaybackActivity {
+    agent: bool,
+    system: bool,
+    cue: bool,
+}
+
+impl PlaybackActivity {
+    fn update(&mut self, event: &PlaybackEvent) {
+        match event.event {
+            value
+                if value == PlaybackEvent::AGENT_STARTED as u8
+                    || value == PlaybackEvent::AGENT_RESUMED as u8 =>
+            {
+                self.agent = true
+            }
+            value
+                if value == PlaybackEvent::AGENT_PAUSED as u8
+                    || value == PlaybackEvent::AGENT_DISCARDED as u8
+                    || value == PlaybackEvent::AGENT_COMPLETED as u8 =>
+            {
+                self.agent = false
+            }
+            value if value == PlaybackEvent::SYSTEM_STARTED as u8 => self.system = true,
+            value
+                if value == PlaybackEvent::SYSTEM_COMPLETED as u8
+                    || value == PlaybackEvent::SYSTEM_ABORTED as u8 =>
+            {
+                self.system = false
+            }
+            value if value == PlaybackEvent::CUE_STARTED as u8 => self.cue = true,
+            value if value == PlaybackEvent::CUE_COMPLETED as u8 => self.cue = false,
+            _ => {}
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.agent || self.system || self.cue
+    }
+}
 
 #[derive(Debug, Error)]
 enum AecError {
@@ -291,7 +358,10 @@ impl StreamValidator {
         }
     }
 
-    fn validate(&mut self, message: &AudioFrame) -> Result<(), String> {
+    /// Validates the immutable stream contract and advances continuity state.
+    /// A sequence/sample gap is recoverable and returned to the caller so it
+    /// can flush DSP state without killing the long-running audio graph.
+    fn validate(&mut self, message: &AudioFrame) -> Result<Option<String>, String> {
         if message.source_id != self.source_id
             || message.stream_id != self.stream_id
             || message.encoding != "PCM16LE"
@@ -311,22 +381,6 @@ impl StreamValidator {
                 message.layout
             ));
         }
-        if let Some(expected) = self.expected_seq {
-            if message.seq != expected {
-                return Err(format!(
-                    "sequence discontinuity: expected {expected}, got {}",
-                    message.seq
-                ));
-            }
-        }
-        if let Some(expected) = self.expected_sample_index {
-            if message.sample_index != expected {
-                return Err(format!(
-                    "sample-index discontinuity: expected {expected}, got {}",
-                    message.sample_index
-                ));
-            }
-        }
         let expected_bytes = message.frame_count as usize * self.channels as usize * 2;
         if message.final_ {
             if message.frame_count != 0 || !message.data.is_empty() {
@@ -338,6 +392,23 @@ impl StreamValidator {
                 message.frame_count,
                 message.data.len()
             ));
+        }
+        let mut discontinuities = Vec::new();
+        if let Some(expected) = self.expected_seq {
+            if message.seq != expected {
+                discontinuities.push(format!(
+                    "sequence discontinuity: expected {expected}, got {}",
+                    message.seq
+                ));
+            }
+        }
+        if let Some(expected) = self.expected_sample_index {
+            if message.sample_index != expected {
+                discontinuities.push(format!(
+                    "sample-index discontinuity: expected {expected}, got {}",
+                    message.sample_index
+                ));
+            }
         }
         self.expected_seq = Some(
             message
@@ -351,7 +422,7 @@ impl StreamValidator {
                 .checked_add(u64::from(message.frame_count))
                 .ok_or_else(|| "sample index overflow".to_owned())?,
         );
-        Ok(())
+        Ok((!discontinuities.is_empty()).then(|| discontinuities.join("; ")))
     }
 
     fn reset(&mut self) {
@@ -433,6 +504,11 @@ struct AecRuntime {
     max_near_frames: usize,
     max_far_samples: usize,
     output_seq: u64,
+    output_sample_index: Option<u64>,
+    playback_active: bool,
+    tail_frames_remaining: usize,
+    far_wait_frames: usize,
+    mode: AecMode,
 }
 
 impl AecRuntime {
@@ -451,7 +527,28 @@ impl AecRuntime {
             max_near_frames,
             max_far_samples,
             output_seq: 0,
+            output_sample_index: None,
+            playback_active: false,
+            tail_frames_remaining: 0,
+            far_wait_frames: FAR_WAIT_MS / 10,
+            mode: AecMode::Bypass,
         })
+    }
+
+    fn set_playback_active(&mut self, active: bool) {
+        if active {
+            self.playback_active = true;
+            self.tail_frames_remaining = 0;
+        } else if self.playback_active {
+            self.playback_active = false;
+            self.tail_frames_remaining = AEC_TAIL_MS / 10;
+        }
+    }
+
+    fn finish_input(&mut self) {
+        self.playback_active = false;
+        self.tail_frames_remaining = 0;
+        self.far_wait_frames = 0;
     }
 
     fn push_near(&mut self, message: &AudioFrame) -> Result<(), AecError> {
@@ -474,22 +571,17 @@ impl AecRuntime {
                 capture_time_ns,
             });
         }
-        if self.near.len() > self.max_near_frames {
-            return Err(AecError::Buffer(format!(
-                "microphone backlog exceeded {} 10 ms frames while waiting for render reference",
-                self.max_near_frames
-            )));
-        }
         Ok(())
     }
 
     fn push_far_converted(&mut self, samples: Vec<i16>) -> Result<(), AecError> {
         self.far_delay.push(samples, &mut self.far);
         if self.far.len() > self.max_far_samples {
-            return Err(AecError::Buffer(format!(
-                "render-reference backlog exceeded {} samples",
-                self.max_far_samples
-            )));
+            let excess = self.far.len() - self.max_far_samples;
+            self.far.drain(..excess);
+            eprintln!(
+                "audio_aec warning: discarded {excess} stale render-reference samples to keep the queue bounded"
+            );
         }
         Ok(())
     }
@@ -500,24 +592,89 @@ impl AecRuntime {
         self.aec.reset()
     }
 
-    fn process_ready(&mut self, publisher: &r2r::Publisher<AudioFrame>) -> Result<(), AecError> {
-        while !self.near.is_empty() && self.far.len() >= FRAME_SAMPLES {
-            let near = self.near.pop_front().expect("near queue became empty");
-            let far = self.far.drain(..FRAME_SAMPLES).collect::<Vec<_>>();
-            let cleaned = self.aec.process(&far, &near.samples)?;
-            publisher.publish(&audio_message(
-                cleaned,
-                self.output_seq,
-                near.sample_index,
-                near.capture_time_ns,
-                false,
-            ))?;
-            self.output_seq = self
-                .output_seq
-                .checked_add(1)
-                .ok_or_else(|| AecError::Buffer("output sequence overflow".to_owned()))?;
+    fn resynchronize_near(&mut self) -> Result<(), AecError> {
+        self.near.clear();
+        self.reset_far()
+    }
+
+    fn flush_near_raw(
+        &mut self,
+        publisher: &r2r::Publisher<AudioFrame>,
+    ) -> Result<(), AecError> {
+        while let Some(near) = self.near.pop_front() {
+            if self.far.len() >= FRAME_SAMPLES {
+                self.far.drain(..FRAME_SAMPLES);
+            }
+            self.publish_frame(publisher, near.samples.clone(), &near)?;
         }
+        self.mode = AecMode::Degraded;
         Ok(())
+    }
+
+    fn publish_frame(
+        &mut self,
+        publisher: &r2r::Publisher<AudioFrame>,
+        samples: Vec<i16>,
+        near: &NearFrame,
+    ) -> Result<(), AecError> {
+        let sample_index = *self.output_sample_index.get_or_insert(near.sample_index);
+        publisher.publish(&audio_message(
+            samples,
+            self.output_seq,
+            sample_index,
+            near.capture_time_ns,
+            false,
+        ))?;
+        self.output_seq = self
+            .output_seq
+            .checked_add(1)
+            .ok_or_else(|| AecError::Buffer("output sequence overflow".to_owned()))?;
+        self.output_sample_index = Some(
+            sample_index
+                .checked_add(FRAME_SAMPLES as u64)
+                .ok_or_else(|| AecError::Buffer("output sample index overflow".to_owned()))?,
+        );
+        Ok(())
+    }
+
+    fn process_ready(
+        &mut self,
+        publisher: &r2r::Publisher<AudioFrame>,
+    ) -> Result<AecMode, AecError> {
+        while !self.near.is_empty() {
+            let wants_aec = self.playback_active || self.tail_frames_remaining > 0;
+            if wants_aec
+                && self.far.len() < FRAME_SAMPLES
+                && self.near.len() <= self.far_wait_frames.min(self.max_near_frames)
+            {
+                break;
+            }
+            let near = self.near.pop_front().expect("near queue became empty");
+            if wants_aec && self.far.len() >= FRAME_SAMPLES {
+                let far = self.far.drain(..FRAME_SAMPLES).collect::<Vec<_>>();
+                let cleaned = self.aec.process(&far, &near.samples)?;
+                self.publish_frame(publisher, cleaned, &near)?;
+                self.mode = if self.playback_active {
+                    AecMode::Active
+                } else {
+                    AecMode::Tail
+                };
+            } else {
+                if self.far.len() >= FRAME_SAMPLES {
+                    self.far.drain(..FRAME_SAMPLES);
+                }
+                self.publish_frame(publisher, near.samples.clone(), &near)?;
+                self.mode = if wants_aec {
+                    AecMode::Degraded
+                } else {
+                    AecMode::Bypass
+                };
+            }
+            if !self.playback_active && self.tail_frames_remaining > 0 {
+                self.tail_frames_remaining -= 1;
+            }
+        }
+        Ok(self.mode)
     }
 }
 
@@ -550,19 +707,34 @@ fn main() -> Result<(), AecError> {
     let mut near_input = node.subscribe::<AudioFrame>(RAW_TOPIC, qos.clone())?;
     let mut far_input = node.subscribe::<AudioFrame>(RENDER_TOPIC, qos.clone())?;
     let output = node.create_publisher::<AudioFrame>(OUTPUT_TOPIC, qos)?;
+    let mut playback_events =
+        node.subscribe::<PlaybackEvent>(PLAYBACK_EVENT_TOPIC, control_qos())?;
+    let status = node.create_publisher::<StringMessage>(STATUS_TOPIC, status_qos())?;
 
     let running = Arc::new(AtomicBool::new(true));
     let signal_running = Arc::clone(&running);
     ctrlc::set_handler(move || signal_running.store(false, Ordering::SeqCst))?;
+    publish_status(&status, AecMode::Bypass)?;
     eprintln!(
-        "audio_aec ready: WebRTC AEC3, near=16 kHz mono, far={far_rate} Hz/{far_channels} ch, stream_delay_ms={stream_delay_ms}"
+        "audio_aec ready: raw bypass while idle, WebRTC AEC3 while playing + {AEC_TAIL_MS} ms tail, far={far_rate} Hz/{far_channels} ch, stream_delay_ms={stream_delay_ms}"
     );
 
     let mut near_final = false;
+    let mut playback = PlaybackActivity::default();
+    let mut published_mode = AecMode::Bypass;
+    let mut last_status_publish = Instant::now();
     while running.load(Ordering::SeqCst) {
         node.spin_once(Duration::from_millis(5));
+        for event in take_ready_bounded(&mut playback_events, CONTROL_QOS_DEPTH) {
+            playback.update(&event);
+            runtime.set_playback_active(playback.active());
+        }
         for message in take_ready_bounded(&mut far_input, FAR_MESSAGES_PER_TICK) {
-            far_validator.validate(&message).map_err(AecError::Far)?;
+            if let Some(reason) = far_validator.validate(&message).map_err(AecError::Far)? {
+                eprintln!("audio_aec warning: render reference resynchronized: {reason}");
+                runtime.reset_far()?;
+                render_converter.reset()?;
+            }
             if message.final_ {
                 runtime.reset_far()?;
                 render_converter.reset()?;
@@ -574,29 +746,50 @@ fn main() -> Result<(), AecError> {
         }
         render_converter.drain(&mut runtime)?;
         for message in take_ready_bounded(&mut near_input, NEAR_MESSAGES_PER_TICK) {
-            near_validator.validate(&message).map_err(AecError::Near)?;
+            if let Some(reason) = near_validator.validate(&message).map_err(AecError::Near)? {
+                eprintln!("audio_aec warning: microphone stream resynchronized: {reason}");
+                runtime.flush_near_raw(&output)?;
+                runtime.resynchronize_near()?;
+                render_converter.reset()?;
+                near_final = false;
+            }
             if message.final_ {
                 near_final = true;
                 continue;
             }
             if near_final {
-                return Err(AecError::Near(
-                    "PCM arrived after the final microphone marker".to_owned(),
-                ));
+                eprintln!(
+                    "audio_aec warning: microphone resumed after a final marker; resynchronizing"
+                );
+                runtime.resynchronize_near()?;
+                render_converter.reset()?;
+                near_final = false;
             }
             runtime.push_near(&message)?;
         }
         render_converter.drain(&mut runtime)?;
-        runtime.process_ready(&output)?;
+        if near_final {
+            runtime.finish_input();
+        }
+        let mode = runtime.process_ready(&output)?;
+        if mode != published_mode || last_status_publish.elapsed() >= Duration::from_secs(1) {
+            publish_status(&status, mode)?;
+            if mode != published_mode {
+                eprintln!("audio_aec mode: {}", mode.as_str());
+            }
+            published_mode = mode;
+            last_status_publish = Instant::now();
+        }
         if near_final {
             if !runtime.near.is_empty() {
-                return Err(AecError::Buffer(
-                    "microphone ended before queued frames received render reference".to_owned(),
-                ));
+                continue;
             }
-            let final_sample_index = near_validator.expected_sample_index.ok_or_else(|| {
-                AecError::Near("final marker arrived before microphone PCM".to_owned())
-            })?;
+            let final_sample_index = runtime
+                .output_sample_index
+                .or(near_validator.expected_sample_index)
+                .ok_or_else(|| {
+                    AecError::Near("final marker arrived before microphone PCM".to_owned())
+                })?;
             output.publish(&audio_message(
                 Vec::new(),
                 runtime.output_seq,
@@ -629,6 +822,36 @@ fn audio_qos() -> QosProfile {
         durability: DurabilityPolicy::Volatile,
         ..QosProfile::default()
     }
+}
+
+fn control_qos() -> QosProfile {
+    QosProfile {
+        history: HistoryPolicy::KeepLast,
+        depth: CONTROL_QOS_DEPTH,
+        reliability: ReliabilityPolicy::Reliable,
+        durability: DurabilityPolicy::Volatile,
+        ..QosProfile::default()
+    }
+}
+
+fn status_qos() -> QosProfile {
+    QosProfile {
+        history: HistoryPolicy::KeepLast,
+        depth: 1,
+        reliability: ReliabilityPolicy::Reliable,
+        durability: DurabilityPolicy::TransientLocal,
+        ..QosProfile::default()
+    }
+}
+
+fn publish_status(
+    publisher: &r2r::Publisher<StringMessage>,
+    mode: AecMode,
+) -> Result<(), AecError> {
+    publisher.publish(&StringMessage {
+        data: mode.as_str().to_owned(),
+    })?;
+    Ok(())
 }
 
 fn audio_message(
@@ -731,8 +954,8 @@ fn env_usize(name: &str, default: usize) -> Result<usize, AecError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        take_ready_bounded, AecRuntime, FarDelayLine, RenderConverter, WebRtcAec,
-        AEC_SAMPLE_RATE_HZ, FRAME_SAMPLES,
+        AEC_SAMPLE_RATE_HZ, AEC_TAIL_MS, AUDIO_QOS_DEPTH, AecRuntime, FRAME_SAMPLES, FarDelayLine,
+        RenderConverter, WebRtcAec, audio_qos, take_ready_bounded,
     };
     use futures::stream;
     use std::collections::VecDeque;
@@ -745,6 +968,22 @@ mod tests {
         assert_eq!(take_ready_bounded(&mut values, 3), vec![0, 1, 2]);
         assert_eq!(take_ready_bounded(&mut values, 3), vec![3, 4, 5]);
         assert_eq!(take_ready_bounded(&mut values, 10), vec![6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn audio_transport_uses_the_shared_reliable_history_depth() {
+        assert_eq!(audio_qos().depth, AUDIO_QOS_DEPTH);
+        assert_eq!(AUDIO_QOS_DEPTH, 256);
+    }
+
+    #[test]
+    fn playback_completion_keeps_the_configured_aec_tail() {
+        let mut runtime = AecRuntime::new(40, 100, 64_000).expect("AEC runtime failed");
+        runtime.set_playback_active(true);
+        assert!(runtime.playback_active);
+        runtime.set_playback_active(false);
+        assert!(!runtime.playback_active);
+        assert_eq!(runtime.tail_frames_remaining, AEC_TAIL_MS / 10);
     }
 
     #[test]

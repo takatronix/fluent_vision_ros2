@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
-use fv_speech_ros2::audio::{AudioPacket, AudioValidator, pcm16le_to_i16};
+use fv_speech_ros2::audio::{AudioPacket, AudioValidation, AudioValidator, pcm16le_to_i16};
 use fv_speech_ros2::manifest::{RuntimeManifest, default_runtime_manifest_path};
 use fv_speech_ros2::ros::{header, speech_qos};
 use fv_speech_ros2::vad::{SileroVad, VadResult};
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if message.source_id != INPUT_SOURCE_ID || message.stream_id != INPUT_STREAM_ID {
                 return Err("Silero input identity mismatch".into());
             }
-            validator.validate(&AudioPacket {
+            let validation = validator.validate_resyncing(&AudioPacket {
                 seq: message.seq,
                 sample_index: message.sample_index,
                 frame_count: message.frame_count,
@@ -56,6 +56,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bit_depth: message.bit_depth,
                 layout: &message.layout,
             })?;
+            if let AudioValidation::Resynchronized(reason) = validation {
+                eprintln!("silero_vad warning: audio stream resynchronized: {reason}");
+                vad.reset();
+                base_sample_index = Some(message.sample_index);
+            }
             if message.final_ {
                 let base = base_sample_index.ok_or("Silero final marker arrived before audio")?;
                 for result in vad.flush()? {

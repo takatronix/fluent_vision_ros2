@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use futures::{FutureExt, StreamExt};
 use fv_speech_ros2::ros::{header, speech_qos};
-use fv_speech_ros2::turn::{Activity, Turn, TurnDetector};
+use fv_speech_ros2::turn::{Activity, Turn, TurnDetector, TurnError};
 use fv_speech_ros2::{SESSION_ID, TURN_STREAM_ID, VAD_SOURCE_ID, VAD_STREAM_ID};
 use r2r::fv_speech_interfaces::msg::{TurnEvent, VoiceActivity};
 use r2r::{Context, Node};
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         end_silence_frames as u64,
         turn_id_prefix,
     )?;
-    let qos = speech_qos(100);
+    let qos = speech_qos(256);
     let mut activity = node.subscribe::<VoiceActivity>("/dialogue/vad/activity", qos.clone())?;
     let publisher = node.create_publisher::<TurnEvent>("/dialogue/turn/event", qos)?;
     let mut finished = false;
@@ -64,12 +64,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 finished = true;
                 continue;
             }
-            if let Some(event) = detector.push(Activity {
+            let next = Activity {
                 seq: message.seq,
                 sample_index: message.sample_index,
                 frame_count: message.frame_count,
                 state: message.state,
-            })? {
+            };
+            let event = match detector.push(next.clone()) {
+                Ok(event) => event,
+                Err(TurnError::Sequence { .. } | TurnError::Sample { .. }) => {
+                    eprintln!("turn_detector warning: VoiceActivity stream resynchronized");
+                    if let Some(ended) = detector.resynchronize_input() {
+                        publish_turn(&publisher, ended)?;
+                    }
+                    detector.push(next)?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(event) = event {
                 publish_turn(&publisher, event)?;
             }
         }

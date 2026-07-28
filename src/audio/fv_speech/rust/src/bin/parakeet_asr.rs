@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use futures::{FutureExt, StreamExt};
 use fv_speech_ros2::asr::{AsrRuntime, BufferedAudio, InferenceCommand};
-use fv_speech_ros2::audio::{AudioPacket, AudioValidator, pcm16le_to_i16};
+use fv_speech_ros2::audio::{AudioPacket, AudioValidation, AudioValidator, pcm16le_to_i16};
 use fv_speech_ros2::inference::{InferenceEvent, run_inference_thread};
 use fv_speech_ros2::manifest::{RuntimeManifest, default_runtime_manifest_path};
 use fv_speech_ros2::ros::{header, ready_qos, speech_qos};
@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("parakeet_asr startup: parameters loaded");
 
-    let qos = speech_qos(200);
+    let qos = speech_qos(256);
     let mut audio = node.subscribe::<AudioFrame>("/audio/mic/frame", qos.clone())?;
     let mut controls = node.subscribe::<AsrControl>("/dialogue/asr/control", qos.clone())?;
     let transcripts = node.create_publisher::<Transcript>("/dialogue/asr/transcript", qos)?;
@@ -143,7 +143,7 @@ fn handle_audio(
     if message.source_id != INPUT_SOURCE_ID || message.stream_id != INPUT_STREAM_ID {
         return Err("parakeet input identity mismatch".into());
     }
-    validator.validate(&AudioPacket {
+    let validation = validator.validate_resyncing(&AudioPacket {
         seq: message.seq,
         sample_index: message.sample_index,
         frame_count: message.frame_count,
@@ -155,6 +155,10 @@ fn handle_audio(
         bit_depth: message.bit_depth,
         layout: &message.layout,
     })?;
+    if let AudioValidation::Resynchronized(reason) = validation {
+        eprintln!("parakeet_asr warning: audio stream resynchronized: {reason}");
+        send_commands(sender, runtime.resynchronize_audio())?;
+    }
     if message.final_ {
         return Ok(());
     }

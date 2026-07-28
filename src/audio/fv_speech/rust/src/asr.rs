@@ -64,6 +64,7 @@ pub struct AsrRuntime {
     history_frames: u64,
     history: VecDeque<BufferedAudio>,
     active: Option<ActiveTurn>,
+    resynchronized_turn: Option<ActiveTurn>,
     expected_control_seq: u64,
 }
 
@@ -77,12 +78,26 @@ impl AsrRuntime {
             history_frames,
             history: VecDeque::new(),
             active: None,
+            resynchronized_turn: None,
             expected_control_seq: 0,
         })
     }
 
     pub fn latest_sample_index(&self) -> Option<u64> {
         self.history.back().map(BufferedAudio::end_sample_index)
+    }
+
+    /// Flushes audio-clock-dependent state while preserving the independent
+    /// ASR control sequence. Any in-flight GPU inference is explicitly
+    /// cancelled before audio from the new clock epoch is accepted.
+    pub fn resynchronize_audio(&mut self) -> Vec<InferenceCommand> {
+        self.history.clear();
+        self.resynchronized_turn = self.active.take();
+        if self.resynchronized_turn.is_some() {
+            vec![InferenceCommand::Cancel]
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn push_audio(
@@ -141,6 +156,19 @@ impl AsrRuntime {
         self.expected_control_seq += 1;
         if session_id.is_empty() || user_turn_id.is_empty() || stream_id != self.input_stream_id {
             return Err(AsrRuntimeError::Identity);
+        }
+        if self.active.is_none()
+            && matches!(action, "stop" | "cancel")
+            && self.resynchronized_turn.as_ref().is_some_and(|turn| {
+                (
+                    turn.session_id.as_str(),
+                    turn.user_turn_id.as_str(),
+                    turn.stream_id.as_str(),
+                ) == (session_id, user_turn_id, stream_id)
+            })
+        {
+            self.resynchronized_turn = None;
+            return Ok(Vec::new());
         }
         match action {
             "start" => self.start(session_id, user_turn_id, stream_id, start_sample_index),
@@ -355,5 +383,32 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn audio_resync_cancels_inference_and_absorbs_the_old_stop() {
+        let mut runtime = AsrRuntime::new("mic".into(), 32_000).unwrap();
+        runtime
+            .push_audio(BufferedAudio {
+                sample_index: 0,
+                samples: vec![0; 160],
+            })
+            .unwrap();
+        runtime
+            .push_control("start", "session", "turn", "mic", 0, 0, 0)
+            .unwrap();
+        assert_eq!(runtime.resynchronize_audio(), [InferenceCommand::Cancel]);
+        runtime
+            .push_audio(BufferedAudio {
+                sample_index: 10_000,
+                samples: vec![0; 160],
+            })
+            .unwrap();
+        assert!(
+            runtime
+                .push_control("stop", "session", "turn", "mic", 1, 0, 10_000)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

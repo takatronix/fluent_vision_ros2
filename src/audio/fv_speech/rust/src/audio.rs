@@ -30,6 +30,12 @@ pub struct AudioPacket<'a> {
     pub layout: &'a str,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum AudioValidation {
+    Continuous,
+    Resynchronized(AudioContractError),
+}
+
 #[derive(Default)]
 pub struct AudioValidator {
     previous_seq: Option<u64>,
@@ -78,6 +84,31 @@ impl AudioValidator {
         self.previous_end = Some(packet.sample_index + u64::from(packet.frame_count));
         Ok(())
     }
+
+    pub fn validate_resyncing(
+        &mut self,
+        packet: &AudioPacket<'_>,
+    ) -> Result<AudioValidation, AudioContractError> {
+        match self.validate(packet) {
+            Ok(()) => Ok(AudioValidation::Continuous),
+            Err(
+                error @ (AudioContractError::Sequence { .. }
+                | AudioContractError::Sample { .. }
+                | AudioContractError::AfterFinal),
+            ) => {
+                self.reset();
+                self.validate(packet)?;
+                Ok(AudioValidation::Resynchronized(error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.previous_seq = None;
+        self.previous_end = None;
+        self.finished = false;
+    }
 }
 
 pub fn pcm16le_to_i16(payload: &[u8]) -> Result<Vec<i16>, AudioContractError> {
@@ -92,7 +123,7 @@ pub fn pcm16le_to_i16(payload: &[u8]) -> Result<Vec<i16>, AudioContractError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioContractError, AudioPacket, AudioValidator, pcm16le_to_i16};
+    use super::{AudioContractError, AudioPacket, AudioValidation, AudioValidator, pcm16le_to_i16};
 
     fn packet(
         seq: u64,
@@ -141,6 +172,24 @@ mod tests {
                 expected: 160,
                 actual: 161,
             })
+        );
+    }
+
+    #[test]
+    fn resynchronizes_sequence_and_sample_gaps() {
+        let mut validator = AudioValidator::default();
+        validator
+            .validate_resyncing(&packet(7, 1000, 160, false))
+            .unwrap();
+        assert!(matches!(
+            validator.validate_resyncing(&packet(12, 4000, 160, false)),
+            Ok(AudioValidation::Resynchronized(
+                AudioContractError::Sequence { .. }
+            ))
+        ));
+        assert_eq!(
+            validator.validate_resyncing(&packet(13, 4160, 160, false)),
+            Ok(AudioValidation::Continuous)
         );
     }
 

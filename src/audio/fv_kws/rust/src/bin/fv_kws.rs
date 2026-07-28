@@ -108,7 +108,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if dialogue_state != DialogueSessionState::Sleeping || wake_sent {
                 continue;
             }
-            activity_tracker.validate(&message)?;
+            if activity_tracker.validate(&message)? {
+                eprintln!("fv_kws warning: VoiceActivity stream resynchronized");
+                spotter.reset();
+                segmenter.reset();
+                audio_tracker.reset();
+                joiner.reset();
+                wake_sent = false;
+                ready_sent = false;
+                ready_publisher.publish(&r2r::std_msgs::msg::Bool { data: false })?;
+            }
             if message.final_ {
                 ready_publisher.publish(&r2r::std_msgs::msg::Bool { data: false })?;
                 return Err("KWS VoiceActivity stream ended".into());
@@ -119,7 +128,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if dialogue_state != DialogueSessionState::Sleeping || wake_sent {
                 continue;
             }
-            audio_tracker.validate(&message)?;
+            if audio_tracker.validate(&message)? {
+                eprintln!("fv_kws warning: microphone stream resynchronized");
+                spotter.reset();
+                segmenter.reset();
+                activity_tracker.reset();
+                joiner.reset();
+                wake_sent = false;
+                ready_sent = false;
+                ready_publisher.publish(&r2r::std_msgs::msg::Bool { data: false })?;
+            }
             if message.final_ {
                 ready_publisher.publish(&r2r::std_msgs::msg::Bool { data: false })?;
                 return Err("KWS microphone stream ended".into());
@@ -219,7 +237,7 @@ struct AudioTracker {
 }
 
 impl AudioTracker {
-    fn validate(&mut self, message: &AudioFrame) -> Result<(), String> {
+    fn validate(&mut self, message: &AudioFrame) -> Result<bool, String> {
         if message.source_id != INPUT_SOURCE_ID || message.stream_id != INPUT_STREAM_ID {
             return Err("KWS microphone identity mismatch".to_owned());
         }
@@ -231,23 +249,12 @@ impl AudioTracker {
         {
             return Err("KWS input must be 16 kHz mono interleaved PCM16LE".to_owned());
         }
-        if let Some(previous) = self.previous_seq
-            && message.seq != previous + 1
-        {
-            return Err(format!(
-                "KWS microphone sequence discontinuity: expected {}, got {}",
-                previous + 1,
-                message.seq
-            ));
-        }
-        if let Some(expected) = self.next_sample_index
-            && message.sample_index != expected
-        {
-            return Err(format!(
-                "KWS microphone sample discontinuity: expected {expected}, got {}",
-                message.sample_index
-            ));
-        }
+        let sequence_gap = self
+            .previous_seq
+            .is_some_and(|previous| message.seq != previous + 1);
+        let sample_gap = self
+            .next_sample_index
+            .is_some_and(|expected| message.sample_index != expected);
         if message.final_ {
             if message.frame_count != 0 || !message.data.is_empty() {
                 return Err("KWS microphone final marker must not contain audio".to_owned());
@@ -263,7 +270,7 @@ impl AudioTracker {
                 .checked_add(message.frame_count.into())
                 .ok_or("KWS microphone sample index overflow")?,
         );
-        Ok(())
+        Ok(sequence_gap || sample_gap)
     }
 
     fn reset(&mut self) {
@@ -278,27 +285,16 @@ struct ActivityTracker {
 }
 
 impl ActivityTracker {
-    fn validate(&mut self, message: &VoiceActivity) -> Result<(), String> {
+    fn validate(&mut self, message: &VoiceActivity) -> Result<bool, String> {
         if message.source_id != ACTIVITY_SOURCE_ID || message.stream_id != ACTIVITY_STREAM_ID {
             return Err("KWS VoiceActivity identity mismatch".to_owned());
         }
-        if let Some(previous) = self.previous_seq
-            && message.seq != previous + 1
-        {
-            return Err(format!(
-                "KWS VoiceActivity sequence discontinuity: expected {}, got {}",
-                previous + 1,
-                message.seq
-            ));
-        }
-        if let Some(expected) = self.next_sample_index
-            && message.sample_index != expected
-        {
-            return Err(format!(
-                "KWS VoiceActivity sample discontinuity: expected {expected}, got {}",
-                message.sample_index
-            ));
-        }
+        let sequence_gap = self
+            .previous_seq
+            .is_some_and(|previous| message.seq != previous + 1);
+        let sample_gap = self
+            .next_sample_index
+            .is_some_and(|expected| message.sample_index != expected);
         if message.final_ {
             if message.frame_count != 0 {
                 return Err("KWS VoiceActivity final marker must have zero frames".to_owned());
@@ -315,7 +311,7 @@ impl ActivityTracker {
                 .checked_add(message.frame_count.into())
                 .ok_or("KWS VoiceActivity sample index overflow")?,
         );
-        Ok(())
+        Ok(sequence_gap || sample_gap)
     }
 
     fn reset(&mut self) {

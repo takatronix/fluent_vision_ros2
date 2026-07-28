@@ -81,6 +81,17 @@ impl TurnDetector {
         self.next_output_seq
     }
 
+    /// Starts a new input clock epoch without resetting output sequencing.
+    /// An active turn is closed first so downstream ASR state is not orphaned.
+    pub fn resynchronize_input(&mut self) -> Option<Turn> {
+        let ended = self.active_turn_id.is_some().then(|| self.end_turn());
+        self.previous_input_seq = None;
+        self.previous_input_start = None;
+        self.previous_input_end = None;
+        self.silence_frames = 0;
+        ended
+    }
+
     pub fn push(&mut self, activity: Activity) -> Result<Option<Turn>, TurnError> {
         if activity.frame_count == 0 || !matches!(activity.state.as_str(), "speech" | "silence") {
             return Err(TurnError::Activity);

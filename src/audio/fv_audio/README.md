@@ -10,22 +10,30 @@ ROS 2 owns both physical audio devices and the robot's single playback stream.
   missing or mismatched ID.
 - `audio_capture` uses Rust/CPAL only to acquire the device's native PCM. Every
   input buffer then passes through the required persistent GStreamer
-  `audioconvert ! audioresample` pipeline before the node publishes 16 kHz mono
-  PCM16LE to `/audio/mic/raw` with `source_id=fv_audio_capture` and
-  `stream_id=audio/mic/raw`. There is no custom microphone resampler or conversion
-  fallback; a GStreamer construction, negotiation, conversion, or streaming
-  failure stops the capture process. The bounded 64-chunk handoff queue absorbs
-  the observed GStreamer startup burst; exhausting it during steady operation is
-  still fatal.
-- `audio_aec` is the mandatory WebRTC AEC3 boundary between raw capture and
-  speech processing. It consumes `/audio/mic/raw` and the volume-scaled,
+  `audioconvert ! audioresample ! audiobuffersplit` pipeline. Converted PCM is
+  copied into a lock-free SPSC byte ring; the ROS publisher thread prebuffers
+  four 10 ms chunks and then removes exactly one chunk per monotonic-clock
+  deadline. This absorbs the device's observed 40 ms callback bursts without
+  publishing four ROS messages at once. The node publishes 16 kHz mono PCM16LE
+  to `/audio/mic/raw` with `source_id=fv_audio_capture` and
+  `stream_id=audio/mic/raw`. There is no custom microphone resampler or
+  conversion fallback; a GStreamer construction, negotiation, conversion,
+  streaming, ring overflow, or 500 ms capture stall stops the process. The ring
+  holds 64 chunks by default.
+- `audio_aec` is the continuous boundary between raw capture and speech
+  processing. While ASPA is silent it forwards `/audio/mic/raw` unchanged.
+  During playback it consumes the volume-scaled,
   callback-timed `/audio/output/render_reference`, converts the render reference
   through persistent GStreamer `audioconvert ! audioresample`, applies the
   accepted 40 ms render delay, and publishes 16 kHz mono PCM16LE to
   `/audio/mic/frame` with
-  `source_id=fv_audio_aec` and `stream_id=audio/mic/main`. A missing,
-  discontinuous, malformed, or overrun render reference is fatal; raw microphone
-  PCM is never passed through as an implicit fallback.
+  `source_id=fv_audio_aec` and `stream_id=audio/mic/main`. AEC remains active for
+  500 ms after playback completes to cover room reverberation. If the render
+  reference is unavailable, output falls back to raw microphone PCM and
+  `/audio/aec/status` reports `degraded`; it automatically returns to AEC when
+  the reference recovers. Sequence/sample gaps flush DSP state and resynchronize
+  without resetting the output sequence. Identity, format, and malformed-payload
+  violations remain fatal.
 - `playback_controller` is a Rust/GStreamer node and the only long playback
   queue. It subscribes to
   `/audio/agent/frame`, `/audio/system/frame`, and `/audio/cue/frame`, performs
@@ -51,9 +59,9 @@ ROS 2 owns both physical audio devices and the robot's single playback stream.
   samples already handed to the host buffer are discarded.
 
 The launch file keeps capture, AEC, controller, and output as separate recovery
-domains. Each node exits on a contract failure and the launch owner respawns
-that exact executable after two seconds; it never substitutes raw capture for
-AEC output or bypasses playback invalidation. Live UI reports both the process
+domains. Each node exits on an unrecoverable contract failure and the launch
+owner respawns that exact executable after two seconds. Recoverable transport
+gaps are handled in-process so `/audio/mic/frame` remains available. Live UI reports both the process
 and ROS-node state and can request the same exact-process restart. If the launch
 owner itself is absent, an individual restart fails instead of starting an
 unowned process.
@@ -103,6 +111,7 @@ Playback coordination uses typed messages throughout:
 - `/audio/mic/raw`: `fv_speech_interfaces/msg/AudioFrame`
 - `/audio/output/render_reference`: `fv_speech_interfaces/msg/AudioFrame`
 - `/audio/mic/frame`: `fv_speech_interfaces/msg/AudioFrame`
+- `/audio/aec/status`: `std_msgs/msg/String` (`bypass|active|tail|degraded`)
 - `/audio/output/drained`: `fv_audio_interfaces/msg/OutputDrained`
 - `/audio/output/flush`: `fv_audio_interfaces/srv/FlushAudio`
 - `/audio/devices/list`: `fv_audio_interfaces/srv/ListAudioDevices`
