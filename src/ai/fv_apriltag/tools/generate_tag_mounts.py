@@ -355,7 +355,7 @@ def main() -> int:
     p.add_argument('--flat-plates', default=None,
                    help="comma list 'id[:LABEL][@mm]' of face-down "
                         "two-colour plate 3MFs (calibration grade), "
-                        "e.g. '0:CALIB,10:ID10,20:DOCK@100'. "
+                        "e.g. '0:CALIB,10:ID10,20:HOME@150'. "
                         "Size defaults to 50mm, label to IDnnn")
     p.add_argument('--corner-stand-mm', type=float, default=None,
                    help='emit a corner-registering stand STL sized for '
@@ -364,7 +364,7 @@ def main() -> int:
     args = p.parse_args()
     out = Path(args.out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
-    for s in [float(v) for v in args.paper_sizes.split(',')]:
+    for s in [float(v) for v in args.paper_sizes.split(',') if v.strip()]:
         tag = int(s)          # paper == nominal (cut on the artwork edge)
         stake = args.stake_mm if args.stake_mm is not None else (
             70.0 if s <= 80 else 80.0)
