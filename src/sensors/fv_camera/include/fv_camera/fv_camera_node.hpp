@@ -55,6 +55,10 @@ private:
         int gain = -1;
         int exposure = -1;
         bool rotate_180 = false;  // physically inverted mounts (e.g., overhead C920)
+        // Effective output rotation in degrees clockwise (0/90/180/270).
+        // Folded from camera.rotation + rotate_180 at load; 90/270 swap the
+        // published width/height (portrait use, e.g. gripper close-up cam).
+        int rotation = 0;
     };
 
     struct StreamConfig
