@@ -197,47 +197,49 @@ def main() -> int:
     out = Path(args.out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
 
+    # File naming: '<3-digit id>_<name>_...' so a directory listing
+    # sorts by tag id (multi-id sheets use the id range).
     if args.cube_kit_out:
         ck = Path(args.cube_kit_out).expanduser()
         ck.mkdir(parents=True, exist_ok=True)
         make_sheet(cube_entries('60A', '60B'), 50.0,
-                   ck / 'sheet_cube60_ab_id300-311_50mm')
+                   ck / '300-311_cube60_ab_50mm')
         make_sheet(cube_entries('60C', '100A'), 50.0,
-                   ck / 'sheet_cube60c_100a_id312-325_50mm')
+                   ck / '312-325_cube60c_100a_50mm')
         make_sheet(cube_entries('100B', '100C'), 50.0,
-                   ck / 'sheet_cube100_bc_id326-337_50mm')
+                   ck / '326-337_cube100_bc_50mm')
 
     # Calibration spares: 12× ID 0 (paper tags wear; recut, re-paste).
     make_sheet([(0, 'CALIB')] * 12, 50.0,
-               out / 'sheet_calibration_id000_x12_50mm')
+               out / '000_calib_x12_50mm')
     # Surface corner anchors: distinct id per corner (registry 10-19;
     # 10-13 = first surface). Paper spares — the permanent install is
     # the two-colour printed plate (generate_tag_mounts --flat-plates).
     make_sheet([(i, f'CORNER ID{i}') for i in range(10, 14)], 50.0,
-               out / 'sheet_surface_corners_id010-013_50mm')
+               out / '010-013_corner_50mm')
     # Mother-stem marks: class id 100 for every stem (position tells
     # individuals apart; registry v2).
     make_sheet([(100, 'MOTHER STEM')] * 12, 50.0,
-               out / 'sheet_mother_stem_id100_x12_50mm')
+               out / '100_mother_stem_x12_50mm')
     # Field markers are 150mm unified (registry 2026-07-21): one tag
     # per A4 sheet, banner design v3. Print a sheet per installed spot
     # (duplicates of one ID are legitimate — several keep-out spots
     # share the meaning).
-    make_field_sheet(20, 'HOME', out / 'sheet_home_id020_150mm')
+    make_field_sheet(20, 'HOME', out / '020_home_150mm')
     # lane anchors (registry v2.1): 'LANE<k> START'/'END', lanes 1-5
     for k in range(1, 6):
         sid = 28 + 2 * k
         make_field_sheet(sid, f'LANE{k} START',
-                         out / f'sheet_lane{k}_start_id{sid:03d}_150mm')
+                         out / f'{sid:03d}_lane{k}_start_150mm')
         make_field_sheet(sid + 1, f'LANE{k} END',
-                         out / f'sheet_lane{k}_end_id{sid + 1:03d}_150mm')
-    make_field_sheet(50, 'KEEP OUT', out / 'sheet_keep_out_id050_150mm')
-    make_field_sheet(51, 'STOP', out / 'sheet_stop_id051_150mm')
-    make_field_sheet(52, 'SLOW', out / 'sheet_slow_id052_150mm')
+                         out / f'{sid + 1:03d}_lane{k}_end_150mm')
+    make_field_sheet(50, 'KEEP OUT', out / '050_keep_out_150mm')
+    make_field_sheet(51, 'STOP', out / '051_stop_150mm')
+    make_field_sheet(52, 'SLOW', out / '052_slow_150mm')
     # localization anchors (registry 110-119): distinct id per point
     for i, letter in enumerate('ABCD'):
         make_field_sheet(110 + i, f'ANCHOR {letter}',
-                         out / f'sheet_loc_anchor_id{110 + i}_150mm')
+                         out / f'{110 + i}_anchor_{letter.lower()}_150mm')
     return 0
 
 
