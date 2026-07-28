@@ -65,7 +65,7 @@ def test_kws_uses_ttl_gated_vad_windows_and_one_resettable_recognizer():
     assert "DEFAULT_END_SILENCE_SAMPLES: usize = 3_072" in source
     assert "detected_sample_index" in segmenter
     assert "resample" not in source.lower()
-    assert "KWS microphone sample discontinuity" in source
+    assert "KWS PCM join discontinuity" in source
     assert "PcmActivityJoiner" in source
     assert "wake_sent" in source
 
