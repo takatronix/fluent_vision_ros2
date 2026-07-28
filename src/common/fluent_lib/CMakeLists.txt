@@ -38,7 +38,7 @@ if(FREETYPE_FOUND AND OPENCV_FREETYPE_INCLUDE)
 else()
   set(FLUENT_HAS_FREETYPE FALSE)
   message(WARNING "fluent_lib: opencv2/freetype.hpp not found - "
-                  "building WITHOUT fluent_text (text drawing disabled)")
+                  "using cv::putText fallback (Japanese glyphs unavailable)")
 endif()
 find_package(yaml-cpp REQUIRED)
 
@@ -52,13 +52,18 @@ set(FLUENT_LIB_SOURCES
   src/fluent_image.cpp
   src/fluent_cloud_impl.cpp
   src/fluent_utils.cpp
+  # Always provide fluent::text symbols. Without opencv_contrib/freetype the
+  # implementation falls back to cv::putText.
+  src/fluent_text.cpp
 )
-if(FLUENT_HAS_FREETYPE)
-  list(APPEND FLUENT_LIB_SOURCES src/fluent_text.cpp)
-endif()
 
 # Create library
 add_library(${PROJECT_NAME} SHARED ${FLUENT_LIB_SOURCES})
+if(FLUENT_HAS_FREETYPE)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE FLUENT_HAS_FREETYPE=1)
+else()
+  target_compile_definitions(${PROJECT_NAME} PRIVATE FLUENT_HAS_FREETYPE=0)
+endif()
 
 # Target dependencies
 ament_target_dependencies(${PROJECT_NAME}

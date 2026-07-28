@@ -37,6 +37,19 @@ set(REALSENSE2_LIBRARIES "")
 # 方法0: CMake config (正規)。ros-jazzy-librealsense2 は
 # /opt/ros/<distro>/lib/<arch>/cmake/realsense2/ に config を置く
 # (lib 本体も <arch> サブディレクトリ側 — 方法2 の固定パスには載らない)。
+# 同じ版のSDKが複数ある場合は、実行時とのABI不一致を避けるためシステム側を
+# 優先する。明示された realsense2_DIR は尊重する。
+if(NOT realsense2_DIR)
+  foreach(_rs2_config_dir
+      "/opt/ros/$ENV{ROS_DISTRO}/lib/${CMAKE_LIBRARY_ARCHITECTURE}/cmake/realsense2"
+      "/usr/local/lib/cmake/realsense2")
+    if(EXISTS "${_rs2_config_dir}/realsense2Config.cmake")
+      set(realsense2_DIR "${_rs2_config_dir}" CACHE PATH
+          "Preferred RealSense SDK CMake config")
+      break()
+    endif()
+  endforeach()
+endif()
 find_package(realsense2 CONFIG QUIET)
 if(realsense2_FOUND)
   set(REALSENSE2_FOUND TRUE)
@@ -59,7 +72,7 @@ if(NOT REALSENSE2_FOUND AND REALSENSE2_PKG_FOUND)
   set(REALSENSE2_INCLUDE_DIRS ${REALSENSE2_PKG_INCLUDE_DIRS})
   set(REALSENSE2_LIBRARIES ${REALSENSE2_PKG_LIBRARIES})
   message(STATUS "Found RealSense SDK via pkg-config")
-else()
+elseif(NOT REALSENSE2_FOUND)
   # 方法2: 直接ライブラリを検索
   find_library(REALSENSE2_LIB
     NAMES realsense2 librealsense2

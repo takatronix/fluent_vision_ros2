@@ -1,9 +1,12 @@
 #include "fluent_text.hpp"
+#if FLUENT_HAS_FREETYPE
 #include <opencv2/freetype.hpp>
+#endif
 
 namespace fluent {
 namespace text {
 
+#if FLUENT_HAS_FREETYPE
 // FreeType2インスタンスを一度だけ生成（シングルトン）
 cv::Ptr<cv::freetype::FreeType2>& getFT2() {
     static cv::Ptr<cv::freetype::FreeType2> ft2 = cv::freetype::createFreeType2();
@@ -33,13 +36,20 @@ void putJapaneseText(cv::Mat& img, const std::string& text, cv::Point org, int f
     }
     ft2->putText(img, text, org, fontHeight, color, -1, cv::LINE_AA, true);
 }
+#endif
 
 
 void draw(cv::Mat& img, const std::string& text, cv::Point org,
-          cv::Scalar color, double font_scale, int /*thickness*/, int baseline_offset) {
+          cv::Scalar color, double font_scale, int thickness, int baseline_offset) {
+#if FLUENT_HAS_FREETYPE
     int fontHeight = static_cast<int>(24 * font_scale);
     cv::Point text_org = org + cv::Point(0, baseline_offset);
     putJapaneseText(img, text, text_org, fontHeight > 0 ? fontHeight : 24, color, "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc");
+#else
+    cv::putText(img, text, org + cv::Point(0, baseline_offset),
+                cv::FONT_HERSHEY_SIMPLEX, font_scale, color,
+                thickness, cv::LINE_AA);
+#endif
 }
 
 void drawShadow(cv::Mat& img, const std::string& text, cv::Point org,
