@@ -26,6 +26,7 @@ Run example:
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import List, Tuple
@@ -336,6 +337,12 @@ def generate_flat_plate_3mf(tag_id: int, tag_mm: float, out_3mf: Path,
           f'(face-down 2-colour, {len(black)}+{len(white)} tris)')
 
 
+def _plate_stem(tag_id: int, label: str, size_mm: float) -> str:
+    """'<3-digit id>_<label slug>_<size>mm' — directory sorts by tag id."""
+    slug = re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
+    return f'{tag_id:03d}_{slug}_{int(size_mm)}mm'
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out-dir', required=True)
@@ -355,7 +362,7 @@ def main() -> int:
     p.add_argument('--flat-plates', default=None,
                    help="comma list 'id[:LABEL][@mm]' of face-down "
                         "two-colour plate 3MFs (calibration grade), "
-                        "e.g. '0:CALIB,10:ID10,20:DOCK@100'. "
+                        "e.g. '0:CALIB,10:ID10,20:HOME@150'. "
                         "Size defaults to 50mm, label to IDnnn")
     p.add_argument('--corner-stand-mm', type=float, default=None,
                    help='emit a corner-registering stand STL sized for '
@@ -364,7 +371,7 @@ def main() -> int:
     args = p.parse_args()
     out = Path(args.out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
-    for s in [float(v) for v in args.paper_sizes.split(',')]:
+    for s in [float(v) for v in args.paper_sizes.split(',') if v.strip()]:
         tag = int(s)          # paper == nominal (cut on the artwork edge)
         stake = args.stake_mm if args.stake_mm is not None else (
             70.0 if s <= 80 else 80.0)
@@ -381,7 +388,7 @@ def main() -> int:
     if args.flat_plate_id is not None:
         generate_flat_plate_3mf(
             args.flat_plate_id, 50.0,
-            out / f'tag_plate_flat_id{args.flat_plate_id:03d}_50mm.3mf')
+            out / (_plate_stem(args.flat_plate_id, 'CALIB', 50.0) + '.3mf'))
     if args.flat_plates:
         for spec in args.flat_plates.split(','):
             spec = spec.strip()
@@ -391,10 +398,10 @@ def main() -> int:
                 size = float(sz)
             id_s, _, label = spec.partition(':')
             tid = int(id_s)
+            label = label or f'ID{tid}'
             generate_flat_plate_3mf(
-                tid, size,
-                out / f'tag_plate_flat_id{tid:03d}_{int(size)}mm.3mf',
-                label=label or f'ID{tid}')
+                tid, size, out / (_plate_stem(tid, label, size) + '.3mf'),
+                label=label)
     if args.corner_stand_mm is not None:
         generate_corner_stand(
             args.corner_stand_mm,

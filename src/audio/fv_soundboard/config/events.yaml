@@ -446,9 +446,12 @@ events:
     record: lidar_online
     category: safety
 
+  # 台詞は aspa_control_bridge の MOTION_DETECTED_SAY と同文にする
+  # (bridge は JSON payload で say を毎回上書きするため、ここがズレると
+  # 設定画面の表示だけが実際の発話と食い違う)。
   motion_detected:
     sound: attention
-    say: "周囲に人を検知しました"
+    say: "近くに生物を検知しました"
     speak: true
     interrupt: false
     record: motion_detected
@@ -459,4 +462,21 @@ events:
     speak: false
     interrupt: false
     record: motion_cleared
+    category: safety
+
+  # カメラの人認識 (aspa person_node)。motion_detected (人感センサー) とは
+  # 別イベント — 出どころが違えば台詞も記録マーカーも分ける。
+  person_detected:
+    sound: attention
+    say: "カメラに人を検知しました"
+    speak: true
+    interrupt: false
+    record: person_detected
+    category: safety
+  person_lost:
+    sound: ""
+    say: ""
+    speak: false
+    interrupt: false
+    record: person_lost
     category: safety

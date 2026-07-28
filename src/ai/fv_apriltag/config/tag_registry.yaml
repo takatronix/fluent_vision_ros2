@@ -8,7 +8,10 @@
 #     position, EXCEPT surface corners which get distinct ids so an
 #     uncalibrated fixed camera can one-shot PnP its extrinsics.
 #   - low bands (0-49) = permanently installed infrastructure
-#     (calibration, surface corners, dock, navigation anchors).
+#     (calibration, surface corners, home, navigation anchors).
+#
+# v2.1 (2026-07-29): naming only, ids unchanged — dock -> home (HOME),
+# row N/S -> "LANE<k> START" / "LANE<k> END".
 #   - cube faces moved 1-38 -> 300 band (see legacy below).
 #
 # Print sizes: tag_mm is the NOMINAL 10x10-cell edge INCLUDING the
@@ -25,14 +28,17 @@ allocations:
       note: "work-surface corner anchors, DISTINCT id per corner;
              10-13 = first surface. known-truth PnP targets for fixed
              cameras + extrinsics health checks" }
-  - { ids: [20, 29],   class: dock, label: "DOCK", tag_mm: 150,
-      note: "20 = home/charge dock final-approach target. All FIELD
-             tags unified at 150mm (2026-07-21); the older installed
-             100mm dock tag must be swapped before relying on pose
-             distance" }
+  - { ids: [20, 29],   class: home, label: "HOME", tag_mm: 150,
+      note: "20 = HOME (home/charge station) final-approach target
+             (class renamed from dock 2026-07-29, ids unchanged). All
+             FIELD tags unified at 150mm (2026-07-21); the older
+             installed 100mm tag must be swapped before relying on
+             pose distance" }
   - { ids: [30, 49],   class: navigation, tag_mm: 150,
-      note: "row entry / U-turn anchors: row k -> north 30+2k,
-             south 31+2k" }
+      note: "lane anchors (renamed from row N/S 2026-07-29, ids
+             unchanged): lane k (1-based) -> 'LANE<k> START' = 28+2k,
+             'LANE<k> END' = 29+2k. Lanes 1-5 = ids 30-39; 40-49
+             reserved for lanes 6-10" }
   - { ids: [50, 50],   class: keep_out,  label: "KEEP OUT",  tag_mm: 150,
       note: "field zone marker: do not enter" }
   - { ids: [51, 51],   class: stop,      label: "STOP",      tag_mm: 150 }
@@ -43,7 +49,7 @@ allocations:
       note: "class id 100 for every stem (position tells them apart);
              101-109 only if per-row grouping becomes necessary" }
   - { ids: [110, 119], class: loc_anchor, tag_mm: 150,
-      note: "general localization anchors (field corners, dock area,
+      note: "general localization anchors (field corners, home area,
              mid-field posts): DISTINCT id per point, taught into map
              once, then fixed. 110 = A, 111 = B, ... labels follow" }
   - { ids: [120, 199], class: domain_reserved }
@@ -69,5 +75,5 @@ legacy:
       note: "v1 future-reserved board — superseded by surface_corner
              10-19" }
   - { ids: [60, 62], class: field_markers_v1,
-      note: "v1 HOME/ROW ids — replaced by dock 20 and navigation
+      note: "v1 HOME/ROW ids — replaced by home 20 and navigation
              30-band; paper sheets regenerated, never deployed" }

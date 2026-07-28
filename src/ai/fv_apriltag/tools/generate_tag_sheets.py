@@ -1,10 +1,16 @@
 """Generate A4 multi-tag sheets: many tags per page with scissor cut
 lines, at true scale (300 DPI).
 
-Each cell is a light-gray CUT BOX of exactly (tag + 5 mm margin per
-side) — the size the mount pockets expect — with the id/label caption
-printed OUTSIDE the box in the gutter (readable before cutting,
-discarded after). 50 mm tags tile 3×4 = 12 per sheet; 100 mm tags 1×2.
+50 mm sheets (grid): each cell is a light-gray CUT BOX of exactly
+(tag + margin) — the size the mount pockets expect — with the id/label
+caption printed OUTSIDE the box in the gutter (readable before cutting,
+discarded after). 50 mm tags tile 3×4 = 12 per sheet.
+
+150 mm FIELD sheets (design v3, 2026-07-29): one tag per A4 with a
+black NAME BANNER (white capitals — readable by humans from metres
+away) under the tag. TWO cut lines: the inner line hugs the tag
+artwork (drop-in for the mount/plate pockets), the outer line keeps
+tag + banner together for direct pasting with the name attached.
 
 Run example:
     python3 generate_tag_sheets.py \
@@ -88,6 +94,82 @@ def make_sheet(entries: List[Tuple[int, str]], tag_mm: float,
           f'{cols}col)')
 
 
+BANNER_GAP_MM = 8.0    # white between tag artwork and banner — keeps the
+                       # quiet zone generous even on the pasted-with-name cut
+BANNER_H_MM = 26.0
+OUTER_PAD_MM = 5.0
+
+
+def _crop_marks(draw: ImageDraw.ImageDraw, x0: int, y0: int,
+                x1: int, y1: int, len_px: int, w: int) -> None:
+    """Corner crop marks (four L ticks) instead of a full cut rectangle.
+
+    A full gray rectangle hugging the artwork becomes an aruco quad
+    candidate; being bigger than the tag's black square and with
+    corners within 5% of its perimeter, candidate merging KEEPS the
+    rectangle and DROPS the real marker — the sheet stops decoding.
+    Ticks never form a quad, and the cut still lands on the artwork
+    edge (mount pockets expect exactly tag_mm)."""
+    for cx, cy, sx, sy in ((x0, y0, 1, 1), (x1, y0, -1, 1),
+                           (x1, y1, -1, -1), (x0, y1, 1, -1)):
+        draw.line([(cx, cy), (cx + sx * len_px, cy)], fill=CUT_GRAY, width=w)
+        draw.line([(cx, cy), (cx, cy + sy * len_px)], fill=CUT_GRAY, width=w)
+
+
+def make_field_sheet(tag_id: int, label: str, out_stem: Path,
+                     tag_mm: float = 150.0) -> None:
+    """One 150 mm field tag per A4, design v3: name banner + dual cut.
+
+    inner cut = tag artwork edge, marked by corner CROP MARKS (mount-
+    pocket drop-in, name discarded — see _crop_marks for why not a box)
+    outer cut = tag + banner + OUTER_PAD (paste with the name attached)
+    The id/spec caption sits OUTSIDE the outer line (gutter, discarded).
+    """
+    w, h = _px(A4_MM[0]), _px(A4_MM[1])
+    canvas = Image.new('L', (w, h), color=255)
+    draw = ImageDraw.Draw(canvas)
+    tag_x = (A4_MM[0] - tag_mm) / 2.0
+    tag_y = 28.0
+    cut_w = max(1, _px(CUT_W_MM))
+    # tag artwork + crop marks on its edge
+    pattern = fetch_tag_array(tag_id)          # 10×10, 0=black
+    tag_px = _px(tag_mm)
+    tile = Image.fromarray((pattern * 255).astype('uint8'), 'L') \
+        .resize((tag_px, tag_px), Image.NEAREST)
+    x0, y0 = _px(tag_x), _px(tag_y)
+    canvas.paste(tile, (x0, y0))
+    _crop_marks(draw, x0, y0, x0 + tag_px, y0 + tag_px,
+                _px(6.0), cut_w)
+    # name banner: black bar, white bold capitals, full tag width
+    b_y0 = tag_y + tag_mm + BANNER_GAP_MM
+    bx0, by0 = _px(tag_x), _px(b_y0)
+    bx1, by1 = _px(tag_x + tag_mm), _px(b_y0 + BANNER_H_MM)
+    draw.rectangle([bx0, by0, bx1, by1], fill=0)
+    font = _font_for_box(label, bx1 - bx0 - _px(10.0),
+                         by1 - by0 - _px(7.0))
+    bbox = font.getbbox(label)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(((bx0 + bx1 - tw) // 2 - bbox[0],
+               (by0 + by1 - th) // 2 - bbox[1]), label, fill=255,
+              font=font)
+    # outer cut line: tag + banner stay one piece
+    ox0, oy0 = _px(tag_x - OUTER_PAD_MM), _px(tag_y - OUTER_PAD_MM)
+    ox1 = _px(tag_x + tag_mm + OUTER_PAD_MM)
+    oy1 = _px(b_y0 + BANNER_H_MM + OUTER_PAD_MM)
+    draw.rectangle([ox0, oy0, ox1, oy1], outline=CUT_GRAY, width=cut_w)
+    # spec caption in the gutter below the outer line
+    caption = (f'id{tag_id:03d}  {label}  tag36h11  '
+               f'{tag_mm:.0f}mm (black {tag_mm * 0.8:.0f}mm)')
+    cfont = _font_for_box(caption, ox1 - ox0 - 8, _px(5.0))
+    cbox = cfont.getbbox(caption)
+    draw.text((((ox0 + ox1) - (cbox[2] - cbox[0])) // 2 - cbox[0],
+               oy1 + _px(2.0) - cbox[1]), caption, fill=90, font=cfont)
+    canvas.save(out_stem.with_suffix('.pdf'), 'PDF', resolution=DPI)
+    canvas.save(out_stem.with_suffix('.png'), dpi=(DPI, DPI))
+    print(f'field sheet: {out_stem}.pdf  (id{tag_id:03d} {label} '
+          f'@ {tag_mm:.0f}mm, banner)')
+
+
 FACE_NAMES = ('top', 'front', 'right', 'back', 'left', 'bottom')
 CUBE_BASE_IDS = {'60A': 300, '60B': 306, '60C': 312,
                  '100A': 320, '100B': 326, '100C': 332}
@@ -115,47 +197,49 @@ def main() -> int:
     out = Path(args.out_dir).expanduser()
     out.mkdir(parents=True, exist_ok=True)
 
+    # File naming: '<3-digit id>_<name>_...' so a directory listing
+    # sorts by tag id (multi-id sheets use the id range).
     if args.cube_kit_out:
         ck = Path(args.cube_kit_out).expanduser()
         ck.mkdir(parents=True, exist_ok=True)
         make_sheet(cube_entries('60A', '60B'), 50.0,
-                   ck / 'sheet_cube60_ab_id300-311_50mm')
+                   ck / '300-311_cube60_ab_50mm')
         make_sheet(cube_entries('60C', '100A'), 50.0,
-                   ck / 'sheet_cube60c_100a_id312-325_50mm')
+                   ck / '312-325_cube60c_100a_50mm')
         make_sheet(cube_entries('100B', '100C'), 50.0,
-                   ck / 'sheet_cube100_bc_id326-337_50mm')
+                   ck / '326-337_cube100_bc_50mm')
 
     # Calibration spares: 12× ID 0 (paper tags wear; recut, re-paste).
     make_sheet([(0, 'CALIB')] * 12, 50.0,
-               out / 'sheet_calibration_id000_x12_50mm')
+               out / '000_calib_x12_50mm')
     # Surface corner anchors: distinct id per corner (registry 10-19;
     # 10-13 = first surface). Paper spares — the permanent install is
     # the two-colour printed plate (generate_tag_mounts --flat-plates).
     make_sheet([(i, f'CORNER ID{i}') for i in range(10, 14)], 50.0,
-               out / 'sheet_surface_corners_id010-013_50mm')
+               out / '010-013_corner_50mm')
     # Mother-stem marks: class id 100 for every stem (position tells
     # individuals apart; registry v2).
     make_sheet([(100, 'MOTHER STEM')] * 12, 50.0,
-               out / 'sheet_mother_stem_id100_x12_50mm')
+               out / '100_mother_stem_x12_50mm')
     # Field markers are 150mm unified (registry 2026-07-21): one tag
-    # per A4 sheet. Print a sheet per installed spot (duplicates of one
-    # ID are legitimate — several keep-out spots share the meaning).
-    make_sheet([(20, 'DOCK')], 150.0,
-               out / 'sheet_dock_id020_150mm')
-    make_sheet([(50, 'KEEP OUT')], 150.0,
-               out / 'sheet_keep_out_id050_150mm')
-    make_sheet([(51, 'STOP')], 150.0,
-               out / 'sheet_stop_id051_150mm')
-    make_sheet([(52, 'SLOW')], 150.0,
-               out / 'sheet_slow_id052_150mm')
-    make_sheet([(30, 'ROW N')], 150.0,
-               out / 'sheet_row_anchor_id030_150mm')
-    make_sheet([(31, 'ROW S')], 150.0,
-               out / 'sheet_row_anchor_id031_150mm')
+    # per A4 sheet, banner design v3. Print a sheet per installed spot
+    # (duplicates of one ID are legitimate — several keep-out spots
+    # share the meaning).
+    make_field_sheet(20, 'HOME', out / '020_home_150mm')
+    # lane anchors (registry v2.1): 'LANE<k> START'/'END', lanes 1-5
+    for k in range(1, 6):
+        sid = 28 + 2 * k
+        make_field_sheet(sid, f'LANE{k} START',
+                         out / f'{sid:03d}_lane{k}_start_150mm')
+        make_field_sheet(sid + 1, f'LANE{k} END',
+                         out / f'{sid + 1:03d}_lane{k}_end_150mm')
+    make_field_sheet(50, 'KEEP OUT', out / '050_keep_out_150mm')
+    make_field_sheet(51, 'STOP', out / '051_stop_150mm')
+    make_field_sheet(52, 'SLOW', out / '052_slow_150mm')
     # localization anchors (registry 110-119): distinct id per point
     for i, letter in enumerate('ABCD'):
-        make_sheet([(110 + i, f'ANCHOR {letter}')], 150.0,
-                   out / f'sheet_loc_anchor_id{110 + i}_150mm')
+        make_field_sheet(110 + i, f'ANCHOR {letter}',
+                         out / f'{110 + i}_anchor_{letter.lower()}_150mm')
     return 0
 
 
