@@ -7,8 +7,8 @@
 
 | engine | 実装 | 特徴 |
 |--------|------|------|
-| `voicevox` (既定) | VOICEVOX ENGINE (HTTP) | 高品質・ずんだもん等。**別プロセスの ENGINE 起動が必要** (24kHz出力→自動リサンプル) |
-| `pyopenjtalk` | Open JTalk | 追加サーバ不要・オフライン。音量控えめ |
+| `pyopenjtalk` (既定) | Open JTalk | 軽量・追加サーバ不要・オフライン。音量控えめ |
+| `voicevox` | VOICEVOX ENGINE (HTTP) | 高品質・話者選択可。**別プロセスの ENGINE 起動が必要** (24kHz出力→自動リサンプル) |
 
 `engine`パラメータで切り替えます。「進化成長」原則に沿ってバックエンドは抽象化されており、
 `fv_tts_py/voicevox_backend.py`のように新エンジンを足せます。**fallbackはしません** — 選んだ
@@ -23,21 +23,21 @@ curl http://127.0.0.1:50021/version   # 疎通確認
 ```
 
 - `voicevox_url`: ENGINE のURL
-- `voicevox_speaker`: 話者ID (既定 3 = ずんだもんノーマル)。`Speak.voice_id`に数値文字列を渡すと個別上書き
+- `voicevox_speaker`: 話者ID (既定 30 = No.7 / アナウンス)。`Speak.voice_id`に数値文字列を渡すと個別上書き
 - ENGINE は 24kHz mono 16bit で返すため、`output_sample_rate` (既定48000) へリサンプルしてから
   `audio/output/frame`へ流します。**この値は`fv_audio_output`の`audio.sample_rate`と一致させること**
   (不一致だと format mismatch で無音になります)。
 
 ## 依存
-- VOICEVOX ENGINE (engine=voicevox 時、外部プロセス)
-- `pyopenjtalk` (engine=pyopenjtalk 時)
+- `pyopenjtalk-plus` (`import pyopenjtalk`互換、engine=pyopenjtalk 時)
+- VOICEVOX ENGINE (engine=voicevox 時のみ、外部プロセス)
 - `python3-numpy`
 
 ## 起動
 ```bash
 ros2 launch fv_tts fv_tts.launch.py
 # または
-ros2 run fv_tts fv_tts_node --ros-args -p engine:=voicevox -p voicevox_speaker:=3
+ros2 launch fv_tts fv_tts.launch.py engine:=voicevox default_volume_db:=0.0
 ```
 
 ## 発話の2系統

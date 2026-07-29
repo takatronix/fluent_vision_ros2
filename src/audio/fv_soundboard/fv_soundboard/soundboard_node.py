@@ -349,6 +349,9 @@ class SoundboardNode(Node):
             if not isinstance(obj, dict):
                 raise ValueError("object required")
             enabled = bool(obj.get("robot_enabled", True))
+            # enable_tts は任意キー: 無指定なら現状維持 (起動パラメータ値)。
+            # 「通知音は鳴らすが読み上げ(VOICEVOX)だけ止める」用 (_speak が参照)。
+            tts_flag = obj.get("enable_tts")
             disabled = {
                 str(name) for name in obj.get("disabled_events", [])
                 if str(name) in self.registry
@@ -357,9 +360,12 @@ class SoundboardNode(Node):
             self.get_logger().warn(f"settings parse失敗: {exc}")
             return
         self.robot_enabled = enabled
+        if tts_flag is not None:
+            self.enable_tts = bool(tts_flag)
         self.disabled_events = disabled
         self.get_logger().info(
             f"audio settings: robot={'on' if enabled else 'off'}, "
+            f"tts={'on' if self.enable_tts else 'off'}, "
             f"disabled={len(disabled)}")
 
     def _on_preview(self, msg: String):

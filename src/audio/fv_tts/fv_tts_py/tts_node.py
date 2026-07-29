@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -22,25 +23,43 @@ from fv_tts.srv import Speak
 
 from fv_tts_py.voicevox_backend import VoicevoxBackend, VoicevoxError
 
-# Set pyopenjtalk dictionary directory to user's home directory
-os.environ.setdefault("OPEN_JTALK_DICT_DIR", str(Path.home() / ".pyopenjtalk"))
-
 # Disable tqdm progress bar for pyopenjtalk downloads
 os.environ["TQDM_DISABLE"] = "1"
 
-try:
-    # Suppress download progress output during pyopenjtalk import
-    _original_stderr = sys.stderr
-    sys.stderr = open(os.devnull, 'w')
-    import pyopenjtalk
-    sys.stderr.close()
-    sys.stderr = _original_stderr
-except ImportError as exc:  # pragma: no cover - import guard
-    sys.stderr = _original_stderr
-    pyopenjtalk = None
-    _IMPORT_ERROR = exc
-else:
-    _IMPORT_ERROR = None
+pyopenjtalk = None
+_IMPORT_ERROR = None
+_PYOPENJTALK_LOADED = False
+
+
+def load_pyopenjtalk():
+    """Load Open JTalk only when selected.
+
+    VOICEVOX mode must not pay for loading a second synthesis engine.  The
+    bundled ARM64 wheel also contains the dictionary and voice, so importing
+    it eagerly would use otherwise avoidable memory.
+    """
+    global pyopenjtalk, _IMPORT_ERROR, _PYOPENJTALK_LOADED
+    if _PYOPENJTALK_LOADED:
+        return pyopenjtalk
+    _PYOPENJTALK_LOADED = True
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    quiet_stream = None
+    try:
+        # Suppress dictionary/download progress output during the first import.
+        quiet_stream = open(os.devnull, "w", encoding="utf-8")
+        sys.stdout = quiet_stream
+        sys.stderr = quiet_stream
+        pyopenjtalk = importlib.import_module("pyopenjtalk")
+    except ImportError as exc:  # pragma: no cover - deployment guard
+        _IMPORT_ERROR = exc
+        pyopenjtalk = None
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        if quiet_stream is not None:
+            quiet_stream.close()
+    return pyopenjtalk
 
 
 class CachedAudio:
@@ -66,9 +85,11 @@ class FvTtsNode(Node):
         self.declare_parameter("use_playback_topic", True)
         self.declare_parameter("stop_topic", "audio/output/stop")
         self.declare_parameter("cache_dir", "")
-        self.declare_parameter("default_volume_db", 0.0)
-        # エンジン差替え: "voicevox"(既定) | "pyopenjtalk"
-        self.declare_parameter("engine", "voicevox")
+        # Open JTalk is quieter than VOICEVOX, hence the lightweight default's
+        # +8 dB.  The launch script passes 0 dB when VOICEVOX is selected.
+        self.declare_parameter("default_volume_db", 8.0)
+        # エンジン差替え: "pyopenjtalk"(軽量・既定) | "voicevox"
+        self.declare_parameter("engine", "pyopenjtalk")
         self.declare_parameter("voicevox_url", "http://127.0.0.1:50021")
         self.declare_parameter("voicevox_speaker", 30)  # No.7 (アナウンス)
         # 出力パイプライン (fv_audio_output) のサンプルレート。voicevox は 24kHz を
@@ -98,7 +119,7 @@ class FvTtsNode(Node):
         # エンジンごとに必要リソースを確認 (fallback せず、駄目なら止める)
         self.voicevox: Optional[VoicevoxBackend] = None
         if self.engine == "pyopenjtalk":
-            if pyopenjtalk is None:
+            if load_pyopenjtalk() is None:
                 raise RuntimeError(
                     f"engine=pyopenjtalk だが pyopenjtalk が使えません: {_IMPORT_ERROR}"
                 ) from _IMPORT_ERROR
@@ -335,11 +356,12 @@ class FvTtsNode(Node):
         return CachedAudio(audio_bytes, int(out_sr), 1, 16, rms, peak)
 
     def _synthesize_pyopenjtalk(self, text: str, voice_id: str, volume_db: float) -> CachedAudio:
-        if pyopenjtalk is None:
+        if load_pyopenjtalk() is None:
             raise RuntimeError(f"pyopenjtalk is not available: {_IMPORT_ERROR}")
-        options = {}
+        options = {"predict_nani": False}
         if voice_id:
-            options["voice"] = voice_id
+            self.get_logger().warn(
+                f"pyopenjtalk: voice_id='{voice_id}' is ignored (single voice engine)")
         wav, sample_rate = pyopenjtalk.tts(text, **options)
         waveform = np.asarray(wav, dtype=np.float32)
 
