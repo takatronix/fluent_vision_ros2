@@ -73,10 +73,20 @@ class ActiveLock:
 
 
 def _pid_alive(pid: int) -> bool:
+    # pid が「録画ノードとして」生きているかを確認する。コンテナ再起動で
+    # PID 空間が変わると、残留ロックの pid が無関係なプロセスに再利用されて
+    # 「生きている」と誤判定し、録画ノードが永久に起動拒否する
+    # (2026-08-08 実害)。存在確認だけでなく cmdline まで見る。
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        return b"recorder_node" in cmdline
+    except OSError:
         return False
     except PermissionError:
         # process exists but we lack signal permission -> treat as alive
