@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -552,7 +552,7 @@ impl AecRuntime {
     }
 
     fn push_near(&mut self, message: &AudioFrame) -> Result<(), AecError> {
-        if message.frame_count as usize % FRAME_SAMPLES != 0 {
+        if !(message.frame_count as usize).is_multiple_of(FRAME_SAMPLES) {
             return Err(AecError::Near(format!(
                 "frame_count {} is not a whole number of WebRTC 10 ms frames",
                 message.frame_count
@@ -597,10 +597,7 @@ impl AecRuntime {
         self.reset_far()
     }
 
-    fn flush_near_raw(
-        &mut self,
-        publisher: &r2r::Publisher<AudioFrame>,
-    ) -> Result<(), AecError> {
+    fn flush_near_raw(&mut self, publisher: &r2r::Publisher<AudioFrame>) -> Result<(), AecError> {
         while let Some(near) = self.near.pop_front() {
             if self.far.len() >= FRAME_SAMPLES {
                 self.far.drain(..FRAME_SAMPLES);
@@ -954,8 +951,8 @@ fn env_usize(name: &str, default: usize) -> Result<usize, AecError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AEC_SAMPLE_RATE_HZ, AEC_TAIL_MS, AUDIO_QOS_DEPTH, AecRuntime, FRAME_SAMPLES, FarDelayLine,
-        RenderConverter, WebRtcAec, audio_qos, take_ready_bounded,
+        audio_qos, take_ready_bounded, AecRuntime, FarDelayLine, RenderConverter, WebRtcAec,
+        AEC_SAMPLE_RATE_HZ, AEC_TAIL_MS, AUDIO_QOS_DEPTH, FRAME_SAMPLES,
     };
     use futures::stream;
     use std::collections::VecDeque;

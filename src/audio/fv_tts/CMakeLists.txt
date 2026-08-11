@@ -1,132 +1,63 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.16)
 project(fv_tts)
-
-if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 17)
-endif()
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(ament_cmake REQUIRED)
 find_package(fv_audio_interfaces REQUIRED)
-find_package(nlohmann_json REQUIRED)
-find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 
-# voicevox_core is the pinned ASPA source-alignment build installed by
-# scripts/setup-voicevox-core. An explicit cache value wins, followed by the
-# setup script's environment/default locations and then normal system paths.
-set(VOICEVOX_CORE_ROOT "" CACHE PATH "Root containing voicevox_core include/ and lib/")
-set(_voicevox_core_hints "")
-if(VOICEVOX_CORE_ROOT)
-  list(APPEND _voicevox_core_hints "${VOICEVOX_CORE_ROOT}")
+if(EXISTS "$ENV{HOME}/.cargo/bin/cargo")
+  set(CARGO_EXECUTABLE "$ENV{HOME}/.cargo/bin/cargo")
+else()
+  find_program(CARGO_EXECUTABLE cargo REQUIRED)
 endif()
-if(DEFINED ENV{VOICEVOX_CORE_ROOT} AND NOT "$ENV{VOICEVOX_CORE_ROOT}" STREQUAL "")
-  list(APPEND _voicevox_core_hints "$ENV{VOICEVOX_CORE_ROOT}")
-endif()
-if(DEFINED ENV{VOICEVOX_CORE_INSTALL_ROOT} AND NOT "$ENV{VOICEVOX_CORE_INSTALL_ROOT}" STREQUAL "")
-  list(APPEND _voicevox_core_hints "$ENV{VOICEVOX_CORE_INSTALL_ROOT}/current/core")
-endif()
-if(DEFINED ENV{HOME} AND NOT "$ENV{HOME}" STREQUAL "")
-  list(APPEND _voicevox_core_hints "$ENV{HOME}/.aspa/voicevox_core/current/core")
-endif()
-
-find_path(VOICEVOX_CORE_INCLUDE_DIR
-  NAMES voicevox_core.h
-  HINTS ${_voicevox_core_hints}
-  PATH_SUFFIXES include
+set(FV_TTS_RUST_TOOLCHAIN "1.88.0")
+execute_process(
+  COMMAND ${CMAKE_COMMAND} -E env RUSTUP_TOOLCHAIN=${FV_TTS_RUST_TOOLCHAIN}
+    ${CARGO_EXECUTABLE} --version
+  OUTPUT_VARIABLE CARGO_VERSION_OUTPUT
+  OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-find_library(VOICEVOX_CORE_LIBRARY
-  NAMES voicevox_core
-  HINTS ${_voicevox_core_hints}
-  PATH_SUFFIXES lib
-)
-if(NOT VOICEVOX_CORE_INCLUDE_DIR OR NOT VOICEVOX_CORE_LIBRARY)
-  message(FATAL_ERROR
-    "voicevox_core C API was not found. Run scripts/setup-voicevox-core, or "
-    "configure with -DVOICEVOX_CORE_ROOT=/path/to/voicevox_core.")
-endif()
-get_filename_component(VOICEVOX_CORE_LIBRARY_DIR "${VOICEVOX_CORE_LIBRARY}" DIRECTORY)
-include(CheckCXXSymbolExists)
-set(CMAKE_REQUIRED_INCLUDES "${VOICEVOX_CORE_INCLUDE_DIR}")
-set(CMAKE_REQUIRED_LIBRARIES "${VOICEVOX_CORE_LIBRARY}")
-check_cxx_symbol_exists(
-  voicevox_open_jtalk_rc_analyze_with_source_map
-  "voicevox_core.h"
-  VOICEVOX_CORE_HAS_SOURCE_MAP
-)
-unset(CMAKE_REQUIRED_INCLUDES)
-unset(CMAKE_REQUIRED_LIBRARIES)
-if(NOT VOICEVOX_CORE_HAS_SOURCE_MAP)
-  message(FATAL_ERROR
-    "voicevox_core does not provide the required ASPA source-map API. "
-    "Run scripts/setup-voicevox-core and rebuild fv_tts.")
+string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" CARGO_VERSION "${CARGO_VERSION_OUTPUT}")
+if(NOT CARGO_VERSION OR CARGO_VERSION VERSION_LESS "1.88.0")
+  message(FATAL_ERROR "fv_tts requires Rust/Cargo >= 1.88; found ${CARGO_VERSION_OUTPUT}")
 endif()
 
-add_library(fv_tts_core STATIC
-  src/contracts.cpp
-  src/source_alignment.cpp
-  src/synthesis_cache.cpp
-  src/synthesis_scheduler.cpp
-  src/synthesis_watchdog.cpp
-  src/voicevox_backend.cpp
+set(CARGO_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargo-target")
+add_custom_target(fv_tts_rust ALL
+  COMMAND ${CMAKE_COMMAND} -E env
+    RUSTUP_TOOLCHAIN=${FV_TTS_RUST_TOOLCHAIN}
+    CARGO_TARGET_DIR=${CARGO_TARGET_DIR}
+    IDL_PACKAGE_FILTER=fv_audio_interfaces\;std_srvs
+    ${CARGO_EXECUTABLE} build --locked --release
+      --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/rust
+  COMMENT "Building Rust MagpieTTS-RT ROS 2 streaming node"
+  VERBATIM
 )
-target_include_directories(fv_tts_core
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-  PRIVATE
-    "${VOICEVOX_CORE_INCLUDE_DIR}"
+install(PROGRAMS
+  ${CARGO_TARGET_DIR}/release/fv_tts_node
+  DESTINATION lib/${PROJECT_NAME}
 )
-target_link_libraries(fv_tts_core
-  PUBLIC nlohmann_json::nlohmann_json
-  PRIVATE "${VOICEVOX_CORE_LIBRARY}"
-)
-target_compile_options(fv_tts_core PRIVATE -Wall -Wextra -Wpedantic)
-
-add_executable(fv_tts_node src/tts_node.cpp)
-target_link_libraries(fv_tts_node fv_tts_core "${VOICEVOX_CORE_LIBRARY}")
-ament_target_dependencies(fv_tts_node
-  fv_audio_interfaces
-  rclcpp
-  std_msgs
-  std_srvs
-)
-target_compile_options(fv_tts_node PRIVATE -Wall -Wextra -Wpedantic)
-set_target_properties(fv_tts_node PROPERTIES
-  BUILD_RPATH "${VOICEVOX_CORE_LIBRARY_DIR}"
-  INSTALL_RPATH "${VOICEVOX_CORE_LIBRARY_DIR}"
-)
-
-install(TARGETS fv_tts_core fv_tts_node
-  ARCHIVE DESTINATION lib
-  RUNTIME DESTINATION lib/${PROJECT_NAME}
-)
-install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY launch config resource DESTINATION share/${PROJECT_NAME}
   PATTERN "__pycache__" EXCLUDE
   PATTERN "*.pyc" EXCLUDE
 )
+install(FILES README.md DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
-  ament_add_gtest(test_fv_tts_core
-    test/test_contracts.cpp
-    test/test_source_alignment.cpp
-    test/test_synthesis_cache.cpp
-    test/test_synthesis_scheduler.cpp
-    test/test_synthesis_watchdog.cpp
-  )
-  if(TARGET test_fv_tts_core)
-    target_link_libraries(test_fv_tts_core fv_tts_core "${VOICEVOX_CORE_LIBRARY}")
-    set_target_properties(test_fv_tts_core PROPERTIES
-      BUILD_RPATH "${VOICEVOX_CORE_LIBRARY_DIR}"
-    )
-  endif()
   ament_add_pytest_test(test_fv_tts_launch test/test_launch_contract.py)
+  add_test(
+    NAME fv_tts_rust_tests
+    COMMAND ${CMAKE_COMMAND} -E env
+      RUSTUP_TOOLCHAIN=${FV_TTS_RUST_TOOLCHAIN}
+      CARGO_TARGET_DIR=${CARGO_TARGET_DIR}
+      IDL_PACKAGE_FILTER=fv_audio_interfaces\;std_srvs
+      ${CARGO_EXECUTABLE} test --locked
+        --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml
+  )
+  set_tests_properties(fv_tts_rust_tests PROPERTIES TIMEOUT 600)
 endif()
 
-ament_export_include_directories(include)
 ament_package()

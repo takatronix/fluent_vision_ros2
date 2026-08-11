@@ -33,6 +33,20 @@ events:
     interrupt: false
     record: ready
     category: system
+  slam_initializing:
+    sound: ""
+    say: "スラムを初期化しています。約1分間、ロボットを動かさないでください"
+    speak: true
+    interrupt: false
+    record: slam_initializing
+    category: system
+  slam_ready:
+    sound: ""
+    say: "スラムの準備ができました。走行できます"
+    speak: true
+    interrupt: false
+    record: slam_ready
+    category: system
   mode_manual:
     sound: auto_stop
     say: "手動運転モードに切り替えました"

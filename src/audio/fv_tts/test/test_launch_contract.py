@@ -1,10 +1,9 @@
 from pathlib import Path
 
-
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 
 
-def test_launch_respawns_native_tts_as_its_own_recovery_domain():
+def test_launch_respawns_magpie_tts_as_its_own_recovery_domain():
     source = (PACKAGE_DIR / "launch" / "fv_tts.launch.py").read_text(
         encoding="utf-8"
     )
@@ -16,69 +15,75 @@ def test_launch_respawns_native_tts_as_its_own_recovery_domain():
     assert "on_exit=EmitEvent(" not in source
 
 
-def test_synthesis_timeout_is_configured_and_forwarded_as_float():
+def test_all_native_frontend_and_watchdog_timeouts_are_explicit():
     launch_source = (PACKAGE_DIR / "launch" / "fv_tts.launch.py").read_text(
         encoding="utf-8"
     )
     config_source = (PACKAGE_DIR / "config" / "default.yaml").read_text(
         encoding="utf-8"
     )
+    compact_launch_source = "".join(launch_source.split())
 
-    assert (
-        'DeclareLaunchArgument("synthesis_timeout_seconds", default_value="60.0")'
-        in launch_source
-    )
-    assert 'LaunchConfiguration("synthesis_timeout_seconds")' in launch_source
-    assert "value_type=float" in launch_source
-    assert "synthesis_timeout_seconds: 60.0" in config_source
+    for name, default in (
+        ("frontend_timeout_seconds", "2.0"),
+        ("request_progress_timeout_seconds", "30.0"),
+        ("cancellation_timeout_seconds", "2.0"),
+        ("startup_timeout_seconds", "300.0"),
+        ("timing_collector_discovery_timeout_seconds", "10.0"),
+        ("scheduler_watchdog_seconds", "5.0"),
+    ):
+        assert (
+            f'DeclareLaunchArgument("{name}",default_value="{default}")'
+            in compact_launch_source
+        )
+        assert f'LaunchConfiguration("{name}")' in compact_launch_source
+        assert f"{name}: {default}" in config_source
 
 
-def test_synthesis_cache_is_configurable_and_off_by_default():
+def test_runtime_and_frontend_assets_are_explicit_environment_inputs():
     launch_source = (PACKAGE_DIR / "launch" / "fv_tts.launch.py").read_text(
         encoding="utf-8"
     )
     config_source = (PACKAGE_DIR / "config" / "default.yaml").read_text(
         encoding="utf-8"
     )
-    node_source = (PACKAGE_DIR / "src" / "tts_node.cpp").read_text(
-        encoding="utf-8"
-    )
-
-    # 置き場所を決めるのは配備側。パッケージ既定では永続化しない。
-    assert (
-        'DeclareLaunchArgument("cache_directory", default_value="")'
-        in launch_source
-    )
-    assert (
-        'DeclareLaunchArgument("cache_warmup_file", default_value="")'
-        in launch_source
-    )
-    assert 'cache_directory: ""' in config_source
-    assert 'cache_warmup_file: ""' in config_source
-    for name in ("cache_memory_entries", "cache_disk_budget_mb"):
-        assert f'DeclareLaunchArgument("{name}"' in launch_source
-        assert f'LaunchConfiguration("{name}"), value_type=int' in launch_source
-
-    # 合成の入口は必ずキャッシュを通る
-    assert "return synthesize_cached(text);" in node_source
-    assert "cache_->lookup(style_id, text)" in node_source
-    # 話者が変わった合成結果は残さない
-    assert "if (backend_->style_id() == style_id) {" in node_source
+    for parameter, environment in (
+        ("native_library", "MAGPIE_TTS_RT_NATIVE_LIBRARY"),
+        ("bundle_path", "MAGPIE_TTS_RT_BUNDLE"),
+        ("manifest_sha256", "MAGPIE_TTS_RT_MANIFEST_SHA256"),
+        ("frontend_python", "MAGPIE_TTS_RT_FRONTEND_PYTHON"),
+        ("frontend_server", "MAGPIE_TTS_RT_FRONTEND_SERVER"),
+        ("frontend_lock", "MAGPIE_TTS_RT_FRONTEND_LOCK"),
+        ("frontend_contract", "MAGPIE_TTS_RT_FRONTEND_CONTRACT"),
+    ):
+        assert f'"{parameter}"' in launch_source
+        assert f'"{environment}"' in launch_source
+        assert f'{parameter}: ""' in config_source
 
 
-def test_native_startup_and_request_calls_are_both_guarded():
-    node_source = (PACKAGE_DIR / "src" / "tts_node.cpp").read_text(
-        encoding="utf-8"
+def test_voicevox_and_mutable_voice_apis_are_removed():
+    package_files = [
+        path
+        for path in PACKAGE_DIR.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and ".cache" not in path.parts
+        and path != Path(__file__).resolve()
+        and path.name != "README.md"
+    ]
+    source = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in package_files
     )
-    scheduler_source = (
-        PACKAGE_DIR / "src" / "synthesis_scheduler.cpp"
-    ).read_text(encoding="utf-8")
+    assert "VOICEVOX" not in source
+    assert "/aspa/tts/settings" not in source
+    assert "/aspa/tts/voices" not in source
+    assert "style_id" not in source
+    assert "voicevox_backend" not in source
 
-    assert (
-        'declare_parameter<double>("synthesis_timeout_seconds", 60.0)'
-        in node_source
-    )
-    assert '"startup smoke synthesis"' in node_source
-    assert "synthesis_timeout_);" in node_source
-    assert "SynthesisWatchdog watchdog(synthesis_timeout_" in scheduler_source
-    assert "request_synthesis_context(request)" in scheduler_source
+
+def test_rust_codegen_is_limited_to_the_declared_tts_interfaces():
+    source = (PACKAGE_DIR / "CMakeLists.txt").read_text(encoding="utf-8")
+
+    assert source.count(
+        r"IDL_PACKAGE_FILTER=fv_audio_interfaces\;std_srvs"
+    ) == 2

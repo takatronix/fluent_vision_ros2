@@ -1,0 +1,26 @@
+[package]
+name = "fv-tts-ros2"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+
+[lib]
+name = "fv_tts_ros2"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fv_tts_node"
+path = "src/bin/fv_tts_node.rs"
+
+[dependencies]
+ctrlc = "3.5"
+futures = "0.3"
+libc = "0.2"
+libloading = "0.8"
+magpie-tts-rt = { git = "https://github.com/Escenda/magpie-tts-rt", rev = "06818fd85a625754e52e5ef77d64b548a25efc30" }
+r2r = "0.9.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"

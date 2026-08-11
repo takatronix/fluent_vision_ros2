@@ -12,7 +12,7 @@ use cpal::{
     BufferSize, Device, OutputCallbackInfo, SampleFormat, StreamConfig, SupportedStreamConfig,
 };
 use futures::{FutureExt, StreamExt};
-use r2r::fv_audio_interfaces::msg::{OutputDrained, PlaybackFrame};
+use r2r::fv_audio_interfaces::msg::{OutputDrained, PlaybackFrame, TtsTimingEvent};
 use r2r::fv_audio_interfaces::srv::FlushAudio;
 use r2r::fv_speech_interfaces::msg::AudioFrame;
 use r2r::qos::{DurabilityPolicy, HistoryPolicy, ReliabilityPolicy};
@@ -27,6 +27,7 @@ const STATUS_ACCEPTED: u8 = OutputDrained::ACCEPTED as u8;
 const STATUS_DRAINED: u8 = OutputDrained::DRAINED as u8;
 const STATUS_FLUSHED: u8 = OutputDrained::FLUSHED as u8;
 const PLAYOUT_QOS_DEPTH: usize = 256;
+const TIMING_QUEUE_CAPACITY: usize = 256;
 const RENDER_SOURCE_ID: &str = "fv_audio_output";
 const RENDER_STREAM_ID: &str = "audio/render_reference/main";
 const RENDER_TOPIC: &str = "/audio/output/render_reference";
@@ -75,6 +76,32 @@ struct OutputPacket {
     playback_start: Option<Instant>,
     playback_end: Option<Instant>,
     ack: OutputAck,
+    timing_identity: Option<Arc<TtsTimingIdentity>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TtsTimingIdentity {
+    kind: u8,
+    request_id: String,
+    generation_id: String,
+    utterance_id: String,
+}
+
+struct TimingSignal {
+    identity: Arc<TtsTimingIdentity>,
+    stage: u8,
+    monotonic_time_ns: u64,
+    underrun_frames: u64,
+}
+
+#[derive(Default)]
+struct PhysicalStartState {
+    // Playback serializes each kind and only AGENT can resume around an
+    // intervening SYSTEM stream. One exact identity per kind therefore
+    // preserves seq-zero deduplication across CPAL stream recreation without
+    // an allocating, process-lifetime tombstone set in the device callback.
+    agent: Option<Arc<TtsTimingIdentity>>,
+    system: Option<Arc<TtsTimingIdentity>>,
 }
 
 struct RenderReferencePacket {
@@ -86,6 +113,19 @@ struct RenderReferencePacket {
 struct ClockAnchor {
     instant: Instant,
     unix_time_ns: u64,
+}
+
+#[derive(Clone)]
+struct OutputStreamState {
+    packets: Arc<Mutex<VecDeque<OutputPacket>>>,
+    ack_sender: Sender<ScheduledAck>,
+    render_sender: SyncSender<RenderReferencePacket>,
+    timing_sender: SyncSender<TimingSignal>,
+    physical_starts: Arc<Mutex<PhysicalStartState>>,
+    clock_anchor: ClockAnchor,
+    output_gain: Arc<AtomicU32>,
+    stream_failed: Arc<AtomicBool>,
+    stream_error: Arc<Mutex<Option<String>>>,
 }
 
 impl OutputPacket {
@@ -121,6 +161,13 @@ struct ScheduledAck {
     playback_start: Instant,
     playback_end: Instant,
     publish_after: Instant,
+    physical_end: Option<PhysicalEndTiming>,
+}
+
+#[derive(Clone)]
+struct PhysicalEndTiming {
+    identity: Arc<TtsTimingIdentity>,
+    monotonic_time_ns: u64,
 }
 
 impl ScheduledAck {
@@ -165,11 +212,24 @@ fn main() -> Result<(), OutputError> {
     let (ack_sender, ack_receiver) = channel::<ScheduledAck>();
     let (render_sender, render_receiver) =
         sync_channel::<RenderReferencePacket>(render_queue_chunks);
+    let (timing_sender, timing_receiver) = sync_channel::<TimingSignal>(TIMING_QUEUE_CAPACITY);
+    let physical_starts = Arc::new(Mutex::new(PhysicalStartState::default()));
     let mut scheduled_acks = VecDeque::<ScheduledAck>::new();
     let mut rejected_keys = HashSet::<(String, u64)>::new();
     let clock_anchor = ClockAnchor {
         instant: Instant::now(),
         unix_time_ns: unix_time_ns()?,
+    };
+    let output_stream_state = OutputStreamState {
+        packets: Arc::clone(&packets),
+        ack_sender: ack_sender.clone(),
+        render_sender: render_sender.clone(),
+        timing_sender,
+        physical_starts,
+        clock_anchor,
+        output_gain: Arc::clone(&output_gain),
+        stream_failed: Arc::clone(&stream_failed),
+        stream_error: Arc::clone(&stream_error),
     };
 
     let host = cpal::default_host();
@@ -184,13 +244,7 @@ fn main() -> Result<(), OutputError> {
         &device,
         device_config,
         buffer_frames,
-        Arc::clone(&packets),
-        ack_sender.clone(),
-        render_sender.clone(),
-        clock_anchor,
-        Arc::clone(&output_gain),
-        Arc::clone(&stream_failed),
-        Arc::clone(&stream_error),
+        output_stream_state.clone(),
     )?;
 
     let context = Context::create()?;
@@ -207,6 +261,8 @@ fn main() -> Result<(), OutputError> {
         node.create_publisher::<OutputDrained>("/audio/output/drained", QosProfile::default())?;
     let render_reference =
         node.create_publisher::<AudioFrame>(RENDER_TOPIC, playout_qos.clone())?;
+    let timing_events =
+        node.create_publisher::<TtsTimingEvent>("/aspa/tts/timing", playout_qos.clone())?;
     let mut flush =
         node.create_service::<FlushAudio::Service>("/audio/output/flush", QosProfile::default())?;
     let volume_qos = QosProfile {
@@ -234,6 +290,7 @@ fn main() -> Result<(), OutputError> {
             &mut render_seq,
             &mut render_sample_index,
         )?;
+        publish_timing_events(&timing_receiver, &timing_events)?;
         while let Some(Some(volume)) = volumes.next().now_or_never() {
             if volume.data.is_finite() {
                 output_gain.store(volume.data.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
@@ -267,7 +324,12 @@ fn main() -> Result<(), OutputError> {
             enqueue_frame(&packets, frame, max_samples)?;
         }
         collect_scheduled_acks(&ack_receiver, &mut scheduled_acks)?;
-        publish_due_acks(&mut scheduled_acks, &drained, Instant::now())?;
+        publish_due_acks(
+            &mut scheduled_acks,
+            &drained,
+            &timing_events,
+            Instant::now(),
+        )?;
         while let Some(Some(request)) = flush.next().now_or_never() {
             if request.message.utterance_ids.len() != request.message.seqs.len() {
                 request.respond(FlushAudio::Response {
@@ -284,7 +346,12 @@ fn main() -> Result<(), OutputError> {
                 .zip(request.message.seqs.iter().copied())
                 .collect::<HashSet<_>>();
             collect_scheduled_acks(&ack_receiver, &mut scheduled_acks)?;
-            publish_due_acks(&mut scheduled_acks, &drained, Instant::now())?;
+            publish_due_acks(
+                &mut scheduled_acks,
+                &drained,
+                &timing_events,
+                Instant::now(),
+            )?;
             // Closing the CPAL stream is the only portable way to discard samples
             // already handed to the host buffer instead of merely pausing them.
             let now = Instant::now();
@@ -330,13 +397,7 @@ fn main() -> Result<(), OutputError> {
                 &device,
                 device_config,
                 buffer_frames,
-                Arc::clone(&packets),
-                ack_sender.clone(),
-                render_sender.clone(),
-                clock_anchor,
-                Arc::clone(&output_gain),
-                Arc::clone(&stream_failed),
-                Arc::clone(&stream_error),
+                output_stream_state.clone(),
             )?;
             stream.play().map_err(OutputError::Start)?;
             request.respond(FlushAudio::Response {
@@ -345,7 +406,12 @@ fn main() -> Result<(), OutputError> {
             })?;
         }
         collect_scheduled_acks(&ack_receiver, &mut scheduled_acks)?;
-        publish_due_acks(&mut scheduled_acks, &drained, Instant::now())?;
+        publish_due_acks(
+            &mut scheduled_acks,
+            &drained,
+            &timing_events,
+            Instant::now(),
+        )?;
         if stream_failed.load(Ordering::SeqCst) {
             let error = stream_error
                 .lock()
@@ -372,46 +438,31 @@ fn build_native_stream(
     device: &Device,
     native: SupportedStreamConfig,
     buffer_frames: Option<u32>,
-    packets: Arc<Mutex<VecDeque<OutputPacket>>>,
-    ack_sender: Sender<ScheduledAck>,
-    render_sender: SyncSender<RenderReferencePacket>,
-    clock_anchor: ClockAnchor,
-    output_gain: Arc<AtomicU32>,
-    stream_failed: Arc<AtomicBool>,
-    stream_error: Arc<Mutex<Option<String>>>,
+    state: OutputStreamState,
 ) -> Result<cpal::Stream, OutputError> {
+    let sample_rate = native.sample_rate();
+    let channels = native.channels();
     let mut config: StreamConfig = native.into();
     if let Some(buffer_frames) = buffer_frames {
         config.buffer_size = BufferSize::Fixed(buffer_frames);
         eprintln!(
             "audio_output requested callback period: {} frames ({:.1} ms)",
             buffer_frames,
-            buffer_frames as f64 * 1_000.0 / native.sample_rate() as f64
+            buffer_frames as f64 * 1_000.0 / sample_rate as f64
         );
     }
-    let callback_stream_failed = Arc::clone(&stream_failed);
-    let callback_stream_error = Arc::clone(&stream_error);
+    let error_stream_failed = Arc::clone(&state.stream_failed);
+    let error_stream_error = Arc::clone(&state.stream_error);
+    let mut active_tts: Option<Arc<TtsTimingIdentity>> = None;
     device
         .build_output_stream(
             config,
             move |output: &mut [i16], info| {
-                fill_device_buffer(
-                    output,
-                    info,
-                    native.sample_rate(),
-                    native.channels(),
-                    &packets,
-                    &ack_sender,
-                    &render_sender,
-                    clock_anchor,
-                    &output_gain,
-                    &callback_stream_failed,
-                    &callback_stream_error,
-                );
+                fill_device_buffer(output, info, sample_rate, channels, &state, &mut active_tts);
             },
             move |error| {
-                *stream_error.lock().expect("error mutex poisoned") = Some(error.to_string());
-                stream_failed.store(true, Ordering::SeqCst);
+                *error_stream_error.lock().expect("error mutex poisoned") = Some(error.to_string());
+                error_stream_failed.store(true, Ordering::SeqCst);
             },
             None,
         )
@@ -423,28 +474,188 @@ fn fill_device_buffer(
     info: &OutputCallbackInfo,
     sample_rate: u32,
     channels: u16,
-    packets: &Arc<Mutex<VecDeque<OutputPacket>>>,
-    ack_sender: &Sender<ScheduledAck>,
-    render_sender: &SyncSender<RenderReferencePacket>,
-    clock_anchor: ClockAnchor,
-    output_gain: &Arc<AtomicU32>,
-    stream_failed: &Arc<AtomicBool>,
-    stream_error: &Arc<Mutex<Option<String>>>,
+    state: &OutputStreamState,
+    active_tts: &mut Option<Arc<TtsTimingIdentity>>,
 ) {
     let callback_now = Instant::now();
+    let callback_monotonic_ns = match monotonic_time_ns() {
+        Ok(value) => value,
+        Err(error) => {
+            output.fill(0);
+            mark_stream_failed(error, &state.stream_failed, &state.stream_error);
+            return;
+        }
+    };
     let timestamp = info.timestamp();
     let device_latency = timestamp.playback.duration_since(timestamp.callback);
     let buffer_playback_start = callback_now + device_latency;
-    let gain = f32::from_bits(output_gain.load(Ordering::Relaxed));
-    let mut queue = packets.lock().expect("audio queue poisoned");
+    let gain = f32::from_bits(state.output_gain.load(Ordering::Relaxed));
+    let mut queue = match state.packets.lock() {
+        Ok(queue) => queue,
+        Err(_) => {
+            output.fill(0);
+            mark_stream_failed(
+                "audio queue mutex poisoned".to_owned(),
+                &state.stream_failed,
+                &state.stream_error,
+            );
+            return;
+        }
+    };
     let mut output_offset = 0;
     while output_offset < output.len() {
         let Some(packet) = queue.front_mut() else {
+            if let Some(identity) = active_tts.as_ref() {
+                let remaining_samples = output.len() - output_offset;
+                let underrun_frames =
+                    match active_underrun_frames(true, remaining_samples, channels) {
+                        Ok(Some(value)) => value,
+                        Ok(None) => unreachable!("active TTS must produce an underrun count"),
+                        Err(error) => {
+                            output[output_offset..].fill(0);
+                            mark_stream_failed(error, &state.stream_failed, &state.stream_error);
+                            return;
+                        }
+                    };
+                let offset = frames_duration(output_offset / channels as usize, sample_rate);
+                let timing_ns = match device_latency.checked_add(offset).and_then(|delay| {
+                    u64::try_from(delay.as_nanos())
+                        .ok()
+                        .and_then(|delay_ns| callback_monotonic_ns.checked_add(delay_ns))
+                }) {
+                    Some(value) => value,
+                    None => {
+                        output[output_offset..].fill(0);
+                        mark_stream_failed(
+                            "physical underrun timestamp overflowed".to_owned(),
+                            &state.stream_failed,
+                            &state.stream_error,
+                        );
+                        return;
+                    }
+                };
+                if let Err(error) = state.timing_sender.try_send(TimingSignal {
+                    identity: Arc::clone(identity),
+                    stage: TtsTimingEvent::PLAYBACK_UNDERRUN as u8,
+                    monotonic_time_ns: timing_ns,
+                    underrun_frames,
+                }) {
+                    let message = match error {
+                        TrySendError::Full(_) => "TTS timing callback queue overflowed",
+                        TrySendError::Disconnected(_) => {
+                            "TTS timing callback receiver disconnected"
+                        }
+                    };
+                    output[output_offset..].fill(0);
+                    mark_stream_failed(
+                        message.to_owned(),
+                        &state.stream_failed,
+                        &state.stream_error,
+                    );
+                    return;
+                }
+            }
             for sample in &mut output[output_offset..] {
                 *sample = 0;
             }
             break;
         };
+        if packet.cursor == 0 {
+            match (&packet.timing_identity, active_tts.as_ref()) {
+                (Some(identity), Some(active)) if active.as_ref() != identity.as_ref() => {
+                    output[output_offset..].fill(0);
+                    mark_stream_failed(
+                        "TTS output identity changed before a final frame".to_owned(),
+                        &state.stream_failed,
+                        &state.stream_error,
+                    );
+                    return;
+                }
+                (Some(identity), None) => {
+                    *active_tts = Some(Arc::clone(identity));
+                }
+                (None, Some(_)) => {
+                    output[output_offset..].fill(0);
+                    mark_stream_failed(
+                        "cue output interrupted an active non-final TTS stream".to_owned(),
+                        &state.stream_failed,
+                        &state.stream_error,
+                    );
+                    return;
+                }
+                (None, None) | (Some(_), Some(_)) => {}
+            }
+            if packet.ack.seq == 0 {
+                if let Some(identity) = packet.timing_identity.as_ref() {
+                    let mut physical_starts = match state.physical_starts.lock() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            output[output_offset..].fill(0);
+                            mark_stream_failed(
+                                "physical-start timing mutex poisoned".to_owned(),
+                                &state.stream_failed,
+                                &state.stream_error,
+                            );
+                            return;
+                        }
+                    };
+                    let previous_physical_start = match identity.kind {
+                        KIND_AGENT => &mut physical_starts.agent,
+                        KIND_SYSTEM => &mut physical_starts.system,
+                        _ => {
+                            output[output_offset..].fill(0);
+                            mark_stream_failed(
+                                "physical-start timing identity has an invalid TTS kind".to_owned(),
+                                &state.stream_failed,
+                                &state.stream_error,
+                            );
+                            return;
+                        }
+                    };
+                    if physical_start_changed(previous_physical_start.as_ref(), identity) {
+                        let offset =
+                            frames_duration(output_offset / channels as usize, sample_rate);
+                        let timing_ns = match device_latency.checked_add(offset).and_then(|delay| {
+                            u64::try_from(delay.as_nanos())
+                                .ok()
+                                .and_then(|delay_ns| callback_monotonic_ns.checked_add(delay_ns))
+                        }) {
+                            Some(value) => value,
+                            None => {
+                                output[output_offset..].fill(0);
+                                mark_stream_failed(
+                                    "physical playback timestamp overflowed".to_owned(),
+                                    &state.stream_failed,
+                                    &state.stream_error,
+                                );
+                                return;
+                            }
+                        };
+                        if let Err(error) = state.timing_sender.try_send(TimingSignal {
+                            identity: Arc::clone(identity),
+                            stage: TtsTimingEvent::PHYSICAL_PLAYBACK_STARTED as u8,
+                            monotonic_time_ns: timing_ns,
+                            underrun_frames: 0,
+                        }) {
+                            let message = match error {
+                                TrySendError::Full(_) => "TTS timing callback queue overflowed",
+                                TrySendError::Disconnected(_) => {
+                                    "TTS timing callback receiver disconnected"
+                                }
+                            };
+                            output[output_offset..].fill(0);
+                            mark_stream_failed(
+                                message.to_owned(),
+                                &state.stream_failed,
+                                &state.stream_error,
+                            );
+                            return;
+                        }
+                        *previous_physical_start = Some(Arc::clone(identity));
+                    }
+                }
+            }
+        }
         let available = packet.samples.len() - packet.cursor;
         let count = available.min(output.len() - output_offset);
         for (target, source) in output[output_offset..output_offset + count]
@@ -469,25 +680,70 @@ fn fill_device_buffer(
             let playback_end = completed
                 .playback_end
                 .expect("completed packet has no playback deadline");
+            let completed_final = completed.ack.is_final;
+            let physical_end = if completed_final {
+                completed
+                    .timing_identity
+                    .as_ref()
+                    .map(|identity| {
+                        let delay = playback_end
+                            .checked_duration_since(callback_now)
+                            .ok_or_else(|| {
+                                "physical playback end predates the output callback".to_owned()
+                            })?;
+                        let delay_ns = u64::try_from(delay.as_nanos())
+                            .map_err(|_| "physical playback end delay exceeds uint64".to_owned())?;
+                        let monotonic_time_ns =
+                            callback_monotonic_ns.checked_add(delay_ns).ok_or_else(|| {
+                                "physical playback end timestamp overflowed".to_owned()
+                            })?;
+                        Ok(PhysicalEndTiming {
+                            identity: Arc::clone(identity),
+                            monotonic_time_ns,
+                        })
+                    })
+                    .transpose()
+                    .unwrap_or_else(|error| {
+                        output[output_offset..].fill(0);
+                        mark_stream_failed(error, &state.stream_failed, &state.stream_error);
+                        None
+                    })
+            } else {
+                None
+            };
+            if state.stream_failed.load(Ordering::SeqCst) {
+                return;
+            }
             for scheduled in
-                schedule_completed_packet(completed.ack, playback_start, playback_end, callback_now)
+                schedule_completed_packet(completed.ack, playback_start, playback_end, physical_end)
             {
-                let _ = ack_sender.send(scheduled);
+                if state.ack_sender.send(scheduled).is_err() {
+                    output[output_offset..].fill(0);
+                    mark_stream_failed(
+                        "output acknowledgement receiver disconnected".to_owned(),
+                        &state.stream_failed,
+                        &state.stream_error,
+                    );
+                    return;
+                }
+            }
+            if completed.timing_identity.is_some() && completed_final {
+                *active_tts = None;
             }
         }
     }
-    if output.len() % channels as usize != 0 {
+    if !output.len().is_multiple_of(channels as usize) {
         mark_stream_failed(
             "CPAL output callback returned a partial interleaved frame".to_owned(),
-            stream_failed,
-            stream_error,
+            &state.stream_failed,
+            &state.stream_error,
         );
         return;
     }
-    let playback_time_ns = match instant_to_unix_ns(clock_anchor, buffer_playback_start) {
+    let playback_time_ns = match instant_to_unix_ns(state.clock_anchor, buffer_playback_start) {
         Ok(value) => value,
         Err(error) => {
-            mark_stream_failed(error, stream_failed, stream_error);
+            mark_stream_failed(error, &state.stream_failed, &state.stream_error);
             return;
         }
     };
@@ -495,13 +751,38 @@ fn fill_device_buffer(
         samples: output.to_vec(),
         playback_time_ns,
     };
-    if let Err(error) = render_sender.try_send(packet) {
+    if let Err(error) = state.render_sender.try_send(packet) {
         let message = match error {
             TrySendError::Full(_) => "render-reference callback queue overflowed",
             TrySendError::Disconnected(_) => "render-reference receiver disconnected",
         };
-        mark_stream_failed(message.to_owned(), stream_failed, stream_error);
+        mark_stream_failed(
+            message.to_owned(),
+            &state.stream_failed,
+            &state.stream_error,
+        );
     }
+}
+
+fn physical_start_changed(
+    previous: Option<&Arc<TtsTimingIdentity>>,
+    current: &Arc<TtsTimingIdentity>,
+) -> bool {
+    previous.is_none_or(|previous| previous.as_ref() != current.as_ref())
+}
+
+fn active_underrun_frames(
+    tts_stream_active: bool,
+    remaining_samples: usize,
+    channels: u16,
+) -> Result<Option<u64>, String> {
+    if !tts_stream_active {
+        return Ok(None);
+    }
+    if channels == 0 || !remaining_samples.is_multiple_of(channels as usize) {
+        return Err("CPAL underrun range is not aligned to output frames".to_owned());
+    }
+    Ok(Some((remaining_samples / channels as usize) as u64))
 }
 
 fn publish_render_reference(
@@ -561,6 +842,51 @@ fn discard_render_reference(receiver: &Receiver<RenderReferencePacket>) -> Resul
             }
         }
     }
+}
+
+fn publish_timing_events(
+    receiver: &Receiver<TimingSignal>,
+    publisher: &r2r::Publisher<TtsTimingEvent>,
+) -> Result<(), OutputError> {
+    loop {
+        match receiver.try_recv() {
+            Ok(signal) => {
+                publish_timing_event(
+                    publisher,
+                    &signal.identity,
+                    signal.stage,
+                    signal.monotonic_time_ns,
+                    signal.underrun_frames,
+                )?;
+            }
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => {
+                return Err(OutputError::Stream(
+                    "TTS timing callback channel disconnected".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
+fn publish_timing_event(
+    publisher: &r2r::Publisher<TtsTimingEvent>,
+    identity: &TtsTimingIdentity,
+    stage: u8,
+    monotonic_time_ns: u64,
+    underrun_frames: u64,
+) -> Result<(), OutputError> {
+    publisher.publish(&TtsTimingEvent {
+        version: TtsTimingEvent::TTS_TIMING_SCHEMA_VERSION as u32,
+        stage,
+        kind: identity.kind,
+        request_id: identity.request_id.clone(),
+        generation_id: identity.generation_id.clone(),
+        utterance_id: identity.utterance_id.clone(),
+        monotonic_time_ns,
+        underrun_frames,
+    })?;
+    Ok(())
 }
 
 fn render_reference_message(
@@ -636,11 +962,37 @@ fn unix_time_ns() -> Result<u64, OutputError> {
         .map_err(|_| OutputError::Stream("system clock exceeds ROS nanosecond range".to_owned()))
 }
 
+fn monotonic_time_ns() -> Result<u64, String> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: timestamp points to initialized writable storage and
+    // CLOCK_MONOTONIC is shared by every process on this Linux host.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+        return Err(format!(
+            "CLOCK_MONOTONIC failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if timestamp.tv_sec < 0 || !(0..1_000_000_000).contains(&timestamp.tv_nsec) {
+        return Err("CLOCK_MONOTONIC returned an invalid timespec".to_owned());
+    }
+    let seconds = u64::try_from(timestamp.tv_sec)
+        .map_err(|_| "CLOCK_MONOTONIC seconds exceed uint64".to_owned())?;
+    let nanoseconds = u64::try_from(timestamp.tv_nsec)
+        .map_err(|_| "CLOCK_MONOTONIC nanoseconds exceed uint64".to_owned())?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .ok_or_else(|| "CLOCK_MONOTONIC nanoseconds overflow uint64".to_owned())
+}
+
 fn schedule_completed_packet(
     ack: OutputAck,
     playback_start: Instant,
     playback_end: Instant,
-    _callback_now: Instant,
+    physical_end: Option<PhysicalEndTiming>,
 ) -> [ScheduledAck; 2] {
     let accepted = OutputAck {
         status: STATUS_ACCEPTED,
@@ -655,12 +1007,14 @@ fn schedule_completed_packet(
             // the device.  The semantic `*_started` event must not lead the
             // physical playback boundary used for interruption context.
             publish_after: playback_start,
+            physical_end: None,
         },
         ScheduledAck {
             ack,
             playback_start,
             playback_end,
             publish_after: playback_end,
+            physical_end,
         },
     ]
 }
@@ -670,6 +1024,16 @@ fn enqueue_frame(
     frame: PlaybackFrame,
     max_samples: usize,
 ) -> Result<(), OutputError> {
+    let timing_identity = if frame.kind == KIND_CUE {
+        None
+    } else {
+        Some(Arc::new(TtsTimingIdentity {
+            kind: frame.kind,
+            request_id: frame.request_id.clone(),
+            generation_id: frame.generation_id.clone(),
+            utterance_id: frame.utterance_id.clone(),
+        }))
+    };
     let samples = frame
         .pcm_s16le
         .chunks_exact(2)
@@ -689,6 +1053,7 @@ fn enqueue_frame(
         channels: frame.channels as usize,
         playback_start: None,
         playback_end: None,
+        timing_identity,
         ack: OutputAck {
             utterance_id: frame.utterance_id,
             seq: frame.seq,
@@ -719,21 +1084,31 @@ fn collect_scheduled_acks(
 
 fn publish_due_acks(
     scheduled: &mut VecDeque<ScheduledAck>,
-    publisher: &r2r::Publisher<OutputDrained>,
+    drained_publisher: &r2r::Publisher<OutputDrained>,
+    timing_publisher: &r2r::Publisher<TtsTimingEvent>,
     now: Instant,
 ) -> Result<(), OutputError> {
-    for ack in take_due_acks(scheduled, now) {
-        publish_ack(publisher, ack)?;
+    for due in take_due_acks(scheduled, now) {
+        publish_ack(drained_publisher, due.ack)?;
+        if let Some(physical_end) = due.physical_end {
+            publish_timing_event(
+                timing_publisher,
+                &physical_end.identity,
+                TtsTimingEvent::PHYSICAL_PLAYBACK_ENDED as u8,
+                physical_end.monotonic_time_ns,
+                0,
+            )?;
+        }
     }
     Ok(())
 }
 
-fn take_due_acks(scheduled: &mut VecDeque<ScheduledAck>, now: Instant) -> Vec<OutputAck> {
+fn take_due_acks(scheduled: &mut VecDeque<ScheduledAck>, now: Instant) -> Vec<ScheduledAck> {
     let mut waiting = VecDeque::new();
     let mut due = Vec::new();
     while let Some(scheduled_ack) = scheduled.pop_front() {
         if scheduled_ack.publish_after <= now {
-            due.push(scheduled_ack.ack);
+            due.push(scheduled_ack);
         } else {
             waiting.push_back(scheduled_ack);
         }
@@ -781,7 +1156,13 @@ fn publish_ack(
 }
 
 fn validate_frame(frame: &PlaybackFrame, rate: u32, channels: u16) -> Result<(), OutputError> {
+    let identity_valid = if frame.kind == KIND_CUE {
+        frame.request_id.is_empty() && frame.generation_id.is_empty()
+    } else {
+        canonical_uuid(&frame.request_id) && canonical_uuid(&frame.generation_id)
+    };
     if !matches!(frame.kind, KIND_AGENT | KIND_SYSTEM | KIND_CUE)
+        || !identity_valid
         || frame.utterance_id.is_empty()
         || frame.frame_count == 0
         || frame.sample_rate_hz != rate
@@ -793,6 +1174,18 @@ fn validate_frame(frame: &PlaybackFrame, rate: u32, channels: u16) -> Result<(),
         ));
     }
     Ok(())
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && matches!(bytes.get(8), Some(b'-'))
+        && matches!(bytes.get(13), Some(b'-'))
+        && matches!(bytes.get(18), Some(b'-'))
+        && matches!(bytes.get(23), Some(b'-'))
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) || matches!(byte, b'0'..=b'9' | b'a'..=b'f')
+        })
 }
 
 fn scale_sample(sample: i16, gain: f32) -> i16 {
@@ -880,13 +1273,16 @@ fn env_optional_u32(name: &str) -> Result<Option<u32>, OutputError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_played_frames, render_reference_message, requested_device_matches, scale_sample,
+        active_underrun_frames, estimate_played_frames, physical_start_changed,
+        render_reference_message, requested_device_matches, scale_sample,
         schedule_completed_packet, take_due_acks, validate_frame, OutputAck, OutputPacket,
-        KIND_AGENT, RENDER_SOURCE_ID, RENDER_STREAM_ID, STATUS_ACCEPTED, STATUS_DRAINED,
+        PhysicalEndTiming, PhysicalStartState, TtsTimingIdentity, KIND_AGENT, KIND_CUE,
+        KIND_SYSTEM, RENDER_SOURCE_ID, RENDER_STREAM_ID, STATUS_ACCEPTED, STATUS_DRAINED,
         STATUS_FLUSHED,
     };
     use r2r::fv_audio_interfaces::msg::PlaybackFrame;
     use std::collections::VecDeque;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -905,6 +1301,8 @@ mod tests {
     fn invalid_playout_frame_is_rejected_without_entering_the_device_queue() {
         let mut frame = PlaybackFrame {
             kind: KIND_AGENT,
+            request_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            generation_id: "00000000-0000-4000-8000-000000000002".to_owned(),
             utterance_id: "agent-0-invalid".to_owned(),
             seq: 0,
             sample_index: 0,
@@ -916,9 +1314,73 @@ mod tests {
             playout_generation: 0,
         };
         assert!(validate_frame(&frame, 48_000, 2).is_ok());
+
+        let mut missing_tts_identity = frame.clone();
+        missing_tts_identity.request_id.clear();
+        assert!(validate_frame(&missing_tts_identity, 48_000, 2).is_err());
+
+        let mut cue = frame.clone();
+        cue.kind = KIND_CUE;
+        cue.request_id.clear();
+        cue.generation_id.clear();
+        assert!(validate_frame(&cue, 48_000, 2).is_ok());
+        cue.request_id = "00000000-0000-4000-8000-000000000003".to_owned();
+        assert!(validate_frame(&cue, 48_000, 2).is_err());
+
         frame.frame_count = 0;
         frame.pcm_s16le.clear();
         assert!(validate_frame(&frame, 48_000, 2).is_err());
+    }
+
+    #[test]
+    fn underrun_is_reported_only_during_an_active_tts_stream() {
+        assert_eq!(
+            active_underrun_frames(true, 960, 2).expect("aligned active underrun"),
+            Some(480)
+        );
+        assert_eq!(
+            active_underrun_frames(false, 960, 2).expect("ordinary idle"),
+            None
+        );
+        assert!(active_underrun_frames(true, 959, 2).is_err());
+        assert!(active_underrun_frames(true, 960, 0).is_err());
+    }
+
+    #[test]
+    fn physical_start_is_emitted_once_across_stream_recreation() {
+        let mut starts = PhysicalStartState::default();
+        let first = Arc::new(TtsTimingIdentity {
+            kind: KIND_AGENT,
+            request_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            generation_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+            utterance_id: "agent-0-first".to_owned(),
+        });
+        assert!(physical_start_changed(starts.agent.as_ref(), &first));
+        starts.agent = Some(Arc::clone(&first));
+
+        let interleaved_system = Arc::new(TtsTimingIdentity {
+            kind: KIND_SYSTEM,
+            request_id: "00000000-0000-4000-8000-000000000003".to_owned(),
+            generation_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+            utterance_id: "system-0-first".to_owned(),
+        });
+        assert!(physical_start_changed(
+            starts.system.as_ref(),
+            &interleaved_system
+        ));
+        starts.system = Some(interleaved_system);
+
+        // Recreating the CPAL stream, or playing SYSTEM audio in between, must
+        // not create a second physical-start event for a resumed AGENT seq 0.
+        assert!(!physical_start_changed(starts.agent.as_ref(), &first));
+
+        let second_agent = Arc::new(TtsTimingIdentity {
+            kind: KIND_AGENT,
+            request_id: "00000000-0000-4000-8000-000000000004".to_owned(),
+            generation_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+            utterance_id: "agent-0-second".to_owned(),
+        });
+        assert!(physical_start_changed(starts.agent.as_ref(), &second_agent));
     }
 
     #[test]
@@ -959,7 +1421,7 @@ mod tests {
             },
             playback_start,
             playback_end,
-            now,
+            None,
         );
 
         assert_eq!(scheduled[0].ack.status, STATUS_ACCEPTED);
@@ -989,6 +1451,7 @@ mod tests {
             channels: 1,
             playback_start: Some(playback_start),
             playback_end: Some(playback_end),
+            timing_identity: None,
             ack: OutputAck {
                 utterance_id: "agent-0-partial".to_owned(),
                 seq: 0,
@@ -1025,16 +1488,56 @@ mod tests {
             },
             playback_start,
             playback_end,
-            now,
+            None,
         );
         let mut scheduled = VecDeque::from([first[1].clone(), first[0].clone()]);
 
         let due = take_due_acks(&mut scheduled, playback_start);
 
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].status, STATUS_ACCEPTED);
+        assert_eq!(due[0].ack.status, STATUS_ACCEPTED);
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].ack.status, STATUS_DRAINED);
+    }
+
+    #[test]
+    fn physical_end_is_due_only_after_the_final_device_drain() {
+        let now = Instant::now();
+        let playback_start = now + Duration::from_millis(5);
+        let playback_end = now + Duration::from_millis(25);
+        let identity = Arc::new(TtsTimingIdentity {
+            kind: KIND_AGENT,
+            request_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            generation_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+            utterance_id: "agent-0-final".to_owned(),
+        });
+        let scheduled = schedule_completed_packet(
+            OutputAck {
+                utterance_id: "agent-0-final".to_owned(),
+                seq: 4,
+                frame_count: 960,
+                is_final: true,
+                status: STATUS_DRAINED,
+            },
+            playback_start,
+            playback_end,
+            Some(PhysicalEndTiming {
+                identity,
+                monotonic_time_ns: 123_456,
+            }),
+        );
+        let mut pending = VecDeque::from(scheduled);
+
+        let before_end = take_due_acks(&mut pending, playback_end - Duration::from_nanos(1));
+        assert_eq!(before_end.len(), 1);
+        assert!(before_end[0].physical_end.is_none());
+        let at_end = take_due_acks(&mut pending, playback_end);
+        assert_eq!(at_end.len(), 1);
+        let physical_end = at_end[0]
+            .physical_end
+            .as_ref()
+            .expect("final drain must carry physical end");
+        assert_eq!(physical_end.monotonic_time_ns, 123_456);
     }
 
     #[test]

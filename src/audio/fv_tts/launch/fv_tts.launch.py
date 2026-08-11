@@ -12,27 +12,54 @@ def generate_launch_description():
     share = get_package_share_directory("fv_tts")
     return LaunchDescription([
         DeclareLaunchArgument(
-            "onnxruntime_filename",
-            default_value=EnvironmentVariable("VOICEVOX_ONNXRUNTIME_PATH", default_value=""),
+            "native_library",
+            default_value=EnvironmentVariable(
+                "MAGPIE_TTS_RT_NATIVE_LIBRARY", default_value=""
+            ),
         ),
         DeclareLaunchArgument(
-            "open_jtalk_dict_dir",
-            default_value=EnvironmentVariable("VOICEVOX_OPEN_JTALK_DICT_DIR", default_value=""),
+            "bundle_path",
+            default_value=EnvironmentVariable("MAGPIE_TTS_RT_BUNDLE", default_value=""),
         ),
         DeclareLaunchArgument(
-            "voice_model_path",
-            default_value=EnvironmentVariable("VOICEVOX_VOICE_MODEL_PATH", default_value=""),
+            "manifest_sha256",
+            default_value=EnvironmentVariable(
+                "MAGPIE_TTS_RT_MANIFEST_SHA256", default_value=""
+            ),
         ),
-        DeclareLaunchArgument("acceleration_mode", default_value="auto"),
-        DeclareLaunchArgument("cpu_num_threads", default_value="0"),
-        DeclareLaunchArgument("style_id", default_value="30"),
-        DeclareLaunchArgument("synthesis_timeout_seconds", default_value="60.0"),
-        # 合成結果の再利用。既定は無効で、置き場所は配備側が決める。
-        DeclareLaunchArgument("cache_directory", default_value=""),
-        DeclareLaunchArgument("cache_memory_entries", default_value="64"),
-        DeclareLaunchArgument("cache_disk_budget_mb", default_value="256"),
-        # 起動後に先に合成しておく文の一覧 (1行1発話、'#' 始まりはコメント)
-        DeclareLaunchArgument("cache_warmup_file", default_value=""),
+        DeclareLaunchArgument("cuda_device_index", default_value="0"),
+        DeclareLaunchArgument(
+            "frontend_python",
+            default_value=EnvironmentVariable(
+                "MAGPIE_TTS_RT_FRONTEND_PYTHON", default_value=""
+            ),
+        ),
+        DeclareLaunchArgument(
+            "frontend_server",
+            default_value=EnvironmentVariable(
+                "MAGPIE_TTS_RT_FRONTEND_SERVER", default_value=""
+            ),
+        ),
+        DeclareLaunchArgument(
+            "frontend_lock",
+            default_value=EnvironmentVariable(
+                "MAGPIE_TTS_RT_FRONTEND_LOCK", default_value=""
+            ),
+        ),
+        DeclareLaunchArgument(
+            "frontend_contract",
+            default_value=EnvironmentVariable(
+                "MAGPIE_TTS_RT_FRONTEND_CONTRACT", default_value=""
+            ),
+        ),
+        DeclareLaunchArgument("frontend_timeout_seconds", default_value="2.0"),
+        DeclareLaunchArgument("request_progress_timeout_seconds", default_value="30.0"),
+        DeclareLaunchArgument("cancellation_timeout_seconds", default_value="2.0"),
+        DeclareLaunchArgument("startup_timeout_seconds", default_value="300.0"),
+        DeclareLaunchArgument(
+            "timing_collector_discovery_timeout_seconds", default_value="10.0"
+        ),
+        DeclareLaunchArgument("scheduler_watchdog_seconds", default_value="5.0"),
         Node(
             package="fv_tts",
             executable="fv_tts_node",
@@ -43,28 +70,42 @@ def generate_launch_description():
             parameters=[
                 os.path.join(share, "config", "default.yaml"),
                 {
-                    "onnxruntime_filename": LaunchConfiguration("onnxruntime_filename"),
-                    "open_jtalk_dict_dir": LaunchConfiguration("open_jtalk_dict_dir"),
-                    "voice_model_path": LaunchConfiguration("voice_model_path"),
-                    "acceleration_mode": LaunchConfiguration("acceleration_mode"),
-                    "cpu_num_threads": ParameterValue(
-                        LaunchConfiguration("cpu_num_threads"), value_type=int
+                    "native_library": LaunchConfiguration("native_library"),
+                    "bundle_path": LaunchConfiguration("bundle_path"),
+                    "manifest_sha256": LaunchConfiguration("manifest_sha256"),
+                    "cuda_device_index": ParameterValue(
+                        LaunchConfiguration("cuda_device_index"), value_type=int
                     ),
-                    "style_id": ParameterValue(
-                        LaunchConfiguration("style_id"), value_type=int
-                    ),
-                    "synthesis_timeout_seconds": ParameterValue(
-                        LaunchConfiguration("synthesis_timeout_seconds"),
+                    "frontend_python": LaunchConfiguration("frontend_python"),
+                    "frontend_server": LaunchConfiguration("frontend_server"),
+                    "frontend_lock": LaunchConfiguration("frontend_lock"),
+                    "frontend_contract": LaunchConfiguration("frontend_contract"),
+                    "frontend_timeout_seconds": ParameterValue(
+                        LaunchConfiguration("frontend_timeout_seconds"),
                         value_type=float,
                     ),
-                    "cache_directory": LaunchConfiguration("cache_directory"),
-                    "cache_memory_entries": ParameterValue(
-                        LaunchConfiguration("cache_memory_entries"), value_type=int
+                    "request_progress_timeout_seconds": ParameterValue(
+                        LaunchConfiguration("request_progress_timeout_seconds"),
+                        value_type=float,
                     ),
-                    "cache_disk_budget_mb": ParameterValue(
-                        LaunchConfiguration("cache_disk_budget_mb"), value_type=int
+                    "cancellation_timeout_seconds": ParameterValue(
+                        LaunchConfiguration("cancellation_timeout_seconds"),
+                        value_type=float,
                     ),
-                    "cache_warmup_file": LaunchConfiguration("cache_warmup_file"),
+                    "startup_timeout_seconds": ParameterValue(
+                        LaunchConfiguration("startup_timeout_seconds"),
+                        value_type=float,
+                    ),
+                    "timing_collector_discovery_timeout_seconds": ParameterValue(
+                        LaunchConfiguration(
+                            "timing_collector_discovery_timeout_seconds"
+                        ),
+                        value_type=float,
+                    ),
+                    "scheduler_watchdog_seconds": ParameterValue(
+                        LaunchConfiguration("scheduler_watchdog_seconds"),
+                        value_type=float,
+                    ),
                 },
             ],
         ),

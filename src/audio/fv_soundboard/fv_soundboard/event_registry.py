@@ -100,13 +100,16 @@ class EventRegistry:
                     raise ValueError(f"soundboard cue does not exist: {candidate}")
                 sound_path = str(candidate)
             fixed_say = say.strip() if speak else ""
-            if not sound_path and not fixed_say:
-                raise ValueError(f"soundboard {name} has neither fixed speech nor cue")
+            fixed_record = record.strip()
+            if not sound_path and not fixed_say and not fixed_record:
+                raise ValueError(
+                    f"soundboard {name} has neither fixed speech, cue, nor record marker"
+                )
             events[name] = ResolvedEvent(
                 name=name,
                 say=fixed_say,
                 sound_path=sound_path,
-                record=record.strip(),
+                record=fixed_record,
             )
         return cls(events)
 

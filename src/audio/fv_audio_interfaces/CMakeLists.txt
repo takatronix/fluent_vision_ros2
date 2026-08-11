@@ -10,10 +10,22 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   msg/PlaybackControl.msg
   msg/PlaybackEvent.msg
   msg/PlaybackFrame.msg
-  msg/SpeechMark.msg
-  msg/SynthesizedSpeech.msg
+  msg/SynthesizedSpeechChunk.msg
+  msg/TtsAdmissionState.msg
+  msg/TtsAlignmentEvent.msg
+  msg/TtsRequest.msg
+  msg/TtsResult.msg
+  msg/TtsRuntimeState.msg
+  msg/TtsSay.msg
+  msg/TtsSourceProgress.msg
+  msg/TtsTimingEvent.msg
+  msg/TtsTimingReceipt.msg
+  msg/VoiceMaintenanceState.msg
   srv/FlushAudio.srv
   srv/ListAudioDevices.srv
+  srv/QuiesceTts.srv
+  srv/SetTtsAdmission.srv
+  srv/SetVoiceMaintenance.srv
 )
 
 ament_export_dependencies(rosidl_default_runtime)

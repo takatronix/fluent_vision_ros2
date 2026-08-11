@@ -2,7 +2,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, TimerAction
+from launch.actions import DeclareLaunchArgument, Shutdown, TimerAction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -18,6 +18,10 @@ def generate_launch_description():
     output_rate = LaunchConfiguration("output_rate")
     output_channels = LaunchConfiguration("output_channels")
     output_buffer_ms = LaunchConfiguration("output_buffer_ms")
+    tts_timing_receipt_path = LaunchConfiguration("tts_timing_receipt_path")
+    tts_timing_receipt_limit = LaunchConfiguration("tts_timing_receipt_limit")
+    tts_timing_timeout_seconds = LaunchConfiguration(
+        "tts_timing_timeout_seconds")
     aec_stream_delay_ms = LaunchConfiguration("aec_stream_delay_ms")
 
     capture = Node(
@@ -45,6 +49,25 @@ def generate_launch_description():
             "FV_AUDIO_AEC_FAR_CHANNELS": output_channels,
         },
     )
+    timing_collector = Node(
+        package="fv_audio",
+        executable="tts_timing_collector",
+        output="screen",
+        respawn=False,
+        on_exit=[
+            Shutdown(
+                reason=(
+                    "tts_timing_collector exited; the audio launch group "
+                    "cannot continue without timing evidence"
+                ),
+            ),
+        ],
+        additional_env={
+            "FV_AUDIO_TTS_TIMING_RECEIPT_PATH": tts_timing_receipt_path,
+            "FV_AUDIO_TTS_TIMING_RECEIPT_LIMIT": tts_timing_receipt_limit,
+            "FV_AUDIO_TTS_TIMING_TIMEOUT_SECONDS": tts_timing_timeout_seconds,
+        },
+    )
 
     return LaunchDescription([
         DeclareLaunchArgument("capture_device", default_value="default"),
@@ -55,6 +78,13 @@ def generate_launch_description():
         DeclareLaunchArgument("output_rate", default_value="48000"),
         DeclareLaunchArgument("output_channels", default_value="2"),
         DeclareLaunchArgument("output_buffer_ms", default_value="80"),
+        DeclareLaunchArgument(
+            "tts_timing_receipt_path",
+            default_value=os.path.expanduser(
+                "~/.aspa/tts-timing-receipts.json"),
+        ),
+        DeclareLaunchArgument("tts_timing_receipt_limit", default_value="256"),
+        DeclareLaunchArgument("tts_timing_timeout_seconds", default_value="180"),
         DeclareLaunchArgument("aec_stream_delay_ms", default_value="40"),
         Node(
             package="fv_audio",
@@ -63,6 +93,7 @@ def generate_launch_description():
             respawn=True,
             respawn_delay=2.0,
         ),
+        timing_collector,
         Node(
             package="fv_audio",
             executable="playback_controller",

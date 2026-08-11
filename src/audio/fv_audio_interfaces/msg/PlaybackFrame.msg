@@ -4,6 +4,10 @@ uint8 SYSTEM=2
 uint8 CUE=3
 
 uint8 kind
+# AGENT and SYSTEM frames carry the exact originating TTS identity. CUE frames
+# carry empty request_id and generation_id because they are not synthesized.
+string request_id
+string generation_id
 string utterance_id
 uint64 seq
 uint64 sample_index

@@ -1,0 +1,27 @@
+uint8 STARTING=1
+uint8 READY=2
+uint8 QUIESCING=3
+uint8 STOPPED=4
+uint8 FAILED=5
+
+uint32 version
+string generation_id
+uint64 heartbeat_sequence
+uint8 state
+bool ready
+uint32 process_id
+string voice
+string engine
+string bundle_manifest_sha256
+string tokenizer_identity_sha256
+int32 cuda_device_index
+uint32 sample_rate_hz
+uint32 channels
+uint32 codec_frame_samples
+uint32 initial_frames
+uint32 steady_frames
+uint32 tail_min_frames
+uint32 tail_max_frames
+bool last_result_valid
+fv_audio_interfaces/TtsResult last_result
+string error

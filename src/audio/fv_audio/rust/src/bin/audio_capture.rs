@@ -127,17 +127,37 @@ struct CapturePipeline {
     source: AppSrc,
 }
 
+struct CapturePipelineSink {
+    producer: HeapProd<u8>,
+    consumer_thread: Thread,
+    failure_sender: SyncSender<CaptureFailure>,
+    overflowed: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+}
+
+struct CaptureStreamState {
+    producer: HeapProd<u8>,
+    consumer_thread: Thread,
+    failure_sender: SyncSender<CaptureFailure>,
+    overflowed: Arc<AtomicBool>,
+    cpal_failed: Arc<AtomicBool>,
+    gstreamer_failed: Arc<AtomicBool>,
+}
+
 impl CapturePipeline {
     fn new<T: GStreamerPcmSample>(
         input_rate: u32,
         input_channels: u16,
         chunk_bytes: usize,
-        mut producer: HeapProd<u8>,
-        consumer_thread: Thread,
-        failure_sender: SyncSender<CaptureFailure>,
-        overflowed: Arc<AtomicBool>,
-        failed: Arc<AtomicBool>,
+        sink_state: CapturePipelineSink,
     ) -> Result<Self, CaptureError> {
+        let CapturePipelineSink {
+            mut producer,
+            consumer_thread,
+            failure_sender,
+            overflowed,
+            failed,
+        } = sink_state;
         gst::init().map_err(|error| CaptureError::GStreamer(error.to_string()))?;
         let description = format!(
             "appsrc name=src format=time is-live=true block=false ! \
@@ -373,12 +393,14 @@ fn main() -> Result<(), CaptureError> {
         native,
         buffer_frames,
         chunk_bytes,
-        producer,
-        publisher_thread.clone(),
-        failure_sender,
-        Arc::clone(&overflowed),
-        Arc::clone(&cpal_failed),
-        Arc::clone(&gstreamer_failed),
+        CaptureStreamState {
+            producer,
+            consumer_thread: publisher_thread.clone(),
+            failure_sender,
+            overflowed: Arc::clone(&overflowed),
+            cpal_failed: Arc::clone(&cpal_failed),
+            gstreamer_failed: Arc::clone(&gstreamer_failed),
+        },
     )?;
     stream.play().map_err(CaptureError::Start)?;
 
@@ -432,13 +454,16 @@ fn build_native_stream(
     native: SupportedStreamConfig,
     buffer_frames: Option<u32>,
     chunk_bytes: usize,
-    producer: HeapProd<u8>,
-    consumer_thread: Thread,
-    failure_sender: SyncSender<CaptureFailure>,
-    overflowed: Arc<AtomicBool>,
-    cpal_failed: Arc<AtomicBool>,
-    gstreamer_failed: Arc<AtomicBool>,
+    state: CaptureStreamState,
 ) -> Result<(cpal::Stream, CapturePipeline), CaptureError> {
+    let CaptureStreamState {
+        producer,
+        consumer_thread,
+        failure_sender,
+        overflowed,
+        cpal_failed,
+        gstreamer_failed,
+    } = state;
     let sample_format = native.sample_format();
     let native_rate = native.sample_rate();
     let native_channels = native.channels();
@@ -459,12 +484,14 @@ fn build_native_stream(
                 native_rate,
                 native_channels,
                 chunk_bytes,
-                producer,
-                consumer_thread,
-                failure_sender,
-                overflowed,
-                cpal_failed,
-                gstreamer_failed,
+                CaptureStreamState {
+                    producer,
+                    consumer_thread,
+                    failure_sender,
+                    overflowed,
+                    cpal_failed,
+                    gstreamer_failed,
+                },
             )
         };
     }
@@ -485,32 +512,36 @@ fn build_native_stream(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_typed_stream<T>(
     device: &Device,
     config: StreamConfig,
     native_rate: u32,
     native_channels: u16,
     chunk_bytes: usize,
-    producer: HeapProd<u8>,
-    consumer_thread: Thread,
-    failure_sender: SyncSender<CaptureFailure>,
-    overflowed: Arc<AtomicBool>,
-    cpal_failed: Arc<AtomicBool>,
-    gstreamer_failed: Arc<AtomicBool>,
+    state: CaptureStreamState,
 ) -> Result<(cpal::Stream, CapturePipeline), CaptureError>
 where
     T: GStreamerPcmSample,
 {
+    let CaptureStreamState {
+        producer,
+        consumer_thread,
+        failure_sender,
+        overflowed,
+        cpal_failed,
+        gstreamer_failed,
+    } = state;
     let converter = CapturePipeline::new::<T>(
         native_rate,
         native_channels,
         chunk_bytes,
-        producer,
-        consumer_thread.clone(),
-        failure_sender.clone(),
-        Arc::clone(&overflowed),
-        Arc::clone(&gstreamer_failed),
+        CapturePipelineSink {
+            producer,
+            consumer_thread: consumer_thread.clone(),
+            failure_sender: failure_sender.clone(),
+            overflowed: Arc::clone(&overflowed),
+            failed: Arc::clone(&gstreamer_failed),
+        },
     )?;
     let source = converter.source.clone();
     let error_sender = failure_sender.clone();
@@ -553,7 +584,7 @@ fn push_native_input<T: GStreamerPcmSample>(
     native_channels: u16,
     input_frame_index: &mut u64,
 ) -> Result<(), String> {
-    if native_channels == 0 || data.len() % native_channels as usize != 0 {
+    if native_channels == 0 || !data.len().is_multiple_of(native_channels as usize) {
         return Err("CPAL input buffer is not aligned to native channels".to_owned());
     }
     let frame_count = data.len() / native_channels as usize;
@@ -851,7 +882,7 @@ mod tests {
 
     use super::{
         push_native_input, requested_device_matches, CaptureFailure, CapturePipeline,
-        ROS_SAMPLE_RATE,
+        CapturePipelineSink, ROS_SAMPLE_RATE,
     };
 
     #[test]
@@ -877,11 +908,13 @@ mod tests {
             48_000,
             2,
             chunk_bytes,
-            producer,
-            thread::current(),
-            failure_sender,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
+            CapturePipelineSink {
+                producer,
+                consumer_thread: thread::current(),
+                failure_sender,
+                overflowed: Arc::new(AtomicBool::new(false)),
+                failed: Arc::new(AtomicBool::new(false)),
+            },
         )
         .expect("GStreamer input conversion pipeline must start");
         let mut input_frame_index = 0;

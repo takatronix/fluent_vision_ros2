@@ -1,22 +1,20 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>fv_tts</name>
-  <version>0.2.0</version>
-  <description>Native C++ voicevox_core ROS 2 TTS for ASPA dialogue.</description>
+  <version>0.3.0</version>
+  <description>Rust MagpieTTS-RT streaming ROS 2 TTS for ASPA dialogue.</description>
   <maintainer email="info@vegetalia.co.jp">ASPA Team</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>libclang-dev</build_depend>
   <depend>fv_audio_interfaces</depend>
-  <depend>nlohmann_json</depend>
-  <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
 
-  <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_cmake_pytest</test_depend>
 
   <export><build_type>ament_cmake</build_type></export>

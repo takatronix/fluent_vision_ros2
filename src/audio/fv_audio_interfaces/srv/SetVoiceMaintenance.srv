@@ -1,0 +1,10 @@
+uint8 ENTER=1
+uint8 EXIT=2
+
+uint8 action
+string operation_id
+string reason
+---
+bool success
+fv_audio_interfaces/VoiceMaintenanceState state
+string error

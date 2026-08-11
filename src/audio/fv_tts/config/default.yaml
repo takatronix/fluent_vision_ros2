@@ -1,14 +1,16 @@
 fv_tts:
   ros__parameters:
-    onnxruntime_filename: ""
-    open_jtalk_dict_dir: ""
-    voice_model_path: ""
-    acceleration_mode: "auto"
-    cpu_num_threads: 0
-    style_id: 30
-    synthesis_timeout_seconds: 60.0
-    # 合成結果の再利用。cache_directory が空なら永続層なし (プロセス内のみ)。
-    cache_directory: ""
-    cache_memory_entries: 64
-    cache_disk_budget_mb: 256
-    cache_warmup_file: ""
+    native_library: ""
+    bundle_path: ""
+    manifest_sha256: ""
+    cuda_device_index: 0
+    frontend_python: ""
+    frontend_server: ""
+    frontend_lock: ""
+    frontend_contract: ""
+    frontend_timeout_seconds: 2.0
+    request_progress_timeout_seconds: 30.0
+    cancellation_timeout_seconds: 2.0
+    startup_timeout_seconds: 300.0
+    timing_collector_discovery_timeout_seconds: 10.0
+    scheduler_watchdog_seconds: 5.0

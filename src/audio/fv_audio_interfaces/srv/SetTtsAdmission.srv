@@ -1,0 +1,10 @@
+uint8 CLOSE=1
+uint8 OPEN=2
+
+uint8 action
+string generation_id
+---
+bool success
+bool admission_open
+string generation_id
+string error

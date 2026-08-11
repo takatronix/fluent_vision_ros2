@@ -33,6 +33,7 @@ add_custom_target(fv_audio_rust ALL
   COMMAND ${CMAKE_COMMAND} -E env
     RUSTUP_TOOLCHAIN=${FV_AUDIO_RUST_TOOLCHAIN}
     CARGO_TARGET_DIR=${CARGO_TARGET_DIR}
+    IDL_PACKAGE_FILTER=fv_audio_interfaces\;fv_speech_interfaces\;std_msgs
     ${CARGO_EXECUTABLE} build --locked --release
       --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/rust
@@ -45,15 +46,22 @@ install(PROGRAMS
   ${CARGO_TARGET_DIR}/release/audio_aec
   ${CARGO_TARGET_DIR}/release/audio_output
   ${CARGO_TARGET_DIR}/release/playback_controller
+  ${CARGO_TARGET_DIR}/release/tts_timing_collector
   DESTINATION lib/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(
+    test_fv_audio_launch_contract
+    test/test_launch_contract.py
+  )
   add_test(
     NAME fv_audio_rust_tests
     COMMAND ${CMAKE_COMMAND} -E env
       RUSTUP_TOOLCHAIN=${FV_AUDIO_RUST_TOOLCHAIN}
       CARGO_TARGET_DIR=${CARGO_TARGET_DIR}
+      IDL_PACKAGE_FILTER=fv_audio_interfaces\;fv_speech_interfaces\;std_msgs
       ${CARGO_EXECUTABLE} test --locked
         --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml
   )

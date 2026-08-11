@@ -270,7 +270,7 @@ back to legacy meanings.
 <details>
 <summary><b>🔊 Audio (<code>src/audio/</code>)</b></summary>
 
-- `fv_audio` (Rust CPAL/GStreamer capture, playback arbitration, output), `fv_speech` (Rust Silero VAD, turn detector, Parakeet CUDA EP ASR), `fv_tts` (C++ official VOICEVOX Core C API).
+- `fv_audio` (Rust CPAL/GStreamer capture, playback arbitration, output), `fv_speech` (Rust Silero VAD, turn detector, Parakeet CUDA EP ASR), `fv_tts` (Rust MagpieTTS-RT streaming synthesis with fixed Sofia voice).
 
 </details>
 

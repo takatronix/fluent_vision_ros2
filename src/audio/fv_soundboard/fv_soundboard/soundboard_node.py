@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
-from array import array
-from dataclasses import asdict, dataclass
-import json
 import time
 import uuid
 import wave
+from array import array
 
 from ament_index_python.packages import get_package_share_directory
 import rclpy
@@ -16,21 +14,16 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
+from fv_audio_interfaces.msg import (
+    TtsRequest,
+    TtsResult,
+    VoiceMaintenanceState,
+)
 from fv_speech_interfaces.msg import AudioFrame
 
 from .contracts import SoundSettings
 from .event_registry import EventRegistry
 from .wav_pcm import load_wav
-
-
-@dataclass(frozen=True)
-class SayRequest:
-    kind: str
-    utterance_id: str
-    text: str
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
 
 
 class SoundboardNode(Node):
@@ -51,7 +44,12 @@ class SoundboardNode(Node):
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
         )
-        self._say_pub = self.create_publisher(String, "/aspa/tts/say", qos)
+        self._say_pub = self.create_publisher(
+            TtsRequest, "/aspa/dialogue/tts/request", qos
+        )
+        self._tts_result_pub = self.create_publisher(
+            TtsResult, "/aspa/tts/result", qos
+        )
         self._cue_pub = self.create_publisher(AudioFrame, "/audio/cue/frame", qos)
         self._marker_pub = self.create_publisher(String, "/fv/event/active", qos)
         self.create_subscription(String, "/fv/event", self._on_event, qos)
@@ -64,6 +62,18 @@ class SoundboardNode(Node):
         )
         self.create_subscription(
             String, "/fv/sound/settings", self._on_settings, settings_qos
+        )
+        self._maintenance_state = None
+        self._maintenance_ack_pub = self.create_publisher(
+            VoiceMaintenanceState,
+            "/fv/soundboard/voice-maintenance",
+            settings_qos,
+        )
+        self.create_subscription(
+            VoiceMaintenanceState,
+            "/aspa/voice/maintenance",
+            self._on_voice_maintenance,
+            settings_qos,
         )
         self.get_logger().info(
             f"fv_soundboard ready: {len(self._registry)} fixed events"
@@ -89,6 +99,17 @@ class SoundboardNode(Node):
 
     def _on_preview(self, msg: String) -> None:
         self._handle_event(msg.data, preview=True)
+
+    def _on_voice_maintenance(
+            self, msg: VoiceMaintenanceState) -> None:
+        try:
+            _validate_voice_maintenance(msg)
+        except ValueError as exc:
+            self._maintenance_state = None
+            self.get_logger().error(str(exc))
+            return
+        self._maintenance_state = msg
+        self._maintenance_ack_pub.publish(msg)
 
     def _handle_event(self, payload: str, *, preview: bool) -> None:
         try:
@@ -129,12 +150,85 @@ class SoundboardNode(Node):
             self._cue_pub.publish(cue)
 
         if event.say:
-            request = SayRequest(
-                kind="system",
-                utterance_id=f"system-{event.name}-{suffix}",
-                text=event.say,
+            request_id = str(uuid.uuid4())
+            utterance_id = f"system-{event.name}-{suffix}"
+            state = self._maintenance_state
+            if state is None:
+                self._reject_tts_request(
+                    request_id,
+                    utterance_id,
+                    "voice maintenance state has not been observed",
+                )
+            elif state.active:
+                self._reject_tts_request(
+                    request_id,
+                    utterance_id,
+                    "voice maintenance is active "
+                    f"(operation_id={state.operation_id}, "
+                    f"reason={state.reason})",
+                )
+            else:
+                self._say_pub.publish(
+                    TtsRequest(
+                        kind=TtsRequest.SYSTEM,
+                        request_id=request_id,
+                        utterance_id=utterance_id,
+                        text=event.say,
+                    )
+                )
+
+    def _reject_tts_request(
+            self,
+            request_id: str,
+            utterance_id: str,
+            error: str,
+    ) -> None:
+        self._tts_result_pub.publish(
+            TtsResult(
+                kind=TtsResult.SYSTEM,
+                status=TtsResult.REJECTED,
+                request_id=request_id,
+                generation_valid=False,
+                generation_id="",
+                utterance_id=utterance_id,
+                error=error,
             )
-            self._say_pub.publish(String(data=request.to_json()))
+        )
+        self.get_logger().warning(
+            f"soundboard TTS request rejected: {error}"
+        )
+
+
+def _validate_voice_maintenance(msg: VoiceMaintenanceState) -> None:
+    if msg.version != 1:
+        raise ValueError("voice maintenance state version must be 1")
+    if msg.active:
+        try:
+            operation_id = uuid.UUID(msg.operation_id)
+        except ValueError as exc:
+            raise ValueError(
+                "active voice maintenance operation_id must be UUIDv4"
+            ) from exc
+        if operation_id.version != 4 or str(operation_id) != msg.operation_id:
+            raise ValueError(
+                "active voice maintenance operation_id must be UUIDv4"
+            )
+        if (
+            not msg.reason
+            or msg.reason != msg.reason.strip()
+            or len(msg.reason) > 128
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in msg.reason
+            )
+        ):
+            raise ValueError(
+                "active voice maintenance reason is invalid"
+            )
+    elif msg.operation_id or msg.reason:
+        raise ValueError(
+            "inactive voice maintenance must not retain operation data"
+        )
 
 
 def main(args=None) -> None:

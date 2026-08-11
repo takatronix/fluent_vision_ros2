@@ -25,14 +25,21 @@ path = "src/bin/audio_output.rs"
 name = "playback_controller"
 path = "src/bin/playback_controller.rs"
 
+[[bin]]
+name = "tts_timing_collector"
+path = "src/bin/tts_timing_collector.rs"
+
 [dependencies]
 cpal = "0.18.1"
 ctrlc = "3.5"
 futures = "0.3"
 gstreamer = "0.25.2"
 gstreamer-app = "0.25.2"
+libc = "0.2"
 r2r = "0.9.5"
 ringbuf = "0.4.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
 webrtc-audio-processing = { version = "~2.1", features = ["bundled"] }
 webrtc-audio-processing-config = "2.1"

@@ -1,0 +1,6 @@
+string generation_id
+---
+bool success
+string generation_id
+uint32 cancelled_requests
+string error

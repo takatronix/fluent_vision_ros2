@@ -13,11 +13,19 @@ uint8 AGENT_COMPLETED=7
 uint8 SYSTEM_COMPLETED=8
 uint8 CUE_COMPLETED=9
 uint8 SYSTEM_ABORTED=10
+uint8 AGENT_ABORTED=11
+uint8 AGENT_PAUSE_COMMITTED=12
 
 uint8 event
 uint8 kind
+# AGENT_PAUSED and AGENT_PAUSE_COMMITTED carry the originating PAUSE UUID.
+# An internal SYSTEM hold may emit AGENT_PAUSED with this field empty.
+string pause_id
+string request_id
+string generation_id
 string utterance_id
 uint64 played_frames
+bool total_frames_valid
 uint64 total_frames
 bool source_position_valid
 uint64 played_source_characters
