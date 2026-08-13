@@ -1,0 +1,24 @@
+schema: fluent.scene/v1alpha1
+kind: Scene
+metadata:
+  name: type_mismatch_fixture
+inputs:
+  status_text:
+    type: string
+    required: true
+    update: on_change
+nodes:
+  - id: camera_layer
+    type: visual.image2d
+    inputs:
+      image: $inputs.status_text
+outputs:
+  frame:
+    type: layer
+    source: $nodes.camera_layer.layer
+budgets:
+  max_width: 1920
+  max_height: 1080
+  max_gpu_bytes: 268435456
+  max_upload_bytes_per_frame: 33554432
+  max_frames_in_flight: 2

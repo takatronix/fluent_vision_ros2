@@ -1,0 +1,129 @@
+# Same scene as examples/camera_detection_hud.fvs with every legal mapping
+# reordered and the node list permuted. The canonical IR digest must not change.
+kind: Scene
+schema: fluent.scene/v1alpha1
+budgets:
+  max_frames_in_flight: 2
+  max_upload_bytes_per_frame: 33554432
+  max_gpu_bytes: 268435456
+  max_height: 1080
+  max_width: 1920
+fallbacks:
+  default_status:
+    value: "映像を待っています"
+  empty_detections:
+    value: []
+  hide_depth:
+    value: null
+  no_frame:
+    behavior: output_unavailable
+outputs:
+  diagnostics:
+    source: $runtime.diagnostics
+    type: diagnostic_set
+  frame:
+    source: $nodes.composite.image
+    type: image.rgba8
+nodes:
+  - type: composite.layers
+    id: composite
+    params:
+      color_space: srgb
+    inputs:
+      layers:
+        - $nodes.camera_layer.layer
+        - $nodes.detection_layer.layer
+        - $nodes.status_layer.layer
+  - bounds:
+      overflow: truncate_end
+      max_glyphs: 128
+    params:
+      default_text: "映像を待っています"
+      shadow: true
+      color: [1.0, 1.0, 1.0, 1.0]
+      position: [24.0, 24.0]
+      font: $resources.ui_font
+    inputs:
+      text: $inputs.status_text
+    type: text.dynamic
+    id: status_layer
+  - id: detection_layer
+    bounds:
+      max_instances: 128
+      overflow: drop_lowest_score
+    inputs:
+      detections: $inputs.detections
+    params:
+      show_label: true
+      color: $params.accent_color
+    type: visual.boxes2d
+  - params:
+      fit: contain
+    inputs:
+      image: $inputs.camera
+    id: camera_layer
+    type: visual.image2d
+resources:
+  ui_font:
+    glyph_capacity: 2048
+    uri: builtin://fonts/default-cjk
+    type: font
+inputs:
+  status_text:
+    fallback: default_status
+    constraints:
+      max_utf8_bytes: 256
+    update: on_change
+    required: false
+    type: string
+  camera_calibration:
+    fallback: no_frame
+    update: on_change
+    required: true
+    type: calibration
+  detections:
+    fallback: empty_detections
+    metadata:
+      synchronization_group: sensor_frame
+      clock: required
+      timestamp: required
+      frame: required
+    update: per_frame
+    required: false
+    type: sequence<Detection2D, 128>
+  depth:
+    fallback: hide_depth
+    metadata:
+      synchronization_group: sensor_frame
+      depth: required
+      calibration: camera_calibration
+      clock: required
+      timestamp: required
+      frame: required
+    update: per_frame
+    required: false
+    type: image.depth32f
+  camera:
+    fallback: no_frame
+    metadata:
+      synchronization_group: sensor_frame
+      calibration: camera_calibration
+      clock: required
+      timestamp: required
+      frame: required
+    update: per_frame
+    required: true
+    type: image.rgba8
+types:
+  Detection2D:
+    struct:
+      bbox: vec4f
+      score: f32
+      label: string
+params:
+  accent_color:
+    runtime_mutable: true
+    default: [0.1, 0.9, 0.7, 1.0]
+    type: vec4f
+metadata:
+  name: camera_detection_hud
