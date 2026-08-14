@@ -86,13 +86,20 @@ def _pid_alive(pid: int) -> bool:
     return _pid_is_recorder(pid)
 
 
+def _read_cmdline(pid: int) -> bytes:
+    """/proc/<pid>/cmdline を返す (読めなければ OSError)。テストで差し替える
+    最小の縫い目 — pathlib.Path 全体を patch するとプロセス全体を巻き込む。"""
+    return Path(f"/proc/{pid}/cmdline").read_bytes()
+
+
 def _pid_is_recorder(pid: int) -> bool:
     """pid の cmdline が録画ノードのものか (テストから直接検証できる形)。
 
-    /proc が読めない場合は False = 録画ノードではない扱い (ロックは orphan
-    として上書きされ、次の録画開始で回復する)。"""
+    /proc が読めない場合は False = 録画ノードではない扱い (ロックは
+    orphan として上書きされ、次の録画開始で回復する)。
+    """
     try:
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        cmdline = _read_cmdline(pid).replace(b"\0", b" ")
         return b"recorder_node" in cmdline
     except OSError:      # PermissionError 含む
         return False
