@@ -36,6 +36,23 @@ Building a real-world robot perception stack usually means: a tangled launch fil
 
 ---
 
+## 🌿 Fluent Scene — declarative GPU visual runtime (new)
+
+A framework-neutral rendering core that turns a typed YAML scene (`.fvs`) into a
+retained **Vulkan** composite — camera imagery, detection boxes, Japanese text —
+with type checking, GPU budget planning, and a ROS 2 adapter. Measured ~26×
+faster than CPU compositing at 1080p on Jetson Thor. Lives in
+[`core/fluent_scene/`](core/fluent_scene/) (standalone CMake, no ROS/GPU
+dependency in the core, `COLCON_IGNORE`d so colcon workflows are unaffected).
+
+| | |
+|---|---|
+| 🇯🇵 日本語 README（デモページへのリンクあり） | [core/fluent_scene/README.md](core/fluent_scene/README.md) |
+| 🇬🇧 English README | [core/fluent_scene/README.en.md](core/fluent_scene/README.en.md) |
+| 📐 Design spec (en / ja) | [docs/design/fluent_vision_architecture.md](docs/design/fluent_vision_architecture.md) · [ja](docs/design/fluent_vision_architecture.ja.md) |
+
+---
+
 ## 🚀 60-second demo
 
 ```bash

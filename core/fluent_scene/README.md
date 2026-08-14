@@ -1,16 +1,26 @@
-# Fluent Scene core（ROS 非依存 `.fvs` パーサー / バリデーター / 正準 IR）
+# Fluent Scene — 宣言的 GPU ビジュアルランタイム
 
-設計書 [docs/design/fluent_vision_architecture.ja.md](../../docs/design/fluent_vision_architecture.ja.md)
-第 14.2 節「次の実行可能スライス」の実装です。**ROS 2・学習フレームワーク・GPU に一切依存しません**
-（`COLCON_IGNORE` により colcon ワークスペースからも除外されています）。
+[English](README.en.md) | **日本語**
 
-This is the MVP vertical slice from
-[docs/design/fluent_vision_architecture.md](../../docs/design/fluent_vision_architecture.md)
-section 14.2: a ROS-free `.fvs` parser, schema/type validator, deterministic
-canonical typed IR with a SHA-256 digest, structured diagnostics, and a CLI —
-plus roadmap stages 1 (resource/pass planner) and 2 (retained Vulkan renderer).
+**🌿 デモページ（ライブHUD再現・実測値・実レンダリング）:**
+<https://claude.ai/code/artifact/25d03136-2389-4b50-8cd9-eb50075f7970>
+
+`.fvs` シーン（YAML）を **パース → 型検証 → 正準 IR → 資源計画 → Vulkan 保持型描画 →
+ROS 2 配線** まで実行するランタイムコアです。設計書
+[fluent_vision_architecture.ja.md](../../docs/design/fluent_vision_architecture.ja.md)
+のロードマップ **MVP + Stage 1〜4 実装済み**。コアは **ROS 2・学習フレームワーク・GPU に
+一切依存しません**（`COLCON_IGNORE` により colcon ワークスペースからも除外。
+レンダラー / ROS アダプターは依存が揃った環境でだけ自動的にビルドされる別ターゲット）。
 
 ![§11 の例シーンを Vulkan バックエンドでヘッドレス描画したもの](docs/demo_hud.png)
+
+| 読むもの | 場所 |
+|---|---|
+| デモページ | <https://claude.ai/code/artifact/25d03136-2389-4b50-8cd9-eb50075f7970> |
+| 設計書（規範、日本語） | [docs/design/fluent_vision_architecture.ja.md](../../docs/design/fluent_vision_architecture.ja.md) |
+| Design spec (English) | [docs/design/fluent_vision_architecture.md](../../docs/design/fluent_vision_architecture.md) |
+| シーン例 (§11) | [examples/camera_detection_hud.fvs](examples/camera_detection_hud.fvs) |
+| ROS 2 バインディング例 (§12) | [examples/camera_detection_hud_ros2.binding.yaml](examples/camera_detection_hud_ros2.binding.yaml) |
 
 ## ビルドとテスト / Build & test
 
