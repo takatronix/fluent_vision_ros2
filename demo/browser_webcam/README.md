@@ -36,13 +36,6 @@ docker run --rm -p 7860:7860 fv-demo
 
 ## Deploy to Hugging Face Spaces / HF Spacesへのデプロイ
 
-> ⚠️ As of 2026-08, hosting **Docker Spaces requires a PRO subscription**
-> (only Static Spaces are free — verified by an actual 402 on repo creation).
-> Free alternatives: a Cloudflare Tunnel from your own machine, or an
-> Oracle Cloud Always Free VM.
-> 2026年8月時点、**Docker SpaceのホスティングはPROサブスク必須**です
-> （無料はStatic Spaceのみ。repo作成時の402で実確認済み）。
-
 1. Create a new Space → SDK: **Docker** (Blank template), CPU basic.
 2. Push a repo with this layout (or mirror this repository and set the
    Space's Dockerfile path to `demo/browser_webcam/Dockerfile`):
