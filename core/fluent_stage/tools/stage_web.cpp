@@ -108,6 +108,9 @@ std::atomic<int> g_mjpeg_clients{0};
 struct AccessUnit {
     std::vector<uint8_t> data;  // Annex-B
     bool key = false;
+    uint64_t t_us = 0;  // wall-clock at emission — fMP4 timestamps follow
+                        // real time, so MSE playback never drifts from the
+                        // true frame rate (declared-fps drift = latency)
 };
 using AuPtr = std::shared_ptr<const AccessUnit>;
 
@@ -768,10 +771,16 @@ function msePath() {
     const q = [];
     sb.addEventListener('updateend', () => {
       if (q.length && !sb.updating) sb.appendBuffer(q.shift());
-      if (video.buffered.length) {
-        const end = video.buffered.end(video.buffered.length - 1);
-        if (end - video.currentTime > 0.3) video.currentTime = end - 0.05;  // chase live
+      if (!video.buffered.length) return;
+      // Live-edge chase: soak small drift with playbackRate, jump hard past
+      // 0.25 s — changing a filter must show up now, not seconds later.
+      const lag = video.buffered.end(video.buffered.length - 1) - video.currentTime;
+      if (lag > 0.25) {
+        video.currentTime = video.buffered.end(video.buffered.length - 1) - 0.03;
       }
+      video.playbackRate = lag > 0.1 ? 1.08 : 1.0;
+      if (video.paused) video.play();
+      statusEl.textContent = 'h264/mse  lag ' + Math.max(lag, 0).toFixed(2) + 's';
     });
     const ws = new WebSocket(`ws://${location.host}/ws?fmt=mp4`);
     ws.binaryType = 'arraybuffer';
@@ -888,8 +897,7 @@ void serveWebsocket(int fd, const std::string& request) {
         bool init_sent = false;
         uint32_t seq = 1;
         uint64_t dts = 0;
-        const uint32_t duration =
-            static_cast<uint32_t>(Mp4Muxer::kTimescale / static_cast<uint32_t>(kFps));
+        uint64_t prev_t_us = 0;
         std::vector<uint8_t> frame;
         while (g_running) {
             AuPtr au;
@@ -919,6 +927,15 @@ void serveWebsocket(int fd, const std::string& request) {
                     }
                     init_sent = true;
                 }
+                // Real elapsed time per frame, clamped to something sane.
+                uint32_t duration = Mp4Muxer::kTimescale / 60;
+                if (prev_t_us != 0 && au->t_us > prev_t_us) {
+                    const uint64_t d =
+                        (au->t_us - prev_t_us) * Mp4Muxer::kTimescale / 1000000ull;
+                    duration = static_cast<uint32_t>(
+                        std::min<uint64_t>(std::max<uint64_t>(d, 900), 30000));
+                }
+                prev_t_us = au->t_us;
                 const auto frag = muxer.fragment(au->data, au->key, seq++, dts, duration);
                 dts += duration;
                 ok = wsSendBinary(fd, frag.data(), frag.size());
@@ -1333,7 +1350,13 @@ int main(int argc, char** argv) {
                 encoder_alive = false;
                 return;
             }
-            splitter.feed(chunk, static_cast<size_t>(n), [](AuPtr au) { broadcastAu(au); });
+            splitter.feed(chunk, static_cast<size_t>(n), [](AuPtr au) {
+                const_cast<AccessUnit*>(au.get())->t_us = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+                broadcastAu(au);
+            });
         }
     };
     std::thread au_reader(reader_fn);
@@ -1522,6 +1545,20 @@ int main(int argc, char** argv) {
             encodeJpeg(frame, g_jpeg);
             ++g_frame_seq;
             g_frame_cv.notify_all();
+        }
+
+        // Loop health: real fps to the log every 5 s — declared 60 means
+        // nothing if the loop can't hold it.
+        static auto fps_t0 = std::chrono::steady_clock::now();
+        static uint32_t fps_frames = 0;
+        ++fps_frames;
+        const auto now0 = std::chrono::steady_clock::now();
+        if (now0 - fps_t0 >= std::chrono::seconds(5)) {
+            std::printf("stage_web: render %.1f fps\n",
+                        fps_frames / std::chrono::duration<double>(now0 - fps_t0).count());
+            std::fflush(stdout);
+            fps_t0 = now0;
+            fps_frames = 0;
         }
 
         next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(frame_time);
