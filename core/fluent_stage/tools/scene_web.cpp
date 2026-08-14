@@ -336,17 +336,36 @@ async function startWebcam() {
         if (sendCam) sendCam(await b.arrayBuffer());
         else fetch('/camera', {method: 'POST', body: b}).catch(() => {});
       }, 'image/jpeg', 0.6);
-    }, 33);
+    }, 66);
   } catch (e) { statusTail += '\nwebcam: ' + e; }
 }
 startWebcam();
 
-if ('VideoDecoder' in window) {
+function jpegWsPath() {
+  // Per-message stills, image replaced on arrival (the fv_browser_camera
+  // pattern): no queue anywhere, latency = one network trip. The default
+  // for this mirror-style demo; ?v=h264 selects the codec path.
+  const img = document.createElement('img');
+  img.id = 'v'; img.draggable = false;
+  view.replaceWith(img); view = img;
+  hookPointer(img);
+  let shown = 0, url = null;
+  openWs('jpeg', data => {
+    const next = URL.createObjectURL(new Blob([data], {type: 'image/jpeg'}));
+    img.onload = () => { if (url) URL.revokeObjectURL(url); url = next; ++shown; };
+    img.src = next;
+  }, null, () => framePullFallback('ws unavailable'));
+  setInterval(() => { bar.textContent = statusLine('jpeg/ws ' + shown + ' fps'); shown = 0; }, 1000);
+}
+
+const mode = new URLSearchParams(location.search).get('v');
+if (mode === 'h264' && 'VideoDecoder' in window) {
   webcodecsPath();
-} else if (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42e01e"')) {
+} else if (mode === 'h264' && window.MediaSource &&
+           MediaSource.isTypeSupported('video/mp4; codecs="avc1.42e01e"')) {
   msePath();
 } else {
-  framePullFallback('no decoder');
+  jpegWsPath();
 }
 </script>
 )HTML";
@@ -408,12 +427,44 @@ void serveWs(int fd, const std::string& request) {
 
     auto client = std::make_shared<wsvideo::VideoClient>();
     client->mp4 = request.find("fmt=mp4") != std::string::npos;
-    {
+    const bool jpeg_mode = request.find("fmt=jpeg") != std::string::npos;
+    if (!jpeg_mode) {
         std::lock_guard<std::mutex> lock(wsvideo::g_clients_mutex);
         wsvideo::g_clients.push_back(client);
     }
 
-    std::thread sender([fd, client] {
+    std::thread sender([fd, client, jpeg_mode] {
+        if (jpeg_mode) {
+            // The fv_browser_camera pattern: one JPEG per WS message, the
+            // page replaces its <img> on arrival. No queue exists anywhere,
+            // so latency is one network trip by construction.
+            uint64_t last_seq = 0;
+            std::vector<uint8_t> jpeg;
+            while (g_running) {
+                {
+                    std::unique_lock<std::mutex> lock(g_frame_mutex);
+                    g_frame_cv.wait_for(lock, std::chrono::milliseconds(500),
+                                        [&] { return g_frame_seq != last_seq; });
+                    {
+                        std::lock_guard<std::mutex> cl(client->mutex);
+                        if (client->dead) {
+                            return;
+                        }
+                    }
+                    if (g_frame_seq == last_seq) {
+                        continue;
+                    }
+                    last_seq = g_frame_seq;
+                    jpeg = g_jpeg;
+                }
+                if (!wsvideo::wsSendBinary(fd, jpeg.data(), jpeg.size())) {
+                    break;
+                }
+            }
+            std::lock_guard<std::mutex> lock(client->mutex);
+            client->dead = true;
+            return;
+        }
         wsvideo::Mp4Muxer muxer;
         bool init_sent = false;
         uint32_t seq = 1;
@@ -1307,8 +1358,8 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // Still frames for the /frame fallback, at half rate.
-        if ((frame_tick++ & 1) == 0) {
+        // Stills feed the primary jpeg/ws path and the /frame fallback.
+        if ((frame_tick++ & 0) == 0) {
             std::lock_guard<std::mutex> lock(g_frame_mutex);
             encodeJpeg(frame, g_jpeg);
             ++g_frame_seq;
