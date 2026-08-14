@@ -21,6 +21,9 @@ const std::vector<ConverterSpec>& converterTable() {
          "Detection2DArray to sequence<detection2d> (center/size to logical rect)"},
         {"ros_string_to_utf8", "std_msgs/msg/String", InputType::TextUtf8, false,
          "String to text.utf8"},
+        {"aspa_json_to_detection2d", "std_msgs/msg/String", InputType::SeqDetection2D, false,
+         "aspa perception JSON (class/conf/box_xyxy in image pixels, scaled by "
+         "image_size to the stage canvas) to sequence<detection2d>"},
         {"ros_polygon_to_vec2", "geometry_msgs/msg/Polygon", InputType::SeqVec2, false,
          "Polygon points (x, y) to sequence<vec2> in logical units"},
         {"rgba8_to_ros_image", "sensor_msgs/msg/Image", InputType::ImageRgba8, true,

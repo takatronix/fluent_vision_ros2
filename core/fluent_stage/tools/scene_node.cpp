@@ -169,6 +169,284 @@ void encodeJpeg(const Surface& s, std::vector<uint8_t>& out) {
     free(mem);
 }
 
+// ---- aspa perception JSON → boxes ------------------------------------------
+// The aspa recognition stack publishes detections as a JSON String:
+//   { "image_size": [w, h], "detections": [
+//       { "class": "...", "conf": 0.93, "box_xyxy": [x1, y1, x2, y2] } ] }
+// box_xyxy is in source-image pixels; the render loop scales it into the
+// stage's logical canvas by image_size (exact for a full-frame image layer).
+
+/// A minimal JSON reader for that one payload: just enough grammar
+/// (object/array/string/number/bool/null), no allocation surprises, and it
+/// only extracts what the converter needs.
+class AspaJson {
+public:
+    explicit AspaJson(const std::string& text) : s_(text) {}
+
+    bool parse(float& img_w, float& img_h, std::vector<Box>& boxes) {
+        skipWs();
+        if (!consume('{')) {
+            return false;
+        }
+        bool first = true;
+        while (true) {
+            skipWs();
+            if (consume('}')) {
+                break;
+            }
+            if (!first && !consume(',')) {
+                return false;
+            }
+            first = false;
+            skipWs();
+            std::string key;
+            if (!parseString(key)) {
+                return false;
+            }
+            skipWs();
+            if (!consume(':')) {
+                return false;
+            }
+            skipWs();
+            if (key == "image_size") {
+                float wh[2] = {0, 0};
+                if (!parseNumberArray(wh, 2)) {
+                    return false;
+                }
+                img_w = wh[0];
+                img_h = wh[1];
+            } else if (key == "detections") {
+                if (!parseDetections(boxes)) {
+                    return false;
+                }
+            } else if (!skipValue()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    void skipWs() {
+        while (i_ < s_.size() && (s_[i_] == ' ' || s_[i_] == '\t' || s_[i_] == '\n' ||
+                                  s_[i_] == '\r')) {
+            ++i_;
+        }
+    }
+    bool consume(char c) {
+        if (i_ < s_.size() && s_[i_] == c) {
+            ++i_;
+            return true;
+        }
+        return false;
+    }
+    bool parseString(std::string& out) {
+        if (!consume('"')) {
+            return false;
+        }
+        out.clear();
+        while (i_ < s_.size() && s_[i_] != '"') {
+            char c = s_[i_++];
+            if (c == '\\' && i_ < s_.size()) {
+                const char e = s_[i_++];
+                switch (e) {
+                    case 'n': c = '\n'; break;
+                    case 't': c = '\t'; break;
+                    case 'u': {
+                        // \uXXXX (and surrogate pairs): Python's json.dumps
+                        // escapes Japanese labels this way by default.
+                        uint32_t code = 0;
+                        if (!parseHex4(code)) {
+                            return false;
+                        }
+                        if (code >= 0xd800 && code <= 0xdbff && i_ + 1 < s_.size() &&
+                            s_[i_] == '\\' && s_[i_ + 1] == 'u') {
+                            i_ += 2;
+                            uint32_t low = 0;
+                            if (!parseHex4(low)) {
+                                return false;
+                            }
+                            code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+                        }
+                        appendUtf8(code, out);
+                        continue;
+                    }
+                    default: c = e;
+                }
+            }
+            out += c;
+        }
+        return consume('"');
+    }
+    bool parseHex4(uint32_t& out) {
+        out = 0;
+        for (int k = 0; k < 4; ++k) {
+            if (i_ >= s_.size()) {
+                return false;
+            }
+            const char c = s_[i_++];
+            uint32_t v;
+            if (c >= '0' && c <= '9') {
+                v = static_cast<uint32_t>(c - '0');
+            } else if (c >= 'a' && c <= 'f') {
+                v = static_cast<uint32_t>(c - 'a' + 10);
+            } else if (c >= 'A' && c <= 'F') {
+                v = static_cast<uint32_t>(c - 'A' + 10);
+            } else {
+                return false;
+            }
+            out = (out << 4) | v;
+        }
+        return true;
+    }
+    static void appendUtf8(uint32_t code, std::string& out) {
+        if (code < 0x80) {
+            out += static_cast<char>(code);
+        } else if (code < 0x800) {
+            out += static_cast<char>(0xc0 | (code >> 6));
+            out += static_cast<char>(0x80 | (code & 0x3f));
+        } else if (code < 0x10000) {
+            out += static_cast<char>(0xe0 | (code >> 12));
+            out += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
+            out += static_cast<char>(0x80 | (code & 0x3f));
+        } else {
+            out += static_cast<char>(0xf0 | (code >> 18));
+            out += static_cast<char>(0x80 | ((code >> 12) & 0x3f));
+            out += static_cast<char>(0x80 | ((code >> 6) & 0x3f));
+            out += static_cast<char>(0x80 | (code & 0x3f));
+        }
+    }
+    bool parseNumber(float& out) {
+        const char* start = s_.c_str() + i_;
+        char* end = nullptr;
+        out = std::strtof(start, &end);
+        if (end == start) {
+            return false;
+        }
+        i_ += static_cast<size_t>(end - start);
+        return true;
+    }
+    bool parseNumberArray(float* out, size_t count) {
+        if (!consume('[')) {
+            return false;
+        }
+        for (size_t k = 0; k < count; ++k) {
+            skipWs();
+            if (k != 0 && !consume(',')) {
+                return false;
+            }
+            skipWs();
+            if (!parseNumber(out[k])) {
+                return false;
+            }
+        }
+        skipWs();
+        return consume(']');
+    }
+    bool parseDetections(std::vector<Box>& boxes) {
+        if (!consume('[')) {
+            return false;
+        }
+        bool first = true;
+        while (true) {
+            skipWs();
+            if (consume(']')) {
+                return true;
+            }
+            if (!first && !consume(',')) {
+                return false;
+            }
+            first = false;
+            skipWs();
+            if (!consume('{')) {
+                return false;
+            }
+            Box box;
+            bool obj_first = true;
+            while (true) {
+                skipWs();
+                if (consume('}')) {
+                    break;
+                }
+                if (!obj_first && !consume(',')) {
+                    return false;
+                }
+                obj_first = false;
+                skipWs();
+                std::string key;
+                if (!parseString(key) ) {
+                    return false;
+                }
+                skipWs();
+                if (!consume(':')) {
+                    return false;
+                }
+                skipWs();
+                if (key == "class") {
+                    if (!parseString(box.label)) {
+                        return false;
+                    }
+                } else if (key == "conf") {
+                    if (!parseNumber(box.score)) {
+                        return false;
+                    }
+                } else if (key == "box_xyxy") {
+                    float v[4] = {0, 0, 0, 0};
+                    if (!parseNumberArray(v, 4)) {
+                        return false;
+                    }
+                    box.rect = {v[0], v[1], v[2] - v[0], v[3] - v[1]};
+                } else if (!skipValue()) {
+                    return false;
+                }
+            }
+            boxes.push_back(std::move(box));
+        }
+    }
+    /// Skips any well-formed value (used for keys the converter ignores).
+    bool skipValue() {
+        skipWs();
+        if (i_ >= s_.size()) {
+            return false;
+        }
+        const char c = s_[i_];
+        if (c == '"') {
+            std::string dump;
+            return parseString(dump);
+        }
+        if (c == '{' || c == '[') {
+            const char open = c, close = c == '{' ? '}' : ']';
+            int depth = 0;
+            bool in_str = false;
+            while (i_ < s_.size()) {
+                const char x = s_[i_++];
+                if (in_str) {
+                    if (x == '\\') {
+                        ++i_;
+                    } else if (x == '"') {
+                        in_str = false;
+                    }
+                } else if (x == '"') {
+                    in_str = true;
+                } else if (x == open) {
+                    ++depth;
+                } else if (x == close && --depth == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // number / true / false / null
+        while (i_ < s_.size() && s_[i_] != ',' && s_[i_] != '}' && s_[i_] != ']') {
+            ++i_;
+        }
+        return true;
+    }
+
+    const std::string& s_;
+    size_t i_ = 0;
+};
+
 // ---- feeds: latest-wins slots the callbacks fill ---------------------------
 
 struct Feed {
@@ -322,7 +600,9 @@ int main(int argc, char** argv) {
                     ++raw->seq;
                 });
 #endif
-        } else if (conv == "ros_string_to_utf8") {
+        } else if (conv == "ros_string_to_utf8" || conv == "aspa_json_to_detection2d") {
+            // Both ride a String topic; the render thread interprets per the
+            // converter (raw text vs JSON detections).
             feed->sub = node->create_subscription<std_msgs::msg::String>(
                 b.source.topic, qos, [raw](std_msgs::msg::String::ConstSharedPtr msg) {
                     std::lock_guard<std::mutex> lock(raw->mutex);
@@ -469,6 +749,24 @@ int main(int argc, char** argv) {
                     }
                 } else if (conv == "ros_detections_to_detection2d") {
                     live->setBoxes(feed->decl->input, boxes);
+                } else if (conv == "aspa_json_to_detection2d") {
+                    float img_w = 0, img_h = 0;
+                    std::vector<Box> parsed;
+                    if (AspaJson(text).parse(img_w, img_h, parsed)) {
+                        // box_xyxy is in source-image pixels; scale into the
+                        // stage's logical canvas (exact for full-frame video).
+                        const float sx = img_w > 0 ? live->stage().width() / img_w : 1.0f;
+                        const float sy = img_h > 0 ? live->stage().height() / img_h : 1.0f;
+                        for (Box& box : parsed) {
+                            box.rect = {box.rect.x * sx, box.rect.y * sy, box.rect.w * sx,
+                                        box.rect.h * sy};
+                        }
+                        live->setBoxes(feed->decl->input, parsed);
+                    } else if (!feed->warned) {
+                        feed->warned = true;
+                        std::fprintf(stderr, "scene_node: unparsable JSON on %s\n",
+                                     feed->decl->source.topic.c_str());
+                    }
                 } else if (conv == "ros_string_to_utf8") {
                     live->setText(feed->decl->input, text);
                 } else if (conv == "ros_polygon_to_vec2") {

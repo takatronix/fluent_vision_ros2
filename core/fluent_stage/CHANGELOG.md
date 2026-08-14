@@ -23,6 +23,10 @@
   再起動、設計どおり)
 - 実機 E2E: d405 CompressedImage 30fps + String トピック → 合成 20fps を
   `/fluent_scene/composite` に配信、ライブ文字列と実映像を確認
+- **`aspa_json_to_detection2d` converter**: aspa 認識スタックの独自 JSON
+  (`class` / `conf` / `box_xyxy` 画像ピクセル座標、`\uXXXX` エスケープの
+  日本語ラベル含む)を boxes へ。image_size でステージ論理座標に変換。
+  実機 d405 + 検出枠 HUD(角丸・ラベル・スコア・平滑化)を描画確認
 
 ## 0.8.1 — 2026-08-14 (scene_web: 編集→保存→原子的差し替え)
 
