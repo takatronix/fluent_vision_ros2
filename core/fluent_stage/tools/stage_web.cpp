@@ -71,6 +71,8 @@ std::vector<PointerEventIn> g_events;
 std::atomic<int> g_effect{0};        // 0 = none, 1.. = filterTable() index + 1
 std::atomic<float> g_param{-1.0f};   // 0..1 slider; <0 = use the default
 std::atomic<bool> g_water{true};
+std::atomic<float> g_mouse_x{-10000.0f};  // last pointer position (stage
+std::atomic<float> g_mouse_y{-10000.0f};  // coords) — the PiP flees it
 
 void handleMessage(const char* text, size_t len) {
     std::string s(text, len);
@@ -769,8 +771,23 @@ function msePath() {
   ms.addEventListener('sourceopen', () => {
     const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42e01e"');
     const q = [];
+    // Drain the whole queue as ONE append (MSE accepts concatenated
+    // fragments) — a one-at-a-time drain can never catch up once it slips,
+    // and fragments waiting in q are invisible latency the lag number
+    // doesn't show.
+    const pump = () => {
+      if (sb.updating || !q.length) return;
+      if (q.length === 1) { sb.appendBuffer(q.shift()); return; }
+      let total = 0;
+      for (const b of q) total += b.byteLength;
+      const merged = new Uint8Array(total);
+      let off = 0;
+      for (const b of q) { merged.set(new Uint8Array(b), off); off += b.byteLength; }
+      q.length = 0;
+      sb.appendBuffer(merged);
+    };
     sb.addEventListener('updateend', () => {
-      if (q.length && !sb.updating) sb.appendBuffer(q.shift());
+      pump();
       if (!video.buffered.length) return;
       // Live-edge chase: soak small drift with playbackRate, jump hard past
       // 0.25 s — changing a filter must show up now, not seconds later.
@@ -780,7 +797,7 @@ function msePath() {
       }
       video.playbackRate = lag > 0.1 ? 1.08 : 1.0;
       if (video.paused) video.play();
-      statusEl.textContent = 'h264/mse  lag ' + Math.max(lag, 0).toFixed(2) + 's';
+      statusEl.textContent = 'h264/mse  lag ' + Math.max(lag, 0).toFixed(2) + 's  q ' + q.length;
     });
     const ws = new WebSocket(`ws://${location.host}/ws?fmt=mp4`);
     ws.binaryType = 'arraybuffer';
@@ -788,7 +805,8 @@ function msePath() {
     ws.onclose = () => statusEl.textContent = 'disconnected — reload to reconnect';
     ws.onmessage = e => {
       if (typeof e.data === 'string') return;
-      if (sb.updating || q.length) q.push(e.data); else sb.appendBuffer(e.data);
+      q.push(e.data);
+      pump();
     };
   });
   statusEl.textContent = 'h264/mse';
@@ -1400,6 +1418,7 @@ int main(int argc, char** argv) {
     int current_effect = -1;
     float current_param = -2;
     uint32_t tick = 0;
+    Vec2 pip_pos{kW - 200, 150};
 
     const auto frame_time = std::chrono::duration<double>(1.0 / kFps);
     auto next = std::chrono::steady_clock::now();
@@ -1463,6 +1482,8 @@ int main(int argc, char** argv) {
             events.swap(g_events);
         }
         for (const PointerEventIn& e : events) {
+            g_mouse_x = e.x;
+            g_mouse_y = e.y;
             const float cx = (e.x + off_x) / cover;
             const float cy = (e.y + off_y) / cover;
             if (e.phase == 'd') {
@@ -1482,13 +1503,27 @@ int main(int argc, char** argv) {
         video.setImage({cam_w, cam_h,
                         water_on ? warped.data() : cam_rgba.data(), 0});
 
-        // The PiP glides at the full render rate — layer motion is
-        // independent of how fast its camera delivers frames.
+        // The PiP glides at the full render rate — and flees the pointer:
+        // orbit gently, but when the mouse closes in, slide away smoothly.
         if (have_pip) {
             pip.setImage({pip_w, pip_h, pip_rgba.data(), 0});
             const float t = tick / kFps;
-            pip.position(kW - 200 + 90 * std::sin(t * 0.55f),
-                         150 + 70 * std::sin(t * 0.37f + 1.3f));
+            Vec2 target{kW - 200 + 90 * std::sin(t * 0.55f),
+                        150 + 70 * std::sin(t * 0.37f + 1.3f)};
+            const float dx = pip_pos.x - g_mouse_x;
+            const float dy = pip_pos.y - g_mouse_y;
+            const float dist = std::hypot(dx, dy);
+            const float flee_r = 340;
+            if (dist < flee_r && dist > 1) {
+                const float push = (flee_r - dist) * 1.6f;
+                target.x = pip_pos.x + dx / dist * push;
+                target.y = pip_pos.y + dy / dist * push;
+            }
+            target.x = std::min(std::max(target.x, 180.0f), kW - 180.0f);
+            target.y = std::min(std::max(target.y, 110.0f), kH - 110.0f);
+            pip_pos.x += (target.x - pip_pos.x) * 0.10f;
+            pip_pos.y += (target.y - pip_pos.y) * 0.10f;
+            pip.position(pip_pos);
         }
 
         // ---- effect selection (browser dropdown + slider) ------------------
