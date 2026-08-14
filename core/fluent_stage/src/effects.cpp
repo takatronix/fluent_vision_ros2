@@ -64,9 +64,10 @@ void Ripple::applyFilters() {
     }
     for (const Wave& w : waves_) {
         const float t = w.age / style_.duration;  // 0..1
-        // The wavefront expands with a fast start; the refraction energy
-        // decays quadratically as the wave spreads out.
-        const float radius = style_.max_radius * (1.0f - (1.0f - t) * (1.0f - t));
+        // Water waves travel at constant speed: the wavefront expands
+        // linearly, and the refraction energy decays quadratically as the
+        // ring spreads out.
+        const float radius = style_.max_radius * t;
         const float amplitude = style_.amplitude * w.strength * (1.0f - t) * (1.0f - t);
         target_->filter(RippleWave()
                             .center_x(w.pos.x)

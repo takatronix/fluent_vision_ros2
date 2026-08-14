@@ -92,13 +92,24 @@ target_link_libraries(ripple_demo PRIVATE fluent_stage)
 add_executable(bench examples/bench.cpp)
 target_link_libraries(bench PRIVATE fluent_stage)
 
-# ---- stage_web: the Stage in a browser (MJPEG out, pointer events in) -------
+# ---- stage_web: live camera effects in a browser ----------------------------
+# H.264(NVENC)/WebSocket out, pointer events in. ROS 2 input is optional:
+# configure with the ROS environment sourced to get the live camera topic.
 find_package(JPEG QUIET)
 if(JPEG_FOUND)
   add_executable(stage_web tools/stage_web.cpp)
   target_link_libraries(stage_web PRIVATE fluent_stage JPEG::JPEG)
   find_package(Threads REQUIRED)
   target_link_libraries(stage_web PRIVATE Threads::Threads)
+  find_package(rclcpp QUIET)
+  find_package(sensor_msgs QUIET)
+  if(rclcpp_FOUND AND sensor_msgs_FOUND)
+    target_link_libraries(stage_web PRIVATE rclcpp::rclcpp ${sensor_msgs_TARGETS})
+    target_compile_definitions(stage_web PRIVATE FS_HAVE_ROS=1)
+    message(STATUS "fluent_stage: stage_web with ROS 2 camera input")
+  else()
+    message(STATUS "fluent_stage: stage_web without ROS (source ROS env to enable)")
+  endif()
 else()
   message(STATUS "fluent_stage: stage_web disabled (needs libjpeg-dev)")
 endif()
