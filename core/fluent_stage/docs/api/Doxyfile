@@ -1,0 +1,26 @@
+# Doxygen configuration for fluent_stage.
+# Run from the package root:  doxygen docs/api/Doxyfile
+
+PROJECT_NAME           = fluent_stage
+PROJECT_BRIEF          = "Runtime 2D layer tree + SDF compositing for robots"
+PROJECT_NUMBER         = 0.1.0
+OUTPUT_DIRECTORY       = build/docs/api
+INPUT                  = include/fluent_stage README.md
+USE_MDFILE_AS_MAINPAGE = README.md
+RECURSIVE              = YES
+EXCLUDE                = include/fluent_stage/shared
+FILE_PATTERNS          = *.hpp *.md
+EXTRACT_ALL            = NO
+WARN_IF_UNDOCUMENTED   = YES
+WARN_NO_PARAMDOC       = NO
+QUIET                  = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+HAVE_DOT               = YES
+CALL_GRAPH             = NO
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = YES
+MARKDOWN_SUPPORT       = YES
+IMAGE_PATH             = docs/images
+STRIP_FROM_PATH        = .
+STRIP_FROM_INC_PATH    = include
