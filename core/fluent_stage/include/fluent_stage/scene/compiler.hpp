@@ -23,6 +23,7 @@
 /// caller's frame loop: compile the new document off to the side, then swap
 /// which CompiledScene you render at a frame boundary.
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -30,8 +31,18 @@
 
 #include "fluent_stage/scene/document.hpp"
 #include "fluent_stage/stage.hpp"
+#include "fluent_stage/ui.hpp"
 
 namespace fluent_stage::scene {
+
+/// One user gesture leaving a declared UI control (§10-4). The host decides
+/// where it goes from here — a C++ callback, a ROS topic, a log.
+struct UiEvent {
+    std::string id;       ///< The control layer's id.
+    const char* control;  ///< "button" | "switch" | "slider".
+    float value = 0;      ///< Slider value (switch: 1/0, button: 1).
+    bool flag = false;    ///< Switch state (button taps: true).
+};
 
 /// Resource bounds for compilation. The declared tree (placeholders
 /// included) is checked against `limits` up front and rejected with
@@ -81,6 +92,15 @@ public:
     bool setParam(const std::string& name, bool value);
     /// @}
 
+    /// Installs the single UI event handler (§10-4): every declared
+    /// button/switch/slider routes user gestures here. Pointer injection is
+    /// the host's job (`stage().pointerDown/Move/Up`); programmatic changes
+    /// (setParam on a bound control) do not fire events, exactly like the
+    /// C++ controls.
+    void onUiEvent(std::function<void(const UiEvent&)> handler) {
+        ui_handler_ = std::move(handler);
+    }
+
     /// Runtime diagnostics (bad input names, type mismatches, clamps),
     /// oldest first; clears the queue. Stage diagnostics are included.
     std::vector<std::string> drainDiagnostics();
@@ -107,6 +127,12 @@ public:
         bool background_was_placeholder = false;
         bool fed = false;
     };
+    /// One `$params` binding to a UI control's state (compiler bookkeeping).
+    struct ControlBinding {
+        enum class Kind { SwitchOn, SliderValue, GaugeValue };
+        Kind kind;
+        void* control;  ///< The ui:: instance owned by controls_.
+    };
 
 private:
     friend struct CompileAccess;
@@ -122,8 +148,17 @@ private:
 
     std::map<std::string, std::vector<ParamBinding>> param_bindings_;
     std::map<std::string, std::vector<InputBinding>> input_bindings_;
+    std::map<std::string, std::vector<ControlBinding>> control_bindings_;
     std::map<const Layer*, TransitionDecl> layer_transitions_;
     std::vector<std::string> diagnostics_;
+
+    // Declared UI controls (§10). The objects carry the behavior; their
+    // layers live in the Stage like everything else.
+    std::vector<std::unique_ptr<ui::Button>> buttons_;
+    std::vector<std::unique_ptr<ui::Switch>> switches_;
+    std::vector<std::unique_ptr<ui::Slider>> sliders_;
+    std::vector<std::unique_ptr<ui::Gauge>> gauges_;
+    std::function<void(const UiEvent&)> ui_handler_;
 };
 
 /// The outcome of `compile`. `scene` is null when compilation was rejected.

@@ -30,7 +30,17 @@ struct CompileAccess {
     static auto& nodes(CompiledScene& s) { return s.nodes_; }
     static auto& paramBindings(CompiledScene& s) { return s.param_bindings_; }
     static auto& inputBindings(CompiledScene& s) { return s.input_bindings_; }
+    static auto& controlBindings(CompiledScene& s) { return s.control_bindings_; }
     static auto& layerTransitions(CompiledScene& s) { return s.layer_transitions_; }
+    static auto& buttons(CompiledScene& s) { return s.buttons_; }
+    static auto& switches(CompiledScene& s) { return s.switches_; }
+    static auto& sliders(CompiledScene& s) { return s.sliders_; }
+    static auto& gauges(CompiledScene& s) { return s.gauges_; }
+    static void fire(CompiledScene& s, const UiEvent& event) {
+        if (s.ui_handler_) {
+            s.ui_handler_(event);
+        }
+    }
 };
 
 namespace {
@@ -259,6 +269,13 @@ private:
             return f != nullptr ? f->value.vec2() : Vec2{};
         };
 
+        // UI controls (§10, L4): the compiler instantiates the same ui::
+        // prefabs a C++ author uses. The layer's declared frame places them;
+        // gestures leave through CompiledScene::onUiEvent.
+        if (name == "button" || name == "switch" || name == "slider" || name == "gauge") {
+            return createControl(parent, decl, c);
+        }
+
         Layer* layer = nullptr;
         if (name == "image") {
             layer = &parent.image(ImageView{});
@@ -335,6 +352,95 @@ private:
             registerInput(*layer, decl, src->value.input);
         }
         return layer;
+    }
+
+    /// Builds one UI prefab. Bindable fields (`on`, `value`) may carry a
+    /// $params reference: the control starts at the param's default and
+    /// setParam drives it from then on (programmatic changes fire no event,
+    /// same as the C++ setters).
+    Layer* createControl(Layer& parent, const LayerDecl& decl, const ContentDecl& c) {
+        CompiledScene* scene = &scene_;
+        const std::string name = c.spec->name;
+        const AttrDecl* frame_attr = decl.find(AttrId::Frame);
+        const Rect frame = frame_attr != nullptr ? frame_attr->value.rect() : Rect{};
+
+        // The event id: the declared id, or the auto id assigned later —
+        // resolved lazily at fire time from the control's layer.
+        if (name == "button") {
+            const MapField* label = c.find("label");
+            auto& control = CompileAccess::buttons(scene_).emplace_back(
+                std::make_unique<ui::Button>(parent, frame,
+                                             label != nullptr ? label->value.str : ""));
+            ui::Button* raw = control.get();
+            raw->onTap([scene, raw] {
+                CompileAccess::fire(*scene, {raw->layer().id(), "button", 1, true});
+            });
+            return &raw->layer();
+        }
+        if (name == "switch") {
+            auto& control = CompileAccess::switches(scene_).emplace_back(
+                std::make_unique<ui::Switch>(parent, frame));
+            ui::Switch* raw = control.get();
+            if (const MapField* on = c.find("on")) {
+                if (!on->value.param.empty()) {
+                    const ParamDecl* p = doc_.findParam(on->value.param);
+                    raw->setOn(p->def_flag, false);
+                    CompileAccess::controlBindings(scene_)[p->name].push_back(
+                        {CompiledScene::ControlBinding::Kind::SwitchOn, raw});
+                } else {
+                    raw->setOn(on->value.flag, false);
+                }
+            }
+            raw->onChange([scene, raw](bool on) {
+                CompileAccess::fire(*scene,
+                                    {raw->layer().id(), "switch", on ? 1.0f : 0.0f, on});
+            });
+            return &raw->layer();
+        }
+        if (name == "slider") {
+            float initial = 0;
+            const ParamDecl* bound = nullptr;
+            if (const MapField* value = c.find("value")) {
+                if (!value->value.param.empty()) {
+                    bound = doc_.findParam(value->value.param);
+                    initial = bound->def[0];
+                } else {
+                    initial = value->value.num[0];
+                }
+            }
+            auto& control = CompileAccess::sliders(scene_).emplace_back(
+                std::make_unique<ui::Slider>(parent, frame, initial));
+            ui::Slider* raw = control.get();
+            if (bound != nullptr) {
+                CompileAccess::controlBindings(scene_)[bound->name].push_back(
+                    {CompiledScene::ControlBinding::Kind::SliderValue, raw});
+            }
+            raw->onChange([scene, raw](float v) {
+                CompileAccess::fire(*scene, {raw->layer().id(), "slider", v, false});
+            });
+            return &raw->layer();
+        }
+        // gauge — display only, no events.
+        auto num_of = [&](const char* field, float fallback) {
+            const MapField* f = c.find(field);
+            return f != nullptr && f->value.param.empty() ? f->value.num[0] : fallback;
+        };
+        const MapField* center = c.find("center");
+        auto& control = CompileAccess::gauges(scene_).emplace_back(std::make_unique<ui::Gauge>(
+            parent, center != nullptr ? center->value.vec2() : Vec2{},
+            num_of("radius", 0)));
+        ui::Gauge* raw = control.get();
+        if (const MapField* value = c.find("value")) {
+            if (!value->value.param.empty()) {
+                const ParamDecl* p = doc_.findParam(value->value.param);
+                raw->setValue(p->def[0]);
+                CompileAccess::controlBindings(scene_)[p->name].push_back(
+                    {CompiledScene::ControlBinding::Kind::GaugeValue, raw});
+            } else {
+                raw->setValue(value->value.num[0]);
+            }
+        }
+        return &raw->layer();
     }
 
     void registerInput(Layer& layer, const LayerDecl& decl, const std::string& input_name) {
@@ -517,6 +623,21 @@ bool CompiledScene::setBoxes(const std::string& input, const std::vector<Box>& b
 }
 
 void CompiledScene::applyParam(const ParamDecl& decl, const Value& value) {
+    // Bound UI controls first: their setters carry their own animation and
+    // never fire user-gesture events.
+    for (const ControlBinding& b : control_bindings_[decl.name]) {
+        switch (b.kind) {
+            case ControlBinding::Kind::SwitchOn:
+                static_cast<ui::Switch*>(b.control)->setOn(value.flag);
+                break;
+            case ControlBinding::Kind::SliderValue:
+                static_cast<ui::Slider*>(b.control)->setValue(value.num[0]);
+                break;
+            case ControlBinding::Kind::GaugeValue:
+                static_cast<ui::Gauge*>(b.control)->setValue(value.num[0]);
+                break;
+        }
+    }
     for (const ParamBinding& b : param_bindings_[decl.name]) {
         // Animation priority (§9): the param's animate declaration, else the
         // layer's transition, else snap.

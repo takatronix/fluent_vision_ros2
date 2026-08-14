@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.10.0 — 2026-08-14 (Phase L4: Scene で UI が動く)
+
+- **UI コントロールの Scene 語彙**: `button`(label) / `switch`(on) /
+  `slider`(value) / `gauge`(center, radius, value)。コンパイラは C++ 著者と
+  同じ ui:: プレハブを生成する(§10-1: 新しい描画機構ゼロ)。button/switch/
+  slider はレイヤーの `frame` 必須(validator が要求)
+- **$params 束縛**(§10-2): `switch: { on: $params.light }` — setParam が
+  コントロールを駆動する(プログラム変更はイベントを発火しない、C++ の
+  setter と同じ)。gauge は params でライブ表示
+- **イベントの出口**(§10-4): `CompiledScene::onUiEvent` に全コントロールの
+  ユーザー操作が `{id, control, value, flag}` で届く
+- **scene_web がインタラクティブに**: ページの pointer イベントを論理座標に
+  正規化して GET /pointer → フレーム境界で `stage.pointerDown/Move/Up` に
+  注入(§10-3)。UI イベントは /status にミラー、`--events /topic` で
+  std_msgs/String JSON としても publish — **§14 L4 完了条件
+  (ポインタ注入で動き、イベントが topic/コールバックに出る)を充足**
+- E2E: .fvs 宣言のボタン/スイッチ/スライダーをブラウザ経由の HTTP ポインタで
+  操作し、`{"id": "start", "control": "button", ...}` が ROS トピックに
+  届くことを実機で確認
+
+
 ## 0.9.0 — 2026-08-14 (Phase L3: インスペクター + ROS binding + scene_node)
 
 - **シーンインスペクター**（§13-3、`scene/inspector.hpp`）: 全レイヤーを

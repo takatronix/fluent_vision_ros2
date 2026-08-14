@@ -152,3 +152,28 @@ FS_CSTYLE(corner_radius)
 FS_CSTYLE(smoothing)
 FS_CSTYLE(show_label)
 FS_CONTENT_END(boxes)
+
+// ---- UI controls (§10, Phase L4) -------------------------------------------
+// Prefab subtrees with a state machine (ui.hpp): the compiler instantiates
+// the same ui:: classes a C++ author uses. button/switch/slider live in the
+// layer's declared `frame`; events leave through CompiledScene::onUiEvent
+// (and whatever the host wires it to — a ROS topic, a log). `on` and `value`
+// accept $params references for programmatic control.
+
+FS_CONTENT(button, "a momentary push button (ui.button prefab; needs frame)")
+FS_CFIELD(label, Str, 1, FS_DNONE, "the button label")
+FS_CONTENT_END(button)
+
+FS_CONTENT(switch, "a toggle switch (ui.switch prefab; needs frame)")
+FS_CFIELD(on, Bool, 0, FS_DNONE, "initial state; $params.<bool> binds it")
+FS_CONTENT_END(switch)
+
+FS_CONTENT(slider, "a horizontal slider, value 0..1 (ui.slider prefab; needs frame)")
+FS_CFIELD(value, F32, 0, FS_DF32(0), "initial value 0..1; $params.<f32> binds it")
+FS_CONTENT_END(slider)
+
+FS_CONTENT(gauge, "a display-only radial gauge, value 0..1 (ui.gauge prefab)")
+FS_CFIELD(center, Vec2, 1, FS_DNONE, "center in layer space")
+FS_CFIELD(radius, F32, 1, FS_DNONE, "outer radius in logical units")
+FS_CFIELD(value, F32, 0, FS_DF32(0), "displayed value 0..1; $params.<f32> binds it")
+FS_CONTENT_END(gauge)

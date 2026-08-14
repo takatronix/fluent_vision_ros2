@@ -55,6 +55,19 @@ namespace {
 
 constexpr const char* kPhaseNames = "";  // (diagnostics carry Phase enums)
 
+/// Content fields that accept a `$params` reference (§10: UI control state
+/// bound to a parameter). Everything else stays literal.
+bool fieldBindable(const std::string& content, const std::string& field) {
+    return (content == "switch" && field == "on") ||
+           (content == "slider" && field == "value") ||
+           (content == "gauge" && field == "value");
+}
+
+/// UI prefabs that live in the layer's declared frame (§10-1).
+bool needsFrame(const std::string& content) {
+    return content == "button" || content == "switch" || content == "slider";
+}
+
 bool isIdentifier(const std::string& s) {
     if (s.empty()) {
         return false;
@@ -681,6 +694,14 @@ private:
             }
         }
 
+        // UI prefabs are constructed into the declared frame (§10-1).
+        if (layer.content && needsFrame(layer.content->spec->name) &&
+            layer.find(AttrId::Frame) == nullptr) {
+            error("validate.required", layer.span,
+                  std::string(layer.content->spec->name) +
+                      " content needs the layer to declare 'frame'");
+        }
+
         // frame is sugar over bounds + position; both spellings at once are
         // ambiguous and rejected (same rule the C++ API documents).
         if (layer.find(AttrId::Frame) != nullptr) {
@@ -739,7 +760,8 @@ private:
                 MapField field;
                 field.spec = field_spec;
                 field.span = f.value.span;
-                if (!parseValue(f.value, field_spec->kind, doc, false, field.value)) {
+                const bool bindable = fieldBindable(spec->name, field_spec->name);
+                if (!parseValue(f.value, field_spec->kind, doc, bindable, field.value)) {
                     continue;
                 }
                 content.fields.push_back(std::move(field));

@@ -5,6 +5,7 @@
 // showing a broken frame.
 //
 //   scene_web scene.fvs [--port 8791] [--fps 30] [--image input=topic]...
+//             [--events /topic]   publish UI events as std_msgs/String JSON
 //
 //   GET /        minimal viewer page (stream + status readout)
 //   GET /stream  MJPEG of the live scene
@@ -52,6 +53,7 @@
 #ifdef FS_HAVE_ROS
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
+#include <std_msgs/msg/string.hpp>
 #endif
 
 using namespace fluent_stage;
@@ -72,6 +74,23 @@ uint64_t g_frame_seq = 0;
 
 std::mutex g_status_mutex;
 std::string g_status_json = "{}";
+
+// ---- pointer injection (§10-3): HTTP → queue → render thread ---------------
+// The Stage is single-thread owned, so HTTP handlers only enqueue; the
+// render loop drains at the frame boundary.
+
+struct PointerMsg {
+    int phase;  // 0 down, 1 move, 2 up
+    float x, y;
+};
+std::mutex g_pointer_mutex;
+std::vector<PointerMsg> g_pointer_queue;
+
+// Recent UI events (§10-4), mirrored into /status. `g_event_json_queue`
+// carries the same events as JSON for the optional ROS publisher.
+std::mutex g_events_mutex;
+std::vector<std::string> g_events;
+std::vector<std::string> g_event_json_queue;
 
 // ---- inspector snapshot, shared with /inspect and /at (§13-3) --------------
 // Plain values only (serialized JSON + geometry): the HTTP threads never
@@ -156,9 +175,28 @@ const char* kPage = R"HTML(<!doctype html>
          font-family: ui-monospace, monospace; color: #9aa7b4; }
   #bar.err { color: #ff8a80; }
 </style>
-<img src="/stream">
+<img id="v" src="/stream" draggable="false">
 <div id="bar">…</div>
 <script>
+// Pointer forwarding (§10-3): browser events → logical stage coordinates →
+// GET /pointer. The picture and every reaction stay on the robot.
+const v = document.getElementById('v');
+let lastMove = 0;
+function send(e, ev) {
+  const r = v.getBoundingClientRect();
+  const sx = (v.naturalWidth || r.width) / r.width;
+  const sy = (v.naturalHeight || r.height) / r.height;
+  const x = (ev.clientX - r.left) * sx;
+  const y = (ev.clientY - r.top) * sy;
+  fetch('/pointer?e=' + e + '&x=' + x.toFixed(1) + '&y=' + y.toFixed(1))
+      .catch(() => {});
+}
+v.addEventListener('pointerdown', ev => { v.setPointerCapture(ev.pointerId); send('down', ev); });
+v.addEventListener('pointermove', ev => {
+  const now = performance.now();
+  if (now - lastMove > 33) { lastMove = now; send('move', ev); }
+});
+v.addEventListener('pointerup', ev => send('up', ev));
 async function tick() {
   try {
     const s = await (await fetch('/status')).json();
@@ -167,7 +205,8 @@ async function tick() {
     bar.textContent = 'digest ' + s.digest.slice(0, 12) +
         '  reloads ' + s.reloads +
         (s.errors.length ? '\n' + s.errors.join('\n') : '') +
-        (s.warnings.length ? '\n' + s.warnings.join('\n') : '');
+        (s.warnings.length ? '\n' + s.warnings.join('\n') : '') +
+        (s.events.length ? '\nui: ' + s.events.join('  ') : '');
   } catch (e) {}
   setTimeout(tick, 1000);
 }
@@ -245,6 +284,27 @@ void serverLoop(uint16_t port) {
                 }
                 body += "]}";
                 sendResponse(fd, "200 OK", "application/json", body);
+            } else if (req.rfind("GET /pointer?", 0) == 0) {
+                // /pointer?e=down|move|up&x=<logical>&y=<logical>
+                int phase = -1;
+                if (req.find("e=down") != std::string::npos) {
+                    phase = 0;
+                } else if (req.find("e=move") != std::string::npos) {
+                    phase = 1;
+                } else if (req.find("e=up") != std::string::npos) {
+                    phase = 2;
+                }
+                float x = 0, y = 0;
+                const size_t xp = req.find("x="), yp = req.find("y=");
+                if (phase >= 0 && xp != std::string::npos && yp != std::string::npos) {
+                    x = std::strtof(req.c_str() + xp + 2, nullptr);
+                    y = std::strtof(req.c_str() + yp + 2, nullptr);
+                    std::lock_guard<std::mutex> lock(g_pointer_mutex);
+                    if (g_pointer_queue.size() < 256) {
+                        g_pointer_queue.push_back({phase, x, y});
+                    }
+                }
+                sendResponse(fd, "200 OK", "text/plain", "ok\n");
             } else if (req.rfind("GET /status", 0) == 0) {
                 std::string body;
                 {
@@ -412,6 +472,13 @@ void publishStatus(const std::string& digest, uint64_t reloads,
     for (size_t i = 0; i < warnings.size(); ++i) {
         json << (i ? ", " : "") << "\"" << escapeJson(warnings[i]) << "\"";
     }
+    json << "], \"events\": [";
+    {
+        std::lock_guard<std::mutex> lock(g_events_mutex);
+        for (size_t i = 0; i < g_events.size(); ++i) {
+            json << (i ? ", " : "") << "\"" << escapeJson(g_events[i]) << "\"";
+        }
+    }
     json << "]}";
     std::lock_guard<std::mutex> lock(g_status_mutex);
     g_status_json = json.str();
@@ -437,6 +504,31 @@ void clearErrorBanner(Stage& stage) {
     }
 }
 
+/// Wires a freshly-compiled scene's UI events into the shared event log
+/// (mirrored by /status; the render thread republishes them if ROS output
+/// is configured).
+void armUiEvents(fsc::CompiledScene& scene) {
+    scene.onUiEvent([](const fsc::UiEvent& e) {
+        char buf[160];
+        std::snprintf(buf, sizeof buf, "%s(%s)=%.3g", e.id.c_str(), e.control,
+                      static_cast<double>(e.value));
+        char json[224];
+        std::snprintf(json, sizeof json,
+                      "{\"id\": \"%s\", \"control\": \"%s\", \"value\": %.6g, "
+                      "\"flag\": %s}",
+                      e.id.c_str(), e.control, static_cast<double>(e.value),
+                      e.flag ? "true" : "false");
+        std::lock_guard<std::mutex> lock(g_events_mutex);
+        if (g_events.size() >= 8) {
+            g_events.erase(g_events.begin());
+        }
+        g_events.push_back(buf);
+        if (g_event_json_queue.size() < 64) {
+            g_event_json_queue.push_back(json);
+        }
+    });
+}
+
 time_t fileMtime(const std::string& path) {
     struct stat st {};
     return ::stat(path.c_str(), &st) == 0 ? st.st_mtime : 0;
@@ -456,12 +548,15 @@ int main(int argc, char** argv) {
     const std::string path = argv[1];
     uint16_t port = 8791;
     float fps = 30;
+    std::string events_topic;
     std::vector<std::pair<std::string, std::string>> image_feeds;  // input → topic
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
             fps = std::max(1.0f, static_cast<float>(std::atof(argv[++i])));
+        } else if (std::strcmp(argv[i], "--events") == 0 && i + 1 < argc) {
+            events_topic = argv[++i];
         } else if (std::strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
             const std::string spec = argv[++i];
             const size_t eq = spec.find('=');
@@ -484,12 +579,17 @@ int main(int argc, char** argv) {
     uint64_t reloads = 0;
     LoadOutcome current = loadScene(path);
     std::unique_ptr<fsc::CompiledScene> live = std::move(current.scene);
+    if (live != nullptr) {
+        armUiEvents(*live);
+    }
     std::unique_ptr<Stage> empty_stage;  // stand-in until the first good load
     if (live == nullptr) {
         empty_stage = std::make_unique<Stage>(1280, 720);
         showErrorBanner(*empty_stage, current.errors.empty() ? "?" : current.errors.front());
     }
-    publishStatus(live ? live->digest() : "-", reloads, current.errors, current.warnings);
+    std::vector<std::string> last_errors = current.errors;
+    std::vector<std::string> last_warnings = current.warnings;
+    publishStatus(live ? live->digest() : "-", reloads, last_errors, last_warnings);
     for (const auto& e : current.errors) {
         std::fprintf(stderr, "scene_web: %s\n", e.c_str());
     }
@@ -515,6 +615,12 @@ int main(int argc, char** argv) {
         std::printf("scene_web: $inputs.%s ← %s\n", input.c_str(), topic.c_str());
         feeds.push_back(std::move(feed));
     }
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr event_pub;
+    if (!events_topic.empty()) {
+        event_pub = node->create_publisher<std_msgs::msg::String>(events_topic,
+                                                                  rclcpp::QoS(10));
+        std::printf("scene_web: ui events → %s\n", events_topic.c_str());
+    }
     std::thread spin([&] {
         while (g_running) {
             rclcpp::spin_some(node);
@@ -522,6 +628,10 @@ int main(int argc, char** argv) {
         }
     });
 #else
+    if (!events_topic.empty()) {
+        std::fprintf(stderr,
+                     "scene_web: built without ROS — --events is ignored\n");
+    }
     if (!image_feeds.empty()) {
         std::fprintf(stderr,
                      "scene_web: built without ROS — --image feeds are ignored "
@@ -559,6 +669,7 @@ int main(int argc, char** argv) {
             ++reloads;
             if (candidate.scene != nullptr) {
                 live = std::move(candidate.scene);  // the frame-boundary swap
+                armUiEvents(*live);
                 empty_stage.reset();
                 clearErrorBanner(live->stage());
                 std::printf("scene_web: reload #%llu ok — digest %.12s\n",
@@ -573,8 +684,9 @@ int main(int argc, char** argv) {
                             static_cast<unsigned long long>(reloads),
                             candidate.errors.size());
             }
-            publishStatus(live ? live->digest() : "-", reloads, candidate.errors,
-                          candidate.warnings);
+            last_errors = candidate.errors;
+            last_warnings = candidate.warnings;
+            publishStatus(live ? live->digest() : "-", reloads, last_errors, last_warnings);
             std::fflush(stdout);
         }
 
@@ -602,6 +714,42 @@ int main(int argc, char** argv) {
         }
 #endif
 
+        // ---- pointer injection at the frame boundary (§10-3) --------------
+        {
+            std::vector<PointerMsg> pointers;
+            {
+                std::lock_guard<std::mutex> lock(g_pointer_mutex);
+                pointers.swap(g_pointer_queue);
+            }
+            if (live) {
+                for (const PointerMsg& m : pointers) {
+                    if (m.phase == 0) {
+                        live->stage().pointerDown({m.x, m.y});
+                    } else if (m.phase == 1) {
+                        live->stage().pointerMove({m.x, m.y});
+                    } else {
+                        live->stage().pointerUp({m.x, m.y});
+                    }
+                }
+            }
+        }
+
+#ifdef FS_HAVE_ROS
+        // UI events fired by the pointer injection above go out as JSON.
+        if (event_pub != nullptr) {
+            std::vector<std::string> out;
+            {
+                std::lock_guard<std::mutex> lock(g_events_mutex);
+                out.swap(g_event_json_queue);
+            }
+            for (std::string& j : out) {
+                std_msgs::msg::String msg;
+                msg.data = std::move(j);
+                event_pub->publish(std::move(msg));
+            }
+        }
+#endif
+
         // ---- render, encode, publish --------------------------------------
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::chrono::duration<float>(now - last_frame).count();
@@ -625,9 +773,13 @@ int main(int argc, char** argv) {
                 entries.push_back({fsc::placedLayerJson(p), p.to_stage, p.bounds,
                                    p.eff_opacity, p.paint_index});
             }
-            std::lock_guard<std::mutex> lock(g_inspect_mutex);
-            g_inspect_json = fsc::inspectJson(*live, placed);
-            g_inspect_entries = std::move(entries);
+            {
+                std::lock_guard<std::mutex> lock(g_inspect_mutex);
+                g_inspect_json = fsc::inspectJson(*live, placed);
+                g_inspect_entries = std::move(entries);
+            }
+            // Status carries the rolling UI event log; refresh it too.
+            publishStatus(live->digest(), reloads, last_errors, last_warnings);
         }
 
         next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(frame_time);

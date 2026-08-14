@@ -247,6 +247,31 @@ compiled.scene->setParam("hud_alpha", 0.0f);   // 0.3s かけてフェードア�
 （`protected: true` の遮蔽はエラー）、キャンバス外配置。生成 → validate →
 直す、のループがそのまま品質ループになります。
 
+## YAML で UI を宣言する（L4）
+
+```yaml
+schema: fluent.scene/v1alpha2
+params:
+  light: { type: bool, default: false }
+layers:
+  - id: start
+    frame: [24, 440, 220, 64]
+    content: { button: { label: "収穫開始" } }
+  - id: lamp
+    frame: [270, 450, 96, 48]
+    content: { switch: { on: $params.light } }   # setParam が状態を駆動
+```
+
+```cpp
+compiled.scene->onUiEvent([](const fs::UiEvent& e) {
+    // e.id = "start", e.control = "button" — topic に流すのも自由
+});
+compiled.scene->stage().pointerDown(p);   // 入力はポインタ注入(§10-3)
+```
+
+scene_web はこれを全部配線済み: ブラウザのクリック→/pointer→注入、
+イベント→/status と `--events /topic`。
+
 ## 既知の L0 制限（正直リスト）
 
 - `dash()` が効くのは line / polyline / polygon枠線。arc の破線は未対応

@@ -361,6 +361,78 @@ void testInspector() {
     CHECK(fs::atJson(placed, {40, 40}).find("\"rect\"") != std::string::npos);
 }
 
+void testSceneUiControls() {
+    const char* text = R"(schema: fluent.scene/v1alpha2
+stage: { size: [640, 480] }
+params:
+  light: { type: bool, default: false }
+  speed: { type: f32, default: 0.4 }
+layers:
+  - id: start
+    frame: [40, 400, 200, 56]
+    content: { button: { label: "収穫開始" } }
+  - id: lamp
+    frame: [260, 404, 84, 44]
+    content: { switch: { on: $params.light } }
+  - id: vel
+    frame: [360, 410, 200, 32]
+    content: { slider: { value: $params.speed } }
+  - id: meter
+    content: { gauge: { center: [560, 120], radius: 48, value: $params.speed } }
+)";
+    const fs::ParseResult parsed = fs::parseScene(text);
+    for (const auto& d : parsed.diagnostics.items()) {
+        std::fprintf(stderr, "  ui diag: [%s] %s\n", d.code.c_str(), d.message.c_str());
+    }
+    CHECK(parsed.ok());
+    fs::CompileResult compiled = fs::compile(parsed.doc);
+    CHECK(compiled.ok());
+    fs::CompiledScene& scene = *compiled.scene;
+    Stage& stage = scene.stage();
+
+    std::vector<fs::UiEvent> events;
+    scene.onUiEvent([&](const fs::UiEvent& e) { events.push_back(e); });
+
+    // A tap on the button fires an event carrying the declared id.
+    CHECK(stage.pointerDown({140, 428}));
+    stage.pointerUp({140, 428});
+    CHECK(events.size() == 1);
+    CHECK(events[0].id == "start");
+    CHECK(std::string(events[0].control) == "button");
+
+    // A tap on the switch toggles it (param default was false).
+    CHECK(stage.pointerDown({302, 426}));
+    stage.pointerUp({302, 426});
+    CHECK(events.size() == 2);
+    CHECK(events[1].id == "lamp");
+    CHECK(events[1].flag == true);
+
+    // setParam drives bound controls and fires no user event.
+    const size_t before = events.size();
+    CHECK(scene.setParam("light", false));
+    CHECK(scene.setParam("speed", 0.9f));
+    CHECK(events.size() == before);
+
+    // A slider drag emits continuous values in 0..1.
+    CHECK(stage.pointerDown({460, 426}));
+    stage.pointerMove({560, 426});
+    stage.pointerUp({560, 426});
+    CHECK(events.size() > before);
+    CHECK(events.back().id == "vel");
+    CHECK(events.back().value >= 0.0f && events.back().value <= 1.0f);
+
+    // Rejections: a button without a frame, a param-type mismatch.
+    auto errorsOf = [](const std::string& body) {
+        return fs::parseScene("schema: fluent.scene/v1alpha2\n" + body).diagnostics;
+    };
+    CHECK(hasCode(errorsOf("layers:\n  - content: { button: { label: x } }\n"),
+                  "validate.required"));
+    CHECK(hasCode(errorsOf("params:\n  s: { type: f32, default: 1 }\nlayers:\n"
+                           "  - frame: [0, 0, 80, 40]\n"
+                           "    content: { switch: { on: $params.s } }\n"),
+                  "validate.type"));
+}
+
 void testBindingDoc() {
     const char* kBinding = R"(schema: fluent.binding/v1alpha1
 kind: Binding
@@ -463,6 +535,7 @@ int main() {
     testParamsAnimateAndInputs();
     testLinter();
     testInspector();
+    testSceneUiControls();
     testBindingDoc();
     testDescribe();
     if (g_failures == 0) {
