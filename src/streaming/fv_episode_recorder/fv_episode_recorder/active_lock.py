@@ -82,12 +82,17 @@ def _pid_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        pass
+        pass      # 存在はする — 録画ノードかどうかは cmdline で判定
+    return _pid_is_recorder(pid)
+
+
+def _pid_is_recorder(pid: int) -> bool:
+    """pid の cmdline が録画ノードのものか (テストから直接検証できる形)。
+
+    /proc が読めない場合は False = 録画ノードではない扱い (ロックは orphan
+    として上書きされ、次の録画開始で回復する)。"""
     try:
         cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
         return b"recorder_node" in cmdline
-    except OSError:
+    except OSError:      # PermissionError 含む
         return False
-    except PermissionError:
-        # process exists but we lack signal permission -> treat as alive
-        return True
