@@ -130,7 +130,8 @@ int runWithBindings(const fluent_scene::ValidationResult& scene,
 
 int runBackend(const std::string& backend, const fluent_scene::ValidationResult& scene,
                const fluent_scene::PlanResult& plan, int frames, uint32_t camera_w, uint32_t camera_h,
-               uint32_t out_w, uint32_t out_h, bool validate_layers, const std::string& out_path) {
+               uint32_t out_w, uint32_t out_h, bool validate_layers, const std::string& out_path,
+               const std::vector<std::pair<std::string, float>>& set_params) {
     fluent_scene::DiagnosticList diagnostics;
     fluent_scene::RendererOptions options;
     options.enable_validation = validate_layers;
@@ -148,6 +149,13 @@ int runBackend(const std::string& backend, const fluent_scene::ValidationResult&
     if (!renderer->loadScene(scene, plan, diagnostics)) {
         printDiagnostics(diagnostics);
         return 1;
+    }
+    for (const auto& [param_name, param_value] : set_params) {
+        if (!renderer->setParam(param_name, param_value)) {
+            std::cerr << "fv_render: cannot set parameter \"" << param_name
+                      << "\" (must be a runtime_mutable f32 scene param)\n";
+            return 1;
+        }
     }
     std::vector<double> cpu_ms, gpu_ms;
     for (int frame = 0; frame < frames; ++frame) {
@@ -204,10 +212,18 @@ int main(int argc, char** argv) {
     uint32_t camera_w = 1280, camera_h = 720;
     bool validate_layers = false;
     bool use_bindings = false;
+    std::vector<std::pair<std::string, float>> set_params;
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--bindings") {
             use_bindings = true;
+        } else if (arg == "--set" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const size_t eq = spec.find('=');
+            if (eq != std::string::npos) {
+                set_params.emplace_back(spec.substr(0, eq),
+                                        static_cast<float>(std::atof(spec.substr(eq + 1).c_str())));
+            }
         } else if (arg == "--backend" && i + 1 < argc) {
             backend = argv[++i];
         } else if (arg == "--frames" && i + 1 < argc) {
@@ -265,12 +281,13 @@ int main(int argc, char** argv) {
     if (backend == "both") {
         const int vulkan_result = runBackend("vulkan", scene, plan, frames, camera_w, camera_h, out_w,
                                              out_h, validate_layers,
-                                             out_path.empty() ? "" : out_path + ".vulkan.ppm");
+                                             out_path.empty() ? "" : out_path + ".vulkan.ppm",
+                                             set_params);
         const int cpu_result = runBackend("cpu", scene, plan, frames, camera_w, camera_h, out_w, out_h,
                                           validate_layers,
-                                          out_path.empty() ? "" : out_path + ".cpu.ppm");
+                                          out_path.empty() ? "" : out_path + ".cpu.ppm", set_params);
         return vulkan_result != 0 ? vulkan_result : cpu_result;
     }
     return runBackend(backend, scene, plan, frames, camera_w, camera_h, out_w, out_h, validate_layers,
-                      out_path);
+                      out_path, set_params);
 }

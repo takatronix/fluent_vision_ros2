@@ -4,6 +4,7 @@
 // the flat draw list both renderer backends execute. No GPU types here.
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@ struct DrawOp {
 
     // kImage
     std::string fit;  // contain | cover | fill
+    std::vector<std::string> effect_chain;  // effect node ids, first-applied first
 
     // kBoxes
     float color[4] = {1, 1, 1, 1};
@@ -44,11 +46,36 @@ struct DrawOp {
     uint64_t glyph_capacity = 0;
 };
 
+// Image-space effect (spec section 7.4 Effects): consumes an image, produces
+// an image, with statically bounded kernels/passes.
+struct EffectOp {
+    enum class Kind { kBlur, kColorTransform };
+    Kind kind = Kind::kBlur;
+    std::string node_id;
+    std::string source_input;   // set when the source is a scene input
+    std::string source_effect;  // set when chained onto another effect
+    float radius = 4.0f;        // kBlur (backend clamps to 16)
+    float brightness = 0.0f;    // kColorTransform
+    float contrast = 1.0f;
+    float saturation = 1.0f;
+    float gamma = 1.0f;
+    // When a value came from a $params reference, the scene-parameter name is
+    // recorded here so runtime_mutable updates flow through per frame.
+    std::string radius_param;
+    std::string brightness_param;
+    std::string contrast_param;
+    std::string saturation_param;
+    std::string gamma_param;
+};
+
 struct SceneModel {
     std::string name;
     uint32_t width = 0;
     uint32_t height = 0;
-    std::vector<DrawOp> draws;  // z-order of the exported composite
+    // runtime_mutable f32 scene params: name -> default value.
+    std::map<std::string, float> mutable_params;
+    std::vector<EffectOp> effects;  // dependency order (sources first)
+    std::vector<DrawOp> draws;      // z-order of the exported composite
 };
 
 // Builds the model from the exported composite of `plan`. Reports

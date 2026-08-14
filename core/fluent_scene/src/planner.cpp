@@ -161,8 +161,9 @@ struct PlanDraw {
 
 struct PlanPass {
     std::string id;
-    std::string kind;  // upload | render
+    std::string kind;  // upload | filter | render
     std::string target;
+    std::vector<std::string> reads;   // filter passes: sampled sources
     std::vector<std::string> writes;
     std::vector<PlanDraw> draws;
     uint64_t bytes_per_frame = 0;
@@ -478,9 +479,58 @@ private:
         return false;
     }
 
+    // Intermediate image for an effect node, sized worst-case like all images.
+    std::string ensureEffectImage(const std::string& id, const std::string& source_ref) {
+        PlanResource& resource = ensureResource(id);
+        resource.kind = "image";
+        resource.format = "rgba8";
+        resource.width = max_width_;
+        resource.height = max_height_;
+        resource.bytes = max_width_ * max_height_ * 4;
+        resource.residency = "device";
+        resource.source = source_ref;
+        resource.aliasable = true;  // transient: never exported, rebuilt every frame
+        return id;
+    }
+
+    std::string resolveImageRef(const std::string& ref) {
+        const std::vector<std::string> parts = refParts(ref);
+        if (parts.size() == 2 && parts[0] == "$inputs") {
+            return ensureImportedImage(parts[1]);
+        }
+        if (parts.size() == 3 && parts[0] == "$nodes") {
+            return "img.node." + parts[1];
+        }
+        return {};
+    }
+
     void lowerLiveComposites() {
         for (const std::string& id : node_order_) {
-            if (live_.count(id) == 0 || node_types_.at(id) != "composite.layers") {
+            if (live_.count(id) == 0) {
+                continue;
+            }
+            const std::string& node_type = node_types_.at(id);
+            if (node_type == "effects.blur" || node_type == "effects.color_transform") {
+                const JsonValue& node = *nodes_.at(id);
+                PlanPass pass;
+                pass.id = "pass.filter." + id;
+                pass.kind = "filter";
+                pass.target = ensureEffectImage("img.node." + id, "$nodes." + id + ".image");
+                pass.writes.push_back(pass.target);
+                const std::string source = resolveImageRef(portRef(node, "image"));
+                if (!source.empty()) {
+                    pass.reads.push_back(source);
+                }
+                if (node_type == "effects.blur") {
+                    // Separable Gaussian: horizontal into a transient ping
+                    // buffer, vertical into the target (2 bounded passes).
+                    pass.writes.push_back(
+                        ensureEffectImage("img.node." + id + ".tmp", "$nodes." + id + ".image"));
+                }
+                render_passes_.push_back(std::move(pass));
+                continue;
+            }
+            if (node_type != "composite.layers") {
                 continue;
             }
             const JsonValue& node = *nodes_.at(id);
@@ -561,6 +611,9 @@ private:
             for (const std::string& id : pass.writes) {
                 touch(id);
             }
+            for (const std::string& id : pass.reads) {
+                touch(id);
+            }
             if (pass.kind == "upload") {
                 touch("staging.upload");
             }
@@ -614,6 +667,13 @@ private:
             pass_value.set("index", JsonValue::makeUInt(index));
             if (!pass.target.empty()) {
                 pass_value.set("target", JsonValue::makeString(pass.target));
+            }
+            if (!pass.reads.empty()) {
+                JsonValue reads = JsonValue::makeArray();
+                for (const std::string& id : pass.reads) {
+                    reads.append(JsonValue::makeString(id));
+                }
+                pass_value.set("reads", std::move(reads));
             }
             JsonValue writes = JsonValue::makeArray();
             for (const std::string& id : pass.writes) {

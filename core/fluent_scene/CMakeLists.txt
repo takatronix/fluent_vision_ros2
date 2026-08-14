@@ -67,7 +67,8 @@ if(FLUENT_SCENE_RENDERER)
         file(MAKE_DIRECTORY ${FVS_SHADER_GEN})
         set(FVS_SHADER_INCS "")
         foreach(FVS_SHADER image.vert image.frag boxes.vert boxes.frag text.vert text.frag
-                circles.vert circles.frag polyline.vert polyline.frag)
+                circles.vert circles.frag polyline.vert polyline.frag
+                fullscreen.vert blur.frag color.frag)
             set(FVS_SHADER_INC ${FVS_SHADER_GEN}/${FVS_SHADER}.inc)
             add_custom_command(
                 OUTPUT ${FVS_SHADER_INC}

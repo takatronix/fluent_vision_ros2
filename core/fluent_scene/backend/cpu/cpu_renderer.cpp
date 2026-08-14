@@ -53,6 +53,7 @@ public:
             }
         }
         stats_.pipeline_compiles = 0;  // nothing to compile on the CPU path
+        runtime_params_ = model_.mutable_params;
         loaded_ = true;
         return true;
     }
@@ -80,7 +81,11 @@ public:
                 case render::DrawOp::Kind::kImage: {
                     auto it = inputs.images.find(op.source_input);
                     if (it != inputs.images.end() && it->second.pixels != nullptr) {
-                        drawImage(it->second, op.fit);
+                        CpuImageView view = it->second;
+                        for (const std::string& effect_id : op.effect_chain) {
+                            view = applyEffect(effect_id, view);
+                        }
+                        drawImage(view, op.fit);
                     }
                     break;
                 }
@@ -177,7 +182,24 @@ public:
     const RenderStats& stats() const override { return stats_; }
     const char* name() const override { return "cpu"; }
 
+    bool setParam(const std::string& name, float value) override {
+        auto it = runtime_params_.find(name);
+        if (it == runtime_params_.end()) {
+            return false;
+        }
+        it->second = value;
+        return true;
+    }
+
 private:
+    float effectValue(float literal, const std::string& param_ref) const {
+        if (param_ref.empty()) {
+            return literal;
+        }
+        auto it = runtime_params_.find(param_ref);
+        return it != runtime_params_.end() ? it->second : literal;
+    }
+
     void blendPixel(int x, int y, const float* rgba, float coverage) {
         if (x < 0 || y < 0 || x >= static_cast<int>(model_.width) ||
             y >= static_cast<int>(model_.height)) {
@@ -262,6 +284,87 @@ private:
                 }
             }
         }
+    }
+
+    // Image-space effects, mirroring the GPU shaders (blur.frag / color.frag).
+    CpuImageView applyEffect(const std::string& effect_id, const CpuImageView& source) {
+        const render::EffectOp* op = nullptr;
+        for (const render::EffectOp& candidate : model_.effects) {
+            if (candidate.node_id == effect_id) {
+                op = &candidate;
+                break;
+            }
+        }
+        if (op == nullptr || source.pixels == nullptr) {
+            return source;
+        }
+        std::vector<uint8_t>& out = effect_pixels_[effect_id];
+        out.resize(static_cast<size_t>(source.width) * source.height * 4);
+        if (op->kind == render::EffectOp::Kind::kColorTransform) {
+            const float brightness = effectValue(op->brightness, op->brightness_param);
+            const float contrast = effectValue(op->contrast, op->contrast_param);
+            const float saturation = effectValue(op->saturation, op->saturation_param);
+            const float gamma = std::max(effectValue(op->gamma, op->gamma_param), 0.05f);
+            const size_t count = static_cast<size_t>(source.width) * source.height;
+            for (size_t i = 0; i < count; ++i) {
+                const uint8_t* src = source.pixels + i * 4;
+                uint8_t* dst = out.data() + i * 4;
+                float c[3];
+                for (int ch = 0; ch < 3; ++ch) {
+                    c[ch] = (static_cast<float>(src[ch]) / 255.0f - 0.5f) * contrast + 0.5f +
+                            brightness;
+                }
+                const float luma = 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2];
+                for (int ch = 0; ch < 3; ++ch) {
+                    float v = luma + (c[ch] - luma) * saturation;
+                    v = std::pow(std::clamp(v, 0.0f, 1.0f), 1.0f / gamma);
+                    dst[ch] = static_cast<uint8_t>(std::lround(v * 255.0f));
+                }
+                dst[3] = 0xff;
+            }
+        } else {
+            const float radius =
+                std::clamp(effectValue(op->radius, op->radius_param), 0.5f, 16.0f);
+            const float sigma = std::max(radius * 0.5f, 0.3f);
+            const float two_sigma2 = 2.0f * sigma * sigma;
+            const float step = std::max(radius / 6.0f, 0.001f);
+            float weights[13];
+            float weight_sum = 0.0f;
+            for (int i = -6; i <= 6; ++i) {
+                const float offset = static_cast<float>(i) * step;
+                weights[i + 6] = std::exp(-(offset * offset) / two_sigma2);
+                weight_sum += weights[i + 6];
+            }
+            std::vector<uint8_t>& tmp = effect_tmp_;
+            tmp.resize(out.size());
+            const int w = static_cast<int>(source.width);
+            const int h = static_cast<int>(source.height);
+            const auto pass = [&](const uint8_t* src, uint8_t* dst, bool horizontal) {
+                for (int y = 0; y < h; ++y) {
+                    for (int x = 0; x < w; ++x) {
+                        float sum[3] = {0, 0, 0};
+                        for (int i = -6; i <= 6; ++i) {
+                            const int offset = static_cast<int>(std::lround(i * step));
+                            const int sx = std::clamp(horizontal ? x + offset : x, 0, w - 1);
+                            const int sy = std::clamp(horizontal ? y : y + offset, 0, h - 1);
+                            const uint8_t* pixel = src + (static_cast<size_t>(sy) * w + sx) * 4;
+                            const float weight = weights[i + 6];
+                            sum[0] += pixel[0] * weight;
+                            sum[1] += pixel[1] * weight;
+                            sum[2] += pixel[2] * weight;
+                        }
+                        uint8_t* pixel = dst + (static_cast<size_t>(y) * w + x) * 4;
+                        for (int ch = 0; ch < 3; ++ch) {
+                            pixel[ch] = static_cast<uint8_t>(std::lround(sum[ch] / weight_sum));
+                        }
+                        pixel[3] = 0xff;
+                    }
+                }
+            };
+            pass(source.pixels, tmp.data(), /*horizontal=*/true);
+            pass(tmp.data(), out.data(), /*horizontal=*/false);
+        }
+        return CpuImageView{source.width, source.height, out.data()};
     }
 
     // Same SDF + smoothstep rules as the GPU shaders so both backends agree.
@@ -364,6 +467,9 @@ private:
     std::vector<uint8_t> framebuffer_;
     std::map<std::string, std::unique_ptr<render::TextAtlas>> atlases_;
     std::map<std::string, render::BoxSmoother> smoothers_;
+    std::map<std::string, std::vector<uint8_t>> effect_pixels_;
+    std::vector<uint8_t> effect_tmp_;
+    std::map<std::string, float> runtime_params_;
     std::chrono::steady_clock::time_point last_frame_time_;
     bool has_last_frame_time_ = false;
     double frame_dt_ = 1.0 / 30.0;

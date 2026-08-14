@@ -77,6 +77,25 @@ const JsonValue* paramLiteral(const JsonValue& ir, const JsonValue& node, const 
     return value;
 }
 
+// Returns the scene-parameter name when a node parameter is a $params
+// reference, empty otherwise.
+std::string paramRefName(const JsonValue& node, const std::string& name) {
+    const JsonValue* param = findByName(node.find("params"), "name", name);
+    if (param == nullptr) {
+        return {};
+    }
+    const JsonValue* value = param->find("value");
+    if (value == nullptr || !value->isObject()) {
+        return {};
+    }
+    const JsonValue* ref = value->find("ref");
+    if (ref == nullptr) {
+        return {};
+    }
+    const std::vector<std::string> parts = refParts(ref->stringValue());
+    return parts.size() == 2 && parts[0] == "$params" ? parts[1] : std::string{};
+}
+
 void readVec(const JsonValue* value, float* out, size_t count) {
     if (value == nullptr || !value->isArray() || value->elements().size() != count) {
         return;
@@ -132,6 +151,24 @@ bool buildSceneModel(const ValidationResult& scene, const PlanResult& plan, Scen
     out.width = static_cast<uint32_t>(budgets->find("max_width")->uintValue());
     out.height = static_cast<uint32_t>(budgets->find("max_height")->uintValue());
 
+    // Collect runtime_mutable f32 scene params (the live-tunable knobs).
+    if (const JsonValue* params = ir.find("params")) {
+        for (const JsonValue& param : params->elements()) {
+            const JsonValue* mutable_flag = param.find("runtime_mutable");
+            const JsonValue* type = param.find("type");
+            if (mutable_flag == nullptr || !mutable_flag->boolValue() || type == nullptr ||
+                type->stringValue() != "f32") {
+                continue;
+            }
+            float value = 0.0f;
+            const JsonValue* default_value = param.find("default");
+            if (default_value != nullptr) {
+                value = static_cast<float>(default_value->floatValue());
+            }
+            out.mutable_params[param.find("name")->stringValue()] = value;
+        }
+    }
+
     // The stage-2 backends render the first exported image output.
     const JsonValue* plan_outputs = plan.plan.find("outputs");
     if (plan_outputs == nullptr || !plan_outputs->isArray() || plan_outputs->elements().empty()) {
@@ -175,17 +212,92 @@ bool buildSceneModel(const ValidationResult& scene, const PlanResult& plan, Scen
         draw.node_id = node_id;
         if (op == "draw_image") {
             draw.kind = DrawOp::Kind::kImage;
-            const std::string ref = portRef(*node, "image");
-            const std::vector<std::string> parts = refParts(ref);
-            if (parts.size() != 2 || parts[0] != "$inputs") {
+            draw.fit = readString(paramLiteral(ir, *node, "fit"), "contain");
+            // Follow the image reference through any effect chain back to a
+            // scene input; composite-produced images are still unsupported.
+            std::string ref = portRef(*node, "image");
+            std::vector<std::string> chain;  // draw-side first while walking
+            bool resolved = false;
+            for (int depth = 0; depth < 8; ++depth) {
+                const std::vector<std::string> parts = refParts(ref);
+                if (parts.size() == 2 && parts[0] == "$inputs") {
+                    draw.source_input = parts[1];
+                    resolved = true;
+                    break;
+                }
+                if (parts.size() != 3 || parts[0] != "$nodes") {
+                    break;
+                }
+                const JsonValue* upstream = findByName(nodes, "id", parts[1]);
+                if (upstream == nullptr) {
+                    break;
+                }
+                const std::string upstream_type = upstream->find("type")->stringValue();
+                if (upstream_type != "effects.blur" && upstream_type != "effects.color_transform") {
+                    break;  // e.g. a composite image — not supported yet
+                }
+                chain.push_back(parts[1]);
+                EffectOp effect;
+                effect.node_id = parts[1];
+                if (upstream_type == "effects.blur") {
+                    effect.kind = EffectOp::Kind::kBlur;
+                    const JsonValue* radius = paramLiteral(ir, *upstream, "radius");
+                    if (radius != nullptr) {
+                        effect.radius = static_cast<float>(radius->floatValue());
+                    }
+                    effect.radius_param = paramRefName(*upstream, "radius");
+                } else {
+                    effect.kind = EffectOp::Kind::kColorTransform;
+                    const JsonValue* v = paramLiteral(ir, *upstream, "brightness");
+                    if (v != nullptr) effect.brightness = static_cast<float>(v->floatValue());
+                    v = paramLiteral(ir, *upstream, "contrast");
+                    if (v != nullptr) effect.contrast = static_cast<float>(v->floatValue());
+                    v = paramLiteral(ir, *upstream, "saturation");
+                    if (v != nullptr) effect.saturation = static_cast<float>(v->floatValue());
+                    v = paramLiteral(ir, *upstream, "gamma");
+                    if (v != nullptr) effect.gamma = static_cast<float>(v->floatValue());
+                    effect.brightness_param = paramRefName(*upstream, "brightness");
+                    effect.contrast_param = paramRefName(*upstream, "contrast");
+                    effect.saturation_param = paramRefName(*upstream, "saturation");
+                    effect.gamma_param = paramRefName(*upstream, "gamma");
+                }
+                ref = portRef(*upstream, "image");
+                const std::vector<std::string> src = refParts(ref);
+                if (src.size() == 2 && src[0] == "$inputs") {
+                    effect.source_input = src[1];
+                } else if (src.size() == 3 && src[0] == "$nodes") {
+                    effect.source_effect = src[1];
+                }
+                bool known = false;
+                for (const EffectOp& existing : out.effects) {
+                    if (existing.node_id == effect.node_id) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    // Insert before any effect that consumes this one so the
+                    // list stays in dependency order (sources first).
+                    size_t at = out.effects.size();
+                    for (size_t i = 0; i < out.effects.size(); ++i) {
+                        if (out.effects[i].source_effect == effect.node_id) {
+                            at = i;
+                            break;
+                        }
+                    }
+                    out.effects.insert(out.effects.begin() + static_cast<ptrdiff_t>(at),
+                                       std::move(effect));
+                }
+            }
+            if (!resolved) {
                 err(diagnostics, "compile.unsupported_output",
                     "node \"" + node_id +
-                        "\": the stage-2 backend renders images from scene inputs only "
-                        "(nested composites are not supported yet)");
+                        "\": image sources must be a scene input, optionally through "
+                        "effects.* nodes (composite chaining is not supported yet)");
                 return false;
             }
-            draw.source_input = parts[1];
-            draw.fit = readString(paramLiteral(ir, *node, "fit"), "contain");
+            std::reverse(chain.begin(), chain.end());  // first-applied first
+            draw.effect_chain = std::move(chain);
         } else if (op == "draw_boxes") {
             draw.kind = DrawOp::Kind::kBoxes;
             const std::vector<std::string> parts = refParts(portRef(*node, "detections"));

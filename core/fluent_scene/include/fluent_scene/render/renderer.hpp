@@ -81,6 +81,13 @@ public:
     // Copies the exported output image as tightly packed RGBA8.
     virtual bool readback(std::vector<uint8_t>& pixels, uint32_t& width, uint32_t& height) = 0;
 
+    // Updates a scene parameter declared `runtime_mutable` (f32 only for now).
+    // Effect parameters bound via $params references pick the new value up on
+    // the next frame — a small parameter-block update, never a recompile
+    // (spec section 7.3). Returns false for unknown, immutable, or non-f32
+    // parameters.
+    virtual bool setParam(const std::string& name, float value) = 0;
+
     virtual const RenderStats& stats() const = 0;
     virtual const char* name() const = 0;
 };

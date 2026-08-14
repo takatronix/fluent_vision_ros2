@@ -56,6 +56,15 @@ static const uint32_t kPolylineVertSpv[] =
 static const uint32_t kPolylineFragSpv[] =
 #include "polyline.frag.inc"
     ;
+static const uint32_t kFullscreenVertSpv[] =
+#include "fullscreen.vert.inc"
+    ;
+static const uint32_t kBlurFragSpv[] =
+#include "blur.frag.inc"
+    ;
+static const uint32_t kColorFragSpv[] =
+#include "color.frag.inc"
+    ;
 
 struct PcImage {
     float dst_rect[4];
@@ -84,6 +93,17 @@ struct PcPolyline {
     float viewport[2];
     float thickness;
     float pad;
+};
+struct PcBlur {
+    float texel[2];
+    float radius;
+    float pad;
+};
+struct PcColor {
+    float brightness;
+    float contrast;
+    float saturation;
+    float gamma;
 };
 static_assert(sizeof(PcImage) == 32 && sizeof(PcBoxes) == 32 && sizeof(PcText) == 32 &&
                   sizeof(PcCircles) == 32 && sizeof(PcPolyline) == 32,
@@ -120,6 +140,7 @@ public:
             !createSceneResources(diagnostics)) {
             return false;
         }
+        runtime_params_ = model_.mutable_params;
         loaded_ = true;
         return true;
     }
@@ -131,7 +152,24 @@ public:
     const RenderStats& stats() const override { return stats_; }
     const char* name() const override { return "vulkan"; }
 
+    bool setParam(const std::string& name, float value) override {
+        auto it = runtime_params_.find(name);
+        if (it == runtime_params_.end()) {
+            return false;
+        }
+        it->second = value;
+        return true;
+    }
+
 private:
+    float effectValue(float literal, const std::string& param_ref) const {
+        if (param_ref.empty()) {
+            return literal;
+        }
+        auto it = runtime_params_.find(param_ref);
+        return it != runtime_params_.end() ? it->second : literal;
+    }
+
     // ---- helpers -----------------------------------------------------------
 
     static void diag(DiagnosticList& diagnostics, const char* code, const std::string& message) {
@@ -173,6 +211,19 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    };
+
+    struct EffectState {
+        const render::EffectOp* op = nullptr;
+        Image target;
+        Image tmp;  // blur ping buffer
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        VkFramebuffer fb_tmp = VK_NULL_HANDLE;
+        VkDescriptorSet source_set = VK_NULL_HANDLE;  // samples the effect source
+        VkDescriptorSet tmp_set = VK_NULL_HANDLE;     // samples tmp (blur 2nd pass)
+        VkDescriptorSet target_set = VK_NULL_HANDLE;  // sampled by downstream draws
+        VkImageView last_source_view = VK_NULL_HANDLE;
+        bool ready = false;
     };
 
     bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
@@ -496,7 +547,9 @@ private:
     bool createPipeline(VkShaderModule vert, VkShaderModule frag, bool with_texture,
                         const VkVertexInputBindingDescription* binding,
                         const std::vector<VkVertexInputAttributeDescription>& attributes,
-                        VkPipelineLayout layout, VkPipeline& out, DiagnosticList& diagnostics) {
+                        VkPipelineLayout layout, VkPipeline& out, DiagnosticList& diagnostics,
+                        VkRenderPass target_pass = VK_NULL_HANDLE, bool enable_blend = true,
+                        bool dynamic_viewport = false) {
         VkPipelineShaderStageCreateInfo stages[2] = {};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -542,7 +595,7 @@ private:
         multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
         VkPipelineColorBlendAttachmentState blend_attachment{};
-        blend_attachment.blendEnable = VK_TRUE;
+        blend_attachment.blendEnable = enable_blend ? VK_TRUE : VK_FALSE;
         blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
         blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         blend_attachment.colorBlendOp = VK_BLEND_OP_ADD;
@@ -556,6 +609,12 @@ private:
         blend.attachmentCount = 1;
         blend.pAttachments = &blend_attachment;
 
+        VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo dynamic{};
+        dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamic.dynamicStateCount = 2;
+        dynamic.pDynamicStates = dynamic_states;
+
         VkGraphicsPipelineCreateInfo pipeline{};
         pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         pipeline.stageCount = 2;
@@ -566,8 +625,11 @@ private:
         pipeline.pRasterizationState = &raster;
         pipeline.pMultisampleState = &multisample;
         pipeline.pColorBlendState = &blend;
+        if (dynamic_viewport) {
+            pipeline.pDynamicState = &dynamic;
+        }
         pipeline.layout = layout;
-        pipeline.renderPass = render_pass_;
+        pipeline.renderPass = target_pass != VK_NULL_HANDLE ? target_pass : render_pass_;
         pipeline.subpass = 0;
         if (!vkOk(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &out),
                   diagnostics, "vkCreateGraphicsPipelines")) {
@@ -669,14 +731,75 @@ private:
             ok = createPipeline(polyline_vert, polyline_frag, false, &instance_binding, attributes,
                                 plain_pipeline_layout_, polyline_pipeline_, diagnostics);
         }
+        VkShaderModule fullscreen_vert = VK_NULL_HANDLE;
+        VkShaderModule blur_frag = VK_NULL_HANDLE;
+        VkShaderModule color_frag = VK_NULL_HANDLE;
+        if (ok && !model_.effects.empty()) {
+            ok = createFilterPass(diagnostics);
+            fullscreen_vert = createShader(kFullscreenVertSpv, sizeof(kFullscreenVertSpv), diagnostics);
+            blur_frag = createShader(kBlurFragSpv, sizeof(kBlurFragSpv), diagnostics);
+            color_frag = createShader(kColorFragSpv, sizeof(kColorFragSpv), diagnostics);
+            ok = ok && fullscreen_vert != VK_NULL_HANDLE && blur_frag != VK_NULL_HANDLE &&
+                 color_frag != VK_NULL_HANDLE;
+            if (ok) {
+                ok = createPipeline(fullscreen_vert, blur_frag, true, nullptr, {},
+                                    textured_pipeline_layout_, blur_pipeline_, diagnostics,
+                                    filter_pass_, /*blend=*/false, /*dynamic_viewport=*/true) &&
+                     createPipeline(fullscreen_vert, color_frag, true, nullptr, {},
+                                    textured_pipeline_layout_, color_pipeline_, diagnostics,
+                                    filter_pass_, /*blend=*/false, /*dynamic_viewport=*/true);
+            }
+        }
         for (VkShaderModule module :
              {image_vert, image_frag, boxes_vert, boxes_frag, text_vert, text_frag, circles_vert,
-              circles_frag, polyline_vert, polyline_frag}) {
+              circles_frag, polyline_vert, polyline_frag, fullscreen_vert, blur_frag, color_frag}) {
             if (module != VK_NULL_HANDLE) {
                 vkDestroyShaderModule(device_, module, nullptr);
             }
         }
         return ok;
+    }
+
+    // Offscreen pass for image-space effects: color rgba8, contents discarded
+    // on load, left in SHADER_READ_ONLY for downstream sampling.
+    bool createFilterPass(DiagnosticList& diagnostics) {
+        VkAttachmentDescription color{};
+        color.format = VK_FORMAT_R8G8B8A8_UNORM;
+        color.samples = VK_SAMPLE_COUNT_1_BIT;
+        color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        color.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkAttachmentReference color_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &color_ref;
+        VkSubpassDependency deps[2] = {};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        deps[0].dstSubpass = 0;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].srcSubpass = 0;
+        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        VkRenderPassCreateInfo pass{};
+        pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        pass.attachmentCount = 1;
+        pass.pAttachments = &color;
+        pass.subpassCount = 1;
+        pass.pSubpasses = &subpass;
+        pass.dependencyCount = 2;
+        pass.pDependencies = deps;
+        return vkOk(vkCreateRenderPass(device_, &pass, nullptr, &filter_pass_), diagnostics,
+                    "vkCreateRenderPass(filter)");
     }
 
     bool createSceneResources(DiagnosticList& diagnostics) {
@@ -771,14 +894,24 @@ private:
             return false;
         }
 
-        // Descriptor pool: one set per sampled image draw (inputs) + atlases.
+        // Descriptor pool: one set per sampled image draw (inputs) + atlases
+        // + three per effect (source / tmp / target sampling).
         uint32_t sampled_sets = static_cast<uint32_t>(atlases_.size());
         for (const render::DrawOp& draw : model_.draws) {
             if (draw.kind == render::DrawOp::Kind::kImage) {
                 ++sampled_sets;
             }
         }
+        sampled_sets += static_cast<uint32_t>(model_.effects.size()) * 3u;
         sampled_sets = std::max(sampled_sets, 1u);
+        effect_states_.clear();
+        effect_index_.clear();
+        for (const render::EffectOp& effect : model_.effects) {
+            EffectState state;
+            state.op = &effect;
+            effect_index_.emplace(effect.node_id, effect_states_.size());
+            effect_states_.push_back(state);
+        }
         VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sampled_sets};
         VkDescriptorPoolCreateInfo pool{};
         pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -826,6 +959,102 @@ private:
         vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
     }
 
+    bool createFilterFramebuffer(const Image& image, VkFramebuffer& out,
+                                 DiagnosticList& diagnostics) {
+        VkFramebufferCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        info.renderPass = filter_pass_;
+        info.attachmentCount = 1;
+        info.pAttachments = &image.view;
+        info.width = image.width;
+        info.height = image.height;
+        info.layers = 1;
+        return vkOk(vkCreateFramebuffer(device_, &info, nullptr, &out), diagnostics,
+                    "vkCreateFramebuffer(filter)");
+    }
+
+    void destroyEffectImages(EffectState& state) {
+        if (state.fb != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(device_, state.fb, nullptr);
+            state.fb = VK_NULL_HANDLE;
+        }
+        if (state.fb_tmp != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(device_, state.fb_tmp, nullptr);
+            state.fb_tmp = VK_NULL_HANDLE;
+        }
+        destroyImage(state.target);
+        destroyImage(state.tmp);
+    }
+
+    // Lazily (re)creates effect intermediates to match their source size and
+    // keeps descriptor sets pointing at current views.
+    bool prepareEffects(DiagnosticList& diagnostics) {
+        for (EffectState& state : effect_states_) {
+            const Image* source = nullptr;
+            if (!state.op->source_input.empty()) {
+                auto it = input_images_.find(state.op->source_input);
+                if (it != input_images_.end() && it->second.image != VK_NULL_HANDLE) {
+                    source = &it->second;
+                }
+            } else if (!state.op->source_effect.empty()) {
+                auto it = effect_index_.find(state.op->source_effect);
+                if (it != effect_index_.end() && effect_states_[it->second].ready) {
+                    source = &effect_states_[it->second].target;
+                }
+            }
+            if (source == nullptr) {
+                state.ready = false;
+                continue;
+            }
+            const bool is_blur = state.op->kind == render::EffectOp::Kind::kBlur;
+            if (state.target.image == VK_NULL_HANDLE || state.target.width != source->width ||
+                state.target.height != source->height) {
+                vkDeviceWaitIdle(device_);
+                destroyEffectImages(state);
+                const VkImageUsageFlags usage =
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                if (!createImage(source->width, source->height, VK_FORMAT_R8G8B8A8_UNORM, usage,
+                                 state.target, diagnostics) ||
+                    !createFilterFramebuffer(state.target, state.fb, diagnostics)) {
+                    return false;
+                }
+                if (is_blur &&
+                    (!createImage(source->width, source->height, VK_FORMAT_R8G8B8A8_UNORM, usage,
+                                  state.tmp, diagnostics) ||
+                     !createFilterFramebuffer(state.tmp, state.fb_tmp, diagnostics))) {
+                    return false;
+                }
+                if (state.target_set == VK_NULL_HANDLE) {
+                    if (!allocateSamplerSet(state.target.view, state.target_set, diagnostics)) {
+                        return false;
+                    }
+                } else {
+                    updateSamplerSet(state.target_set, state.target.view);
+                }
+                if (is_blur) {
+                    if (state.tmp_set == VK_NULL_HANDLE) {
+                        if (!allocateSamplerSet(state.tmp.view, state.tmp_set, diagnostics)) {
+                            return false;
+                        }
+                    } else {
+                        updateSamplerSet(state.tmp_set, state.tmp.view);
+                    }
+                }
+            }
+            if (state.source_set == VK_NULL_HANDLE) {
+                if (!allocateSamplerSet(source->view, state.source_set, diagnostics)) {
+                    return false;
+                }
+                state.last_source_view = source->view;
+            } else if (state.last_source_view != source->view) {
+                updateSamplerSet(state.source_set, source->view);
+                state.last_source_view = source->view;
+            }
+            state.ready = true;
+        }
+        return true;
+    }
+
     std::string resolveFont(const std::string& uri) const {
         auto it = options_.font_files.find(uri);
         if (it != options_.font_files.end()) {
@@ -853,6 +1082,21 @@ private:
                 destroyImage(entry.image);
             }
             atlases_.clear();
+            for (EffectState& effect : effect_states_) {
+                destroyEffectImages(effect);
+            }
+            effect_states_.clear();
+            if (filter_pass_ != VK_NULL_HANDLE) {
+                vkDestroyRenderPass(device_, filter_pass_, nullptr);
+                filter_pass_ = VK_NULL_HANDLE;
+            }
+            for (VkPipeline pipeline : {blur_pipeline_, color_pipeline_}) {
+                if (pipeline != VK_NULL_HANDLE) {
+                    vkDestroyPipeline(device_, pipeline, nullptr);
+                }
+            }
+            blur_pipeline_ = VK_NULL_HANDLE;
+            color_pipeline_ = VK_NULL_HANDLE;
             for (auto& [name, image] : input_images_) {
                 destroyImage(image);
             }
@@ -943,6 +1187,7 @@ private:
     std::chrono::steady_clock::time_point last_frame_time_;
     bool has_last_frame_time_ = false;
     double frame_dt_ = 1.0 / 30.0;
+    std::map<std::string, float> runtime_params_;
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
@@ -960,6 +1205,11 @@ private:
     Image target_;
     VkRenderPass render_pass_ = VK_NULL_HANDLE;
     VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+    VkRenderPass filter_pass_ = VK_NULL_HANDLE;
+    VkPipeline blur_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline color_pipeline_ = VK_NULL_HANDLE;
+    std::vector<EffectState> effect_states_;
+    std::map<std::string, size_t> effect_index_;
 
     VkDescriptorSetLayout sampler_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout textured_pipeline_layout_ = VK_NULL_HANDLE;
@@ -1181,6 +1431,9 @@ bool VulkanRenderer::renderFrame(const FrameInputs& inputs, DiagnosticList& diag
         }
     }
 
+    if (!effect_states_.empty() && !prepareEffects(diagnostics)) {
+        return false;
+    }
     if (!submitFrame(uploads, diagnostics)) {
         return false;
     }
@@ -1214,6 +1467,52 @@ bool VulkanRenderer::submitFrame(const std::vector<std::pair<Image*, VkBufferIma
                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
 
+    // ---- image-space effect passes (before the composite pass) -------------
+    const auto recordFilter = [&](VkFramebuffer framebuffer, Image& destination, VkPipeline pipeline,
+                                  VkDescriptorSet set, const void* pc, uint32_t pc_size) {
+        VkRenderPassBeginInfo begin_pass{};
+        begin_pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        begin_pass.renderPass = filter_pass_;
+        begin_pass.framebuffer = framebuffer;
+        begin_pass.renderArea = {{0, 0}, {destination.width, destination.height}};
+        vkCmdBeginRenderPass(frame_cmd_, &begin_pass, VK_SUBPASS_CONTENTS_INLINE);
+        VkViewport viewport{0.0f, 0.0f, static_cast<float>(destination.width),
+                            static_cast<float>(destination.height), 0.0f, 1.0f};
+        VkRect2D scissor{{0, 0}, {destination.width, destination.height}};
+        vkCmdSetViewport(frame_cmd_, 0, 1, &viewport);
+        vkCmdSetScissor(frame_cmd_, 0, 1, &scissor);
+        vkCmdBindPipeline(frame_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(frame_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                textured_pipeline_layout_, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(frame_cmd_, textured_pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, pc_size, pc);
+        vkCmdDraw(frame_cmd_, 6, 1, 0, 0);
+        vkCmdEndRenderPass(frame_cmd_);
+        destination.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    };
+    for (EffectState& effect : effect_states_) {
+        if (!effect.ready) {
+            continue;
+        }
+        if (effect.op->kind == render::EffectOp::Kind::kBlur) {
+            const float radius = std::clamp(
+                effectValue(effect.op->radius, effect.op->radius_param), 0.5f, 16.0f);
+            PcBlur horizontal{{1.0f / static_cast<float>(effect.tmp.width), 0.0f}, radius, 0.0f};
+            recordFilter(effect.fb_tmp, effect.tmp, blur_pipeline_, effect.source_set, &horizontal,
+                         sizeof(horizontal));
+            PcBlur vertical{{0.0f, 1.0f / static_cast<float>(effect.target.height)}, radius, 0.0f};
+            recordFilter(effect.fb, effect.target, blur_pipeline_, effect.tmp_set, &vertical,
+                         sizeof(vertical));
+        } else {
+            PcColor pc{effectValue(effect.op->brightness, effect.op->brightness_param),
+                       effectValue(effect.op->contrast, effect.op->contrast_param),
+                       effectValue(effect.op->saturation, effect.op->saturation_param),
+                       effectValue(effect.op->gamma, effect.op->gamma_param)};
+            recordFilter(effect.fb, effect.target, color_pipeline_, effect.source_set, &pc,
+                         sizeof(pc));
+        }
+    }
+
     VkClearValue clear{};
     clear.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
     VkRenderPassBeginInfo pass{};
@@ -1233,8 +1532,18 @@ bool VulkanRenderer::submitFrame(const std::vector<std::pair<Image*, VkBufferIma
             if (!state.image_ready) {
                 continue;
             }
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            if (!op.effect_chain.empty()) {
+                const EffectState& effect =
+                    effect_states_[effect_index_.at(op.effect_chain.back())];
+                if (!effect.ready) {
+                    continue;
+                }
+                set = effect.target_set;
+            } else {
+                set = input_sets_.at(op.source_input);
+            }
             vkCmdBindPipeline(frame_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, image_pipeline_);
-            VkDescriptorSet set = input_sets_.at(op.source_input);
             vkCmdBindDescriptorSets(frame_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     textured_pipeline_layout_, 0, 1, &set, 0, nullptr);
             PcImage pc{};

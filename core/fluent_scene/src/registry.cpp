@@ -174,6 +174,47 @@ NodeTypeSpec makePolyline2d() {
     return spec;
 }
 
+NodeTypeSpec makeBlur() {
+    NodeTypeSpec spec;
+    spec.name = "effects.blur";
+    spec.inputs.push_back(PortSpec{"image", PortPatternKind::kAnyImage, TypeKind::kImageRgba8, true});
+    ParamSpec radius;  // separable Gaussian; kernel statically bounded (13 taps),
+    radius.name = "radius";  // radius clamped to 16 px by the backend
+    radius.kind = ParamKind::kF32;
+    radius.default_value = JsonValue::makeFloat(4.0);
+    spec.params.push_back(std::move(radius));
+    spec.outputs.push_back(OutputSpec{"image", TypeKind::kImageRgba8});
+    return spec;
+}
+
+NodeTypeSpec makeColorTransform() {
+    NodeTypeSpec spec;
+    spec.name = "effects.color_transform";
+    spec.inputs.push_back(PortSpec{"image", PortPatternKind::kAnyImage, TypeKind::kImageRgba8, true});
+    ParamSpec brightness;
+    brightness.name = "brightness";
+    brightness.kind = ParamKind::kF32;
+    brightness.default_value = JsonValue::makeFloat(0.0);
+    spec.params.push_back(std::move(brightness));
+    ParamSpec contrast;
+    contrast.name = "contrast";
+    contrast.kind = ParamKind::kF32;
+    contrast.default_value = JsonValue::makeFloat(1.0);
+    spec.params.push_back(std::move(contrast));
+    ParamSpec saturation;
+    saturation.name = "saturation";
+    saturation.kind = ParamKind::kF32;
+    saturation.default_value = JsonValue::makeFloat(1.0);
+    spec.params.push_back(std::move(saturation));
+    ParamSpec gamma;
+    gamma.name = "gamma";
+    gamma.kind = ParamKind::kF32;
+    gamma.default_value = JsonValue::makeFloat(1.0);
+    spec.params.push_back(std::move(gamma));
+    spec.outputs.push_back(OutputSpec{"image", TypeKind::kImageRgba8});
+    return spec;
+}
+
 NodeTypeSpec makeCompositeLayers() {
     NodeTypeSpec spec;
     spec.name = "composite.layers";
@@ -196,6 +237,8 @@ NodeRegistry NodeRegistry::builtinMvp() {
     registry.add(makeBoxes2d());
     registry.add(makeCircles2d());
     registry.add(makePolyline2d());
+    registry.add(makeBlur());
+    registry.add(makeColorTransform());
     registry.add(makeTextDynamic());
     registry.add(makeCompositeLayers());
     return registry;

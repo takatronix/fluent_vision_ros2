@@ -97,10 +97,16 @@ ctest --test-dir build --output-on-failure
   文脈 key/value・正準順序。golden テストで固定。
 - **ノードレジストリ**（宣言的シグネチャ）:
   `visual.image2d` / `visual.boxes2d` / `visual.circles2d` / `visual.polyline2d` /
-  `text.dynamic` / `composite.layers`。丸・折れ線は SDF（距離関数）レンダリングで、
-  インスタンス化した四角形1枚+ピクセル距離計算により AA 付き・拡大無劣化。
-  デモは [examples/primitives_demo.fvs](examples/primitives_demo.fvs)
-  (`fv_render examples/primitives_demo.fvs --out prim.ppm`)。
+  `text.dynamic` / `composite.layers` + **リアルタイムエフェクト**
+  `effects.blur` / `effects.color_transform`。丸・折れ線は SDF（距離関数）レンダリングで
+  AA 付き・拡大無劣化。エフェクトは image→image のグラフノード（有界カーネル・
+  中間テクスチャは filter パスとして plan に計上）で、チェーンすればコードなしで
+  新フィルタを合成できる。`runtime_mutable` な f32 シーンパラメータを
+  `$params` 参照で繋ぐと **`Renderer::setParam()` で実行中に変更可**（§7.3、
+  再コンパイルゼロをテストで証明）。デモ:
+  [examples/primitives_demo.fvs](examples/primitives_demo.fvs) /
+  [examples/effects_demo.fvs](examples/effects_demo.fvs)
+  (`fv_render examples/effects_demo.fvs --set blur_radius=12 --out fx.ppm`)。
 - **Stage 4: 分離 binding schema + ROS 2 アダプター**:
   [binding_config.hpp](include/fluent_scene/binding_config.hpp)（ROS 非依存）が §12 の
   `fluent.binding/v1alpha1` 文書をシーン契約に対して検証（未知入力/未登録 converter/

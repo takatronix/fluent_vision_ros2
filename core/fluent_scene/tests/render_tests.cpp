@@ -246,6 +246,124 @@ int main(int argc, char** argv) {
         }
     }
 
+    // --- image-space effects (blur + color transform) -----------------------
+    {
+        fluent_scene::DiagnosticList fx_diagnostics;
+        const fluent_scene::YamlNode fx_root =
+            fluent_scene::parseYaml(readFile("examples/effects_demo.fvs"), fx_diagnostics);
+        fluent_scene::ValidationResult fx_scene;
+        fluent_scene::PlanResult fx_plan;
+        if (!fx_diagnostics.hasErrors()) {
+            const fluent_scene::NodeRegistry registry = fluent_scene::NodeRegistry::builtinMvp();
+            fx_scene = fluent_scene::validateScene(fx_root, registry, fx_diagnostics);
+            if (fx_scene.ok) {
+                fx_plan = fluent_scene::planScene(fx_scene, fx_diagnostics);
+            }
+        }
+        check(fx_plan.ok, "effects scene compiles (blur -> color_transform chain)");
+        bool has_filter_pass = false;
+        if (const fluent_scene::JsonValue* passes = fx_plan.plan.find("passes")) {
+            for (const fluent_scene::JsonValue& pass : passes->elements()) {
+                if (pass.find("kind")->stringValue() == "filter") {
+                    has_filter_pass = true;
+                }
+            }
+        }
+        check(has_filter_pass, "the plan carries filter passes for effect nodes");
+        std::unique_ptr<fluent_scene::Renderer> fx_renderer =
+            fluent_scene::createVulkanRenderer(options, fx_diagnostics);
+        bool rendered = fx_renderer != nullptr &&
+                        fx_renderer->loadScene(fx_scene, fx_plan, fx_diagnostics);
+        const fluent_scene::render::SyntheticFrame fx_frame =
+            fluent_scene::render::makeSyntheticFrame(3, 640, 360, 1920, 1080);
+        for (int frame = 0; rendered && frame < 2; ++frame) {
+            rendered = fx_renderer->renderFrame(fx_frame.inputs(), fx_diagnostics);
+        }
+        if (!rendered) {
+            printDiagnostics(fx_diagnostics);
+        }
+        check(rendered, "effects scene renders on the Vulkan backend");
+        if (rendered) {
+            check(fx_renderer->stats().pipeline_compiles == 7,
+                  "blur/color pipelines also compile only at loadScene (7 total)");
+            std::vector<uint8_t> pixels;
+            uint32_t width = 0, height = 0;
+            fx_renderer->readback(pixels, width, height);
+            const std::string fx_golden = source_dir + "/tests/golden/effects_demo.ppm";
+            if (regen) {
+                fluent_scene::render::writePpm(fx_golden, pixels, width, height);
+                std::cout << "regenerated effects golden\n";
+            } else {
+                std::vector<uint8_t> golden;
+                uint32_t golden_w = 0, golden_h = 0;
+                double mean_diff = 0.0;
+                uint32_t max_diff = 0;
+                if (fluent_scene::render::readPpm(fx_golden, golden, golden_w, golden_h) &&
+                    golden_w == width && golden_h == height) {
+                    fluent_scene::render::diffRgbaVsRgb(pixels, golden, mean_diff, max_diff);
+                    std::cout << "     effects golden diff: mean " << mean_diff << ", max "
+                              << max_diff << '\n';
+                    check(mean_diff <= 2.0 && max_diff <= 96,
+                          "effects render matches the golden image within tolerance");
+                } else {
+                    check(false, "effects golden exists and matches dimensions");
+                }
+            }
+            // Runtime-mutable knob: changing blur_radius live must change the
+            // output on the very next frame with no pipeline recompiles.
+            const uint64_t compiles_before = fx_renderer->stats().pipeline_compiles;
+            check(fx_renderer->setParam("blur_radius", 15.0f),
+                  "runtime_mutable f32 params accept live updates");
+            check(!fx_renderer->setParam("nonexistent", 1.0f),
+                  "unknown or immutable params are rejected");
+            fx_renderer->renderFrame(fx_frame.inputs(), fx_diagnostics);
+            std::vector<uint8_t> heavy_pixels;
+            uint32_t heavy_w = 0, heavy_h = 0;
+            fx_renderer->readback(heavy_pixels, heavy_w, heavy_h);
+            double live_diff = 0.0;
+            {
+                double total = 0.0;
+                for (size_t i = 0; i < pixels.size(); i += 4) {
+                    total += std::abs(int(pixels[i]) - int(heavy_pixels[i]));
+                }
+                live_diff = total / (static_cast<double>(pixels.size()) / 4.0);
+            }
+            check(live_diff > 1.0, "a live radius change visibly changes the next frame");
+            check(fx_renderer->stats().pipeline_compiles == compiles_before,
+                  "live parameter updates never recompile pipelines (spec 7.3)");
+            fx_renderer->setParam("blur_radius", 6.0f);  // restore for cross-check
+            fx_renderer->renderFrame(fx_frame.inputs(), fx_diagnostics);
+            fx_renderer->readback(pixels, width, height);
+
+            // CPU reference agreement on the effect chain.
+            fluent_scene::DiagnosticList cpu_fx_diagnostics;
+            std::unique_ptr<fluent_scene::Renderer> cpu_fx =
+                fluent_scene::createCpuRenderer(options, cpu_fx_diagnostics);
+            if (cpu_fx != nullptr && cpu_fx->loadScene(fx_scene, fx_plan, cpu_fx_diagnostics) &&
+                cpu_fx->renderFrame(fx_frame.inputs(), cpu_fx_diagnostics)) {
+                std::vector<uint8_t> cpu_pixels;
+                uint32_t cpu_w = 0, cpu_h = 0;
+                cpu_fx->readback(cpu_pixels, cpu_w, cpu_h);
+                std::vector<uint8_t> cpu_rgb(static_cast<size_t>(cpu_w) * cpu_h * 3);
+                for (size_t i = 0; i < static_cast<size_t>(cpu_w) * cpu_h; ++i) {
+                    cpu_rgb[i * 3 + 0] = cpu_pixels[i * 4 + 0];
+                    cpu_rgb[i * 3 + 1] = cpu_pixels[i * 4 + 1];
+                    cpu_rgb[i * 3 + 2] = cpu_pixels[i * 4 + 2];
+                }
+                double mean_diff = 0.0;
+                uint32_t max_diff = 0;
+                fluent_scene::render::diffRgbaVsRgb(pixels, cpu_rgb, mean_diff, max_diff);
+                std::cout << "     effects vulkan-vs-cpu diff: mean " << mean_diff << ", max "
+                          << max_diff << '\n';
+                check(mean_diff <= 12.0,
+                      "vulkan and cpu effect chains agree within a loose tolerance");
+            } else {
+                printDiagnostics(cpu_fx_diagnostics);
+                check(false, "cpu reference renders the effects scene");
+            }
+        }
+    }
+
     if (failures == 0) {
         std::cout << "all render tests passed\n";
         return 0;
