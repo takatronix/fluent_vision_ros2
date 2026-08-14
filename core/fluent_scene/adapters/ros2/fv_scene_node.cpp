@@ -23,6 +23,8 @@
 #include <string>
 #include <vector>
 
+#include <geometry_msgs/msg/pose_array.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -233,6 +235,45 @@ private:
                         fluent_scene::DiagnosticList diagnostics;
                         table_->push(input, std::move(value), diagnostics);
                     }));
+            } else if (binding.converter == "ros_path_to_polyline2d") {
+                path_subs_.push_back(create_subscription<nav_msgs::msg::Path>(
+                    binding.topic, qos, [this, input](nav_msgs::msg::Path::ConstSharedPtr message) {
+                        TypedValue value;
+                        value.kind = TypedValue::Kind::kPoints;
+                        for (const auto& stamped : message->poses) {
+                            fluent_scene::Point2f point;
+                            point.x = static_cast<float>(stamped.pose.position.x);
+                            point.y = static_cast<float>(stamped.pose.position.y);
+                            value.points.push_back(point);
+                        }
+                        value.meta.has_timestamp = true;
+                        value.meta.timestamp = rclcpp::Time(message->header.stamp).seconds();
+                        value.meta.frame = message->header.frame_id;
+                        value.meta.clock = "ros_time";
+                        value.meta.sequence = ++sequence_;
+                        fluent_scene::DiagnosticList diagnostics;
+                        table_->push(input, std::move(value), diagnostics);
+                    }));
+            } else if (binding.converter == "ros_pose_array_to_points2d") {
+                pose_array_subs_.push_back(create_subscription<geometry_msgs::msg::PoseArray>(
+                    binding.topic, qos,
+                    [this, input](geometry_msgs::msg::PoseArray::ConstSharedPtr message) {
+                        TypedValue value;
+                        value.kind = TypedValue::Kind::kPoints;
+                        for (const auto& pose : message->poses) {
+                            fluent_scene::Point2f point;
+                            point.x = static_cast<float>(pose.position.x);
+                            point.y = static_cast<float>(pose.position.y);
+                            value.points.push_back(point);
+                        }
+                        value.meta.has_timestamp = true;
+                        value.meta.timestamp = rclcpp::Time(message->header.stamp).seconds();
+                        value.meta.frame = message->header.frame_id;
+                        value.meta.clock = "ros_time";
+                        value.meta.sequence = ++sequence_;
+                        fluent_scene::DiagnosticList diagnostics;
+                        table_->push(input, std::move(value), diagnostics);
+                    }));
             } else if (binding.converter == "ros_string_to_utf8") {
                 string_subs_.push_back(create_subscription<std_msgs::msg::String>(
                     binding.topic, qos, [this, input](std_msgs::msg::String::ConstSharedPtr message) {
@@ -322,6 +363,8 @@ private:
     std::unique_ptr<fluent_scene::BindingTable> table_;
     std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> image_subs_;
     std::vector<rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr> detection_subs_;
+    std::vector<rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr> path_subs_;
+    std::vector<rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr> pose_array_subs_;
     std::vector<rclcpp::Subscription<std_msgs::msg::String>::SharedPtr> string_subs_;
     std::vector<rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr> camera_info_subs_;
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;

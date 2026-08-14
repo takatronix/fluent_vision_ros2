@@ -37,6 +37,9 @@ TypedValue::Kind inputKind(const JsonValue& input) {
     if (type_name.rfind("sequence<", 0) == 0) {
         return TypedValue::Kind::kDetections;
     }
+    if (type_name == "points2d" || type_name == "polyline2d") {
+        return TypedValue::Kind::kPoints;
+    }
     if (type_name == "calibration") {
         return TypedValue::Kind::kCalibration;
     }
@@ -54,6 +57,12 @@ bool converterProduces(const std::string& converter, TypedValue::Kind& out_kind)
         {"ros_image_to_rgba8", TypedValue::Kind::kImage},
         {"ros_depth_to_depth32f_meters", TypedValue::Kind::kImage},
         {"ros_detections_to_Detection2D", TypedValue::Kind::kDetections},
+        // Positions pass through as-is (x, y in message units). Coordinate
+        // conversion is never implicit (spec section 4.2); publishers own the
+        // projection into output-pixel space until explicit transform nodes
+        // exist.
+        {"ros_path_to_polyline2d", TypedValue::Kind::kPoints},
+        {"ros_pose_array_to_points2d", TypedValue::Kind::kPoints},
         {"ros_string_to_utf8", TypedValue::Kind::kString},
         {"ros_camera_info_to_calibration", TypedValue::Kind::kCalibration},
     };

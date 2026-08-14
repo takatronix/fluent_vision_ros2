@@ -120,11 +120,15 @@ if(FLUENT_SCENE_ROS2 AND TARGET fluent_scene_render)
     find_package(sensor_msgs QUIET)
     find_package(vision_msgs QUIET)
     find_package(std_msgs QUIET)
-    if(rclcpp_FOUND AND sensor_msgs_FOUND AND vision_msgs_FOUND AND std_msgs_FOUND)
+    find_package(nav_msgs QUIET)
+    find_package(geometry_msgs QUIET)
+    if(rclcpp_FOUND AND sensor_msgs_FOUND AND vision_msgs_FOUND AND std_msgs_FOUND
+       AND nav_msgs_FOUND AND geometry_msgs_FOUND)
         add_executable(fv_scene_node adapters/ros2/fv_scene_node.cpp)
         target_include_directories(fv_scene_node PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(fv_scene_node PRIVATE fluent_scene_render rclcpp::rclcpp
-            ${sensor_msgs_TARGETS} ${vision_msgs_TARGETS} ${std_msgs_TARGETS})
+            ${sensor_msgs_TARGETS} ${vision_msgs_TARGETS} ${std_msgs_TARGETS}
+            ${nav_msgs_TARGETS} ${geometry_msgs_TARGETS})
         target_compile_options(fv_scene_node PRIVATE -Wall -Wextra)
     else()
         message(STATUS "fluent_scene ROS 2 adapter disabled (rclcpp/sensor_msgs/vision_msgs not found)")

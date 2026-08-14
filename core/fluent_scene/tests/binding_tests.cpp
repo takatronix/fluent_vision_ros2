@@ -375,6 +375,25 @@ int main(int argc, char** argv) {
         }
     }
 
+    // --- 10b. primitives binding document (Path / PoseArray converters) -----
+    {
+        const fluent_scene::ValidationResult primitives =
+            compileScene(readFile("examples/primitives_demo.fvs"));
+        check(primitives.ok, "primitives scene compiles for binding validation");
+        DiagnosticList diagnostics;
+        const fluent_scene::YamlNode doc = fluent_scene::parseYaml(
+            readFile("examples/primitives_demo_ros2.binding.yaml"), diagnostics);
+        auto binding = fluent_scene::parseBindingDocument(doc, primitives, diagnostics);
+        check(binding != nullptr && !diagnostics.hasErrors(),
+              "primitives binding document validates (Path -> polyline2d, PoseArray -> points2d)");
+        fluent_scene::TypedValue::Kind kind;
+        check(fluent_scene::converterProduces("ros_path_to_polyline2d", kind) &&
+                  kind == fluent_scene::TypedValue::Kind::kPoints &&
+                  fluent_scene::converterProduces("ros_pose_array_to_points2d", kind) &&
+                  kind == fluent_scene::TypedValue::Kind::kPoints,
+              "point converters are registered with the points kind");
+    }
+
     // --- 11. binding-document contract violations ----------------------------
     {
         const auto parseWith = [&](const std::string& patch_from, const std::string& patch_to) {

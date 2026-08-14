@@ -108,8 +108,12 @@ ctest --test-dir build --output-on-failure
   queue_capacity を BindingTableOptions へ写像。
   [adapters/ros2/fv_scene_node.cpp](adapters/ros2/fv_scene_node.cpp) は transport のみを所有:
   binding 文書のトピックを購読 → 型付き値へ変換（Image rgb8/bgr8/rgba8/bgra8/mono8、
-  Detection2DArray、String、CameraInfo）→ BindingTable へ push、タイマーで snapshot →
-  保持型描画 → 合成画像を sink トピックへ publish。core/レンダラーは ROS を一切 link しない。
+  Detection2DArray、**nav_msgs/Path → polyline2d、PoseArray → points2d**、String、
+  CameraInfo）→ BindingTable へ push、タイマーで snapshot →
+  保持型描画 → 合成画像を sink トピックへ publish。Path/PoseArray の座標は
+  素通し（暗黙の座標変換はしない、§4.2 — ピクセル空間への投影は publisher 側の責務）。
+  プリミティブ配線例は
+  [examples/primitives_demo_ros2.binding.yaml](examples/primitives_demo_ros2.binding.yaml)。core/レンダラーは ROS を一切 link しない。
   隔離 ROS_DOMAIN_ID での E2E 動作確認済み（トピック経由の日本語テキストが合成に出る）。
   注意: std_msgs/String はヘッダーが無いため受信時刻で stamp する。depth converter は
   検証のみ（未実装、宣言 fallback が効く）。
