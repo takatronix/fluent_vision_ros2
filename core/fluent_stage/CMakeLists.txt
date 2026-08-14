@@ -30,6 +30,8 @@ add_library(fluent_stage
   src/scene/compiler.cpp
   src/scene/describe.cpp
   src/scene/linter.cpp
+  src/scene/inspector.cpp
+  src/scene/binding.cpp
 )
 target_include_directories(fluent_stage PUBLIC include)
 target_link_libraries(fluent_stage PRIVATE PkgConfig::FS_TEXT)
@@ -127,6 +129,23 @@ if(JPEG_FOUND)
       target_compile_definitions(${FS_WEB_TOOL} PRIVATE FS_HAVE_ROS=1)
     endforeach()
     message(STATUS "fluent_stage: stage_web/scene_web with ROS 2 camera input")
+
+    # scene_node: the production ROS 2 adapter (Phase L3) — scene.fvs +
+    # binding.fvb → subscriptions, render, published Surface. Needs ROS.
+    add_executable(scene_node tools/scene_node.cpp)
+    target_link_libraries(scene_node PRIVATE fluent_stage JPEG::JPEG Threads::Threads
+                          rclcpp::rclcpp ${sensor_msgs_TARGETS})
+    find_package(vision_msgs QUIET)
+    find_package(geometry_msgs QUIET)
+    find_package(std_msgs QUIET)
+    if(geometry_msgs_FOUND AND std_msgs_FOUND)
+      target_link_libraries(scene_node PRIVATE ${geometry_msgs_TARGETS} ${std_msgs_TARGETS})
+    endif()
+    if(vision_msgs_FOUND)
+      target_link_libraries(scene_node PRIVATE ${vision_msgs_TARGETS})
+      target_compile_definitions(scene_node PRIVATE FS_HAVE_VISION_MSGS=1)
+      message(STATUS "fluent_stage: scene_node with vision_msgs detections")
+    endif()
   else()
     message(STATUS "fluent_stage: stage_web/scene_web without ROS (source ROS env to enable)")
   endif()

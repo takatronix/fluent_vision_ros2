@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.0 — 2026-08-14 (Phase L3: インスペクター + ROS binding + scene_node)
+
+- **シーンインスペクター**（§13-3、`scene/inspector.hpp`）: 全レイヤーを
+  ステージ空間に固定した配置表（resolved bounds・local→stage 変換・実効
+  opacity・描画順）。`visibleAt` が「座標 (x,y) に見えているものは何か」を
+  最前面から返し、`inspectJson` / `atJson` が JSON で答える。リンターは
+  この同じ配置計算の上の検査になった（幾何の定義は一箇所）
+- scene_web に `/inspect` と `/at?x=&y=` を追加（配置スナップショットは
+  値のみ共有 — HTTP スレッドはライブシーンに触らない）
+- **binding 文書**（`fluent.binding/v1alpha1`、`scene/binding.hpp`）:
+  「何が要るか」（Scene の inputs）と「この機体でどこから来るか」（topic /
+  message_type / qos / converter）の分離。converter カタログは単一表、
+  message_type の適合・adapter・QoS 語彙を activation 前に全て検証。
+  `validateBindingAgainstScene` が未宣言入力(エラー)・型不適合(エラー)・
+  未バインド入力(情報: fallback 提示)を判定
+- **scene_node**（本番 ROS 2 アダプター）: scene.fvs + binding.fvb →
+  購読(Image / CompressedImage / Detection2DArray / String / Polygon)、
+  変換はレンダースレッドで latest-wins、描画(Vulkan、無ければ CPU)、
+  出力 Surface を Image / CompressedImage で publish。scene は
+  ホットリロード(検証→フレーム境界 swap)、binding は寿命固定(配線変更 =
+  再起動、設計どおり)
+- 実機 E2E: d405 CompressedImage 30fps + String トピック → 合成 20fps を
+  `/fluent_scene/composite` に配信、ライブ文字列と実映像を確認
+
 ## 0.8.1 — 2026-08-14 (scene_web: 編集→保存→原子的差し替え)
 
 - `tools/scene_web` — Scene 文書(.fvs)のライブプレビューサーバー。ファイルを

@@ -8,24 +8,16 @@
 #include <string>
 #include <vector>
 
+#include "fluent_stage/scene/inspector.hpp"
 #include "fluent_stage/scene/linter.hpp"
 
 namespace fluent_stage::scene {
 
 namespace {
 
-/// A layer fixed in stage space, with everything the lints need.
-struct Placed {
-    const Layer* layer;
-    const LayerDecl* decl;   ///< Document node (nullptr for synthetic layers).
-    Mat23 to_stage;          ///< Layer-local → stage coordinates.
-    Rect bounds;             ///< Resolved local bounds.
-    Rect stage_bbox;         ///< Axis-aligned bbox of bounds in stage space.
-    float eff_opacity;       ///< Product of opacities down the chain.
-    bool axis_aligned;       ///< No rotation/shear anywhere in the chain.
-    int paint_index;         ///< Pre-order position (greater = painted later).
-    int parent_index;        ///< Placed index of the parent (-1 for root).
-};
+// The placement walk lives in the inspector (§13-3); the lints are checks
+// over that same geometry.
+using Placed = PlacedLayer;
 
 Rect bboxOf(const Mat23& m, Rect r) {
     const Vec2 corners[4] = {m.apply({r.x, r.y}), m.apply({r.x + r.w, r.y}),
@@ -61,38 +53,6 @@ float relativeLuminance(float r, float g, float b) {
 float contrastRatio(float l1, float l2) {
     const float bright = std::max(l1, l2), dark = std::min(l1, l2);
     return (bright + 0.05f) / (dark + 0.05f);
-}
-
-void placeTree(const Layer& layer, const CompiledScene& scene, Mat23 parent_to_stage,
-               Vec2 parent_size, float parent_opacity, bool parent_axis_aligned,
-               int parent_index, int& counter, std::vector<Placed>& out) {
-    if (layer.hidden()) {
-        return;
-    }
-    const Layer::Resolved res = layer.resolve(parent_size);
-    Placed p;
-    p.layer = &layer;
-    p.decl = nullptr;
-    for (const auto& [decl, live] : scene.nodes()) {
-        if (live == &layer) {
-            p.decl = decl;
-            break;
-        }
-    }
-    p.to_stage = parent_to_stage * res.to_parent;
-    p.bounds = res.bounds;
-    p.stage_bbox = bboxOf(p.to_stage, res.bounds);
-    p.eff_opacity = parent_opacity * layer.presentedOpacity();
-    p.axis_aligned = parent_axis_aligned && p.to_stage.b == 0 && p.to_stage.c == 0 &&
-                     p.to_stage.a > 0 && p.to_stage.d > 0;
-    p.paint_index = counter++;
-    p.parent_index = parent_index;
-    const int self_index = static_cast<int>(out.size());
-    out.push_back(p);
-    for (const auto& sub : layer.sublayers()) {
-        placeTree(*sub, scene, p.to_stage, {res.bounds.w, res.bounds.h}, p.eff_opacity,
-                  p.axis_aligned, self_index, counter, out);
-    }
 }
 
 bool isAncestor(const std::vector<Placed>& placed, int maybe_ancestor, int node) {
@@ -137,10 +97,7 @@ DiagnosticList lint(CompiledScene& scene, Renderer& renderer) {
     // One render installs the text measurer and settles auto bounds.
     renderer.render(stage, 0.0f);
 
-    std::vector<Placed> placed;
-    int counter = 0;
-    placeTree(stage.root(), scene, Mat23::identity(), {stage.width(), stage.height()}, 1.0f,
-              true, -1, counter, placed);
+    const std::vector<Placed> placed = placeLayers(scene);
 
     const Rect canvas{0, 0, stage.width(), stage.height()};
 

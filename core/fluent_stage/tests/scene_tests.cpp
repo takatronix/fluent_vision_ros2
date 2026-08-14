@@ -11,8 +11,10 @@
 
 #include <fluent_stage/cpu_renderer.hpp>
 #include <fluent_stage/fluent_stage.hpp>
+#include <fluent_stage/scene/binding.hpp>
 #include <fluent_stage/scene/compiler.hpp>
 #include <fluent_stage/scene/document.hpp>
+#include <fluent_stage/scene/inspector.hpp>
 #include <fluent_stage/scene/linter.hpp>
 
 using namespace fluent_stage;
@@ -310,6 +312,133 @@ layers:
     CHECK(lints.hasErrors());
 }
 
+void testInspector() {
+    const fs::ParseResult parsed = fs::parseScene(kCanonicalScene);
+    CHECK(parsed.ok());
+    fs::CompileResult compiled = fs::compile(parsed.doc);
+    CHECK(compiled.ok());
+    fs::CompiledScene& scene = *compiled.scene;
+    CpuRenderer renderer;
+    renderer.render(scene.stage(), 0.0f);  // settle text bounds
+
+    const auto placed = fs::placeLayers(scene);
+    CHECK(placed.size() >= 6);  // root + 5 declared (placeholders extra)
+
+    // The HUD panel rect wins over the image at a point inside the panel.
+    const auto hits = fs::visibleAt(placed, {40, 40});
+    CHECK(!hits.empty());
+    bool saw_rect = false, saw_image = false;
+    int rect_at = -1, image_at = -1;
+    for (size_t i = 0; i < hits.size(); ++i) {
+        if (std::holds_alternative<RectContent>(hits[i]->layer->content())) {
+            saw_rect = true;
+            rect_at = static_cast<int>(i);
+        }
+        if (std::holds_alternative<ImageContent>(hits[i]->layer->content())) {
+            saw_image = true;
+            image_at = static_cast<int>(i);
+        }
+    }
+    CHECK(saw_rect && saw_image);
+    CHECK(rect_at < image_at);  // topmost first
+
+    // Effective opacity multiplies down the chain (hud declares 0.9).
+    for (const auto* h : hits) {
+        if (std::holds_alternative<RectContent>(h->layer->content())) {
+            CHECK(near(h->eff_opacity, 0.9f));
+        }
+    }
+
+    // A point outside everything hits only parent-filling layers.
+    const auto far_hits = fs::visibleAt(placed, {1900, 1060});
+    for (const auto* h : far_hits) {
+        CHECK(!std::holds_alternative<RectContent>(h->layer->content()));
+    }
+
+    const std::string json = fs::inspectJson(scene, placed);
+    CHECK(json.find("\"digest\"") != std::string::npos);
+    CHECK(json.find("\"hud\"") != std::string::npos);
+    CHECK(fs::atJson(placed, {40, 40}).find("\"rect\"") != std::string::npos);
+}
+
+void testBindingDoc() {
+    const char* kBinding = R"(schema: fluent.binding/v1alpha1
+kind: Binding
+metadata: { name: hud_ros2 }
+scene: { name: camera_detection_hud }
+bindings:
+  camera:
+    source: { adapter: ros2, topic: /camera/color/image_raw,
+              message_type: sensor_msgs/msg/Image, qos: sensor_data }
+    converter: ros_image_to_rgba8
+  detections:
+    source: { adapter: ros2, topic: /perception/detections,
+              message_type: vision_msgs/msg/Detection2DArray, qos: sensor_data }
+    converter: ros_detections_to_detection2d
+outputs:
+  frame:
+    sink: { adapter: ros2, topic: /visualization/composite,
+            message_type: sensor_msgs/msg/Image, qos: sensor_data }
+    converter: rgba8_to_ros_image
+)";
+    const fs::BindingParseResult b = fs::parseBinding(kBinding);
+    for (const auto& d : b.diagnostics.items()) {
+        std::fprintf(stderr, "  bind diag: [%s] %s\n", d.code.c_str(), d.message.c_str());
+    }
+    CHECK(b.ok());
+    CHECK(b.doc.bindings.size() == 2);
+    CHECK(b.doc.outputs.size() == 1);
+    CHECK(b.doc.findBinding("camera") != nullptr);
+
+    // Cross-validation against the §2 scene: clean.
+    const fs::ParseResult scene = fs::parseScene(kCanonicalScene);
+    CHECK(scene.ok());
+    fs::DiagnosticList cross;
+    fs::validateBindingAgainstScene(b.doc, scene.doc, cross);
+    CHECK(!cross.hasErrors());
+
+    // A binding naming an undeclared input is an error; a converter of the
+    // wrong type is an error.
+    const char* kBad = R"(schema: fluent.binding/v1alpha1
+bindings:
+  nonexistent:
+    source: { adapter: ros2, topic: /t, message_type: std_msgs/msg/String }
+    converter: ros_string_to_utf8
+  camera:
+    source: { adapter: ros2, topic: /t2, message_type: std_msgs/msg/String }
+    converter: ros_string_to_utf8
+)";
+    const fs::BindingParseResult bad = fs::parseBinding(kBad);
+    CHECK(bad.ok());
+    fs::DiagnosticList cross2;
+    fs::validateBindingAgainstScene(bad.doc, scene.doc, cross2);
+    CHECK(hasCode(cross2, "bind.unknown_input"));
+    CHECK(hasCode(cross2, "bind.type_mismatch"));
+    CHECK(hasCode(cross2, "bind.unbound_input"));  // detections went unbound
+
+    // Shape rejections: adapter, qos, message type vs converter, relative
+    // topic names, unknown converters.
+    auto errorsOf = [](const std::string& body) {
+        return fs::parseBinding("schema: fluent.binding/v1alpha1\n" + body).diagnostics;
+    };
+    CHECK(hasCode(errorsOf("bindings:\n  a:\n    source: { adapter: dds, topic: /t }\n"
+                           "    converter: ros_string_to_utf8\n"),
+                  "bind.adapter"));
+    CHECK(hasCode(errorsOf("bindings:\n  a:\n    source: { adapter: ros2, topic: t }\n"
+                           "    converter: ros_string_to_utf8\n"),
+                  "bind.topic"));
+    CHECK(hasCode(errorsOf("bindings:\n  a:\n    source: { adapter: ros2, topic: /t, "
+                           "qos: best }\n    converter: ros_string_to_utf8\n"),
+                  "bind.qos"));
+    CHECK(hasCode(errorsOf("bindings:\n  a:\n    source: { adapter: ros2, topic: /t, "
+                           "message_type: sensor_msgs/msg/Image }\n"
+                           "    converter: ros_string_to_utf8\n"),
+                  "bind.message_type"));
+    CHECK(hasCode(errorsOf("bindings:\n  a:\n    source: { adapter: ros2, topic: /t }\n"
+                           "    converter: no_such_converter\n"),
+                  "bind.converter"));
+}
+
 void testDescribe() {
     const std::string json = fs::describeJson();
     CHECK(json.find("\"contents\"") != std::string::npos);
@@ -333,6 +462,8 @@ int main() {
     testYamlCppParity();
     testParamsAnimateAndInputs();
     testLinter();
+    testInspector();
+    testBindingDoc();
     testDescribe();
     if (g_failures == 0) {
         std::printf("scene_tests: all passed\n");

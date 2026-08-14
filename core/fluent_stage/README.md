@@ -74,7 +74,7 @@ ctest --test-dir build          # 単体 + golden画像 + 全example
 - **CALayer 準拠の属性** — frame / position / anchor / rotation / scale /
   opacity / shadow / border / background / cornerRadius / masksToBounds /
   blend。左上原点・+y下の**1座標系のみ**（反転スイッチは存在しない）
-- **フィルタ 29種** — blur / bilateral / color_transform / toon / halftone …
+- **フィルタ 30種** — blur / bilateral / color_transform / toon / halftone / ripple …
   任意のレイヤーにもグループ（合成後の1枚）にも掛かる。本体は GLSL∩C++ の
   単一ソース（[filters_shared.h](include/fluent_stage/shared/filters_shared.h) +
   [filters_def.h](include/fluent_stage/shared/filters_def.h)）で、
@@ -112,7 +112,7 @@ fluent_vision の実行層です。**Scene（宣言/.fvs）→ Stage（実行時
 | L0 | Stage API + CPUリファレンス + Transaction + golden | **完了** |
 | L1 | Vulkan バックエンド（CPU と同一出力） | **完了** — 全goldenをGPUで通過、1080pで 5.6ms/frame（CPU比 ~17倍、読み戻し込み） |
 | L2 | Scene v1alpha2（YAML→Stage）+ describe --json + リンター | **完了** — YAML↔C++ ピクセル一致 golden、並べ替え不変 digest、`fvsc` CLI |
-| L3 | ROS binding / インスペクター | 未着手 |
+| L3 | ROS binding / インスペクター | **完了** — binding文書(fluent.binding/v1alpha1)+scene_node(実機E2E済)+`/inspect`・`/at` |
 | L4 | UI コントロール（ポインタ注入 + 6コントロール先行実装済） | ほぼ完了 |
 
 バックエンドは差し替え式です — `CpuRenderer`（リファレンス・どこでも動く）と

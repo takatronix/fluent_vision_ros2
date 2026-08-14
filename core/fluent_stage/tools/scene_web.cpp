@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -43,6 +44,7 @@
 #include <fluent_stage/fluent_stage.hpp>
 #include <fluent_stage/scene/compiler.hpp>
 #include <fluent_stage/scene/document.hpp>
+#include <fluent_stage/scene/inspector.hpp>
 #include <fluent_stage/scene/linter.hpp>
 #ifdef FS_HAVE_VULKAN
 #include <fluent_stage/vulkan_renderer.hpp>
@@ -70,6 +72,21 @@ uint64_t g_frame_seq = 0;
 
 std::mutex g_status_mutex;
 std::string g_status_json = "{}";
+
+// ---- inspector snapshot, shared with /inspect and /at (§13-3) --------------
+// Plain values only (serialized JSON + geometry): the HTTP threads never
+// touch the live scene, so a reload swap can never race a query.
+
+struct InspectEntry {
+    std::string json;
+    fluent_stage::Mat23 to_stage;
+    fluent_stage::Rect bounds;
+    float eff_opacity = 1;
+    int paint_index = 0;
+};
+std::mutex g_inspect_mutex;
+std::string g_inspect_json = "{}";
+std::vector<InspectEntry> g_inspect_entries;
 
 bool sendAll(int fd, const void* data, size_t size) {
     const char* p = static_cast<const char*>(data);
@@ -190,6 +207,44 @@ void serverLoop(uint16_t port) {
             const std::string req(buf);
             if (req.rfind("GET /stream", 0) == 0) {
                 streamMjpeg(fd);
+            } else if (req.rfind("GET /inspect", 0) == 0) {
+                std::string body;
+                {
+                    std::lock_guard<std::mutex> lock(g_inspect_mutex);
+                    body = g_inspect_json;
+                }
+                sendResponse(fd, "200 OK", "application/json", body);
+            } else if (req.rfind("GET /at?", 0) == 0) {
+                // /at?x=<logical>&y=<logical> — what is visible at a point.
+                float x = 0, y = 0;
+                const size_t xp = req.find("x="), yp = req.find("y=");
+                if (xp != std::string::npos && yp != std::string::npos) {
+                    x = std::strtof(req.c_str() + xp + 2, nullptr);
+                    y = std::strtof(req.c_str() + yp + 2, nullptr);
+                }
+                std::string body = "{\"at\": [" + std::to_string(x) + ", " +
+                                   std::to_string(y) + "], \"layers\": [";
+                {
+                    std::lock_guard<std::mutex> lock(g_inspect_mutex);
+                    std::vector<const InspectEntry*> hits;
+                    for (const InspectEntry& e : g_inspect_entries) {
+                        if (e.eff_opacity <= 0 || e.bounds.w <= 0 || e.bounds.h <= 0) {
+                            continue;
+                        }
+                        if (e.bounds.contains(e.to_stage.inverse().apply({x, y}))) {
+                            hits.push_back(&e);
+                        }
+                    }
+                    std::sort(hits.begin(), hits.end(),
+                              [](const InspectEntry* a, const InspectEntry* b) {
+                                  return a->paint_index > b->paint_index;
+                              });
+                    for (size_t i = 0; i < hits.size(); ++i) {
+                        body += (i ? ", " : "") + hits[i]->json;
+                    }
+                }
+                body += "]}";
+                sendResponse(fd, "200 OK", "application/json", body);
             } else if (req.rfind("GET /status", 0) == 0) {
                 std::string body;
                 {
@@ -491,6 +546,7 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
 
     time_t last_mtime = fileMtime(path);
+    int inspect_tick = 0;
     const auto frame_time = std::chrono::duration<double>(1.0 / fps);
     auto next = std::chrono::steady_clock::now();
     auto last_frame = next;
@@ -558,6 +614,21 @@ int main(int argc, char** argv) {
             ++g_frame_seq;
         }
         g_frame_cv.notify_all();
+
+        // ---- inspector snapshot (§13-3), refreshed ~2 Hz ------------------
+        if (live && ++inspect_tick >= static_cast<int>(fps) / 2) {
+            inspect_tick = 0;
+            const auto placed = fsc::placeLayers(*live);
+            std::vector<InspectEntry> entries;
+            entries.reserve(placed.size());
+            for (const auto& p : placed) {
+                entries.push_back({fsc::placedLayerJson(p), p.to_stage, p.bounds,
+                                   p.eff_opacity, p.paint_index});
+            }
+            std::lock_guard<std::mutex> lock(g_inspect_mutex);
+            g_inspect_json = fsc::inspectJson(*live, placed);
+            g_inspect_entries = std::move(entries);
+        }
 
         next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(frame_time);
         std::this_thread::sleep_until(next);
