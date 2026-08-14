@@ -239,6 +239,66 @@ void testDropdown() {
     CHECK(last == 2);
 }
 
+void testDropdownScroll() {
+    Stage stage(640, 600);
+    std::vector<std::string> options;
+    for (int i = 0; i < 12; ++i) {
+        options.push_back("opt" + std::to_string(i));
+    }
+    ui::Dropdown dd(stage.root(), {100, 40, 220, 48}, options, 0);
+    int last = -1;
+    dd.onChange([&](int i) { last = i; });
+
+    stage.pointerDown({150, 60});
+    stage.pointerUp({150, 60});
+    CHECK(dd.isOpen());
+
+    // Drag up 100 units: scrolls, and the release selects nothing.
+    stage.pointerDown({150, 200});
+    stage.pointerMove({150, 100});
+    stage.pointerUp({150, 100});
+    CHECK(dd.isOpen());
+    CHECK(dd.selected() == 0 && last == -1);
+
+    // Tap a row through the scrolled list: popup top is y=92, pad 6,
+    // scroll −100 → y=120 lands on row (120−92−6+100)/44 = 2.77 → row 2.
+    stage.pointerDown({150, 120});
+    stage.pointerUp({150, 120});
+    CHECK(!dd.isOpen());
+    CHECK(dd.selected() == 2);
+    CHECK(last == 2);
+}
+
+void testRipple() {
+    Stage stage(640, 360);
+    const uint32_t baseline = stage.layerCount();
+    fx::RippleStyle style;
+    style.max_rings = 4;
+    fx::Ripple ripple(stage.root(), style);
+
+    ripple.pointerMoved({100, 100});  // far from anywhere → ring 1
+    ripple.pointerMoved({110, 100});  // 10 < spacing → no ring
+    CHECK(ripple.ringCount() == 1);
+    ripple.pointerMoved({140, 100});  // 40 ≥ spacing → ring 2
+    CHECK(ripple.ringCount() == 2);
+
+    ripple.splash({200, 200});  // ring 3 now, ring 4 after 0.1 s
+    CHECK(ripple.ringCount() == 3);
+    ripple.tick(0.05f);
+    CHECK(ripple.ringCount() == 3);
+    ripple.tick(0.06f);
+    CHECK(ripple.ringCount() == 4);
+
+    // The cap recycles the oldest ring instead of growing.
+    ripple.pointerMoved({300, 100});
+    CHECK(ripple.ringCount() == 4);
+
+    // Everything expires and the tree returns to group-only.
+    ripple.tick(1.0f);
+    CHECK(ripple.ringCount() == 0);
+    CHECK(stage.layerCount() == baseline + 1);
+}
+
 }  // namespace
 
 int main() {
@@ -251,6 +311,8 @@ int main() {
     testSegmented();
     testGauge();
     testDropdown();
+    testDropdownScroll();
+    testRipple();
     if (g_failures == 0) {
         std::printf("all ui_tests passed\n");
         return 0;

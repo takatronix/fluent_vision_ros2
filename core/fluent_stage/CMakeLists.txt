@@ -20,6 +20,7 @@ add_library(fluent_stage
   src/text_atlas.cpp
   src/cpu_renderer.cpp
   src/ui.cpp
+  src/effects.cpp
 )
 target_include_directories(fluent_stage PUBLIC include)
 target_link_libraries(fluent_stage PRIVATE PkgConfig::FS_TEXT)
@@ -41,6 +42,9 @@ target_link_libraries(ui_demo PRIVATE fluent_stage)
 
 add_executable(ui_catalog examples/ui_catalog.cpp)
 target_link_libraries(ui_catalog PRIVATE fluent_stage)
+
+add_executable(ripple_demo examples/ripple_demo.cpp)
+target_link_libraries(ripple_demo PRIVATE fluent_stage)
 
 # ---- tests ------------------------------------------------------------------
 
@@ -67,3 +71,4 @@ add_test(NAME example_transaction_fade COMMAND transaction_fade)
 add_test(NAME example_filters_tour COMMAND filters_tour)
 add_test(NAME example_ui_demo COMMAND ui_demo)
 add_test(NAME example_ui_catalog COMMAND ui_catalog)
+add_test(NAME example_ripple_demo COMMAND ripple_demo)

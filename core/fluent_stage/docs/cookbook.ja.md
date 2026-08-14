@@ -161,9 +161,31 @@ profile.onChange([&](int i) { robot.setProfile(i); });
   タッチ/VRではプルダウンより誤操作が少ない
 - **Dropdown** のポップアップは root 末尾のグループ（ツリー順=重なり順）+
   全面透明スクリム（外側タップで閉じる）。下に入りきらない時は上に開く。
-  初版は `max_visible`（既定8行）で切り、スクロールは次版
+  `max_visible`（既定8行）を超えるリストは**ドラッグでスクロール**
+  （約6単位動いたらタップではなくドラッグと判定）。開いた時は選択行が
+  見える位置までスクロール済み
 - **Gauge** は表示専用。値の平滑化はテレメトリ側の仕事（ジャンプする
   ソースなら EMA を挟んでから `setValue`）
+
+## ポインタの波紋（ホバーの水面エフェクト）
+
+```cpp
+fx::Ripple ripple(stage.root());   // UIより後に作る（リングが最前面に乗る）
+
+// 入力経路から（Webビューアのmousemove / タッチ / VRレイ）:
+ripple.pointerMoved(pos);          // 動いた軌跡に波紋（間隔は自動間引き）
+ripple.splash(pos);                // タップは強め二重リング
+
+// フレームループ（renderと同じdtを渡す = すべて決定的）:
+ripple.tick(dt);
+renderer.render(stage, dt);
+```
+
+![波紋エフェクト](images/ripple.png)
+
+実体は円レイヤーの拡大+フェード（Transaction）だけで、`max_rings`（既定
+24）で有界。下の映像そのものを歪ませる屈折波紋は L1 の GPU フィルタ
+（filters_shared.h に ripple 関数を1つ足す）で計画済み。
 
 ## どのレイヤーが押されたか（hit-test）
 
@@ -196,6 +218,7 @@ const Surface& full    = renderer.render(stage, 3840, 2160, dt); // 同じ木
 - フィルタの色は sRGB 空間で計算（リニア化は L1 検討）
 - 裸のグループに `masksToBounds` / `background` を付けても bounds がゼロの
   ため何も起きない — `bounds()` を明示すること
-- Dropdown のリストはドラッグスクロール未対応（`max_visible` で切る）
-- ホバー演出（波紋等）は未実装 — ポインタ注入は capture 中の Move のみ
-  ルーティングする。ホバー配信とエフェクトヘルパーは次版
+- レイヤー単位のホバー状態（ボタンのhover強調等）は未実装 — ポインタ注入
+  は capture 中の Move のみルーティングする（波紋のような画面エフェクトは
+  fx::Ripple に位置を直接流すので影響なし）
+- 屈折式の水面波紋（映像を歪ませる方）は L1 の GPU フィルタで対応予定

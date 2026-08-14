@@ -21,6 +21,7 @@
 #include "fluent_stage/animation.hpp"
 #include "fluent_stage/content.hpp"
 #include "fluent_stage/cpu_renderer.hpp"
+#include "fluent_stage/effects.hpp"
 #include "fluent_stage/filters.hpp"
 #include "fluent_stage/geometry.hpp"
 #include "fluent_stage/layer.hpp"

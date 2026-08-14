@@ -298,6 +298,23 @@ void sceneUiCatalog(CpuRenderer& r) {
     checkScene("ui_catalog", r.render(stage, 0.0f));
 }
 
+void sceneRipple(CpuRenderer& r) {
+    // The pointer-wake effect at t = 0.15 s, deterministic like everything.
+    Stage stage(480, 300);
+    stage.rect({0, 0, 480, 300}).color({0.08f, 0.12f, 0.16f, 1});
+    stage.grid(60).color({1, 1, 1, 0.08f});
+    fx::Ripple ripple(stage.root());
+    ripple.splash({120, 150});
+    ripple.pointerMoved({240, 90});
+    ripple.pointerMoved({300, 120});
+    ripple.pointerMoved({360, 160});
+    for (int i = 0; i < 3; ++i) {
+        ripple.tick(0.05f);
+        stage.advance(0.05f);
+    }
+    checkScene("ripple_t015", r.render(stage, 0.0f));
+}
+
 void sceneText(CpuRenderer& r) {
     Stage stage(480, 300);
     stage.rect({0, 0, 480, 300}).color({0.1f, 0.12f, 0.15f, 1});
@@ -332,6 +349,7 @@ int main(int argc, char** argv) {
     sceneImagePaste(r);
     sceneUi(r);
     sceneUiCatalog(r);
+    sceneRipple(r);
     sceneText(r);
     if (g_failures == 0) {
         std::printf("all golden_tests passed\n");

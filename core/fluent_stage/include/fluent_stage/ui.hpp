@@ -301,8 +301,8 @@ struct DropdownStyle {
     float corner_radius = 10;      ///< Plate and popup rounding.
     float font_size = 20;          ///< Label and row text size.
     float row_height = 44;         ///< Popup row height.
-    uint32_t max_visible = 8;      ///< Rows shown at once (no scrolling yet;
-                                   ///< longer lists are clipped — v1 limit).
+    uint32_t max_visible = 8;      ///< Rows shown at once; longer lists
+                                   ///< scroll by dragging inside the popup.
     float open_duration = 0.12f;   ///< Open/close fade+slide transition.
     float disabled_opacity = 0.4f; ///< Whole-control opacity when disabled.
 };
@@ -311,8 +311,9 @@ struct DropdownStyle {
 /// is nothing special: a group appended at the top of the root (tree order
 /// = stacking order), a transparent full-stage scrim beneath it catches
 /// the outside tap that closes it, and the chevron flips via ordinary
-/// rotation. Lists longer than `max_visible` are clipped in this version
-/// (drag scrolling is the follow-up).
+/// rotation. Lists longer than `max_visible` scroll by dragging inside the
+/// popup (a move beyond ~6 units becomes a drag, not a tap); opening
+/// scrolls the selected row into view.
 class Dropdown {
 public:
     /// Builds the prefab under \p parent at \p frame (the closed plate).
@@ -350,11 +351,18 @@ private:
     Layer* chevron_ = nullptr;
     Layer* scrim_ = nullptr;
     Layer* popup_ = nullptr;
+    Layer* popup_rows_ = nullptr;
     DropdownStyle style_;
     Rect frame_;
     std::vector<std::string> options_;
     int selected_ = 0;
     bool enabled_ = true;
+    // popup drag-scroll state
+    float scroll_ = 0;
+    float min_scroll_ = 0;
+    float drag_start_y_ = 0;
+    float drag_start_scroll_ = 0;
+    bool dragging_ = false;
     std::function<void(int)> on_change_;
 };
 

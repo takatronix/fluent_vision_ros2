@@ -583,33 +583,70 @@ void Dropdown::openPopup() {
 
     popup_ = &stage.root().group();
     popup_->frame({px, py, pw, ph});
-    popup_->masksToBounds(true);  // v1: long lists clip at max_visible
+    popup_->masksToBounds(true);
     popup_->rect({0, 0, pw, ph}).cornerRadius(style_.corner_radius).color(style_.popup);
-    for (uint32_t i = 0; i < visible; ++i) {
-        const float row_y = pad + i * style_.row_height;
+
+    // All rows live in an inner group whose origin drag-scrolls; the popup
+    // clips it. Opening scrolls the selected row into view.
+    const float content_h = static_cast<float>(options_.size()) * style_.row_height;
+    const float visible_h = visible * style_.row_height;
+    min_scroll_ = std::min(visible_h - content_h, 0.0f);
+    scroll_ = std::clamp(-(selected_ * style_.row_height) + (visible_h - style_.row_height) * 0.5f,
+                         min_scroll_, 0.0f);
+    dragging_ = false;
+    popup_rows_ = &popup_->group();
+    popup_rows_->position(0, pad + scroll_);
+    for (size_t i = 0; i < options_.size(); ++i) {
+        const float row_y = i * style_.row_height;
         if (static_cast<int>(i) == selected_) {
-            popup_->rect({pad, row_y, pw - 2 * pad, style_.row_height})
+            popup_rows_->rect({pad, row_y, pw - 2 * pad, style_.row_height})
                 .cornerRadius(style_.corner_radius - 4)
                 .color(style_.accent.faded(0.22f));
         }
-        popup_->text(options_[i],
-                     {16, row_y + centeredTextY(stage, options_[i], style_.font_size,
-                                                style_.row_height)})
+        popup_rows_->text(options_[i],
+                          {16, row_y + centeredTextY(stage, options_[i], style_.font_size,
+                                                     style_.row_height)})
             .size(style_.font_size)
             .color(static_cast<int>(i) == selected_ ? style_.accent : style_.label);
     }
-    popup_->onPointer([this, pad, visible](const PointerEvent& e) {
-        if (e.phase != PointerPhase::Up || !e.inside) {
-            return;
-        }
-        const int row = static_cast<int>((e.local_pos.y - pad) / style_.row_height);
-        if (row >= 0 && row < static_cast<int>(visible)) {
-            const bool changed = row != selected_;
-            select(row);
-            close();
-            if (changed && on_change_) {
-                on_change_(selected_);
+
+    popup_->onPointer([this, pad](const PointerEvent& e) {
+        switch (e.phase) {
+            case PointerPhase::Down:
+                drag_start_y_ = e.local_pos.y;
+                drag_start_scroll_ = scroll_;
+                dragging_ = false;
+                break;
+            case PointerPhase::Move: {
+                const float dy = e.local_pos.y - drag_start_y_;
+                if (!dragging_ && std::fabs(dy) > 6.0f) {
+                    dragging_ = true;
+                }
+                if (dragging_ && min_scroll_ < 0) {
+                    scroll_ = std::clamp(drag_start_scroll_ + dy, min_scroll_, 0.0f);
+                    popup_rows_->position(0, pad + scroll_);
+                }
+                break;
             }
+            case PointerPhase::Up: {
+                if (dragging_ || !e.inside) {
+                    return;
+                }
+                const int row =
+                    static_cast<int>((e.local_pos.y - pad - scroll_) / style_.row_height);
+                if (row >= 0 && row < static_cast<int>(options_.size())) {
+                    const bool changed = row != selected_;
+                    select(row);
+                    close();
+                    if (changed && on_change_) {
+                        on_change_(selected_);
+                    }
+                }
+                break;
+            }
+            case PointerPhase::Cancel:
+                dragging_ = false;
+                break;
         }
     });
 
@@ -630,6 +667,7 @@ Dropdown& Dropdown::close() {
         popup_->onPointer({});
         popup_->remove();
         popup_ = nullptr;
+        popup_rows_ = nullptr;
     }
     if (scrim_ != nullptr) {
         scrim_->onPointer({});

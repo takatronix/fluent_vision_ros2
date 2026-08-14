@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 — 2026-08-14 (波紋エフェクト + Dropdownスクロール)
+
+- `fx::Ripple`（effects.hpp 新設）: ポインタの軌跡に広がって消える
+  リング波紋（トレイル + タップの二重スプラッシュ）。円レイヤー +
+  Transaction のみ、`max_rings` で有界、dt 駆動で決定的
+- Dropdown: `max_visible` 超のリストをドラッグスクロール（6単位で
+  タップ/ドラッグ弁別、開いた時に選択行へ自動スクロール）
+- テスト: ripple 生成/間引き/上限/消滅、dropdown スクロール+選択。
+  golden `ripple_t015`、example `ripple_demo`
+
 ## 0.3.0 — 2026-08-14 (UIカタログ完成)
 
 - `ui::Slider`（0..1。ドラッグはポインタ直結・onChange連続、setValueは
