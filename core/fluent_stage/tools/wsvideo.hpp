@@ -57,9 +57,9 @@ inline void broadcastAu(AuPtr au) {
         }
         // A stalling client skips to the next keyframe — deltas cannot be
         // dropped individually and latency must never accumulate. The cap is
-        // deliberately tight (~0.5 s at 6 Mbps): WAN viewers should skip
+        // deliberately tight (under a second even on a slow link): WAN viewers should skip
         // early rather than nurse a growing backlog.
-        if (c->queued_bytes > 768u << 10) {
+        if (c->queued_bytes > 384u << 10) {
             c->queue.clear();
             c->queued_bytes = 0;
             c->wait_for_key = true;

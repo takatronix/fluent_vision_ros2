@@ -240,7 +240,7 @@ function framePullFallback(reason) {
 
 function webcodecsPath() {
   const ctx = view.getContext('2d');
-  let frames = 0, seq = 0, sized = false, total = 0;
+  let frames = 0, seq = 0, sized = false, total = 0, dropUntilKey = false, q = 0;
   const decoder = new VideoDecoder({
     output: f => {
       if (!sized) { view.width = f.displayWidth; view.height = f.displayHeight; sized = true; }
@@ -253,14 +253,24 @@ function webcodecsPath() {
   openWs('', data => {
     const bytes = new Uint8Array(data);
     ++total;
+    const key = bytes[0] === 1;
+    // Client-side skip-to-keyframe: if decode+draw falls behind the link,
+    // drop deltas until the next key instead of letting the decoder queue
+    // grow into visible, accumulating lag.
+    if (decoder.decodeQueueSize > 4 && !key) dropUntilKey = true;
+    if (dropUntilKey) {
+      if (!key) return;
+      dropUntilKey = false;
+    }
+    q = decoder.decodeQueueSize;
     decoder.decode(new EncodedVideoChunk({
-      type: bytes[0] === 1 ? 'key' : 'delta',
+      type: key ? 'key' : 'delta',
       timestamp: (seq++) * 16666,
       data: bytes.subarray(1),
     }));
   }, () => hookPointer(view),
      () => { if (total === 0) framePullFallback('ws unavailable'); });
-  setInterval(() => { bar.textContent = statusLine('h264/webcodecs ' + frames + ' fps'); frames = 0; }, 1000);
+  setInterval(() => { bar.textContent = statusLine('h264/webcodecs ' + frames + ' fps  dq ' + q); frames = 0; }, 1000);
 }
 
 function msePath() {
