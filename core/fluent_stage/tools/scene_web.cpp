@@ -203,7 +203,11 @@ function openWs(fmt, onBinary, onOpen, onDead) {
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     sendMsg = t => { try { ws.send(t); } catch (e) {} };
-    sendCam = b => { try { ws.send(b); } catch (e) {} };
+    // Latest wins upstream too: if the uplink is behind, drop this frame
+    // instead of letting ws.bufferedAmount grow into seconds of lag.
+    sendCam = b => {
+      try { if (ws.bufferedAmount < 262144) ws.send(b); } catch (e) {}
+    };
     if (onOpen) onOpen(ws);
   };
   ws.onclose = () => { sendMsg = null; sendCam = null; if (onDead) onDead(); };
