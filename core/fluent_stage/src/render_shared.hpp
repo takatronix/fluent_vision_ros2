@@ -228,16 +228,32 @@ inline Rect subtreeExtent(const Layer& layer, Vec2 parent_size, const TextMeasur
 
 // ---- filters ---------------------------------------------------------------
 
-// Applies the logical→pixel factor to Length-typed parameters (§5-3);
-// Scalars pass through. Both backends feed the shared bodies these values.
-inline void scaleFilterValues(const Filter& f, float scale, float out[5]) {
+// Converts a filter's parameters into what the shared bodies expect (§5-3);
+// both backends feed the bodies through this one function:
+//   Length — logical units × the logical→buffer-pixel factor;
+//   CoordX/CoordY — positions in the layer's local space, mapped into the
+//   filter pass's normalized uv over the buffer (`ext` is the local-space
+//   rect the buffer covers);
+//   Scalar — untouched.
+inline void scaleFilterValues(const Filter& f, float scale, Rect ext, float buf_w, float buf_h,
+                              float out[5]) {
     for (int i = 0; i < 5; ++i) {
         out[i] = f.values[i];
     }
     if (const FilterSpec* spec = findFilterSpec(f.mode)) {
         for (size_t i = 0; i < spec->params.size() && i < 5; ++i) {
-            if (spec->params[i].unit == FilterUnit::Length) {
-                out[i] *= scale;
+            switch (spec->params[i].unit) {
+                case FilterUnit::Scalar:
+                    break;
+                case FilterUnit::Length:
+                    out[i] *= scale;
+                    break;
+                case FilterUnit::CoordX:
+                    out[i] = (out[i] - ext.x) * scale / buf_w;
+                    break;
+                case FilterUnit::CoordY:
+                    out[i] = (out[i] - ext.y) * scale / buf_h;
+                    break;
             }
         }
     }

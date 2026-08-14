@@ -17,7 +17,9 @@
 // them by its logical→source-pixel factor before the body sees them, so
 // `blur(4)` looks identical on a 640×480 and a 4K source (§5-3 of the
 // design). `Scalar` parameters pass through untouched (ratios, angles,
-// normalized 0–1 positions).
+// normalized 0–1 positions). `CoordX`/`CoordY` are positions in the
+// layer's local logical space; the renderer maps them into the filter
+// pass's normalized uv (so bodies get a ready-to-use uv center).
 //
 // No include guard: this file is included multiple times by design.
 //
@@ -156,3 +158,11 @@ FS_END(ZoomBlur)
 FS_FILTER(Halftone, halftone, FS_HALFTONE, "halftone dots")
 FS_PARAM(0, spacing, 8.0f, Length)
 FS_END(Halftone)
+
+FS_FILTER(RippleWave, ripple, FS_RIPPLE, "water refraction wave (expanding wavefront)")
+FS_PARAM(0, center_x, 0.0f, CoordX)
+FS_PARAM(1, center_y, 0.0f, CoordY)
+FS_PARAM(2, radius, 60.0f, Length)
+FS_PARAM(3, amplitude, 6.0f, Length)
+FS_PARAM(4, wavelength, 26.0f, Length)
+FS_END(RippleWave)

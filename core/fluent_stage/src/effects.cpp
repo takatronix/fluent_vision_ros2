@@ -1,70 +1,79 @@
-// effects.cpp — pointer-driven effects built from ordinary layers.
+// effects.cpp — fx::Ripple drives fs_ripple refraction filters on its
+// target layer; the wave math itself lives once in filters_shared.h and
+// runs on whichever backend renders the frame.
 
 #include "fluent_stage/effects.hpp"
 
 #include <cmath>
 
-#include "fluent_stage/stage.hpp"
-#include "fluent_stage/transaction.hpp"
-
 namespace fluent_stage {
 namespace fx {
 
-Ripple::Ripple(Layer& parent, RippleStyle style) : style_(style) {
-    group_ = &parent.group();
-}
+Ripple::Ripple(Layer& target, RippleStyle style)
+    : target_(&target), base_filters_(target.filters()), style_(style) {}
 
 Ripple::~Ripple() {
-    if (group_ != nullptr) {
-        group_->remove();
+    // Leave the layer as we found it.
+    if (target_ != nullptr) {
+        target_->clearFilters();
+        for (const Filter& f : base_filters_) {
+            target_->filter(f);
+        }
     }
 }
 
-void Ripple::spawn(Vec2 pos, float alpha_mult) {
-    if (rings_.size() >= style_.max_rings) {
-        rings_.front().layer->remove();
-        rings_.erase(rings_.begin());
+void Ripple::spawn(Vec2 pos, float strength) {
+    if (waves_.size() >= style_.max_waves) {
+        waves_.erase(waves_.begin());  // oldest wave yields its pass
     }
-    Layer& ring = group_->circle({0, 0}, style_.radius)
-                      .thickness(style_.thickness)
-                      .color(style_.color.faded(alpha_mult))
-                      .position(pos)
-                      .scale(style_.start_scale);
-    {
-        Transaction t(style_.duration, Ease::Out);
-        ring.scale(1.0f);
-        ring.opacity(0.0f);
-    }
-    rings_.push_back({&ring, style_.duration});
+    waves_.push_back({pos, 0, strength});
     last_spawn_ = pos;
+    applyFilters();
 }
 
 void Ripple::pointerMoved(Vec2 pos) {
     const float dist = std::hypot(pos.x - last_spawn_.x, pos.y - last_spawn_.y);
     if (dist >= style_.spawn_spacing) {
-        spawn(pos, 0.7f);
+        spawn(pos, style_.trail_scale);
     }
 }
 
-void Ripple::splash(Vec2 pos) {
-    spawn(pos, 1.0f);
-    pending_.push_back({pos, 0.1f});  // second ring rides 0.1 s behind
-}
+void Ripple::splash(Vec2 pos) { spawn(pos, 1.0f); }
 
 void Ripple::tick(float dt) {
-    for (size_t i = pending_.size(); i-- > 0;) {
-        pending_[i].delay -= dt;
-        if (pending_[i].delay <= 0) {
-            spawn(pending_[i].pos, 0.8f);
-            pending_.erase(pending_.begin() + static_cast<ptrdiff_t>(i));
-        }
+    if (waves_.empty()) {
+        return;
     }
-    for (size_t i = rings_.size(); i-- > 0;) {
-        rings_[i].remaining -= dt;
-        if (rings_[i].remaining <= 0) {
-            rings_[i].layer->remove();
-            rings_.erase(rings_.begin() + static_cast<ptrdiff_t>(i));
+    bool changed = false;
+    for (size_t i = waves_.size(); i-- > 0;) {
+        waves_[i].age += dt;
+        if (waves_[i].age >= style_.duration) {
+            waves_.erase(waves_.begin() + static_cast<ptrdiff_t>(i));
         }
+        changed = true;
+    }
+    if (changed) {
+        applyFilters();
+    }
+}
+
+void Ripple::applyFilters() {
+    target_->clearFilters();
+    for (const Filter& f : base_filters_) {
+        target_->filter(f);
+    }
+    for (const Wave& w : waves_) {
+        const float t = w.age / style_.duration;  // 0..1
+        // The wavefront expands with a fast start; the refraction energy
+        // decays quadratically as the wave spreads out.
+        const float radius = style_.max_radius * (1.0f - (1.0f - t) * (1.0f - t));
+        const float amplitude = style_.amplitude * w.strength * (1.0f - t) * (1.0f - t);
+        target_->filter(RippleWave()
+                            .center_x(w.pos.x)
+                            .center_y(w.pos.y)
+                            .radius(radius)
+                            .amplitude(amplitude)
+                            .wavelength(style_.wavelength));
     }
 }
 

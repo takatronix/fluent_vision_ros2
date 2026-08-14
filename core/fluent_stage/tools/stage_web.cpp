@@ -271,15 +271,35 @@ void serverLoop(uint16_t port) {
 // ---- the demo HUD ----------------------------------------------------------
 
 std::vector<uint8_t> makeCamera(uint32_t t) {
+    // A synthetic asparagus field: sky gradient over ridged crop rows in
+    // perspective — enough structure that the water refraction visibly
+    // bends it. Swap for a real camera frame and nothing else changes.
     const uint32_t w = 640, h = 360;
     std::vector<uint8_t> px(w * h * 4);
     for (uint32_t y = 0; y < h; ++y) {
         for (uint32_t x = 0; x < w; ++x) {
             uint8_t* p = &px[(y * w + x) * 4];
             const float fy = static_cast<float>(y) / h;
-            p[0] = static_cast<uint8_t>(30 + 24 * fy + 6 * ((x + t) % 5 == 0));
-            p[1] = static_cast<uint8_t>(58 + 70 * fy);
-            p[2] = static_cast<uint8_t>(48 + 34 * fy);
+            float r, g, b;
+            if (fy < 0.32f) {  // sky band
+                r = 96 + 40 * fy;
+                g = 128 + 60 * fy;
+                b = 120 + 30 * fy;
+            } else {           // field: perspective crop rows + furrows
+                const float depth = (fy - 0.32f) / 0.68f;             // 0 far → 1 near
+                const float row_w = 14 + 70 * depth;                  // rows widen nearby
+                const float cx = x - w * 0.5f;
+                const float u = cx / (0.35f + depth) + t * 0.6f;      // slow drive-by
+                const float row = std::fabs(std::fmod(u, row_w) / row_w - 0.5f) * 2;
+                const float ridge = row < 0.42f ? 1.0f : 0.55f;       // plant vs furrow
+                const float shade = 0.55f + 0.45f * depth;
+                r = (34 + 26 * row) * ridge * shade + 12;
+                g = (96 + 40 * row) * ridge * shade + 20;
+                b = (52 + 22 * row) * ridge * shade + 14;
+            }
+            p[0] = static_cast<uint8_t>(std::min(r, 255.0f));
+            p[1] = static_cast<uint8_t>(std::min(g, 255.0f));
+            p[2] = static_cast<uint8_t>(std::min(b, 255.0f));
             p[3] = 255;
         }
     }
@@ -327,7 +347,12 @@ int main(int argc, char** argv) {
     ui::Dropdown profile(stage.root(), {24, 460, 220, 46}, {"標準", "低速", "高速", "点検"}, 0);
     ui::Gauge battery(stage.root(), {1180, 90}, 52);
     stage.text("BATT", {1180, 160}).size(16).align(Align::Center).color({1, 1, 1, 0.6f});
-    fx::Ripple ripple(stage.root());  // last: rings on top
+    fx::RippleStyle ripple_style;
+    ripple_style.amplitude = 12;
+    ripple_style.wavelength = 34;
+    ripple_style.max_radius = 340;
+    ripple_style.duration = 1.4f;
+    fx::Ripple ripple(video, ripple_style);  // the camera image is the water surface
 
     bool harvesting = false;
     start.onTap([&] {

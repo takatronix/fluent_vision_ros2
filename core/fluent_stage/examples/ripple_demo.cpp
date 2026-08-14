@@ -1,9 +1,9 @@
-// ripple_demo — the pointer-wake effect (fx::Ripple) over a HUD scene.
+// ripple_demo — the real water ripple: fs_ripple refraction waves bending
+// the image beneath (no rings drawn on top).
 //
-// A scripted pointer path sweeps across the screen with a tap splash;
-// frames at t = 0.12 and t = 0.35 show young and dissolving rings. Feed
-// the effect real positions from your web viewer / touch input and it
-// becomes the live hover wake.
+// A tap splash plus a hover trail run over a grid-and-panel scene; frames
+// at t = 0.15 and t = 0.45 show the wavefronts expanding and the grid
+// genuinely warping. Deterministic: run it twice, same bytes.
 
 #include <cstdio>
 #include <string>
@@ -39,13 +39,19 @@ void writePpm(const std::string& path, const Surface& s) {
 
 int main() {
     Stage stage(640, 360);
-    stage.rect({0, 0, 640, 360}).color({0.08f, 0.12f, 0.16f, 1});
-    stage.grid(80).color({1, 1, 1, 0.07f});
+    // Everything inside `water` refracts; the HUD above stays crisp.
+    auto& water = stage.group("water");
+    water.bounds({0, 0, 640, 360});
+    water.rect({0, 0, 640, 360}).color({0.07f, 0.11f, 0.15f, 1});
+    water.grid(40).color({1, 1, 1, 0.22f});
+    water.circle({480, 220}, 60).color(Color::Teal.faded(0.35f));
+    water.text("水面", {60, 250}).size(60).color({1, 1, 1, 0.5f});
+
     auto& hud = stage.group("hud").position(24, 24);
     hud.rect({0, 0, 240, 64}).cornerRadius(12).color({0, 0, 0, 0.45f});
     hud.text("巡回中", {16, 16}).size(26);
 
-    fx::Ripple ripple(stage.root());  // after the UI: rings draw on top
+    fx::Ripple ripple(water);
 
     CpuRenderer renderer;
     const auto frame = [&](float dt) {
@@ -53,17 +59,12 @@ int main() {
         return renderer.render(stage, dt);  // one clock for everything
     };
 
-    // Scripted pointer sweep + a tap.
-    const Vec2 path[] = {{80, 300}, {160, 260}, {240, 230}, {330, 210}, {420, 200}, {510, 180}};
-    for (const Vec2& p : path) {
-        ripple.pointerMoved(p);
-    }
-    ripple.splash({560, 120});
-
-    frame(0.06f);
-    writePpm("ripple_young.ppm", frame(0.06f));   // t = 0.12
-    frame(0.12f);
-    writePpm("ripple_fading.ppm", frame(0.11f));  // t = 0.35
-    std::printf("wrote ripple_young/fading.ppm\n");
+    ripple.splash({320, 180});          // tap
+    ripple.pointerMoved({520, 120});    // hover trail
+    frame(0.075f);
+    writePpm("ripple_young.ppm", frame(0.075f));   // t = 0.15
+    frame(0.15f);
+    writePpm("ripple_spread.ppm", frame(0.15f));   // t = 0.45
+    std::printf("wrote ripple_young/spread.ppm\n");
     return 0;
 }

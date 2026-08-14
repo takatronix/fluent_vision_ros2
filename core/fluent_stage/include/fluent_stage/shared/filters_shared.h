@@ -51,6 +51,7 @@ const int FS_MEDIAN = 27;
 // are the shared vocabulary) but no body in fs_apply — renderers implement
 // it as two 1-D passes. Radius is in logical units like every other length.
 const int FS_BLUR = 28;
+const int FS_RIPPLE = 29;
 
 #ifdef FS_SAMPLE
 
@@ -255,6 +256,21 @@ vec3 fs_zoom_blur(vec2 uv, float strength) {
     return accum / 9.0;
 }
 
+// A water-surface refraction wave: the sampling position is displaced by a
+// damped sinusoid concentrated around an expanding wavefront, so the image
+// beneath genuinely bends (this is the real ripple — the classic GL demo,
+// not rings drawn on top). The driver animates `radius` outward and decays
+// `amplitude`; stacking several instances layers multiple waves.
+vec3 fs_ripple(vec2 uv, float center_x, float center_y, float radius, float amplitude,
+               float wavelength) {
+    vec2 d = (uv - vec2(center_x, center_y)) / FS_TEXEL;  // pixel space
+    float r = max(length(d), 1e-3);
+    float band = (r - radius) / max(wavelength, 1.0);
+    float envelope = exp(-band * band);  // energy lives near the wavefront
+    float displacement = sin(band * 6.28318530718) * amplitude * envelope;
+    return FS_SAMPLE(uv - (d / r) * displacement * FS_TEXEL);
+}
+
 vec3 fs_halftone(vec2 uv, float spacing) {
     float s = max(spacing, 2.0);
     vec2 px = uv / FS_TEXEL;
@@ -298,6 +314,7 @@ vec4 fs_apply(int mode, vec2 uv, float p0, float p1, float p2, float p3, float p
     else if (mode == FS_COLOR_TRANSFORM) c = fs_color_transform(c, p0, p1, p2, p3);
     else if (mode == FS_BILATERAL)       c = fs_bilateral(uv, p0, p1);
     else if (mode == FS_MEDIAN)          c = fs_median(uv);
+    else if (mode == FS_RIPPLE)          c = fs_ripple(uv, p0, p1, p2, p3, p4);
     return vec4(clamp(c, 0.0, 1.0), alpha);
 }
 

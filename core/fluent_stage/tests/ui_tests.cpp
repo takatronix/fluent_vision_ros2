@@ -271,32 +271,38 @@ void testDropdownScroll() {
 
 void testRipple() {
     Stage stage(640, 360);
-    const uint32_t baseline = stage.layerCount();
+    // A layer with an existing filter: the ripple must keep it as the base.
+    auto& water = stage.rect({0, 0, 640, 360}).color({0.2f, 0.3f, 0.4f, 1}).blur(2);
     fx::RippleStyle style;
-    style.max_rings = 4;
-    fx::Ripple ripple(stage.root(), style);
+    style.max_waves = 3;
+    {
+        fx::Ripple ripple(water, style);
+        CHECK(water.filters().size() == 1);
 
-    ripple.pointerMoved({100, 100});  // far from anywhere → ring 1
-    ripple.pointerMoved({110, 100});  // 10 < spacing → no ring
-    CHECK(ripple.ringCount() == 1);
-    ripple.pointerMoved({140, 100});  // 40 ≥ spacing → ring 2
-    CHECK(ripple.ringCount() == 2);
+        ripple.splash({100, 100});
+        CHECK(ripple.waveCount() == 1);
+        CHECK(water.filters().size() == 2);  // base blur + one refraction wave
+        CHECK(water.filters()[0].mode == FS_BLUR);
+        CHECK(water.filters()[1].mode == FS_RIPPLE);
 
-    ripple.splash({200, 200});  // ring 3 now, ring 4 after 0.1 s
-    CHECK(ripple.ringCount() == 3);
-    ripple.tick(0.05f);
-    CHECK(ripple.ringCount() == 3);
-    ripple.tick(0.06f);
-    CHECK(ripple.ringCount() == 4);
+        ripple.pointerMoved({110, 100});  // 10 < spacing → no wave
+        CHECK(ripple.waveCount() == 1);
+        ripple.pointerMoved({160, 100});  // trail wave
+        ripple.pointerMoved({220, 100});
+        CHECK(ripple.waveCount() == 3);
+        ripple.splash({300, 100});  // cap: oldest wave recycles
+        CHECK(ripple.waveCount() == 3);
 
-    // The cap recycles the oldest ring instead of growing.
-    ripple.pointerMoved({300, 100});
-    CHECK(ripple.ringCount() == 4);
-
-    // Everything expires and the tree returns to group-only.
-    ripple.tick(1.0f);
-    CHECK(ripple.ringCount() == 0);
-    CHECK(stage.layerCount() == baseline + 1);
+        // Waves advance only through tick and dissipate on schedule.
+        ripple.tick(0.5f);
+        CHECK(ripple.waveCount() == 3);
+        ripple.tick(2.0f);
+        CHECK(ripple.waveCount() == 0);
+        CHECK(water.filters().size() == 1);
+    }
+    // Destruction restores the layer exactly as found.
+    CHECK(water.filters().size() == 1);
+    CHECK(water.filters()[0].mode == FS_BLUR);
 }
 
 }  // namespace

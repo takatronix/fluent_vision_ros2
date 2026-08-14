@@ -293,10 +293,11 @@ void gaussianBlur(Buf& buf, float radius_px) {
 }
 
 // Applies one filter to the buffer. `scale` converts logical units to
-// buffer pixels for Length parameters (§5-3).
-void applyFilter(Buf& buf, const Filter& f, float scale) {
+// buffer pixels; `ext` is the local-space rect the buffer covers (§5-3).
+void applyFilter(Buf& buf, const Filter& f, float scale, Rect ext) {
     float values[5];
-    plan::scaleFilterValues(f, scale, values);
+    plan::scaleFilterValues(f, scale, ext, static_cast<float>(buf.w),
+                            static_cast<float>(buf.h), values);
     if (f.mode == FS_BLUR) {
         gaussianBlur(buf, values[0]);
         return;
@@ -829,7 +830,7 @@ struct CpuRenderer::Impl {
         }
 
         for (const Filter& f : layer.filters()) {
-            applyFilter(buf, f, scale);
+            applyFilter(buf, f, scale, ext);
         }
 
         const Mat23 inv = m.inverse();

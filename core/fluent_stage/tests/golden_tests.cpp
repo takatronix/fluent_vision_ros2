@@ -313,15 +313,15 @@ void sceneUiCatalog(Renderer& r) {
 }
 
 void sceneRipple(Renderer& r) {
-    // The pointer-wake effect at t = 0.15 s, deterministic like everything.
+    // The water-refraction wave at t = 0.15 s: the grid beneath must bend.
     Stage stage(480, 300);
-    stage.rect({0, 0, 480, 300}).color({0.08f, 0.12f, 0.16f, 1});
-    stage.grid(60).color({1, 1, 1, 0.08f});
-    fx::Ripple ripple(stage.root());
-    ripple.splash({120, 150});
-    ripple.pointerMoved({240, 90});
-    ripple.pointerMoved({300, 120});
-    ripple.pointerMoved({360, 160});
+    auto& water = stage.group("water");
+    water.bounds({0, 0, 480, 300});
+    water.rect({0, 0, 480, 300}).color({0.08f, 0.12f, 0.16f, 1});
+    water.grid(40).color({1, 1, 1, 0.25f});
+    fx::Ripple ripple(water);
+    ripple.splash({160, 150});
+    ripple.pointerMoved({360, 110});
     for (int i = 0; i < 3; ++i) {
         ripple.tick(0.05f);
         stage.advance(0.05f);

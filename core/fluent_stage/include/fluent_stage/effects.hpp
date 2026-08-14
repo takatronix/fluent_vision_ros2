@@ -1,30 +1,32 @@
 #pragma once
 
 /// \file effects.hpp
-/// \brief Pointer-driven visual effects — same philosophy as ui.hpp:
-///        prefab layers + implicit animation, no new drawing mechanisms.
+/// \brief Pointer-driven effects.
 ///
-/// Effects are app-owned helpers with an explicit clock: feed them pointer
-/// positions from your input path and `tick(dt)` once per frame with the
-/// same dt you pass to `render()`. Everything stays deterministic — a fixed
-/// dt sequence reproduces the exact same rings, which is how the golden
-/// test draws "a ripple at t = 0.15 s".
+/// fx::Ripple is the **real water ripple**: each wave is an `fs_ripple`
+/// refraction filter (shared/filters_shared.h — the same body runs as
+/// SPIR-V on the GPU) whose sampling positions are displaced by a damped
+/// sinusoid around an expanding wavefront. The image beneath genuinely
+/// bends; nothing is drawn on top.
+///
+/// The helper owns the *filter chain of a target layer* — point it at the
+/// layer you want to behave like a water surface (the camera image, or a
+/// background group):
 ///
 /// ```cpp
-/// fx::Ripple ripple(stage.root());       // construct after your UI so the
-///                                        // rings draw on top
+/// fx::Ripple ripple(video_layer);        // this layer becomes the water
 /// // input path (web viewer / touch / VR):
-/// ripple.pointerMoved(pos);              // hover trail (spacing-throttled)
-/// ripple.splash(pos);                    // tap splash (double ring)
-/// // frame loop:
+/// ripple.pointerMoved(pos);              // wake along the hover trail
+/// ripple.splash(pos);                    // tap → a stronger wave
+/// // frame loop, same dt as render():
 /// ripple.tick(dt);
 /// renderer.render(stage, dt);
 /// ```
 ///
-/// This is the *ring* ripple (Material-style wake). The refractive water
-/// ripple that warps the image beneath is a GPU filter planned with the
-/// Vulkan backend (L1) — same single-source filter pipeline, one more
-/// function in filters_shared.h.
+/// Positions are in the target layer's local logical space (for a
+/// full-canvas layer that is simply stage coordinates). Deterministic:
+/// waves advance only through tick(dt), so a fixed dt sequence reproduces
+/// the exact refraction — golden-testable like everything else.
 
 #include <vector>
 
@@ -33,61 +35,55 @@
 namespace fluent_stage {
 namespace fx {
 
-/// Visual parameters of the ring ripple; every field has a working default.
+/// Wave parameters; every field has a working default.
 struct RippleStyle {
-    Color color{1, 1, 1, 0.45f};  ///< Ring color (alpha = starting opacity).
-    float radius = 44;            ///< Ring radius at full expansion.
-    float thickness = 2.5f;       ///< Ring stroke width.
-    float duration = 0.7f;        ///< Seconds from spawn to fully faded.
-    float start_scale = 0.15f;    ///< Rings start at radius × start_scale.
-    float spawn_spacing = 36;     ///< Trail: logical units between rings.
-    uint32_t max_rings = 24;      ///< Hard cap (S-6); oldest rings recycle.
+    float amplitude = 7;      ///< Peak refraction displacement (logical units).
+    float wavelength = 26;    ///< Crest-to-crest distance (logical units).
+    float max_radius = 220;   ///< Wavefront radius when fully expanded.
+    float duration = 1.1f;    ///< Seconds from splash to dissipated.
+    float trail_scale = 0.5f; ///< Amplitude factor for hover-trail waves.
+    float spawn_spacing = 48; ///< Trail: logical units between waves.
+    uint32_t max_waves = 8;   ///< Hard cap (each wave is one filter pass);
+                              ///< the oldest wave recycles past it.
 };
 
-/// Expanding, fading rings that trail the pointer like a wake on water.
-/// Bounded, deterministic, and made of ordinary circle layers animated by
-/// Transaction — remove the helper and the effect is gone.
+/// Expanding refraction waves on a target layer (see file comment).
 class Ripple {
 public:
-    /// Builds the effect group under \p parent (append after your UI so
-    /// rings composite on top).
-    explicit Ripple(Layer& parent, RippleStyle style = {});
+    /// Takes ownership of \p target's filter chain: filters present now are
+    /// kept as the base; waves are appended after them each tick.
+    explicit Ripple(Layer& target, RippleStyle style = {});
     ~Ripple();
     Ripple(const Ripple&) = delete;
     Ripple& operator=(const Ripple&) = delete;
 
-    /// Feed every pointer position (hover or drag). Spawns a trail ring
-    /// whenever the pointer moved `spawn_spacing` units since the last one.
+    /// Feed every pointer position (hover or drag); spawns a trail wave
+    /// each `spawn_spacing` units of travel.
     void pointerMoved(Vec2 pos);
 
-    /// A tap splash: an immediate ring plus a delayed second ring.
+    /// A tap splash: one full-strength wave.
     void splash(Vec2 pos);
 
-    /// Advances ring lifetimes and prunes finished rings. Call once per
-    /// frame with the same dt you pass to render().
+    /// Advances the waves and rewrites the target's filter chain. Call
+    /// once per frame with the same dt you pass to render().
     void tick(float dt);
 
-    /// Live ring count (for tests and budgeting).
-    size_t ringCount() const { return rings_.size(); }
-
-    /// The effect's root group.
-    Layer& layer() { return *group_; }
+    /// Live wave count (for tests and budgeting).
+    size_t waveCount() const { return waves_.size(); }
 
 private:
-    void spawn(Vec2 pos, float alpha_mult);
+    void spawn(Vec2 pos, float strength);
+    void applyFilters();
 
-    struct Ring {
-        Layer* layer;
-        float remaining;
-    };
-    struct Pending {
+    struct Wave {
         Vec2 pos;
-        float delay;
+        float age;
+        float strength;
     };
 
-    Layer* group_ = nullptr;
-    std::vector<Ring> rings_;
-    std::vector<Pending> pending_;
+    Layer* target_ = nullptr;
+    std::vector<Filter> base_filters_;
+    std::vector<Wave> waves_;
     RippleStyle style_;
     Vec2 last_spawn_{-1e9f, -1e9f};
 };

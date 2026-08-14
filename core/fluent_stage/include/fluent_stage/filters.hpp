@@ -37,6 +37,9 @@ struct Filter {
 enum class FilterUnit {
     Scalar,  ///< Unitless: ratios, angles, normalized positions. Passed through.
     Length,  ///< Logical units; the renderer converts to source pixels.
+    CoordX,  ///< X position in the layer's local logical space; the
+             ///< renderer maps it into the filter pass's normalized uv.
+    CoordY,  ///< Y position, same mapping.
 };
 
 /// Metadata for one filter parameter (generated from filters_def.h).

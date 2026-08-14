@@ -1445,7 +1445,8 @@ struct VulkanRenderer::Impl {
         // Filters: ping-pong through transients (fullscreen passes).
         for (const Filter& f : layer.filters()) {
             float values[5];
-            plan::scaleFilterValues(f, scale, values);
+            plan::scaleFilterValues(f, scale, ext, static_cast<float>(bw),
+                                    static_cast<float>(bh), values);
             if (f.mode == FS_BLUR) {
                 buf = gaussianBlur(buf, values[0]);
                 continue;
