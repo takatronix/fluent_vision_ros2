@@ -179,11 +179,14 @@ struct VulkanRenderer::Impl {
     Buffer points_ssbo;  // polygon points, rewritten per frame
     Buffer dummy_ssbo;   // bound when a draw needs no points
 
+    // Keyed by the source pixels, not the layer: any number of layers can
+    // borrow the same ImageView and the frame transfers exactly once
+    // (§5-2b's "転送は1回" promise, load-bearing for filter-wall scenes).
     struct ContentTex {
         Image image;
         uint64_t frame_used = 0;
     };
-    std::map<const Layer*, ContentTex> image_cache;
+    std::map<const void*, ContentTex> image_cache;
     Image atlas_tex;
     uint64_t atlas_uploaded_revision = 0;
     uint64_t frame_counter = 0;
@@ -945,7 +948,7 @@ struct VulkanRenderer::Impl {
             }
         } else if (const auto* img = std::get_if<ImageContent>(&content)) {
             if (img->view.valid()) {
-                uploadContentImage(layer, img->view);
+                uploadContentImage(img->view);
             }
         }
         for (const auto& child : layer.sublayers()) {
@@ -953,12 +956,16 @@ struct VulkanRenderer::Impl {
         }
     }
 
-    void uploadContentImage(const Layer& layer, const ImageView& view) {
-        auto& entry = image_cache[&layer];
+    void uploadContentImage(const ImageView& view) {
+        auto& entry = image_cache[view.pixels];
+        if (entry.frame_used == frame_counter) {
+            return;  // shared source already transferred this frame
+        }
         if (entry.image.w != static_cast<int>(view.width) ||
             entry.image.h != static_cast<int>(view.height)) {
             if (entry.image.image != VK_NULL_HANDLE) {
-                vkDeviceWaitIdle(device);
+                // The frame fence has already drained the previous submit;
+                // nothing in flight references this image.
                 destroyImage(entry.image);
             }
             entry.image = createImage(static_cast<int>(view.width), static_cast<int>(view.height),
@@ -1163,7 +1170,8 @@ struct VulkanRenderer::Impl {
 
     void drawImageContent(Image& target, const Layer& layer, const ImageContent& c, Rect bounds,
                           const Mat23& m, const Mat23& inv, float alpha, Blend blend) {
-        auto it = image_cache.find(&layer);
+        (void)layer;
+        auto it = image_cache.find(c.view.pixels);
         if (it == image_cache.end() || !c.view.valid() || bounds.w <= 0 || bounds.h <= 0) {
             return;
         }
@@ -1624,10 +1632,10 @@ struct VulkanRenderer::Impl {
                 std::min<VkDeviceSize>(polygon_points.size() * sizeof(Vec2), points_ssbo.size);
             std::memcpy(points_ssbo.mapped, polygon_points.data(), bytes);
         }
-        // Drop image cache entries whose layers vanished.
+        // Drop image cache entries not referenced for a while (a grace
+        // period keeps double-buffered sources from churning textures).
         for (auto it = image_cache.begin(); it != image_cache.end();) {
-            if (it->second.frame_used != frame_counter) {
-                vkDeviceWaitIdle(device);
+            if (it->second.frame_used + 60 < frame_counter) {
                 destroyImage(it->second.image);
                 it = image_cache.erase(it);
             } else {
