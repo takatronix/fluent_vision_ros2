@@ -1,0 +1,52 @@
+# あなたのWebカメラが水面になる — scene_web のショーケース。
+#   ./build/scene_web examples/scenes/webcam_water.fvs --webcam camera --ripple water
+# ブラウザ(https)で開くと: ホバー=航跡、クリック=スプラッシュ。
+# 下段はフィルタタイル(同じカメラを sourceRect 共有、転送は1回)。
+schema: fluent.scene/v1alpha2
+stage: { size: [1280, 720] }
+inputs:
+  camera: { type: image.rgba8, update: per_frame }
+layers:
+  - id: water
+    content: { image: { source: $inputs.camera, fit: cover } }
+  - id: hud
+    position: [24, 24]
+    opacity: 0.92
+    shadow: {}
+    sublayers:
+      - content: { rect: { size: [430, 64], corner_radius: 14, color: [0, 0, 0, 0.45] } }
+      - content: { text: { text: "FLUENT SCENE — 触ると波打つ", position: [18, 16], size: 26 } }
+  - id: tiles
+    position: [0, 566]
+    sublayers:
+      - content: { rect: { rect: [0, 0, 1280, 154], color: [0, 0, 0, 0.35] } }
+      - id: t1
+        frame: [12, 10, 240, 134]
+        content: { image: { source: $inputs.camera, fit: cover } }
+        corner_radius: 10
+        masks_to_bounds: true
+        filters: [ { toon: {} } ]
+      - id: t2
+        frame: [264, 10, 240, 134]
+        content: { image: { source: $inputs.camera, fit: cover } }
+        corner_radius: 10
+        masks_to_bounds: true
+        filters: [ { sketch: {} } ]
+      - id: t3
+        frame: [516, 10, 240, 134]
+        content: { image: { source: $inputs.camera, fit: cover } }
+        corner_radius: 10
+        masks_to_bounds: true
+        filters: [ { halftone: {} } ]
+      - id: t4
+        frame: [768, 10, 240, 134]
+        content: { image: { source: $inputs.camera, fit: cover } }
+        corner_radius: 10
+        masks_to_bounds: true
+        filters: [ { hue: { angle: 150 } } ]
+      - id: t5
+        frame: [1020, 10, 240, 134]
+        content: { image: { source: $inputs.camera, fit: cover } }
+        corner_radius: 10
+        masks_to_bounds: true
+        filters: [ { pixelate: {} } ]

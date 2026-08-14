@@ -6,6 +6,10 @@
 //
 //   scene_web scene.fvs [--port 8791] [--fps 30] [--image input=topic]...
 //             [--events /topic]   publish UI events as std_msgs/String JSON
+//             [--webcam input]    accept browser webcam JPEG on POST /camera
+//                                 and feed it into $inputs.<input>
+//             [--ripple layer_id] attach the refraction ripple (fx::Ripple)
+//                                 to a layer: hover = wake, click = splash
 //
 //   GET /        minimal viewer page (stream + status readout)
 //   GET /stream  MJPEG of the live scene
@@ -42,6 +46,7 @@
 #include <jpeglib.h>
 
 #include <fluent_stage/cpu_renderer.hpp>
+#include <fluent_stage/effects.hpp>
 #include <fluent_stage/fluent_stage.hpp>
 #include <fluent_stage/scene/compiler.hpp>
 #include <fluent_stage/scene/document.hpp>
@@ -74,6 +79,12 @@ uint64_t g_frame_seq = 0;
 
 std::mutex g_status_mutex;
 std::string g_status_json = "{}";
+
+// ---- browser webcam frames (POST /camera) ----------------------------------
+
+std::mutex g_webcam_mutex;
+std::vector<uint8_t> g_webcam_jpeg;
+uint64_t g_webcam_seq = 0;
 
 // ---- pointer injection (§10-3): HTTP → queue → render thread ---------------
 // The Stage is single-thread owned, so HTTP handlers only enqueue; the
@@ -197,6 +208,37 @@ v.addEventListener('pointermove', ev => {
   if (now - lastMove > 33) { lastMove = now; send('move', ev); }
 });
 v.addEventListener('pointerup', ev => send('up', ev));
+
+// Webcam → POST /camera (JPEG, ~12fps). Needs a secure context (https or
+// localhost); the bar shows why when capture is unavailable.
+async function startWebcam() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    document.getElementById('bar').textContent =
+        'webcam needs https or localhost (secure context)';
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(
+        {video: {width: 640, height: 480}, audio: false});
+    const video = document.createElement('video');
+    video.srcObject = stream;
+    video.muted = true;
+    await video.play();
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = 480;
+    const ctx = canvas.getContext('2d');
+    setInterval(() => {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(b => {
+        if (b) fetch('/camera', {method: 'POST', body: b}).catch(() => {});
+      }, 'image/jpeg', 0.7);
+    }, 83);
+  } catch (e) {
+    document.getElementById('bar').textContent = 'webcam: ' + e;
+  }
+}
+startWebcam();
 async function tick() {
   try {
     const s = await (await fetch('/status')).json();
@@ -236,15 +278,57 @@ void serverLoop(uint16_t port) {
             continue;
         }
         std::thread([fd] {
-            char buf[2048];
-            const ssize_t n = ::recv(fd, buf, sizeof buf - 1, 0);
-            if (n <= 0) {
+            // Read the full request: headers, then Content-Length of body
+            // (webcam frames arrive as POST bodies).
+            std::string req;
+            char buf[8192];
+            while (req.find("\r\n\r\n") == std::string::npos && req.size() < (1u << 16)) {
+                const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+                if (n <= 0) {
+                    ::close(fd);
+                    return;
+                }
+                req.append(buf, static_cast<size_t>(n));
+            }
+            const size_t header_end = req.find("\r\n\r\n");
+            if (header_end == std::string::npos) {
                 ::close(fd);
                 return;
             }
-            buf[n] = '\0';
-            const std::string req(buf);
-            if (req.rfind("GET /stream", 0) == 0) {
+            size_t content_length = 0;
+            {
+                // Case-insensitive Content-Length scan.
+                std::string lower = req.substr(0, header_end);
+                for (char& c : lower) {
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                const size_t at = lower.find("content-length:");
+                if (at != std::string::npos) {
+                    content_length = std::strtoul(lower.c_str() + at + 15, nullptr, 10);
+                }
+            }
+            const size_t body_start = header_end + 4;
+            if (content_length > (8u << 20)) {
+                ::close(fd);
+                return;
+            }
+            while (req.size() < body_start + content_length) {
+                const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+                if (n <= 0) {
+                    break;
+                }
+                req.append(buf, static_cast<size_t>(n));
+            }
+            if (req.rfind("POST /camera", 0) == 0) {
+                if (content_length > 0 && req.size() >= body_start + content_length) {
+                    std::lock_guard<std::mutex> lock(g_webcam_mutex);
+                    g_webcam_jpeg.assign(req.begin() + static_cast<long>(body_start),
+                                         req.begin() +
+                                             static_cast<long>(body_start + content_length));
+                    ++g_webcam_seq;
+                }
+                sendResponse(fd, "200 OK", "text/plain", "ok\n");
+            } else if (req.rfind("GET /stream", 0) == 0) {
                 streamMjpeg(fd);
             } else if (req.rfind("GET /inspect", 0) == 0) {
                 std::string body;
@@ -356,6 +440,32 @@ void encodeJpeg(const Surface& s, std::vector<uint8_t>& out) {
     out.assign(mem, mem + mem_size);
     jpeg_destroy_compress(&cinfo);
     free(mem);
+}
+
+/// JPEG → tightly packed RGBA8 (browser webcam frames and ROS feeds alike).
+bool decodeJpegToRgbaWeb(const uint8_t* data, size_t len, std::vector<uint8_t>& out,
+                         uint32_t& w, uint32_t& h) {
+    jpeg_decompress_struct cinfo{};
+    jpeg_error_mgr jerr{};
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, const_cast<uint8_t*>(data), len);
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+        jpeg_destroy_decompress(&cinfo);
+        return false;
+    }
+    cinfo.out_color_space = JCS_EXT_RGBA;
+    jpeg_start_decompress(&cinfo);
+    w = cinfo.output_width;
+    h = cinfo.output_height;
+    out.resize(static_cast<size_t>(w) * h * 4);
+    while (cinfo.output_scanline < cinfo.output_height) {
+        JSAMPROW row = &out[static_cast<size_t>(cinfo.output_scanline) * w * 4];
+        jpeg_read_scanlines(&cinfo, &row, 1);
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    return true;
 }
 
 #ifdef FS_HAVE_ROS
@@ -549,6 +659,8 @@ int main(int argc, char** argv) {
     uint16_t port = 8791;
     float fps = 30;
     std::string events_topic;
+    std::string webcam_input;
+    std::string ripple_layer;
     std::vector<std::pair<std::string, std::string>> image_feeds;  // input → topic
     for (int i = 2; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -557,6 +669,10 @@ int main(int argc, char** argv) {
             fps = std::max(1.0f, static_cast<float>(std::atof(argv[++i])));
         } else if (std::strcmp(argv[i], "--events") == 0 && i + 1 < argc) {
             events_topic = argv[++i];
+        } else if (std::strcmp(argv[i], "--webcam") == 0 && i + 1 < argc) {
+            webcam_input = argv[++i];
+        } else if (std::strcmp(argv[i], "--ripple") == 0 && i + 1 < argc) {
+            ripple_layer = argv[++i];
         } else if (std::strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
             const std::string spec = argv[++i];
             const size_t eq = spec.find('=');
@@ -655,6 +771,29 @@ int main(int argc, char** argv) {
 #endif
     std::fflush(stdout);
 
+    // The refraction ripple rides a named layer (hover = wake, click =
+    // splash). Recreated on every reload — the layer pointer changes.
+    std::unique_ptr<fx::Ripple> ripple;
+    auto attachRipple = [&]() {
+        ripple.reset();
+        if (!ripple_layer.empty() && live) {
+            if (Layer* target = live->stage().find(ripple_layer)) {
+                ripple = std::make_unique<fx::Ripple>(*target);
+                std::printf("scene_web: ripple on layer '%s'\n", ripple_layer.c_str());
+            } else {
+                std::fprintf(stderr, "scene_web: --ripple layer '%s' not found\n",
+                             ripple_layer.c_str());
+            }
+        }
+    };
+    attachRipple();
+    std::fflush(stdout);
+
+    // Webcam decode state (persistent pixels behind the borrowed view).
+    std::vector<uint8_t> webcam_rgba;
+    uint32_t webcam_w = 0, webcam_h = 0;
+    uint64_t webcam_seen = 0;
+
     time_t last_mtime = fileMtime(path);
     int inspect_tick = 0;
     const auto frame_time = std::chrono::duration<double>(1.0 / fps);
@@ -670,6 +809,7 @@ int main(int argc, char** argv) {
             if (candidate.scene != nullptr) {
                 live = std::move(candidate.scene);  // the frame-boundary swap
                 armUiEvents(*live);
+                attachRipple();
                 empty_stage.reset();
                 clearErrorBanner(live->stage());
                 std::printf("scene_web: reload #%llu ok — digest %.12s\n",
@@ -725,8 +865,14 @@ int main(int argc, char** argv) {
                 for (const PointerMsg& m : pointers) {
                     if (m.phase == 0) {
                         live->stage().pointerDown({m.x, m.y});
+                        if (ripple) {
+                            ripple->splash({m.x, m.y});
+                        }
                     } else if (m.phase == 1) {
                         live->stage().pointerMove({m.x, m.y});
+                        if (ripple) {
+                            ripple->pointerMoved({m.x, m.y});
+                        }
                     } else {
                         live->stage().pointerUp({m.x, m.y});
                     }
@@ -751,9 +897,36 @@ int main(int argc, char** argv) {
 #endif
 
         // ---- render, encode, publish --------------------------------------
+        // Browser webcam frames → the declared input (latest wins).
+        if (!webcam_input.empty() && live) {
+            bool fresh = false;
+            std::vector<uint8_t> jpeg;
+            {
+                std::lock_guard<std::mutex> lock(g_webcam_mutex);
+                if (g_webcam_seq != webcam_seen) {
+                    webcam_seen = g_webcam_seq;
+                    jpeg = g_webcam_jpeg;
+                    fresh = true;
+                }
+            }
+            if (fresh && !jpeg.empty()) {
+                uint32_t w = 0, h = 0;
+                if (decodeJpegToRgbaWeb(jpeg.data(), jpeg.size(), webcam_rgba, w, h)) {
+                    webcam_w = w;
+                    webcam_h = h;
+                }
+            }
+            if (webcam_w != 0) {
+                live->setImage(webcam_input, {webcam_w, webcam_h, webcam_rgba.data(), 0});
+            }
+        }
+
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::chrono::duration<float>(now - last_frame).count();
         last_frame = now;
+        if (ripple) {
+            ripple->tick(dt);
+        }
         Stage& stage = live ? live->stage() : *empty_stage;
         const Surface& frame = renderer->render(stage, dt);
         {
