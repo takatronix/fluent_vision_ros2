@@ -99,6 +99,7 @@ uint32_t g_ws_out_w = 854, g_ws_out_h = 480;
 struct PointerMsg {
     int phase;  // 0 down, 1 move, 2 up
     float x, y;
+    bool normalized = false;  // true: 0..1 fractions, scaled to the stage
 };
 std::mutex g_pointer_mutex;
 std::vector<PointerMsg> g_pointer_queue;
@@ -179,12 +180,12 @@ let sendCam = null;   // webcam JPEG up (WS binary when open, POST fallback)
 function hookPointer(el) {
   let down = false, pending = null, last = 0;
   const send = (phase, e) => {
+    // Normalized fractions: the server scales to the stage's logical size,
+    // so the page never needs to know it.
     const r = el.getBoundingClientRect();
-    const x = ((e.clientX - r.left) / r.width * (el.width || r.width)).toFixed(1);
-    const y = ((e.clientY - r.top) / r.height * (el.height || r.height)).toFixed(1);
+    const x = ((e.clientX - r.left) / r.width).toFixed(4);
+    const y = ((e.clientY - r.top) / r.height).toFixed(4);
     if (sendMsg) { sendMsg(phase + ' ' + x + ' ' + y); }
-    else { fetch('/pointer?e=' + (phase === 'd' ? 'down' : phase === 'u' ? 'up' : 'move')
-                 + '&x=' + x + '&y=' + y).catch(() => {}); }
   };
   const loop = ts => {
     if (pending && ts - last >= 16) { send(down ? 'm' : 'h', pending); pending = null; last = ts; }
@@ -235,7 +236,7 @@ function framePullFallback(reason) {
 
 function webcodecsPath() {
   const ctx = view.getContext('2d');
-  let frames = 0, seq = 0, sized = false;
+  let frames = 0, seq = 0, sized = false, total = 0;
   const decoder = new VideoDecoder({
     output: f => {
       if (!sized) { view.width = f.displayWidth; view.height = f.displayHeight; sized = true; }
@@ -247,12 +248,14 @@ function webcodecsPath() {
   decoder.configure({codec: 'avc1.42e01e', optimizeForLatency: true});
   openWs('', data => {
     const bytes = new Uint8Array(data);
+    ++total;
     decoder.decode(new EncodedVideoChunk({
       type: bytes[0] === 1 ? 'key' : 'delta',
       timestamp: (seq++) * 16666,
       data: bytes.subarray(1),
     }));
-  }, () => hookPointer(view), () => bar.textContent = 'disconnected — reload');
+  }, () => hookPointer(view),
+     () => { if (total === 0) framePullFallback('ws unavailable'); });
   setInterval(() => { bar.textContent = statusLine('h264/webcodecs ' + frames + ' fps'); frames = 0; }, 1000);
 }
 
@@ -328,8 +331,8 @@ async function startWebcam() {
         if (!b) return;
         if (sendCam) sendCam(await b.arrayBuffer());
         else fetch('/camera', {method: 'POST', body: b}).catch(() => {});
-      }, 'image/jpeg', 0.7);
-    }, 83);
+      }, 'image/jpeg', 0.6);
+    }, 33);
   } catch (e) { statusTail += '\nwebcam: ' + e; }
 }
 startWebcam();
@@ -360,7 +363,7 @@ void handlePointerText(const char* text, size_t len) {
     }
     std::lock_guard<std::mutex> lock(g_pointer_mutex);
     if (g_pointer_queue.size() < 256) {
-        g_pointer_queue.push_back({phase, x, y});
+        g_pointer_queue.push_back({phase, x, y, true});
     }
 }
 
@@ -369,7 +372,14 @@ void handlePointerText(const char* text, size_t len) {
 /// binaries come up. Bounded queue + skip-to-keyframe (wsvideo) keeps
 /// latency from ever accumulating on a slow link.
 void serveWs(int fd, const std::string& request) {
-    const size_t key_at = request.find("Sec-WebSocket-Key:");
+    // Header names arrive in whatever casing the client or a reverse proxy
+    // normalizes to (Go proxies say "Sec-Websocket-Key") — match
+    // case-insensitively or the upgrade 502s behind tailscale serve.
+    std::string lower = request;
+    for (char& c : lower) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    const size_t key_at = lower.find("sec-websocket-key:");
     if (key_at == std::string::npos) {
         return;
     }
@@ -1201,18 +1211,22 @@ int main(int argc, char** argv) {
             }
             if (live) {
                 for (const PointerMsg& m : pointers) {
+                    const Vec2 p = m.normalized
+                                       ? Vec2{m.x * live->stage().width(),
+                                              m.y * live->stage().height()}
+                                       : Vec2{m.x, m.y};
                     if (m.phase == 0) {
-                        live->stage().pointerDown({m.x, m.y});
+                        live->stage().pointerDown(p);
                         if (ripple) {
-                            ripple->splash({m.x, m.y});
+                            ripple->splash(p);
                         }
                     } else if (m.phase == 1) {
-                        live->stage().pointerMove({m.x, m.y});
+                        live->stage().pointerMove(p);
                         if (ripple) {
-                            ripple->pointerMoved({m.x, m.y});
+                            ripple->pointerMoved(p);
                         }
                     } else {
-                        live->stage().pointerUp({m.x, m.y});
+                        live->stage().pointerUp(p);
                     }
                 }
             }
