@@ -101,8 +101,8 @@
   <!-- ================= Bottom band: core + external ================= -->
   <rect x="40" y="576" width="700" height="96" rx="12" fill="#10231e" stroke="#2dd4a7" stroke-width="1.5" stroke-dasharray="6 4"/>
   <text x="60" y="606" fill="#2dd4a7" font-size="15" font-weight="700">🎨 core/ — GPU rendering core（ROS非依存 / no ROS dependency）</text>
-  <text x="60" y="630" fill="#d8ede6" font-size="13">fluent_scene — typed .fvs scene → Vulkan composite (~26× CPU)</text>
-  <text x="60" y="652" fill="#d8ede6" font-size="13">fluent_stage — Stage/Layer/Surface runtime · 30 filters · UI · stage_web/scene_web</text>
+  <text x="60" y="630" fill="#d8ede6" font-size="13">fluent_stage — typed .fvs scene → Stage/Layer/Surface → Vulkan (17× CPU)</text>
+  <text x="60" y="652" fill="#d8ede6" font-size="13">30 filters · UI controls · stage_web/scene_web · ROS 2 binding (scene_node)</text>
 
   <rect x="772" y="576" width="428" height="96" rx="12" fill="#10231e" stroke="#5a7a70" stroke-width="1.5" stroke-dasharray="6 4"/>
   <text x="792" y="606" fill="#8fb5aa" font-size="15" font-weight="700">🐳 docker/ — external runtimes（外部推論）</text>

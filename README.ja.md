@@ -32,7 +32,7 @@
 FluentVision は、1つのリポジトリに同居する2つの顔を持ちます。
 
 1. **ROS 2 認識スタック**（`src/`）— カメラ・AI推論・3D幾何・配信・音声・録画をカバーする40以上のパッケージ。YAMLパイプラインとブラウザの視覚エディタで配線します。
-2. **GPUレンダリングコア**（`core/`）— `fluent_stage` とその前身 `fluent_scene`。ROS非依存のスタンドアロンVulkanコンポジタで、型付きYAMLシーンをロボットのHUDに変換します。型検査が**実行前に**走るため、AIが稼働中の画面を安全に編集できます。
+2. **GPUレンダリングコア**（`core/`）— `fluent_stage`。ROS非依存のスタンドアロンVulkanコンポジタで、型付きYAMLシーンをロボットのHUDに変換します。型検査が**実行前に**走るため、AIが稼働中の画面を安全に編集できます。
 
 ---
 
@@ -194,13 +194,13 @@ stage.boxes(detections).color(Color::Teal).smoothing(0.2f);
 
 📖 ドキュメント（開発中の正文は日本語。OSS公開時に英語READMEを用意予定）: [README](core/fluent_stage/README.md) · [5分で始める](core/fluent_stage/docs/getting-started.ja.md) · [クックブック](core/fluent_stage/docs/cookbook.ja.md) · [CHANGELOG](core/fluent_stage/CHANGELOG.md) · [設計書](docs/design/fluent_stage.ja.md)
 
-### fluent_scene — 第一世代
+### fluent_scene — 第一世代（`attic/`に退役）
 
-ノードグラフ型の前身（スキーマ `fluent.scene/v1alpha1`）：型付きYAML → 正準IR → GPU予算プラン → 保持Vulkan合成。Jetson Thor の1080pでCPU合成の約26倍を計測。独自の `fvsc`・`fv_render`・ベンチマーク・ROS 2アダプタノードを同梱。
+ノードグラフ型の前身（スキーマ `fluent.scene/v1alpha1`）は [`attic/fluent_scene_mvp/`](attic/fluent_scene_mvp/) に移動しました：型付きYAML → 正準IR → GPU予算プラン → 保持Vulkan合成、Jetson Thor の1080pでCPU合成の約26倍を計測。fluent_stageに置き換えられ、参照用に保存されています。
 
-📖 [日本語 README](core/fluent_scene/README.md) · [English README](core/fluent_scene/README.en.md) · [アーキテクチャ仕様 (en)](docs/design/fluent_vision_architecture.md) · [ja](docs/design/fluent_vision_architecture.ja.md)
+📖 [日本語 README](attic/fluent_scene_mvp/README.md) · [English README](attic/fluent_scene_mvp/README.en.md) · [アーキテクチャ仕様 (en)](docs/design/fluent_vision_architecture.md) · [ja](docs/design/fluent_vision_architecture.ja.md)
 
-> ⚠️ **両プロジェクトとも拡張子 `.fvs` と CLI名 `fvsc` を使いますが、スキーマは非互換です**（`v1alpha1` ノードグラフ vs `v1alpha2` レイヤーツリー）。新規の開発は **fluent_stage** が対象です。
+> ⚠️ **両プロジェクトとも拡張子 `.fvs` と CLI名 `fvsc` を使いますが、スキーマは非互換です**（`v1alpha1` ノードグラフ vs `v1alpha2` レイヤーツリー）。現行の開発は **fluent_stage** が対象です。
 
 ---
 

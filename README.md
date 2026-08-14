@@ -32,7 +32,7 @@
 FluentVision is two things that share one repository:
 
 1. **A ROS 2 perception stack** (`src/`) — 40+ packages covering cameras, AI inference, 3D geometry, streaming, audio, and recording, wired together by YAML pipeline files and a browser-based visual editor.
-2. **A GPU rendering core** (`core/`) — `fluent_stage` and its predecessor `fluent_scene`: standalone (ROS-free) Vulkan compositors that turn a typed YAML scene into a robot HUD, with type checking *before* execution so an AI can safely edit a live screen.
+2. **A GPU rendering core** (`core/`) — `fluent_stage`: a standalone (ROS-free) Vulkan compositor that turns a typed YAML scene into a robot HUD, with type checking *before* execution so an AI can safely edit a live screen.
 
 ---
 
@@ -194,13 +194,13 @@ stage.boxes(detections).color(Color::Teal).smoothing(0.2f);
 
 📖 Docs (Japanese is the working language; an English README is planned for the OSS release): [README](core/fluent_stage/README.md) · [Getting started](core/fluent_stage/docs/getting-started.ja.md) · [Cookbook](core/fluent_stage/docs/cookbook.ja.md) · [Changelog](core/fluent_stage/CHANGELOG.md) · [Design spec](docs/design/fluent_stage.ja.md)
 
-### fluent_scene — first generation
+### fluent_scene — first generation (retired to `attic/`)
 
-The node-graph-based predecessor (schema `fluent.scene/v1alpha1`): typed YAML → canonical IR → GPU budget plan → retained Vulkan composite. Measured ~26× faster than CPU compositing at 1080p on Jetson Thor. Ships its own `fvsc`, `fv_render`, benchmarks, and a ROS 2 adapter node.
+The node-graph-based predecessor (schema `fluent.scene/v1alpha1`) now lives in [`attic/fluent_scene_mvp/`](attic/fluent_scene_mvp/): typed YAML → canonical IR → GPU budget plan → retained Vulkan composite, measured ~26× faster than CPU compositing at 1080p on Jetson Thor. Superseded by fluent_stage, kept for reference.
 
-📖 [日本語 README](core/fluent_scene/README.md) · [English README](core/fluent_scene/README.en.md) · [Architecture spec (en)](docs/design/fluent_vision_architecture.md) · [ja](docs/design/fluent_vision_architecture.ja.md)
+📖 [日本語 README](attic/fluent_scene_mvp/README.md) · [English README](attic/fluent_scene_mvp/README.en.md) · [Architecture spec (en)](docs/design/fluent_vision_architecture.md) · [ja](docs/design/fluent_vision_architecture.ja.md)
 
-> ⚠️ **Both projects use the `.fvs` extension and ship a CLI named `fvsc`, but the schemas are incompatible** (`v1alpha1` node graph vs `v1alpha2` layer tree). New work targets **fluent_stage**.
+> ⚠️ **Both projects use the `.fvs` extension and ship a CLI named `fvsc`, but the schemas are incompatible** (`v1alpha1` node graph vs `v1alpha2` layer tree). Current work targets **fluent_stage**.
 
 ---
 
