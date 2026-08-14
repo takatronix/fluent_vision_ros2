@@ -139,6 +139,106 @@ void testControlRemoveMidGesture() {
           stage.hitTest({150, 120})->id() == "root");
 }
 
+void testSlider() {
+    Stage stage(640, 360);
+    ui::Slider slider(stage.root(), {100, 100, 240, 32}, 0.0f);
+    float last = -1;
+    int changes = 0;
+    slider.onChange([&](float v) {
+        last = v;
+        ++changes;
+    });
+
+    // Down mid-track jumps there; drag tracks the pointer with no lag.
+    stage.pointerDown({220, 116});  // local x = 120 → (120-16)/(240-32) = 0.5
+    CHECK(near(slider.value(), 0.5f, 0.01f));
+    CHECK(changes == 1);
+    stage.pointerMove({324, 116});  // local x = 224 → 1.0
+    CHECK(near(slider.value(), 1.0f, 0.01f));
+    stage.pointerMove({0, 116});    // clamps at 0
+    stage.pointerUp({0, 116});
+    CHECK(near(slider.value(), 0.0f));
+    CHECK(last >= 0 && changes >= 3);
+
+    // Programmatic set animates and does not fire onChange.
+    const int before = changes;
+    slider.setValue(0.8f);
+    CHECK(changes == before);
+    stage.advance(0.075f);
+    const float mid = slider.value();
+    CHECK(near(mid, 0.8f));  // model value set immediately
+}
+
+void testSegmented() {
+    Stage stage(640, 360);
+    ui::Segmented seg(stage.root(), {100, 100, 300, 44}, {"手動", "巡回", "追従"}, 0);
+    int last = -1;
+    seg.onChange([&](int i) { last = i; });
+
+    CHECK(seg.selected() == 0);
+    stage.pointerDown({350, 120});  // third segment (local x = 250)
+    stage.pointerUp({350, 120});
+    CHECK(seg.selected() == 2);
+    CHECK(last == 2);
+    // Pill slides toward the third segment center (x = 250).
+    stage.advance(0.075f);
+    const float pill_x = seg.layer().sublayers()[1]->presentedPosition().x;
+    CHECK(pill_x > 60 && pill_x < 250);
+    stage.advance(0.2f);
+    CHECK(near(seg.layer().sublayers()[1]->presentedPosition().x, 250, 0.5f));
+
+    // Tapping the selected segment fires nothing.
+    stage.pointerDown({350, 120});
+    stage.pointerUp({350, 120});
+    CHECK(last == 2);
+}
+
+void testGauge() {
+    Stage stage(640, 360);
+    ui::Gauge gauge(stage.root(), {320, 180}, 60);
+    gauge.setValue(0.64f);
+    CHECK(near(gauge.value(), 0.64f));
+    const auto* arc = std::get_if<ArcContent>(&gauge.layer().sublayers()[1]->content());
+    CHECK(arc != nullptr);
+    CHECK(near(arc->end_deg - arc->start_deg, 270 * 0.64f, 0.1f));
+    const auto* text =
+        std::get_if<TextContent>(&gauge.layer().sublayers()[2]->content());
+    CHECK(text != nullptr && text->utf8 == "64%");
+}
+
+void testDropdown() {
+    Stage stage(640, 360);
+    ui::Dropdown dd(stage.root(), {100, 40, 220, 48}, {"標準", "低速", "高速", "点検"}, 0);
+    int last = -1;
+    dd.onChange([&](int i) { last = i; });
+
+    CHECK(!dd.isOpen());
+    stage.pointerDown({150, 60});
+    stage.pointerUp({150, 60});
+    CHECK(dd.isOpen());
+
+    // Pick the third row: popup starts at y = 40+48+4 = 92, rows are 44
+    // tall after a 6px pad → row 2 spans y 186..230.
+    stage.pointerDown({150, 200});
+    stage.pointerUp({150, 200});
+    CHECK(!dd.isOpen());
+    CHECK(dd.selected() == 2);
+    CHECK(last == 2);
+    const auto* label =
+        std::get_if<TextContent>(&dd.layer().sublayers()[1]->content());
+    CHECK(label != nullptr && label->utf8 == "高速");
+
+    // Open again, tap outside → closes without changing the value.
+    stage.pointerDown({150, 60});
+    stage.pointerUp({150, 60});
+    CHECK(dd.isOpen());
+    stage.pointerDown({600, 340});
+    CHECK(!dd.isOpen());
+    stage.pointerUp({600, 340});
+    CHECK(dd.selected() == 2);
+    CHECK(last == 2);
+}
+
 }  // namespace
 
 int main() {
@@ -147,6 +247,10 @@ int main() {
     testDisabledFallsThrough();
     testSwitchToggle();
     testControlRemoveMidGesture();
+    testSlider();
+    testSegmented();
+    testGauge();
+    testDropdown();
     if (g_failures == 0) {
         std::printf("all ui_tests passed\n");
         return 0;

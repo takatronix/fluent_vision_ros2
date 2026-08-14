@@ -405,16 +405,17 @@ params:
    publish — binding の outputs と同じ機構に乗せる。
 5. 初期カタログ: `ui.button`（momentary）/ `ui.switch`（トグル）/
    `ui.slider`（値 0..1）/ `ui.gauge`（表示専用）。
-   **実装状況（2026-08-14）**: button / switch と §10-3 のポインタ注入は
-   L0 完了直後に C++ 先行実装済み（`fluent_stage/ui.hpp`。disabled は
-   ポインタを下へ素通し、状態遷移は Transaction 経由で自動アニメ）。
-   **追加候補（同日オーナー指示）**: `ui.segmented`（2〜5択の排他選択。
-   タッチ/VRではプルダウンより誤操作が少なく、常に全択が見える）/
-   `ui.dropdown`（多数択のポップアップリスト。ポップアップ = root 末尾の
-   グループ、外側タップで閉じる = ポインタキャプチャ、はみ出し =
-   masksToBounds と、既存機構だけで構成する。リストのドラッグスクロール
-   のみ新規要素のため、初版は表示件数上限つき）。優先順は
-   slider → segmented → gauge → dropdown。
+   **実装状況（2026-08-14）**: §10-3 のポインタ注入と、button / switch /
+   slider / segmented / gauge / dropdown の6種を C++ 先行実装済み
+   （`fluent_stage/ui.hpp`）。segmented と dropdown は同日のオーナー指示で
+   カタログに追加（2〜5択は segmented、多数択は dropdown）。dropdown の
+   ポップアップは root 末尾のグループ + 全面透明スクリム（外側タップで
+   閉じる）+ 上下自動開きで、既存機構のみで構成。初版はドラッグスクロール
+   なし（`max_visible` で切る）。disabled はポインタを下へ素通し、状態遷移
+   は Transaction 経由で自動アニメ。残: slider のキーボード/ステップ操作、
+   dropdown スクロール、フォーカスモデル（§10-6）、ホバー配信 +
+   波紋エフェクト（同日オーナー要望。リング波紋は既存機構で可、屈折波紋は
+   L1 の ripple フィルタで）。
 6. 未決定として明示: 入力ソースの構成（配備ごとに web / タッチ / VR）、フォーカス
    モデル、長押し・ドラッグの扱い、アクセシビリティ。
 

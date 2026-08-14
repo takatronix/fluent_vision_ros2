@@ -137,6 +137,34 @@ Transaction 経由なので自動で滑らかに動きます。見た目は `But
 ます。反応させたい間はオブジェクトを生かしておくこと（破棄すると見た目は
 残り、反応だけ消える）。見た目ごと消すのは `remove()`。
 
+## スライダー・切替・ゲージ・プルダウン
+
+```cpp
+ui::Slider speed(stage.root(), {24, 44, 240, 28}, 0.35f);
+speed.onChange([&](float v) { robot.setSpeedLimit(v); });   // ドラッグ中も連続で届く
+
+ui::Segmented mode(stage.root(), {24, 96, 280, 42}, {"手動", "巡回", "追従"});
+mode.onChange([&](int i) { robot.setMode(i); });
+
+ui::Gauge battery(stage.root(), {560, 80}, 48);
+battery.setValue(telemetry.battery01);   // 表示専用・即時反映
+
+ui::Dropdown profile(stage.root(), {24, 168, 220, 46},
+                     {"標準", "低速", "高速", "点検"});
+profile.onChange([&](int i) { robot.setProfile(i); });
+```
+
+![UIカタログ](images/ui_catalog.png)
+
+- **Slider** はドラッグ中ポインタに直結（遅延なし）、`setValue()` は
+  アニメして到達。**Segmented** は2〜5択の排他選択 — 常に全択が見えるので
+  タッチ/VRではプルダウンより誤操作が少ない
+- **Dropdown** のポップアップは root 末尾のグループ（ツリー順=重なり順）+
+  全面透明スクリム（外側タップで閉じる）。下に入りきらない時は上に開く。
+  初版は `max_visible`（既定8行）で切り、スクロールは次版
+- **Gauge** は表示専用。値の平滑化はテレメトリ側の仕事（ジャンプする
+  ソースなら EMA を挟んでから `setValue`）
+
 ## どのレイヤーが押されたか（hit-test）
 
 ```cpp
@@ -168,3 +196,6 @@ const Surface& full    = renderer.render(stage, 3840, 2160, dt); // 同じ木
 - フィルタの色は sRGB 空間で計算（リニア化は L1 検討）
 - 裸のグループに `masksToBounds` / `background` を付けても bounds がゼロの
   ため何も起きない — `bounds()` を明示すること
+- Dropdown のリストはドラッグスクロール未対応（`max_visible` で切る）
+- ホバー演出（波紋等）は未実装 — ポインタ注入は capture 中の Move のみ
+  ルーティングする。ホバー配信とエフェクトヘルパーは次版

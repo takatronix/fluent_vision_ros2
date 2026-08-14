@@ -170,7 +170,10 @@ void Stage::deliverPointer(PointerPhase phase, Vec2 p) {
     const Vec2 local = toLocal(*pointer_capture_, p, bounds);
     const PointerEvent event{phase, p, local,
                              bounds.w > 0 && bounds.h > 0 && bounds.contains(local)};
-    pointer_capture_->pointer_handler_(event);
+    // Invoke a copy: the handler may remove its own layer (a popup closing
+    // itself) and must not destroy the function object mid-execution.
+    const std::function<void(const PointerEvent&)> handler = pointer_capture_->pointer_handler_;
+    handler(event);
 }
 
 bool Stage::pointerDown(Vec2 p) {
@@ -714,6 +717,16 @@ Layer& Layer::setBoxes(const std::vector<Box>& detections) {
 // ===========================================================================
 // Layer — identity, tree, stepping, hit-test
 // ===========================================================================
+
+Layer& Layer::setArc(float start_deg, float end_deg) {
+    if (auto* c = std::get_if<ArcContent>(&content_)) {
+        c->start_deg = start_deg;
+        c->end_deg = end_deg;
+    } else {
+        warn("setArc() applies to arc content only");
+    }
+    return *this;
+}
 
 Layer& Layer::id(const std::string& name) {
     id_ = name;

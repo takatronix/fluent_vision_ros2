@@ -39,6 +39,9 @@ target_link_libraries(filters_tour PRIVATE fluent_stage)
 add_executable(ui_demo examples/ui_demo.cpp)
 target_link_libraries(ui_demo PRIVATE fluent_stage)
 
+add_executable(ui_catalog examples/ui_catalog.cpp)
+target_link_libraries(ui_catalog PRIVATE fluent_stage)
+
 # ---- tests ------------------------------------------------------------------
 
 enable_testing()
@@ -63,3 +66,4 @@ add_test(NAME example_hud_basic COMMAND hud_basic)
 add_test(NAME example_transaction_fade COMMAND transaction_fade)
 add_test(NAME example_filters_tour COMMAND filters_tour)
 add_test(NAME example_ui_demo COMMAND ui_demo)
+add_test(NAME example_ui_catalog COMMAND ui_catalog)

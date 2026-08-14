@@ -295,6 +295,9 @@ public:
     /// Replaces the detections (boxes content only). Smoothing carries
     /// tracks across the update.
     Layer& setBoxes(const std::vector<Box>& detections);
+    /// Replaces the arc's angular range (arc content only) — the
+    /// data-driven update for gauges and angle indicators.
+    Layer& setArc(float start_deg, float end_deg);
 
     /// @}
     // -----------------------------------------------------------------------

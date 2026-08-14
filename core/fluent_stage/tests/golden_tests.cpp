@@ -283,6 +283,21 @@ void sceneUi(CpuRenderer& r) {
     checkScene("ui_controls", r.render(stage, 0.0f));
 }
 
+void sceneUiCatalog(CpuRenderer& r) {
+    // The full §10 control catalog, one state each, dropdown open.
+    Stage stage(480, 420);
+    stage.rect({0, 0, 480, 420}).color({0.10f, 0.12f, 0.15f, 1});
+    ui::Slider slider(stage.root(), {24, 24, 200, 28}, 0.6f);
+    ui::Segmented seg(stage.root(), {24, 76, 240, 40}, {"手動", "巡回", "追従"}, 1);
+    ui::Gauge gauge(stage.root(), {400, 70}, 46);
+    gauge.setValue(0.64f);
+    ui::Dropdown dd(stage.root(), {24, 140, 200, 44}, {"標準", "低速", "高速", "点検"}, 2);
+    stage.pointerDown({100, 160});
+    stage.pointerUp({100, 160});  // open the dropdown
+    stage.advance(0.5f);          // settle transitions
+    checkScene("ui_catalog", r.render(stage, 0.0f));
+}
+
 void sceneText(CpuRenderer& r) {
     Stage stage(480, 300);
     stage.rect({0, 0, 480, 300}).color({0.1f, 0.12f, 0.15f, 1});
@@ -316,6 +331,7 @@ int main(int argc, char** argv) {
     sceneAnimation(r);
     sceneImagePaste(r);
     sceneUi(r);
+    sceneUiCatalog(r);
     sceneText(r);
     if (g_failures == 0) {
         std::printf("all golden_tests passed\n");

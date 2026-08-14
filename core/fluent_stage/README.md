@@ -64,9 +64,13 @@ ctest --test-dir build          # 単体 + golden画像 + 全example
   dt でしか進まないため、**t=0.15s の画面をバイト単位で再現**できる
 - **保持型** — 毎フレームは変更データの差し替えだけ
   （`setImage / setText / setBoxes / opacity()`）
-- **UIコントロール** — `ui::Button` / `ui::Switch`（プレハブ+状態=属性
-  上書き）。入力は `stage.pointerDown/Move/Up` への注入だけ — Webビューア
-  のクリックもタッチもVRレイも同じ3呼び出しに正規化される
+- **UIコントロール** — `ui::Button` / `ui::Switch` / `ui::Slider` /
+  `ui::Segmented` / `ui::Gauge` / `ui::Dropdown`（すべてプレハブ+状態=
+  属性上書き。新しい描画機構はゼロ）。入力は `stage.pointerDown/Move/Up`
+  への注入だけ — Webビューアのクリックもタッチも VR レイも同じ3呼び出しに
+  正規化される
+
+  ![UIコントロールカタログ](docs/images/ui_catalog.png)
 
 ## AI と作る前提の設計
 
@@ -86,7 +90,7 @@ fluent_vision の実行層です。**Scene（宣言/.fvs）→ Stage（実行時
 | L1 | Vulkan バックエンド（CPU と同一出力） | 未着手 |
 | L2 | Scene v1alpha2（YAML→Stage）+ describe --json + リンター | 未着手 |
 | L3 | ROS binding / インスペクター | 未着手 |
-| L4 | UI コントロール（ポインタ注入 + button/switch は先行実装済） | 一部完了 |
+| L4 | UI コントロール（ポインタ注入 + 6コントロール先行実装済） | ほぼ完了 |
 
 既知の L0 制限は [cookbook 末尾](docs/cookbook.ja.md#既知の-l0-制限正直リスト)に
 明記しています。

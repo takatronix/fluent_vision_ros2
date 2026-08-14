@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0 — 2026-08-14 (UIカタログ完成)
+
+- `ui::Slider`（0..1。ドラッグはポインタ直結・onChange連続、setValueは
+  アニメ。fillはクリップ式で角丸を歪めない）
+- `ui::Segmented`（2〜5択の排他選択。ピルがスライド、ラベル色が状態表示）
+- `ui::Gauge`（表示専用ラジアル。`Layer::setArc` データ更新APIを追加）
+- `ui::Dropdown`（root末尾ポップアップ+透明スクリムの外側タップ閉じ+
+  上下自動開き+シェブロン回転。初版は max_visible で切りスクロールなし）
+- ハンドラ実行中の自己remove（ポップアップが自分を閉じる）を安全化
+  （配送時にハンドラをコピーして呼び出す）
+- テスト: ui_tests に4コントロール分を追加、golden `ui_catalog`、
+  example `ui_catalog`
+
 ## 0.2.0 — 2026-08-14 (Phase L4 先行: UIコントロール)
 
 - ポインタ注入（§10-3）: `Stage::pointerDown/Move/Up/Cancel`。Web ビューア
