@@ -16,7 +16,15 @@
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <std_srvs/srv/empty.hpp>
+#if __has_include(<cv_bridge/cv_bridge.h>)
 #include <cv_bridge/cv_bridge.h>
+#elif __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#elif __has_include(<cv_bridge/cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge/cv_bridge.hpp>
+#else
+#error "cv_bridge header not found"
+#endif
 #include <opencv2/opencv.hpp>
 #include <image_transport/image_transport.hpp>
 #include <rosbag2_cpp/writer.hpp>
@@ -255,4 +263,4 @@ private:
     std::string video_time_overlay_format_ {"%Y-%m-%d %H:%M:%S"};
 };
 
-#endif // FV_RECORDER_NODE_HPP 
+#endif // FV_RECORDER_NODE_HPP
