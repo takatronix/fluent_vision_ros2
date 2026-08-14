@@ -4,7 +4,8 @@
 // the last good picture on screen with an error banner instead of ever
 // showing a broken frame.
 //
-//   scene_web scene.fvs [--port 8791] [--fps 30] [--image input=topic]...
+//   scene_web scene.fvs [--port 8791] [--fps 30] [--out WxH] [--quality 80]
+//             [--image input=topic]...
 //             [--events /topic]   publish UI events as std_msgs/String JSON
 //             [--webcam input]    accept browser webcam JPEG on POST /camera
 //                                 and feed it into $inputs.<input>
@@ -133,8 +134,12 @@ bool sendAll(int fd, const void* data, size_t size) {
 
 void sendResponse(int fd, const char* status, const char* type, const std::string& body) {
     std::ostringstream head;
+    // keep-alive: pointer taps and webcam frames arrive many times a second;
+    // a handshake per request (worse: TLS through a proxy) is the classic
+    // latency trap (stage_web learned this the hard way).
     head << "HTTP/1.1 " << status << "\r\nContent-Type: " << type
-         << "\r\nContent-Length: " << body.size() << "\r\nConnection: close\r\n\r\n";
+         << "\r\nContent-Length: " << body.size()
+         << "\r\nConnection: keep-alive\r\n\r\n";
     const std::string h = head.str();
     sendAll(fd, h.data(), h.size());
     sendAll(fd, body.data(), body.size());
@@ -278,10 +283,14 @@ void serverLoop(uint16_t port) {
             continue;
         }
         std::thread([fd] {
-            // Read the full request: headers, then Content-Length of body
-            // (webcam frames arrive as POST bodies).
-            std::string req;
+            // One thread per connection, many requests per connection
+            // (keep-alive): read headers + Content-Length body, handle,
+            // repeat. `pending` carries bytes of the next pipelined request.
+            std::string pending;
             char buf[8192];
+            while (g_running) {
+            std::string req = std::move(pending);
+            pending.clear();
             while (req.find("\r\n\r\n") == std::string::npos && req.size() < (1u << 16)) {
                 const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
                 if (n <= 0) {
@@ -319,6 +328,9 @@ void serverLoop(uint16_t port) {
                 }
                 req.append(buf, static_cast<size_t>(n));
             }
+            if (req.size() > body_start + content_length) {
+                pending = req.substr(body_start + content_length);
+            }
             if (req.rfind("POST /camera", 0) == 0) {
                 if (content_length > 0 && req.size() >= body_start + content_length) {
                     std::lock_guard<std::mutex> lock(g_webcam_mutex);
@@ -330,6 +342,8 @@ void serverLoop(uint16_t port) {
                 sendResponse(fd, "200 OK", "text/plain", "ok\n");
             } else if (req.rfind("GET /stream", 0) == 0) {
                 streamMjpeg(fd);
+                ::close(fd);
+                return;
             } else if (req.rfind("GET /inspect", 0) == 0) {
                 std::string body;
                 {
@@ -401,6 +415,7 @@ void serverLoop(uint16_t port) {
             } else {
                 sendResponse(fd, "404 Not Found", "text/plain", "not found\n");
             }
+            }  // keep-alive: next request on the same connection
             ::close(fd);
         }).detach();
     }
@@ -408,6 +423,8 @@ void serverLoop(uint16_t port) {
 }
 
 // ---- jpeg helpers (same shapes as stage_web) --------------------------------
+
+int g_jpeg_quality = 80;
 
 void encodeJpeg(const Surface& s, std::vector<uint8_t>& out) {
     jpeg_compress_struct cinfo{};
@@ -422,7 +439,7 @@ void encodeJpeg(const Surface& s, std::vector<uint8_t>& out) {
     cinfo.input_components = 3;
     cinfo.in_color_space = JCS_RGB;
     jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, 80, TRUE);
+    jpeg_set_quality(&cinfo, g_jpeg_quality, TRUE);
     jpeg_start_compress(&cinfo, TRUE);
     std::vector<uint8_t> row(s.width * 3);
     while (cinfo.next_scanline < cinfo.image_height) {
@@ -659,6 +676,7 @@ int main(int argc, char** argv) {
     uint16_t port = 8791;
     float fps = 30;
     std::string events_topic;
+    uint32_t out_w = 0, out_h = 0;
     std::string webcam_input;
     std::string ripple_layer;
     std::vector<std::pair<std::string, std::string>> image_feeds;  // input → topic
@@ -669,6 +687,14 @@ int main(int argc, char** argv) {
             fps = std::max(1.0f, static_cast<float>(std::atof(argv[++i])));
         } else if (std::strcmp(argv[i], "--events") == 0 && i + 1 < argc) {
             events_topic = argv[++i];
+        } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            unsigned pw = 0, ph = 0;
+            if (std::sscanf(argv[++i], "%ux%u", &pw, &ph) == 2 && pw != 0 && ph != 0) {
+                out_w = pw;
+                out_h = ph;
+            }
+        } else if (std::strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
+            g_jpeg_quality = std::max(20, std::min(95, std::atoi(argv[++i])));
         } else if (std::strcmp(argv[i], "--webcam") == 0 && i + 1 < argc) {
             webcam_input = argv[++i];
         } else if (std::strcmp(argv[i], "--ripple") == 0 && i + 1 < argc) {
@@ -928,7 +954,9 @@ int main(int argc, char** argv) {
             ripple->tick(dt);
         }
         Stage& stage = live ? live->stage() : *empty_stage;
-        const Surface& frame = renderer->render(stage, dt);
+        const Surface& frame = (out_w != 0 && out_h != 0)
+                                   ? renderer->render(stage, out_w, out_h, dt)
+                                   : renderer->render(stage, dt);
         {
             std::lock_guard<std::mutex> lock(g_frame_mutex);
             encodeJpeg(frame, g_jpeg);
