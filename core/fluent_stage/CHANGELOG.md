@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.1 — 2026-08-14 (scene_web: 編集→保存→原子的差し替え)
+
+- `tools/scene_web` — Scene 文書(.fvs)のライブプレビューサーバー。ファイルを
+  保存すると validate → compile → lint を通し、**フレーム境界で原子的に
+  差し替え**（§2 の activate）。壊れた編集は旧画面を保持したまま赤バナーで
+  エラー行を表示 — 壊れたフレームが表に出る経路は存在しない
+- `--image input=topic` で ROS 2 CompressedImage を宣言済み `$inputs.<名前>`
+  へ接続（ROS 環境を source してビルド）。未接続の image 入力は
+  プレースホルダーパネルのまま = 入力契約がそのままデモになる
+- GET /status が digest・リロード回数・エラー・lint 警告を JSON で返す
+  （ページの状態表示はこれを映すだけ）
+
 ## 0.8.0 — 2026-08-14 (Phase L2: Scene 宣言層)
 
 - **Scene v1alpha2**（`fluent_stage::scene`）: レイヤーツリー YAML（.fvs）
