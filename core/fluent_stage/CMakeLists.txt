@@ -26,6 +26,49 @@ target_include_directories(fluent_stage PUBLIC include)
 target_link_libraries(fluent_stage PRIVATE PkgConfig::FS_TEXT)
 target_compile_options(fluent_stage PRIVATE -Wall -Wextra)
 
+# ---- Vulkan backend (L1): shaders are compiled to SPIR-V at build time ------
+# and embedded — zero shader compilation at runtime (§11). Optional: without
+# Vulkan/glslc the library is CPU-only and FS_HAVE_VULKAN is undefined.
+
+find_package(Vulkan QUIET)
+find_program(FS_GLSLC glslc)
+if(Vulkan_FOUND AND FS_GLSLC)
+  set(FS_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/backend/vulkan/shaders)
+  set(FS_SHADER_GEN ${CMAKE_CURRENT_BINARY_DIR}/shaders_gen)
+  file(MAKE_DIRECTORY ${FS_SHADER_GEN})
+  set(FS_SHADER_INCS "")
+  foreach(FS_SHADER quad.vert fullscreen.vert shape_mask.frag glyph_mask.frag
+          mask_composite.frag shape_color.frag image.frag filter.frag blur.frag
+          composite.frag unpremul.frag)
+    set(FS_SHADER_INC ${FS_SHADER_GEN}/${FS_SHADER}.inc)
+    add_custom_command(
+      OUTPUT ${FS_SHADER_INC}
+      COMMAND ${FS_GLSLC} -O -mfmt=c
+              -I ${CMAKE_CURRENT_SOURCE_DIR}/include -I ${FS_SHADER_DIR}
+              -o ${FS_SHADER_INC} ${FS_SHADER_DIR}/${FS_SHADER}
+      DEPENDS ${FS_SHADER_DIR}/${FS_SHADER}
+              ${FS_SHADER_DIR}/push_common.glsl
+              ${FS_SHADER_DIR}/shape_modes.h
+              ${CMAKE_CURRENT_SOURCE_DIR}/include/fluent_stage/shared/shapes_shared.h
+              ${CMAKE_CURRENT_SOURCE_DIR}/include/fluent_stage/shared/filters_shared.h
+      COMMENT "glslc ${FS_SHADER}")
+    list(APPEND FS_SHADER_INCS ${FS_SHADER_INC})
+  endforeach()
+  add_custom_target(fs_shaders DEPENDS ${FS_SHADER_INCS})
+
+  target_sources(fluent_stage PRIVATE src/vulkan_renderer.cpp)
+  # Vulkan C structs are idiomatically brace-initialized from their sType;
+  # the aggregate zero-fills the rest — the warning is pure noise here.
+  set_source_files_properties(src/vulkan_renderer.cpp
+    PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  add_dependencies(fluent_stage fs_shaders)
+  target_include_directories(fluent_stage PRIVATE ${FS_SHADER_GEN} ${FS_SHADER_DIR})
+  target_link_libraries(fluent_stage PRIVATE Vulkan::Vulkan)
+  target_compile_definitions(fluent_stage PUBLIC FS_HAVE_VULKAN=1)
+else()
+  message(STATUS "fluent_stage: Vulkan backend disabled (needs Vulkan headers + glslc)")
+endif()
+
 # ---- examples (all buildable and runnable; §12-3) ---------------------------
 
 add_executable(hud_basic examples/hud_basic.cpp)
@@ -46,6 +89,9 @@ target_link_libraries(ui_catalog PRIVATE fluent_stage)
 add_executable(ripple_demo examples/ripple_demo.cpp)
 target_link_libraries(ripple_demo PRIVATE fluent_stage)
 
+add_executable(bench examples/bench.cpp)
+target_link_libraries(bench PRIVATE fluent_stage)
+
 # ---- tests ------------------------------------------------------------------
 
 enable_testing()
@@ -64,6 +110,11 @@ target_link_libraries(golden_tests PRIVATE fluent_stage)
 target_compile_definitions(golden_tests
   PRIVATE GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden")
 add_test(NAME golden_tests COMMAND golden_tests)
+
+# The §11 cross-backend guarantee: the GPU renders the same goldens the CPU
+# reference defined. Skips (77) on machines without a Vulkan device.
+add_test(NAME golden_tests_vulkan COMMAND golden_tests --renderer=vulkan)
+set_tests_properties(golden_tests_vulkan PROPERTIES SKIP_RETURN_CODE 77)
 
 # Examples run in CI too (§12-3: every example builds and runs).
 add_test(NAME example_hud_basic COMMAND hud_basic)

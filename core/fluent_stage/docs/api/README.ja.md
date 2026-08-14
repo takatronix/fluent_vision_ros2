@@ -23,6 +23,7 @@ doxygen docs/api/Doxyfile      # → build/docs/api/html/index.html
 | [animation.hpp](../../include/fluent_stage/animation.hpp) | `Animated<T>` とイージング（内部機構だが公開） |
 | [renderer.hpp](../../include/fluent_stage/renderer.hpp) | `Renderer` 契約（dt注入・Surface貸出） |
 | [cpu_renderer.hpp](../../include/fluent_stage/cpu_renderer.hpp) | リファレンスバックエンド |
+| [vulkan_renderer.hpp](../../include/fluent_stage/vulkan_renderer.hpp) | GPU本番バックエンド（CPUと同一出力・実行時シェーダーコンパイルゼロ） |
 | [surface.hpp](../../include/fluent_stage/surface.hpp) | `Surface` — RGBA8出力ビュー |
 
 ## 単一ソース（shared/）
@@ -36,6 +37,10 @@ doxygen docs/api/Doxyfile      # → build/docs/api/html/index.html
   X-macro で型付きstruct・既定値・specテーブルを導出
 - `shapes_shared.h` — 全形状の SDF
 - `glsl_compat.hpp` — CPU 用の GLSL 互換シム
+
+バックエンド間で判断が揃う仕組みは `src/render_shared.hpp`（共有プラン層:
+offscreen判定・extent・dash分割）と `backend/vulkan/shaders/`（同じ共有ヘッダを
+GLSLとしてSPIR-V化）にあります。
 
 フィルタを1つ足す = `filters_shared.h` に関数1個+ディスパッチ1行、
 `filters_def.h` にブロック1個。それだけで型付きAPI・カタログ・

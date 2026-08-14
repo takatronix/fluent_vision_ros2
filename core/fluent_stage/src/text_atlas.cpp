@@ -238,5 +238,36 @@ float TextAtlas::measure(const std::string& utf8) const {
     return width;
 }
 
+bool initAtlasWithFallback(TextAtlas& atlas, const std::string& font_file,
+                           uint32_t pixel_size) {
+    static const char* const kFontSearch[] = {
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    };
+    TextAtlas::Options options;
+    options.pixel_size = pixel_size;
+    std::string error;
+    if (!font_file.empty()) {
+        options.font_file = font_file;
+        if (atlas.init(options, error)) {
+            return true;
+        }
+        std::fprintf(stderr, "fluent_stage: %s — text will not render\n", error.c_str());
+        return false;
+    }
+    for (const char* path : kFontSearch) {
+        options.font_file = path;
+        if (atlas.init(options, error)) {
+            return true;
+        }
+    }
+    std::fprintf(stderr,
+                 "fluent_stage: no usable font found — text will not render "
+                 "(set Options::font_file)\n");
+    return false;
+}
+
 }  // namespace detail
 }  // namespace fluent_stage

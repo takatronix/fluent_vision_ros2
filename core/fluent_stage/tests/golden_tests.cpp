@@ -5,8 +5,14 @@
 // small per-channel tolerance so recompiles and minor FP differences don't
 // flake, while real regressions (a shifted shape, a broken filter) fail.
 //
-//   ./golden_tests            compare against the goldens
-//   ./golden_tests --update   regenerate the goldens from this build
+//   ./golden_tests                     compare CPU output to the goldens
+//   ./golden_tests --update            regenerate goldens (CPU reference)
+//   ./golden_tests --renderer=vulkan   compare the GPU backend to the SAME
+//                                      goldens (looser tolerance: fp16
+//                                      targets and GPU bilinear round
+//                                      differently) — the §11 cross-backend
+//                                      guarantee. Exits 77 (skip) when no
+//                                      Vulkan device exists.
 //
 // On failure the rendered image is written next to the golden as
 // <name>.actual.ppm for visual diffing. The text scene depends on the
@@ -19,7 +25,12 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+
 #include <fluent_stage/fluent_stage.hpp>
+#ifdef FS_HAVE_VULKAN
+#include <fluent_stage/vulkan_renderer.hpp>
+#endif
 
 using namespace fluent_stage;
 
@@ -28,6 +39,9 @@ namespace {
 int g_failures = 0;
 bool g_update = false;
 std::string g_dir;  // tests/golden, from GOLDEN_DIR
+int g_max_diff_limit = 16;
+double g_over_ratio_limit = 0.002;
+std::string g_actual_suffix = ".actual.ppm";
 
 // ---- ppm io ----------------------------------------------------------------
 
@@ -123,10 +137,10 @@ void checkScene(const std::string& name, const Surface& s) {
     }
     const size_t total = static_cast<size_t>(s.width) * s.height * 3;
     const double over_ratio = static_cast<double>(over_threshold) / total;
-    if (max_diff > 16 || over_ratio > 0.002) {
+    if (max_diff > g_max_diff_limit || over_ratio > g_over_ratio_limit) {
         std::fprintf(stderr, "FAIL %s: max_diff=%d over_ratio=%.4f%%\n", name.c_str(), max_diff,
                      over_ratio * 100.0);
-        writePpm(g_dir + "/" + name + ".actual.ppm", s);
+        writePpm(g_dir + "/" + name + g_actual_suffix, s);
         ++g_failures;
     } else {
         std::printf("ok %s (max_diff=%d)\n", name.c_str(), max_diff);
@@ -151,7 +165,7 @@ std::vector<uint8_t> makeTestImage(uint32_t w, uint32_t h) {
 
 // ---- scenes ----------------------------------------------------------------
 
-void sceneShapes(CpuRenderer& r) {
+void sceneShapes(Renderer& r) {
     Stage stage(480, 300);
     stage.grid(60).color({1, 1, 1, 0.12f});
     stage.line({20, 30}, {200, 60}).thickness(5).color(Color::Teal);
@@ -172,7 +186,7 @@ void sceneShapes(CpuRenderer& r) {
     checkScene("shapes", r.render(stage, 0.0f));
 }
 
-void sceneAttributes(CpuRenderer& r) {
+void sceneAttributes(Renderer& r) {
     Stage stage(480, 300);
     stage.rect({0, 0, 480, 300}).color({0.13f, 0.15f, 0.18f, 1});
 
@@ -204,7 +218,7 @@ void sceneAttributes(CpuRenderer& r) {
     checkScene("attributes", r.render(stage, 0.0f));
 }
 
-void sceneTransforms(CpuRenderer& r) {
+void sceneTransforms(Renderer& r) {
     Stage stage(480, 300);
     stage.grid(50).color({1, 1, 1, 0.1f});
     stage.rect({0, 0, 120, 60}).position(110, 90).rotation(25).thickness(3).color(Color::Teal);
@@ -221,7 +235,7 @@ void sceneTransforms(CpuRenderer& r) {
     checkScene("transforms", r.render(stage, 0.0f));
 }
 
-void sceneFilters(CpuRenderer& r) {
+void sceneFilters(Renderer& r) {
     Stage stage(480, 300);
     const auto img = makeTestImage(160, 120);
     const ImageView view{160, 120, img.data(), 0};
@@ -238,7 +252,7 @@ void sceneFilters(CpuRenderer& r) {
     checkScene("filters", r.render(stage, 0.0f));
 }
 
-void sceneAnimation(CpuRenderer& r) {
+void sceneAnimation(Renderer& r) {
     // §13-6: "the screen at t = 0.15 s" must be reproducible.
     Stage stage(320, 200);
     auto& box = stage.rect({0, 0, 60, 60}).position(50, 100).color(Color::Teal);
@@ -254,7 +268,7 @@ void sceneAnimation(CpuRenderer& r) {
     checkScene("animation_t015", r.render(stage, 0.0f));
 }
 
-void sceneImagePaste(CpuRenderer& r) {
+void sceneImagePaste(Renderer& r) {
     // §5-2b: partial copy & paste via sourceRect + frame, plus fit modes.
     Stage stage(480, 300);
     const auto img = makeTestImage(160, 120);
@@ -267,7 +281,7 @@ void sceneImagePaste(CpuRenderer& r) {
     checkScene("image_paste", r.render(stage, 0.0f));
 }
 
-void sceneUi(CpuRenderer& r) {
+void sceneUi(Renderer& r) {
     // §10: controls are prefab subtrees; states are attribute overrides.
     Stage stage(480, 300);
     stage.rect({0, 0, 480, 300}).color({0.10f, 0.12f, 0.15f, 1});
@@ -283,7 +297,7 @@ void sceneUi(CpuRenderer& r) {
     checkScene("ui_controls", r.render(stage, 0.0f));
 }
 
-void sceneUiCatalog(CpuRenderer& r) {
+void sceneUiCatalog(Renderer& r) {
     // The full §10 control catalog, one state each, dropdown open.
     Stage stage(480, 420);
     stage.rect({0, 0, 480, 420}).color({0.10f, 0.12f, 0.15f, 1});
@@ -298,7 +312,7 @@ void sceneUiCatalog(CpuRenderer& r) {
     checkScene("ui_catalog", r.render(stage, 0.0f));
 }
 
-void sceneRipple(CpuRenderer& r) {
+void sceneRipple(Renderer& r) {
     // The pointer-wake effect at t = 0.15 s, deterministic like everything.
     Stage stage(480, 300);
     stage.rect({0, 0, 480, 300}).color({0.08f, 0.12f, 0.16f, 1});
@@ -315,7 +329,7 @@ void sceneRipple(CpuRenderer& r) {
     checkScene("ripple_t015", r.render(stage, 0.0f));
 }
 
-void sceneText(CpuRenderer& r) {
+void sceneText(Renderer& r) {
     Stage stage(480, 300);
     stage.rect({0, 0, 480, 300}).color({0.1f, 0.12f, 0.15f, 1});
     stage.text("走行中 — Stage L0", {20, 20}).size(30);
@@ -330,9 +344,12 @@ void sceneText(CpuRenderer& r) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::string renderer_name = "cpu";
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--update") == 0) {
             g_update = true;
+        } else if (std::strncmp(argv[i], "--renderer=", 11) == 0) {
+            renderer_name = argv[i] + 11;
         }
     }
 #ifdef GOLDEN_DIR
@@ -340,7 +357,32 @@ int main(int argc, char** argv) {
 #else
     g_dir = "tests/golden";
 #endif
-    CpuRenderer r;
+    std::unique_ptr<Renderer> renderer;
+    if (renderer_name == "vulkan") {
+        if (g_update) {
+            std::fprintf(stderr, "goldens are defined by the CPU reference; refuse --update\n");
+            return 1;
+        }
+#ifdef FS_HAVE_VULKAN
+        try {
+            renderer = std::make_unique<VulkanRenderer>();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "skip: %s\n", e.what());
+            return 77;
+        }
+        // fp16 targets, GPU bilinear rounding, and sampler quantization
+        // shift a few LSBs; regressions are orders of magnitude larger.
+        g_max_diff_limit = 48;
+        g_over_ratio_limit = 0.01;
+        g_actual_suffix = ".vulkan.actual.ppm";
+#else
+        std::fprintf(stderr, "skip: built without Vulkan\n");
+        return 77;
+#endif
+    } else {
+        renderer = std::make_unique<CpuRenderer>();
+    }
+    Renderer& r = *renderer;
     sceneShapes(r);
     sceneAttributes(r);
     sceneTransforms(r);

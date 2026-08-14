@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0 — 2026-08-14 (Phase L1: Vulkan バックエンド)
+
+- `VulkanRenderer` — CPU リファレンスと同一出力の GPU 本番バックエンド。
+  全 golden シーンを GPU で通過（ほぼ全て max_diff 1〜2、閾値クリフを持つ
+  フィルタのみ許容差内の残差）。1080p の代表 HUD で 5.6ms/frame
+  （CPU 94.7ms、~17倍。毎フレームの CPU 読み戻し込み）
+- 単一ソースの完結: shapes_shared.h / filters_shared.h が GLSL として
+  SPIR-V にコンパイルされ GPU で実行される（ビルド時 glslc、実行時の
+  シェーダーコンパイルはゼロ）
+- CPU/GPU 共通のプラン層 src/render_shared.hpp（offscreen 判定・extent・
+  dash 分割・フィルタ論理単位スケール）— 両バックエンドが同じ判断で
+  ツリーを歩く
+- ブレンド4種を premultiplied 固定機能式に統一（CPU 実装 = GPU ブレンド
+  ファクタと恒等。Add/Multiply/Screen の意味論を両バックエンドで一致）
+- golden_tests --renderer=vulkan（ctest: golden_tests_vulkan、GPU が無い
+  環境ではスキップ）と examples/bench（CPU vs GPU 実測）
+- 画像/フィルタのサンプリングを CPU とビット同型の texelFetch 実装に
+  （pixelate のブロックずれ・sourceRect 境界の1texel差を根治）
+
 ## 0.4.0 — 2026-08-14 (波紋エフェクト + Dropdownスクロール)
 
 - `fx::Ripple`（effects.hpp 新設）: ポインタの軌跡に広がって消える

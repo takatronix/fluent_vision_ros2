@@ -96,5 +96,12 @@ private:
     Cell replacement_cell_;
 };
 
+// Initializes `atlas` from `font_file`, or from the first usable font in
+// the well-known system locations when it is empty. Prints one stderr
+// notice and returns false when no font works (text then renders nothing).
+// Both backends resolve fonts through this one function.
+bool initAtlasWithFallback(TextAtlas& atlas, const std::string& font_file,
+                           uint32_t pixel_size);
+
 }  // namespace detail
 }  // namespace fluent_stage

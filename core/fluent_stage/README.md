@@ -87,10 +87,24 @@ fluent_vision の実行層です。**Scene（宣言/.fvs）→ Stage（実行時
 | Phase | 範囲 | 状態 |
 |---|---|---|
 | L0 | Stage API + CPUリファレンス + Transaction + golden | **完了** |
-| L1 | Vulkan バックエンド（CPU と同一出力） | 未着手 |
+| L1 | Vulkan バックエンド（CPU と同一出力） | **完了** — 全goldenをGPUで通過、1080pで 5.6ms/frame（CPU比 ~17倍、読み戻し込み） |
 | L2 | Scene v1alpha2（YAML→Stage）+ describe --json + リンター | 未着手 |
 | L3 | ROS binding / インスペクター | 未着手 |
 | L4 | UI コントロール（ポインタ注入 + 6コントロール先行実装済） | ほぼ完了 |
+
+バックエンドは差し替え式です — `CpuRenderer`（リファレンス・どこでも動く）と
+`VulkanRenderer`（本番。シェーダーはビルド時に SPIR-V 化され実行時コンパイル
+ゼロ）。同一ツリーから同一の絵が出ることを golden テストが両方に対して
+保証します:
+
+```cpp
+std::unique_ptr<Renderer> renderer;
+try {
+    renderer = std::make_unique<VulkanRenderer>();
+} catch (const std::exception&) {
+    renderer = std::make_unique<CpuRenderer>();   // GPUが無い環境へのフォールバック
+}
+```
 
 既知の L0 制限は [cookbook 末尾](docs/cookbook.ja.md#既知の-l0-制限正直リスト)に
 明記しています。

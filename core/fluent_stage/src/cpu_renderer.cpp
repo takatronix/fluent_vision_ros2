@@ -38,6 +38,7 @@ using namespace glsl;
 }  // namespace fluent_stage
 
 #include "fluent_stage/stage.hpp"
+#include "render_shared.hpp"
 #include "text_atlas.hpp"
 
 namespace fluent_stage {
@@ -47,6 +48,16 @@ namespace {
 using glsl::vec2;
 using glsl::vec3;
 using glsl::vec4;
+using plan::dashSegments;
+using plan::IRect;
+using plan::pathSegments;
+using plan::rectIntersect;
+using plan::rectPad;
+using plan::rectUnion;
+using plan::scaleOf;
+using plan::Seg;
+using plan::segBounds;
+using plan::targetBBox;
 
 vec2 gv(Vec2 v) { return {v.x, v.y}; }
 
@@ -98,116 +109,47 @@ void sampleBilinear(const Buf& b, float x, float y, float out[4]) {
 }
 
 // ---------------------------------------------------------------------------
-// Blending (premultiplied dst, straight source color + coverage)
+// Blending — THE definition of the four modes, shared with the GPU.
+//
+// All buffers are premultiplied. Each mode is a fixed-function blend
+// equation (cs/cd premultiplied source/dest, sa source alpha), so the
+// Vulkan backend realizes the identical math as blend factors:
+//
+//   Normal:   co = cs           + cd*(1-sa)     (ONE, ONE_MINUS_SRC_ALPHA)
+//   Add:      co = cs           + cd            (ONE, ONE)
+//   Multiply: co = cs*cd        + cd*(1-sa)     (DST_COLOR, ONE_MINUS_SRC_ALPHA)
+//   Screen:   co = cs*(1-cd)    + cd            (ONE_MINUS_DST_COLOR, ONE)
+//   ao = sa + da*(1-sa)                          (all modes)
+//
+// Values may exceed 1 mid-composite (Add); the final surface conversion
+// clamps, exactly like a float16 render target read back through unpremul.
 // ---------------------------------------------------------------------------
 
-// Composites one straight-alpha source sample over a premultiplied dst
-// pixel with the given blend mode (PDF/ISO compositing formulas).
-void blendPixel(float* dst, Color src, float alpha, Blend mode) {
-    const float sa = src.a * alpha;
-    if (sa <= 0) {
-        return;
-    }
-    const float da = dst[3];
-    float cs[3] = {src.r, src.g, src.b};
-    if (mode != Blend::Normal && da > 0) {
-        float cd[3] = {dst[0] / da, dst[1] / da, dst[2] / da};
-        for (int c = 0; c < 3; ++c) {
-            float b = cs[c];
-            switch (mode) {
-                case Blend::Add:      b = std::min(1.0f, cd[c] + cs[c]); break;
-                case Blend::Multiply: b = cd[c] * cs[c]; break;
-                case Blend::Screen:   b = cd[c] + cs[c] - cd[c] * cs[c]; break;
-                case Blend::Normal:   break;
-            }
-            // Blend only where the backdrop exists; plain source elsewhere.
-            cs[c] = cs[c] * (1 - da) + b * da;
-        }
-    }
-    for (int c = 0; c < 3; ++c) {
-        dst[c] = cs[c] * sa + dst[c] * (1 - sa);
-    }
-    dst[3] = sa + da * (1 - sa);
-}
-
-// Composites a premultiplied source sample (already scaled by opacity)
-// over dst with the given blend mode.
+// Composites a premultiplied source sample over dst.
 void blendPremul(float* dst, const float src[4], Blend mode) {
     const float sa = src[3];
     if (sa <= 0) {
         return;
     }
-    if (mode == Blend::Normal) {
-        for (int c = 0; c < 3; ++c) {
-            dst[c] = src[c] + dst[c] * (1 - sa);
+    for (int c = 0; c < 3; ++c) {
+        switch (mode) {
+            case Blend::Normal:   dst[c] = src[c] + dst[c] * (1 - sa); break;
+            case Blend::Add:      dst[c] = src[c] + dst[c]; break;
+            case Blend::Multiply: dst[c] = src[c] * dst[c] + dst[c] * (1 - sa); break;
+            case Blend::Screen:   dst[c] = src[c] * (1 - dst[c]) + dst[c]; break;
         }
-        dst[3] = sa + dst[3] * (1 - sa);
+    }
+    dst[3] = sa + dst[3] * (1 - sa);
+}
+
+// Composites one straight-alpha source sample (color + coverage) over dst.
+void blendPixel(float* dst, Color src, float alpha, Blend mode) {
+    const float sa = src.a * alpha;
+    if (sa <= 0) {
         return;
     }
-    Color straight{src[0] / sa, src[1] / sa, src[2] / sa, 1.0f};
-    blendPixel(dst, straight, sa, mode);
-}
-
-// ---------------------------------------------------------------------------
-// Transform helpers
-// ---------------------------------------------------------------------------
-
-float scaleOf(const Mat23& m) {
-    const float det = std::fabs(m.a * m.d - m.b * m.c);
-    return det > 0 ? std::sqrt(det) : 0.0f;
-}
-
-struct IRect {
-    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // half-open
-    bool empty() const { return x1 <= x0 || y1 <= y0; }
-};
-
-// Target-space integer bbox of a local rect under m, padded and clipped.
-IRect targetBBox(const Mat23& m, Rect local, float pad, int w, int h) {
-    const Vec2 corners[4] = {{local.x, local.y},
-                             {local.x + local.w, local.y},
-                             {local.x, local.y + local.h},
-                             {local.x + local.w, local.y + local.h}};
-    float min_x = 1e30f, min_y = 1e30f, max_x = -1e30f, max_y = -1e30f;
-    for (const Vec2& c : corners) {
-        const Vec2 p = m.apply(c);
-        min_x = std::min(min_x, p.x);
-        min_y = std::min(min_y, p.y);
-        max_x = std::max(max_x, p.x);
-        max_y = std::max(max_y, p.y);
-    }
-    IRect r;
-    r.x0 = std::max(0, static_cast<int>(std::floor(min_x - pad)));
-    r.y0 = std::max(0, static_cast<int>(std::floor(min_y - pad)));
-    r.x1 = std::min(w, static_cast<int>(std::ceil(max_x + pad)) + 1);
-    r.y1 = std::min(h, static_cast<int>(std::ceil(max_y + pad)) + 1);
-    return r;
-}
-
-Rect rectUnion(Rect a, Rect b) {
-    if (a.w <= 0 || a.h <= 0) {
-        return b;
-    }
-    if (b.w <= 0 || b.h <= 0) {
-        return a;
-    }
-    const float x0 = std::min(a.x, b.x);
-    const float y0 = std::min(a.y, b.y);
-    const float x1 = std::max(a.x + a.w, b.x + b.w);
-    const float y1 = std::max(a.y + a.h, b.y + b.h);
-    return {x0, y0, x1 - x0, y1 - y0};
-}
-
-Rect rectIntersect(Rect a, Rect b) {
-    const float x0 = std::max(a.x, b.x);
-    const float y0 = std::max(a.y, b.y);
-    const float x1 = std::min(a.x + a.w, b.x + b.w);
-    const float y1 = std::min(a.y + a.h, b.y + b.h);
-    return {x0, y0, std::max(0.0f, x1 - x0), std::max(0.0f, y1 - y0)};
-}
-
-Rect rectPad(Rect r, float pad) {
-    return {r.x - pad, r.y - pad, r.w + 2 * pad, r.h + 2 * pad};
+    const float premul[4] = {src.r * sa, src.g * sa, src.b * sa, sa};
+    blendPremul(dst, premul, mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -354,14 +296,7 @@ void gaussianBlur(Buf& buf, float radius_px) {
 // buffer pixels for Length parameters (§5-3).
 void applyFilter(Buf& buf, const Filter& f, float scale) {
     float values[5];
-    std::memcpy(values, f.values, sizeof values);
-    if (const FilterSpec* spec = findFilterSpec(f.mode)) {
-        for (size_t i = 0; i < spec->params.size() && i < 5; ++i) {
-            if (spec->params[i].unit == FilterUnit::Length) {
-                values[i] *= scale;
-            }
-        }
-    }
+    plan::scaleFilterValues(f, scale, values);
     if (f.mode == FS_BLUR) {
         gaussianBlur(buf, values[0]);
         return;
@@ -386,63 +321,6 @@ void applyFilter(Buf& buf, const Filter& f, float scale) {
         }
     }
     g_filter_src = nullptr;
-}
-
-// ---------------------------------------------------------------------------
-// Dash splitting (geometry preprocessing; keeps the SDFs simple)
-// ---------------------------------------------------------------------------
-
-struct Seg {
-    Vec2 a, b;
-};
-
-std::vector<Seg> pathSegments(const std::vector<Vec2>& pts, bool closed) {
-    std::vector<Seg> out;
-    for (size_t i = 0; i + 1 < pts.size(); ++i) {
-        out.push_back({pts[i], pts[i + 1]});
-    }
-    if (closed && pts.size() >= 3) {
-        out.push_back({pts.back(), pts.front()});
-    }
-    return out;
-}
-
-// Splits segments into on/off runs of `dash` length (round-tripping the
-// phase across joints so the pattern flows along the path).
-std::vector<Seg> dashSegments(const std::vector<Seg>& segs, float dash) {
-    if (dash <= 0) {
-        return segs;
-    }
-    std::vector<Seg> out;
-    float phase = 0;  // position within the 2*dash cycle
-    for (const Seg& s : segs) {
-        const float len = std::hypot(s.b.x - s.a.x, s.b.y - s.a.y);
-        if (len <= 1e-6f) {
-            continue;
-        }
-        const Vec2 dir{(s.b.x - s.a.x) / len, (s.b.y - s.a.y) / len};
-        float t = 0;
-        while (t < len) {
-            const bool on = phase < dash;
-            const float run = std::min(len - t, (on ? dash : 2 * dash) - phase);
-            if (on) {
-                out.push_back({{s.a.x + dir.x * t, s.a.y + dir.y * t},
-                               {s.a.x + dir.x * (t + run), s.a.y + dir.y * (t + run)}});
-            }
-            t += run;
-            phase += run;
-            if (phase >= 2 * dash) {
-                phase -= 2 * dash;
-            }
-        }
-    }
-    return out;
-}
-
-Rect segBounds(const Seg& s) {
-    const float x0 = std::min(s.a.x, s.b.x);
-    const float y0 = std::min(s.a.y, s.b.y);
-    return {x0, y0, std::max(s.a.x, s.b.x) - x0, std::max(s.a.y, s.b.y) - y0};
 }
 
 // Signed distance to a polygon (negative inside, any winding; per-edge math
@@ -484,32 +362,12 @@ struct CpuRenderer::Impl {
 
     // ---- fonts ------------------------------------------------------------
 
-    static const char* const kFontSearch[4];
-
     void ensureAtlas() {
         if (atlas.ready() || atlas_tried) {
             return;
         }
         atlas_tried = true;
-        detail::TextAtlas::Options ao;
-        ao.pixel_size = options.font_pixel_size;
-        std::string error;
-        if (!options.font_file.empty()) {
-            ao.font_file = options.font_file;
-            if (!atlas.init(ao, error)) {
-                std::fprintf(stderr, "fluent_stage: %s — text will not render\n", error.c_str());
-            }
-            return;
-        }
-        for (const char* path : kFontSearch) {
-            ao.font_file = path;
-            if (atlas.init(ao, error)) {
-                return;
-            }
-        }
-        std::fprintf(stderr,
-                     "fluent_stage: no usable font found — text will not render "
-                     "(set CpuRenderer::Options::font_file)\n");
+        detail::initAtlasWithFallback(atlas, options.font_file, options.font_pixel_size);
     }
 
     // Text metrics in logical units for a content (Stage measurement hook).
@@ -532,64 +390,8 @@ struct CpuRenderer::Impl {
 
     // ---- extent of a subtree in its own local space -----------------------
 
-    Rect contentExtent(const Layer& layer, Rect resolved_bounds) {
-        const Content& content = layer.content();
-        if (std::holds_alternative<std::monostate>(content)) {
-            return {};
-        }
-        if (std::holds_alternative<ImageContent>(content) ||
-            std::holds_alternative<GridContent>(content)) {
-            return resolved_bounds;
-        }
-        if (const auto* t = std::get_if<TextContent>(&content)) {
-            return measureText(*t);
-        }
-        Rect box = layer.contentBounds();
-        float pad = layer.thickness() * 0.5f + 1.0f;
-        if (const auto* a = std::get_if<ArrowContent>(&content)) {
-            const float head =
-                a->head_size > 0 ? a->head_size : std::max(3.0f * layer.thickness(), 9.0f);
-            pad += head;
-        }
-        if (const auto* b = std::get_if<BoxesContent>(&content)) {
-            if (b->show_label) {
-                box = rectUnion(box, rectPad(box, 18.0f));  // label row above
-            }
-        }
-        return rectPad(box, pad);
-    }
-
-    Rect subtreeExtent(const Layer& layer, Vec2 parent_size) {
-        const Layer::Resolved r = layer.resolve(parent_size);
-        Rect ext = contentExtent(layer, r.bounds);
-        if (layer.backgroundValue().a > 0 || layer.borderValue().has_value() ||
-            layer.masksToBounds()) {
-            ext = rectUnion(ext, r.bounds);
-        }
-        for (const auto& child : layer.sublayers()) {
-            if (child->hidden()) {
-                continue;
-            }
-            const Rect ce = subtreeExtent(*child, r.bounds.size());
-            if (ce.w <= 0 || ce.h <= 0) {
-                continue;
-            }
-            const Layer::Resolved cr = child->resolve(r.bounds.size());
-            const Vec2 corners[4] = {{ce.x, ce.y},
-                                     {ce.x + ce.w, ce.y},
-                                     {ce.x, ce.y + ce.h},
-                                     {ce.x + ce.w, ce.y + ce.h}};
-            Rect cb{};
-            for (const Vec2& c : corners) {
-                const Vec2 p = cr.to_parent.apply(c);
-                cb = rectUnion(cb, {p.x, p.y, 0.001f, 0.001f});
-            }
-            ext = rectUnion(ext, cb);
-        }
-        if (layer.masksToBounds()) {
-            ext = rectIntersect(ext, r.bounds);
-        }
-        return ext;
+    plan::TextMeasure measurer() {
+        return [this](const TextContent& c) { return measureText(c); };
     }
 
     // ---- content rasterization --------------------------------------------
@@ -966,20 +768,6 @@ struct CpuRenderer::Impl {
 
     // ---- layer recursion ---------------------------------------------------
 
-    static bool safeOpacityFold(const Layer& layer) {
-        // Folding opacity into the draw is exact when the layer composites
-        // in one pass: any single content (multi-part shapes union through
-        // the coverage mask first). Sublayers or boxes-with-labels blend in
-        // several passes that may overlap, so those go through a buffer.
-        if (!layer.sublayers().empty()) {
-            return false;
-        }
-        if (const auto* b = std::get_if<BoxesContent>(&layer.content())) {
-            return !b->show_label;
-        }
-        return true;
-    }
-
     void renderLayer(Buf& target, const Layer& layer, const Mat23& parent_m, Vec2 parent_size) {
         if (layer.hidden()) {
             return;
@@ -991,11 +779,7 @@ struct CpuRenderer::Impl {
         const Layer::Resolved r = layer.resolve(parent_size);
         const Mat23 m = parent_m * r.to_parent;
 
-        const bool needs_offscreen =
-            !layer.filters().empty() || layer.shadowValue().has_value() ||
-            layer.masksToBounds() ||
-            (layer.blendMode() != Blend::Normal && !layer.sublayers().empty()) ||
-            (opacity < 1.0f && !safeOpacityFold(layer));
+        const bool needs_offscreen = plan::needsOffscreen(layer, opacity);
 
         if (!needs_offscreen) {
             const Blend mode = layer.blendMode();
@@ -1015,7 +799,7 @@ struct CpuRenderer::Impl {
 
         // ---- offscreen path ----
         const float scale = scaleOf(m);
-        Rect ext = subtreeExtent(layer, parent_size);
+        Rect ext = plan::subtreeExtent(layer, parent_size, measurer());
         if (ext.w <= 0 || ext.h <= 0 || scale <= 0) {
             return;
         }
@@ -1148,13 +932,6 @@ struct CpuRenderer::Impl {
         surface.pixels = out_rgba.data();
         return surface;
     }
-};
-
-const char* const CpuRenderer::Impl::kFontSearch[4] = {
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 };
 
 // ===========================================================================
