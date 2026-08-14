@@ -68,17 +68,13 @@ struct PointerEventIn {
 
 std::mutex g_events_mutex;
 std::vector<PointerEventIn> g_events;
-std::atomic<int> g_effect{0};        // 0 = none, 1.. = filterTable() index + 1
-std::atomic<float> g_param{-1.0f};   // 0..1 slider; <0 = use the default
-std::atomic<bool> g_water{true};
-std::atomic<float> g_mouse_x{-10000.0f};  // last pointer position (stage
-std::atomic<float> g_mouse_y{-10000.0f};  // coords) — the PiP flees it
 
+// The page sends ONLY pointer events — every control is a Stage layer
+// rendered inside the video. That is the whole point of the library: the
+// browser is a pane of glass.
 void handleMessage(const char* text, size_t len) {
     std::string s(text, len);
     PointerEventIn e{};
-    int idx = 0;
-    float v = 0;
     if (std::sscanf(s.c_str(), " %c %f %f", &e.phase, &e.x, &e.y) == 3 &&
         (e.phase == 'd' || e.phase == 'm' || e.phase == 'u' || e.phase == 'c' ||
          e.phase == 'h')) {
@@ -86,13 +82,6 @@ void handleMessage(const char* text, size_t len) {
         if (g_events.size() < 256) {
             g_events.push_back(e);
         }
-    } else if (std::sscanf(s.c_str(), " e %d", &idx) == 1) {
-        g_effect = idx;
-        g_param = -1.0f;  // new effect starts from its defaults
-    } else if (std::sscanf(s.c_str(), " p %f", &v) == 1) {
-        g_param = v;
-    } else if (std::sscanf(s.c_str(), " w %d", &idx) == 1) {
-        g_water = idx != 0;
     }
 }
 
@@ -672,41 +661,19 @@ const char* kPage = R"HTML(<!doctype html>
 <style>
   body { margin:0; background:#0d0f13; color:#dde; font:14px system-ui;
          display:flex; flex-direction:column; align-items:center; }
-  #bar { display:flex; gap:10px; align-items:center; margin:8px; flex-wrap:wrap;
-         justify-content:center; }
-  select,input[type=range] { background:#1a1e26; color:#dde; border:1px solid #333a46;
-         border-radius:6px; padding:4px 8px; }
-  #v { max-width:98vw; max-height:86vh; border-radius:8px; background:#000;
+  #v { max-width:98vw; max-height:92vh; border-radius:8px; background:#000;
        touch-action:none; user-select:none; -webkit-user-select:none; }
-  #s { color:#678; font-size:12px; }
-  label { color:#9ab; font-size:13px; }
+  #s { color:#567; font-size:11px; margin:4px; }
 </style>
-<div id="bar">
-  <label>effect <select id="fx"></select></label>
-  <label>param <input id="pr" type="range" min="0" max="100" value="50"></label>
-  <label><input id="wt" type="checkbox" checked> water</label>
-  <span id="s">connecting…</span>
-</div>
 <canvas id="v" width="1280" height="720"></canvas>
+<div id="s">connecting…</div>
 <script>
-const EFFECTS = %%EFFECTS%%;   // the filter catalog, embedded at serve time
+// The page is a pane of glass: video out, pointer in. Every control you
+// see — scene tabs, dropdowns, sliders — is rendered by the robot.
 const W = 1280, H = 720;
 const canvas = document.getElementById('v');
 const statusEl = document.getElementById('s');
-const fxSel = document.getElementById('fx');
-const paramEl = document.getElementById('pr');
-const waterEl = document.getElementById('wt');
 let sendMsg = () => {};
-
-fxSel.onchange = () => { sendMsg('e ' + fxSel.selectedIndex); paramEl.value = 50; };
-paramEl.oninput = () => sendMsg('p ' + (paramEl.value / 100));
-waterEl.onchange = () => sendMsg('w ' + (waterEl.checked ? 1 : 0));
-
-for (const n of ['effect: none', ...EFFECTS]) {
-  const o = document.createElement('option');
-  o.textContent = n;
-  fxSel.appendChild(o);
-}
 
 function hookPointer(el) {
   let down = false, pending = null, last = 0;
@@ -866,20 +833,6 @@ void streamMjpeg(int fd) {
         }
     }
     --g_mjpeg_clients;
-}
-
-std::string effectCatalogJson() {
-    std::string json = "[";
-    for (const FilterSpec& spec : filterTable()) {
-        if (json.size() > 1) {
-            json += ",";
-        }
-        json += "\"";
-        json += spec.name;
-        json += "\"";
-    }
-    json += "]";
-    return json;
 }
 
 void serveWebsocket(int fd, const std::string& request) {
@@ -1088,14 +1041,7 @@ void handleConnection(int fd) {
             buf.erase(0, body_at + want);
             continue;
         }
-        {
-            std::string page = kPage;
-            const size_t token = page.find("%%EFFECTS%%");
-            if (token != std::string::npos) {
-                page.replace(token, 11, effectCatalogJson());
-            }
-            sendResponse(fd, "200 OK", "text/html; charset=utf-8", page);
-        }
+        sendResponse(fd, "200 OK", "text/html; charset=utf-8", kPage);
         ::close(fd);
         return;
     }
@@ -1386,46 +1332,241 @@ int main(int argc, char** argv) {
     (void)pip_topic;
 #endif
 
-    // ---- scene: main camera fills the canvas; the second camera floats as
-    // a PiP layer that glides around at the full render rate ----
-    Stage stage(kW, kH);
-    auto pattern = makeTestPattern(640, 360, 0);
-    auto& video = stage.image({640, 360, pattern.data(), 0}, Fit::Cover);
-    auto& src_label = stage.text("no camera — test pattern", {24, 682})
-                          .size(18)
-                          .color({1, 1, 1, 0.55f});
-    auto& pip = stage.image({640, 360, pattern.data(), 0}, Fit::Cover);
-    pip.frame({kW - 360, 40, 320, 180})
+    // =======================================================================
+    // The showcase. Four scenes, every control rendered BY the Stage —
+    // the page is a pane of glass.
+    // =======================================================================
+
+    Stage stage(kW, kH, StageLimits{2048, 16, 4096, 512, 4096});
+    stage.rect({0, 0, kW, kH}).color({0.05f, 0.06f, 0.09f, 1});
+
+    // Persistent pixel buffers: stable pointers keep the GPU texture cache
+    // hot (one transfer per source per frame, §5-2b).
+    std::vector<uint8_t> cam_rgba = makeTestPattern(640, 360, 0);
+    uint32_t cam_w = 640, cam_h = 360;
+    std::vector<uint8_t> pip_rgba;
+    uint32_t pip_w = 0, pip_h = 0;
+    std::vector<uint8_t> warped;
+    const auto camView = [&] { return ImageView{cam_w, cam_h, cam_rgba.data(), 0}; };
+
+    const float bar_h = 56;
+    const auto& table = filterTable();
+
+    // ---- drag helper: any layer becomes grab-and-move --------------------
+    struct Drag {
+        bool active = false;
+        Vec2 offset{};
+    };
+    const auto makeDraggable = [](Layer& l, std::shared_ptr<Drag> d) {
+        Layer* lp = &l;
+        lp->onPointer([lp, d](const PointerEvent& e) {
+            switch (e.phase) {
+                case PointerPhase::Down:
+                    d->active = true;
+                    d->offset = {lp->position().x - e.stage_pos.x,
+                                 lp->position().y - e.stage_pos.y};
+                    break;
+                case PointerPhase::Move:
+                    if (d->active) {
+                        lp->position(e.stage_pos.x + d->offset.x, e.stage_pos.y + d->offset.y);
+                    }
+                    break;
+                case PointerPhase::Up:
+                case PointerPhase::Cancel:
+                    d->active = false;
+                    break;
+            }
+        });
+    };
+
+    // ---- scene 0: the filter wall — every catalog filter, live, at once --
+    auto& g_wall = stage.group("wall");
+    struct Tile {
+        Layer* group;
+        Layer* img;
+        const FilterSpec* spec;
+        Vec2 home;
+        float phase;
+        float zoom = 1;
+    };
+    std::vector<Tile> tiles;
+    {
+        const int cols = 6;
+        const float tile_w = (kW - 16.0f) / cols;
+        const float tile_h = (kH - bar_h - 14.0f) / 5;
+        for (size_t i = 0; i < table.size(); ++i) {
+            const float x = 8 + (i % cols) * tile_w;
+            const float y = bar_h + 8 + (i / cols) * tile_h;
+            auto& tile = g_wall.group();
+            tile.bounds({0, 0, tile_w - 6, tile_h - 6});
+            const Vec2 home{x + (tile_w - 6) * 0.5f, y + (tile_h - 6) * 0.5f};
+            tile.position(home);
+            auto& img = tile.image(camView(), Fit::Cover);
+            img.cornerRadius(10).masksToBounds(true);
+            tile.rect({0, tile_h - 32, 150, 26}).cornerRadius(6).color({0, 0, 0, 0.45f});
+            tile.text(table[i].name, {8, tile_h - 30}).size(13).color({1, 1, 1, 0.9f});
+            tiles.push_back({&tile, &img, &table[i], home, i * 0.6f});
+        }
+    }
+
+    // ---- scene 1: aqua — water sim + draggable PiP + effect picker -------
+    auto& g_aqua = stage.group("aqua");
+    auto& video = g_aqua.image(camView(), Fit::Cover);
+    g_aqua.text("クリック=スプラッシュ / ホバー=航跡 / PiPはドラッグで移動", {24, kH - 34})
+        .size(16)
+        .color({1, 1, 1, 0.5f});
+    auto& pip = g_aqua.image(camView(), Fit::Cover);
+    pip.frame({kW - 380, bar_h + 24, 320, 180})
         .cornerRadius(14)
         .masksToBounds(true)
         .border(2, {1, 1, 1, 0.6f})
         .shadow(0, 6, 14)
-        .hidden(true);  // shown once the second camera delivers
+        .hidden(true);
+    makeDraggable(pip, std::make_shared<Drag>());
+
+    std::vector<std::string> fx_names{"エフェクトなし"};
+    for (const FilterSpec& spec : table) {
+        fx_names.push_back(spec.name);
+    }
+    ui::Dropdown fx_dd(g_aqua, {24, bar_h + 16, 230, 44}, fx_names, 0);
+    ui::Slider fx_sl(g_aqua, {270, bar_h + 23, 200, 30}, 0.5f);
+    ui::Switch water_sw(g_aqua, {486, bar_h + 15, 88, 44});
+    water_sw.setOn(true, false);
+    g_aqua.text("水面", {584, bar_h + 24}).size(20).color({1, 1, 1, 0.8f});
+    int sel_effect = 0;
+    float sel_param = -1;
+    bool fx_dirty = true;
+    fx_dd.onChange([&](int i) {
+        sel_effect = i;
+        sel_param = -1;
+        fx_sl.setValue(0.5f, false);
+        fx_dirty = true;
+    });
+    fx_sl.onChange([&](float v) {
+        sel_param = v;
+        fx_dirty = true;
+    });
+
+    // ---- scene 2: shards — flying crops of both cameras, all grabbable ---
+    auto& g_shards = stage.group("shards");
+    auto& shards_bg = g_shards.image(camView(), Fit::Cover);
+    shards_bg.filter(ColorTransform().brightness(-0.35f).saturation(0.5f));
+    g_shards.text("映像のかけらは掴んで投げられる", {24, kH - 34}).size(16).color({1, 1, 1, 0.5f});
+    struct Shard {
+        Layer* l;
+        std::shared_ptr<Drag> drag;
+        Vec2 pos;
+        float phase, rx, ry, spin;
+        bool from_pip;
+    };
+    std::vector<Shard> shards;
+    for (int i = 0; i < 10; ++i) {
+        const float w = 170 + 40 * ((i * 7) % 3);
+        const float h = w * 0.62f;
+        auto& sh = g_shards.image(camView(), Fit::Cover);
+        sh.frame({0, 0, w, h}).cornerRadius(12).masksToBounds(true).shadow(0, 5, 12);
+        sh.sourceRect({static_cast<float>((i * 97) % 300), static_cast<float>((i * 61) % 160),
+                       260, 170});
+        auto drag = std::make_shared<Drag>();
+        makeDraggable(sh, drag);
+        shards.push_back({&sh, drag,
+                          {kW * 0.5f, kH * 0.55f},
+                          i * 0.63f,
+                          280 + 30.0f * (i % 4),
+                          150 + 22.0f * (i % 3),
+                          (i % 2 ? 1.0f : -1.0f) * (0.4f + 0.1f * (i % 3)),
+                          i % 3 == 1});
+    }
+
+    // ---- scene 3: the ui catalog, wired to live effects ------------------
+    auto& g_ui = stage.group("uiScene");
+    auto& ui_bg = g_ui.image(camView(), Fit::Cover);
+    auto& panel = g_ui.group("panel");
+    panel.bounds({0, 0, 460, 300});
+    panel.position(24 + 230, bar_h + 24 + 150);
+    panel.background({0, 0, 0, 0.55f});
+    panel.cornerRadius(18);
+    panel.shadow(0, 8, 18);
+    panel.text("コントロールも全部レイヤー", {24, 18}).size(24);
+    panel.text("ぼかし", {24, 74}).size(18).color({1, 1, 1, 0.7f});
+    ui::Slider blur_sl(panel, {110, 72, 310, 28}, 0.0f);
+    panel.text("モノクロ", {24, 130}).size(18).color({1, 1, 1, 0.7f});
+    ui::Switch gray_sw(panel, {110, 122, 84, 42});
+    ui::Segmented tone_seg(panel, {24, 186, 412, 42}, {"そのまま", "トゥーン", "スケッチ"}, 0);
+    ui::Button reset_btn(panel, {24, 244, 180, 44}, "リセット");
+    ui::Gauge fps_gauge(g_ui, {kW - 130, kH - 150}, 56);
+    g_ui.text("FPS", {kW - 130, kH - 74}).size(16).align(Align::Center).color({1, 1, 1, 0.6f});
+    float ui_blur = 0;
+    bool ui_gray = false;
+    int ui_tone = 0;
+    bool ui_dirty = true;
+    blur_sl.onChange([&](float v) {
+        ui_blur = v * 14;
+        ui_dirty = true;
+    });
+    gray_sw.onChange([&](bool on) {
+        ui_gray = on;
+        ui_dirty = true;
+    });
+    tone_seg.onChange([&](int i) {
+        ui_tone = i;
+        ui_dirty = true;
+    });
+    reset_btn.onTap([&] {
+        blur_sl.setValue(0);
+        gray_sw.setOn(false);
+        tone_seg.select(0);
+        ui_blur = 0;
+        ui_gray = false;
+        ui_tone = 0;
+        ui_dirty = true;
+    });
+
+    // ---- top bar (created last: composites above every scene) ------------
+    stage.rect({0, 0, kW, bar_h}).color({0.02f, 0.03f, 0.05f, 0.75f});
+    stage.text("FLUENT STAGE", {20, 13}).size(26);
+    auto& fps_text = stage.text("", {kW - 20, 17}).size(18).align(Align::Right)
+                         .color({1, 1, 1, 0.65f});
+    ui::Segmented scene_seg(stage.root(), {kW * 0.5f - 280, 8, 560, 40},
+                            {"全フィルタ", "水面", "シャード", "UI"}, 0);
+
+    Layer* scene_groups[4] = {&g_wall, &g_aqua, &g_shards, &g_ui};
+    int scene = 0;
+    const auto switchScene = [&](int i) {
+        scene = i;
+        fx_dd.close();
+        for (int j = 0; j < 4; ++j) {
+            if (j == i) {
+                scene_groups[j]->hidden(false);
+                scene_groups[j]->opacity(0);
+                Transaction t(0.3f, Ease::Out);
+                scene_groups[j]->opacity(1);
+            } else {
+                scene_groups[j]->hidden(true);
+            }
+        }
+    };
+    scene_seg.onChange(switchScene);
+    switchScene(0);
 
     std::thread server(serverLoop, port);
 
-    // ---- render loop (owns the Stage) ----
+    // ---- render loop (owns the Stage) -------------------------------------
     WaterSim water;
-    std::vector<uint8_t> cam_rgba;      // latest main camera frame
-    std::vector<uint8_t> pip_rgba;      // latest second camera frame
-    std::vector<uint8_t> warped;        // water-refracted copy handed to the layer
-    uint32_t cam_w = 640, cam_h = 360;
-    uint32_t pip_w = 0, pip_h = 0;
-    cam_rgba = pattern;
     uint64_t seen_seq[2] = {0, 0};
     bool have_ros = false;
     bool have_pip = false;
-    int current_effect = -1;
-    float current_param = -2;
+    Vec2 mouse{-10000, -10000};
     uint32_t tick = 0;
-    Vec2 pip_pos{kW - 200, 150};
+    double fps_now = 0;
 
     const auto frame_time = std::chrono::duration<double>(1.0 / kFps);
     auto next = std::chrono::steady_clock::now();
     while (g_running) {
         ++tick;
+        const float t = tick / kFps;
 
-        // ---- latest camera frames (ROS latest-wins, else animated pattern) -
+        // ---- camera frames (decode straight into the persistent buffers) --
 #ifdef FS_HAVE_ROS
         for (int cam = 0; cam < 2; ++cam) {
             if (g_ros[cam].seq == seen_seq[cam]) {
@@ -1438,23 +1579,18 @@ int main(int argc, char** argv) {
                 seen_seq[cam] = g_ros[cam].seq;
             }
             uint32_t w = 0, h = 0;
-            std::vector<uint8_t> rgba;
-            if (!decodeJpegToRgba(jpeg.data(), jpeg.size(), rgba, w, h)) {
+            std::vector<uint8_t>& dst = cam == 0 ? cam_rgba : pip_rgba;
+            if (!decodeJpegToRgba(jpeg.data(), jpeg.size(), dst, w, h)) {
                 continue;
             }
             if (cam == 0) {
-                cam_rgba.swap(rgba);
                 if (w != cam_w || h != cam_h) {
                     cam_w = w;
                     cam_h = h;
                     water.reset(cam_w, cam_h);
                 }
-                if (!have_ros) {
-                    have_ros = true;
-                    src_label.setText(topic + "  +  " + pip_topic);
-                }
+                have_ros = true;
             } else {
-                pip_rgba.swap(rgba);
                 pip_w = w;
                 pip_h = h;
                 if (!have_pip) {
@@ -1471,83 +1607,133 @@ int main(int argc, char** argv) {
             water.reset(cam_w, cam_h);
         }
 
-        // ---- pointer events: stage coords → camera pixels (Cover inverse) --
+        // ---- pointer events → controls first, then the water --------------
         const float cover = std::max(static_cast<float>(kW) / cam_w,
                                      static_cast<float>(kH) / cam_h);
         const float off_x = (cam_w * cover - kW) * 0.5f;
         const float off_y = (cam_h * cover - kH) * 0.5f;
+        const bool water_on = water_sw.isOn();
         std::vector<PointerEventIn> events;
         {
             std::lock_guard<std::mutex> lock(g_events_mutex);
             events.swap(g_events);
         }
         for (const PointerEventIn& e : events) {
-            g_mouse_x = e.x;
-            g_mouse_y = e.y;
+            mouse = {e.x, e.y};
             const float cx = (e.x + off_x) / cover;
             const float cy = (e.y + off_y) / cover;
-            if (e.phase == 'd') {
-                water.drop(cx, cy, 900, 5);  // a real splash
-            } else if (e.phase == 'm' || e.phase == 'h') {
-                water.drop(cx, cy, 220, 2);  // fine wake trailing the pointer
+            switch (e.phase) {
+                case 'd':
+                    if (!stage.pointerDown({e.x, e.y}) && scene == 1 && water_on) {
+                        water.drop(cx, cy, 900, 5);
+                    }
+                    break;
+                case 'm':
+                    stage.pointerMove({e.x, e.y});
+                    if (scene == 1 && water_on) {
+                        water.drop(cx, cy, 220, 2);
+                    }
+                    break;
+                case 'h':
+                    if (scene == 1 && water_on) {
+                        water.drop(cx, cy, 220, 2);
+                    }
+                    break;
+                case 'u':
+                    stage.pointerUp({e.x, e.y});
+                    break;
+                case 'c':
+                    stage.pointerCancel();
+                    break;
             }
         }
 
-        // ---- water simulation + warp --------------------------------------
-        const bool water_on = g_water;
-        if (water_on) {
-            water.step();
-            warped.resize(cam_rgba.size());
-            water.warp(cam_rgba.data(), warped.data());
-        }
-        video.setImage({cam_w, cam_h,
-                        water_on ? warped.data() : cam_rgba.data(), 0});
-
-        // The PiP glides at the full render rate — and flees the pointer:
-        // orbit gently, but when the mouse closes in, slide away smoothly.
-        if (have_pip) {
-            pip.setImage({pip_w, pip_h, pip_rgba.data(), 0});
-            const float t = tick / kFps;
-            Vec2 target{kW - 200 + 90 * std::sin(t * 0.55f),
-                        150 + 70 * std::sin(t * 0.37f + 1.3f)};
-            const float dx = pip_pos.x - g_mouse_x;
-            const float dy = pip_pos.y - g_mouse_y;
-            const float dist = std::hypot(dx, dy);
-            const float flee_r = 340;
-            if (dist < flee_r && dist > 1) {
-                const float push = (flee_r - dist) * 1.6f;
-                target.x = pip_pos.x + dx / dist * push;
-                target.y = pip_pos.y + dy / dist * push;
-            }
-            target.x = std::min(std::max(target.x, 180.0f), kW - 180.0f);
-            target.y = std::min(std::max(target.y, 110.0f), kH - 110.0f);
-            pip_pos.x += (target.x - pip_pos.x) * 0.10f;
-            pip_pos.y += (target.y - pip_pos.y) * 0.10f;
-            pip.position(pip_pos);
-        }
-
-        // ---- effect selection (browser dropdown + slider) ------------------
-        const int effect = g_effect;
-        const float param = g_param;
-        if (effect != current_effect || param != current_param) {
-            current_effect = effect;
-            current_param = param;
-            video.clearFilters();
-            const auto& table = filterTable();
-            if (effect > 0 && effect <= static_cast<int>(table.size())) {
-                const FilterSpec& spec = table[static_cast<size_t>(effect - 1)];
-                Filter f{spec.mode, {}};
-                for (size_t i = 0; i < spec.params.size() && i < 5; ++i) {
-                    f.values[i] = spec.params[i].default_value;
+        // ---- per-scene live updates ---------------------------------------
+        if (scene == 0) {
+            // Every filter at once; parameters breathe, and the tile under
+            // the pointer zooms up out of the wall.
+            for (Tile& tile : tiles) {
+                tile.img->setImage(camView());
+                Filter f{tile.spec->mode, {}};
+                for (size_t p = 0; p < tile.spec->params.size() && p < 5; ++p) {
+                    f.values[p] = tile.spec->params[p].default_value;
                 }
-                if (param >= 0 && !spec.params.empty()) {
-                    // The slider sweeps the first parameter: 0 → 2×default
-                    // (or 0..1 when the default is 0). Crude but live.
-                    const float def = spec.params[0].default_value;
-                    f.values[0] = def != 0 ? 2 * def * param : param;
+                if (!tile.spec->params.empty()) {
+                    const float def = tile.spec->params[0].default_value;
+                    const float wave = std::sin(t * 0.8f + tile.phase);
+                    f.values[0] = def != 0 ? def * (0.7f + 0.3f * wave) : 0.4f * wave;
                 }
-                video.filter(f);
+                tile.img->clearFilters();
+                tile.img->filter(f);
+                const float dx = tile.home.x - mouse.x;
+                const float dy = tile.home.y - mouse.y;
+                const float want = std::hypot(dx, dy) < 130 ? 1.35f : 1.0f;
+                tile.zoom += (want - tile.zoom) * 0.15f;
+                tile.group->scale(tile.zoom);
             }
+        } else if (scene == 1) {
+            if (water_on) {
+                water.step();
+                warped.resize(cam_rgba.size());
+                water.warp(cam_rgba.data(), warped.data());
+                video.setImage({cam_w, cam_h, warped.data(), 0});
+            } else {
+                video.setImage(camView());
+            }
+            if (have_pip) {
+                pip.setImage({pip_w, pip_h, pip_rgba.data(), 0});
+            }
+            if (fx_dirty) {
+                fx_dirty = false;
+                video.clearFilters();
+                if (sel_effect > 0 && sel_effect <= static_cast<int>(table.size())) {
+                    const FilterSpec& spec = table[static_cast<size_t>(sel_effect - 1)];
+                    Filter f{spec.mode, {}};
+                    for (size_t p = 0; p < spec.params.size() && p < 5; ++p) {
+                        f.values[p] = spec.params[p].default_value;
+                    }
+                    if (sel_param >= 0 && !spec.params.empty()) {
+                        const float def = spec.params[0].default_value;
+                        f.values[0] = def != 0 ? 2 * def * sel_param : sel_param;
+                    }
+                    video.filter(f);
+                }
+            }
+        } else if (scene == 2) {
+            shards_bg.setImage(camView());
+            for (Shard& sh : shards) {
+                sh.l->setImage(sh.from_pip && have_pip
+                                   ? ImageView{pip_w, pip_h, pip_rgba.data(), 0}
+                                   : camView());
+                if (!sh.drag->active) {
+                    const Vec2 target{kW * 0.5f + sh.rx * std::cos(t * 0.5f + sh.phase) * 1.7f,
+                                      bar_h + 80 + sh.ry * (1 + std::sin(t * 0.63f + sh.phase))};
+                    sh.pos.x += (target.x - sh.pos.x) * 0.05f;
+                    sh.pos.y += (target.y - sh.pos.y) * 0.05f;
+                    sh.l->position(sh.pos);
+                    sh.l->rotation(6 * std::sin(t * sh.spin + sh.phase));
+                } else {
+                    sh.pos = sh.l->position();
+                }
+            }
+        } else if (scene == 3) {
+            ui_bg.setImage(camView());
+            if (ui_dirty) {
+                ui_dirty = false;
+                ui_bg.clearFilters();
+                if (ui_blur > 0.3f) {
+                    ui_bg.blur(ui_blur);
+                }
+                if (ui_gray) {
+                    ui_bg.grayscale();
+                }
+                if (ui_tone == 1) {
+                    ui_bg.filter(Toon());
+                } else if (ui_tone == 2) {
+                    ui_bg.filter(Sketch());
+                }
+            }
+            fps_gauge.setValue(static_cast<float>(fps_now / 60.0));
         }
 
         const float dt = static_cast<float>(frame_time.count());
@@ -1555,7 +1741,6 @@ int main(int argc, char** argv) {
 
         // ---- H.264 out (nvenc; one-shot fallback to libx264) ---------------
         if (!encoder_alive && nvenc) {
-            // Closing stdin ends the child; the reader unblocks on EOF.
             close(encoder.stdin_fd);
             au_reader.join();
             close(encoder.stdout_fd);
@@ -1575,27 +1760,26 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        if (g_mjpeg_clients > 0 && (tick & 1) == 0) {  // fallback runs at 30 fps
+        if (g_mjpeg_clients > 0 && (tick & 1) == 0) {
             std::lock_guard<std::mutex> lock(g_frame_mutex);
             encodeJpeg(frame, g_jpeg);
             ++g_frame_seq;
             g_frame_cv.notify_all();
         }
 
-        // Loop health: real fps to the log every 5 s — declared 60 means
-        // nothing if the loop can't hold it.
+        // ---- pacing + health ----------------------------------------------
         static auto fps_t0 = std::chrono::steady_clock::now();
         static uint32_t fps_frames = 0;
         ++fps_frames;
         const auto now0 = std::chrono::steady_clock::now();
-        if (now0 - fps_t0 >= std::chrono::seconds(5)) {
-            std::printf("stage_web: render %.1f fps\n",
-                        fps_frames / std::chrono::duration<double>(now0 - fps_t0).count());
-            std::fflush(stdout);
+        if (now0 - fps_t0 >= std::chrono::seconds(2)) {
+            fps_now = fps_frames / std::chrono::duration<double>(now0 - fps_t0).count();
+            char text[32];
+            std::snprintf(text, sizeof text, "%.0f fps / vulkan", fps_now);
+            fps_text.setText(text);
             fps_t0 = now0;
             fps_frames = 0;
         }
-
         next += std::chrono::duration_cast<std::chrono::steady_clock::duration>(frame_time);
         const auto now = std::chrono::steady_clock::now();
         if (now - next > std::chrono::duration_cast<std::chrono::steady_clock::duration>(
