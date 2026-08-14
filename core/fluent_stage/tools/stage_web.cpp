@@ -78,7 +78,7 @@ void encodeJpeg(const Surface& s, std::vector<uint8_t>& out) {
     cinfo.input_components = 3;
     cinfo.in_color_space = JCS_RGB;
     jpeg_set_defaults(&cinfo);
-    jpeg_set_quality(&cinfo, 85, TRUE);
+    jpeg_set_quality(&cinfo, 75, TRUE);  // ~40% smaller than q85; Wi-Fi friendly
     jpeg_start_compress(&cinfo, TRUE);
     std::vector<uint8_t> row(s.width * 3);
     while (cinfo.next_scanline < cinfo.image_height) {
@@ -123,9 +123,12 @@ function post(phase, e) {
   const y = (e.clientY - r.top) / r.height * H;
   fetch('/pointer', {method:'POST', body: phase + ' ' + x.toFixed(1) + ' ' + y.toFixed(1)});
 }
-let down = false, pendingMove = null;
-function flushMove() {
-  if (pendingMove) { post(down ? 'm' : 'h', pendingMove); pendingMove = null; }
+let down = false, pendingMove = null, lastSend = 0;
+function flushMove(ts) {
+  // ~30 Hz is plenty for hover wake and drag; more just queues latency.
+  if (pendingMove && ts - lastSend >= 33) {
+    post(down ? 'm' : 'h', pendingMove); pendingMove = null; lastSend = ts;
+  }
   requestAnimationFrame(flushMove);
 }
 requestAnimationFrame(flushMove);
@@ -194,53 +197,64 @@ void streamMjpeg(int fd) {
 }
 
 void handleConnection(int fd) {
-    std::string req;
-    char buf[2048];
-    // Read until end of headers (requests here are tiny).
-    while (req.find("\r\n\r\n") == std::string::npos) {
-        const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
-        if (n <= 0) {
+    // Latency rule: pointer connections are KEPT ALIVE — one TCP connection
+    // carries the whole gesture stream. A connection per event stacks
+    // handshakes against the browser's 6-connection limit (which the MJPEG
+    // stream already occupies) and turns hover into visible input lag.
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    std::string buf;
+    char chunk[2048];
+    while (true) {
+        size_t head_end;
+        while ((head_end = buf.find("\r\n\r\n")) == std::string::npos) {
+            const ssize_t n = ::recv(fd, chunk, sizeof chunk, 0);
+            if (n <= 0 || buf.size() > 65536) {
+                ::close(fd);
+                return;
+            }
+            buf.append(chunk, static_cast<size_t>(n));
+        }
+        if (buf.rfind("GET /stream", 0) == 0) {
+            streamMjpeg(fd);
             ::close(fd);
             return;
         }
-        req.append(buf, static_cast<size_t>(n));
-        if (req.size() > 65536) {
-            break;
-        }
-    }
-    const bool is_stream = req.rfind("GET /stream", 0) == 0;
-    const bool is_pointer = req.rfind("POST /pointer", 0) == 0;
-    if (is_stream) {
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-        streamMjpeg(fd);
-    } else if (is_pointer) {
-        // Body may follow the headers in the same read.
-        const size_t body_at = req.find("\r\n\r\n") + 4;
-        size_t want = 0;
-        const size_t cl = req.find("Content-Length:");
-        if (cl != std::string::npos) {
-            want = static_cast<size_t>(std::atoi(req.c_str() + cl + 15));
-        }
-        while (req.size() - body_at < want) {
-            const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
-            if (n <= 0) {
-                break;
+        if (buf.rfind("POST /pointer", 0) == 0) {
+            const size_t body_at = head_end + 4;
+            size_t want = 0;
+            const size_t cl = buf.find("Content-Length:");
+            if (cl != std::string::npos && cl < head_end) {
+                want = static_cast<size_t>(std::atoi(buf.c_str() + cl + 15));
             }
-            req.append(buf, static_cast<size_t>(n));
-        }
-        PointerEventIn e{};
-        if (std::sscanf(req.c_str() + body_at, " %c %f %f", &e.phase, &e.x, &e.y) == 3) {
-            std::lock_guard<std::mutex> lock(g_events_mutex);
-            if (g_events.size() < 256) {
-                g_events.push_back(e);
+            while (buf.size() - body_at < want) {
+                const ssize_t n = ::recv(fd, chunk, sizeof chunk, 0);
+                if (n <= 0) {
+                    ::close(fd);
+                    return;
+                }
+                buf.append(chunk, static_cast<size_t>(n));
             }
+            PointerEventIn e{};
+            if (std::sscanf(buf.c_str() + body_at, " %c %f %f", &e.phase, &e.x, &e.y) == 3) {
+                std::lock_guard<std::mutex> lock(g_events_mutex);
+                if (g_events.size() < 256) {
+                    g_events.push_back(e);
+                }
+            }
+            const char* resp =
+                "HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n";
+            if (!sendAll(fd, resp, std::strlen(resp))) {
+                ::close(fd);
+                return;
+            }
+            buf.erase(0, body_at + want);  // next request on the same socket
+            continue;
         }
-        sendResponse(fd, "204 No Content", "text/plain", "");
-    } else {
         sendResponse(fd, "200 OK", "text/html; charset=utf-8", kPage);
+        ::close(fd);
+        return;
     }
-    ::close(fd);
 }
 
 void serverLoop(uint16_t port) {
@@ -352,7 +366,9 @@ int main(int argc, char** argv) {
     ripple_style.wavelength = 34;
     ripple_style.max_radius = 340;
     ripple_style.duration = 1.4f;
-    fx::Ripple ripple(video, ripple_style);  // the camera image is the water surface
+    // The whole screen is the water surface: a filter on the root applies
+    // to the composited frame, so panels, buttons, and popups warp too.
+    fx::Ripple ripple(stage.root(), ripple_style);
 
     bool harvesting = false;
     start.onTap([&] {
