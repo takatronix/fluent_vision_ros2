@@ -349,19 +349,29 @@ function jpegWsPath() {
   img.id = 'v'; img.draggable = false;
   view.replaceWith(img); view = img;
   hookPointer(img);
-  let shown = 0, url = null;
+  let shown = 0, url = null, wsRef = null;
   openWs('jpeg', data => {
     const next = URL.createObjectURL(new Blob([data], {type: 'image/jpeg'}));
-    img.onload = () => { if (url) URL.revokeObjectURL(url); url = next; ++shown; };
+    img.onload = () => {
+      if (url) URL.revokeObjectURL(url);
+      url = next; ++shown;
+      if (wsRef) wsRef.send('a');   // painted — request the next latest frame
+    };
+    img.onerror = () => { if (wsRef) wsRef.send('a'); };
     img.src = next;
-  }, null, () => framePullFallback('ws unavailable'));
+  }, ws => { wsRef = ws; ws.send('a'); },
+     () => framePullFallback('ws unavailable'));
   setInterval(() => { bar.textContent = statusLine('jpeg/ws ' + shown + ' fps'); shown = 0; }, 1000);
 }
 
+// Default: the H.264 codec path (WebCodecs, then MSE) — the config the
+// field test liked. ?v=jpeg keeps the ack-paced stills experiment.
 const mode = new URLSearchParams(location.search).get('v');
-if (mode === 'h264' && 'VideoDecoder' in window) {
+if (mode === 'jpeg') {
+  jpegWsPath();
+} else if ('VideoDecoder' in window) {
   webcodecsPath();
-} else if (mode === 'h264' && window.MediaSource &&
+} else if (window.MediaSource &&
            MediaSource.isTypeSupported('video/mp4; codecs="avc1.42e01e"')) {
   msePath();
 } else {
@@ -435,27 +445,38 @@ void serveWs(int fd, const std::string& request) {
 
     std::thread sender([fd, client, jpeg_mode] {
         if (jpeg_mode) {
-            // The fv_browser_camera pattern: one JPEG per WS message, the
-            // page replaces its <img> on arrival. No queue exists anywhere,
-            // so latency is one network trip by construction.
+            // Ack-paced stills: exactly ONE frame in flight end-to-end. The
+            // page acks after painting; only then does the next (latest)
+            // frame go out. TCP and proxy buffers can never hold a backlog,
+            // so latency pins to one round trip and the rate adapts to the
+            // link instead of the link adapting with lag.
             uint64_t last_seq = 0;
             std::vector<uint8_t> jpeg;
             while (g_running) {
                 {
+                    std::unique_lock<std::mutex> cl(client->mutex);
+                    client->cv.wait_for(cl, std::chrono::milliseconds(500),
+                                        [&] { return client->want_frame || client->dead; });
+                    if (client->dead) {
+                        return;
+                    }
+                    if (!client->want_frame) {
+                        continue;
+                    }
+                }
+                {
                     std::unique_lock<std::mutex> lock(g_frame_mutex);
                     g_frame_cv.wait_for(lock, std::chrono::milliseconds(500),
                                         [&] { return g_frame_seq != last_seq; });
-                    {
-                        std::lock_guard<std::mutex> cl(client->mutex);
-                        if (client->dead) {
-                            return;
-                        }
-                    }
                     if (g_frame_seq == last_seq) {
                         continue;
                     }
                     last_seq = g_frame_seq;
                     jpeg = g_jpeg;
+                }
+                {
+                    std::lock_guard<std::mutex> cl(client->mutex);
+                    client->want_frame = false;
                 }
                 if (!wsvideo::wsSendBinary(fd, jpeg.data(), jpeg.size())) {
                     break;
@@ -567,7 +588,15 @@ void serveWs(int fd, const std::string& request) {
                 }
             }
             if (opcode == 1) {
-                handlePointerText(reinterpret_cast<const char*>(&buf[at]), len);
+                if (len == 1 && buf[at] == 'a') {
+                    {
+                        std::lock_guard<std::mutex> cl(client->mutex);
+                        client->want_frame = true;
+                    }
+                    client->cv.notify_all();
+                } else {
+                    handlePointerText(reinterpret_cast<const char*>(&buf[at]), len);
+                }
             } else if (opcode == 2) {
                 std::lock_guard<std::mutex> lock(g_webcam_mutex);
                 g_webcam_jpeg.assign(buf.begin() + static_cast<long>(at),

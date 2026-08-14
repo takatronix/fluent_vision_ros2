@@ -41,7 +41,8 @@ struct VideoClient {
     size_t queued_bytes = 0;
     bool wait_for_key = true;
     bool dead = false;
-    bool mp4 = false;  // mux to fMP4 for the MSE path
+    bool mp4 = false;        // mux to fMP4 for the MSE path
+    bool want_frame = false; // ack-paced stills: page consumed the last one
 };
 
 inline std::mutex g_clients_mutex;
@@ -99,14 +100,14 @@ inline Encoder spawnEncoder(bool nvenc, uint32_t width, uint32_t height, int fps
             execlp("ffmpeg", "ffmpeg", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt",
                    "rgba", "-s", size.c_str(), "-r", fps.c_str(), "-i", "pipe:0", "-c:v",
                    "h264_nvenc", "-preset", "p1", "-tune", "ull", "-zerolatency", "1",
-                   "-delay", "0", "-bf", "0", "-g", gop.c_str(), "-b:v", "3M", "-maxrate",
-                   "4M", "-bufsize", "1M", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
+                   "-delay", "0", "-bf", "0", "-g", gop.c_str(), "-b:v", "4M", "-maxrate",
+                   "5M", "-bufsize", "1M", "-profile:v", "baseline", "-pix_fmt", "yuv420p",
                    "-f", "h264", "pipe:1", static_cast<char*>(nullptr));
         } else {
             execlp("ffmpeg", "ffmpeg", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt",
                    "rgba", "-s", size.c_str(), "-r", fps.c_str(), "-i", "pipe:0", "-c:v",
                    "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-bf", "0",
-                   "-g", gop.c_str(), "-b:v", "3M", "-profile:v", "baseline", "-pix_fmt",
+                   "-g", gop.c_str(), "-b:v", "4M", "-profile:v", "baseline", "-pix_fmt",
                    "yuv420p", "-f", "h264", "pipe:1", static_cast<char*>(nullptr));
         }
         _exit(127);
