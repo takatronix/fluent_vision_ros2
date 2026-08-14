@@ -1282,8 +1282,10 @@ void rosThread(std::string main_topic, std::string pip_topic) {
 
 int main(int argc, char** argv) {
     const uint16_t port = argc > 1 ? static_cast<uint16_t>(std::atoi(argv[1])) : 8790;
-    const std::string topic = argc > 2 ? argv[2] : "/d405_color/image_raw/compressed";
-    const std::string pip_topic = argc > 3 ? argv[3] : "/aspa/restamped/color_compressed";
+    // Head camera (D555 relay) fullscreen — it sees the room; the arm
+    // camera rides in the PiP.
+    const std::string topic = argc > 2 ? argv[2] : "/aspa/restamped/color_compressed";
+    const std::string pip_topic = argc > 3 ? argv[3] : "/d405_color/image_raw/compressed";
     std::signal(SIGPIPE, SIG_IGN);
     std::signal(SIGINT, [](int) { std::_Exit(0); });
     std::signal(SIGTERM, [](int) { std::_Exit(0); });
@@ -1381,6 +1383,8 @@ int main(int argc, char** argv) {
 
     // ---- scene 0: the filter wall — every catalog filter, live, at once --
     auto& g_wall = stage.group("wall");
+    g_wall.bounds({0, 0, kW, kH});  // scene groups need real bounds: image
+                                    // children default to parent-fill
     struct Tile {
         Layer* group;
         Layer* img;
@@ -1411,6 +1415,7 @@ int main(int argc, char** argv) {
 
     // ---- scene 1: aqua — water sim + draggable PiP + effect picker -------
     auto& g_aqua = stage.group("aqua");
+    g_aqua.bounds({0, 0, kW, kH});
     auto& video = g_aqua.image(camView(), Fit::Cover);
     g_aqua.text("クリック=スプラッシュ / ホバー=航跡 / PiPはドラッグで移動", {24, kH - 34})
         .size(16)
@@ -1422,7 +1427,35 @@ int main(int argc, char** argv) {
         .border(2, {1, 1, 1, 0.6f})
         .shadow(0, 6, 14)
         .hidden(true);
-    makeDraggable(pip, std::make_shared<Drag>());
+    // The PiP floats on its own and is grab-and-move; released, it drifts
+    // around wherever you dropped it.
+    auto pip_drag = std::make_shared<Drag>();
+    Vec2 pip_home{kW - 380 + 160, bar_h + 24 + 90};
+    Vec2 pip_pos = pip_home;
+    {
+        Layer* lp = &pip;
+        lp->onPointer([lp, pip_drag, &pip_home, &pip_pos](const PointerEvent& e) {
+            switch (e.phase) {
+                case PointerPhase::Down:
+                    pip_drag->active = true;
+                    pip_drag->offset = {lp->position().x - e.stage_pos.x,
+                                        lp->position().y - e.stage_pos.y};
+                    break;
+                case PointerPhase::Move:
+                    if (pip_drag->active) {
+                        pip_pos = {e.stage_pos.x + pip_drag->offset.x,
+                                   e.stage_pos.y + pip_drag->offset.y};
+                        lp->position(pip_pos);
+                    }
+                    break;
+                case PointerPhase::Up:
+                case PointerPhase::Cancel:
+                    pip_drag->active = false;
+                    pip_home = pip_pos;
+                    break;
+            }
+        });
+    }
 
     std::vector<std::string> fx_names{"エフェクトなし"};
     for (const FilterSpec& spec : table) {
@@ -1449,6 +1482,7 @@ int main(int argc, char** argv) {
 
     // ---- scene 2: shards — flying crops of both cameras, all grabbable ---
     auto& g_shards = stage.group("shards");
+    g_shards.bounds({0, 0, kW, kH});
     auto& shards_bg = g_shards.image(camView(), Fit::Cover);
     shards_bg.filter(ColorTransform().brightness(-0.35f).saturation(0.5f));
     g_shards.text("映像のかけらは掴んで投げられる", {24, kH - 34}).size(16).color({1, 1, 1, 0.5f});
@@ -1467,6 +1501,20 @@ int main(int argc, char** argv) {
         sh.frame({0, 0, w, h}).cornerRadius(12).masksToBounds(true).shadow(0, 5, 12);
         sh.sourceRect({static_cast<float>((i * 97) % 300), static_cast<float>((i * 61) % 160),
                        260, 170});
+        // Each flying shard carries its own live effect.
+        static const char* kShardFx[10] = {"invert",   "toon",     "hue",      "sketch",
+                                           "pixelate", "halftone", "swirl",    "edge_sobel",
+                                           "sepia",    "posterize"};
+        for (const FilterSpec& spec : table) {
+            if (std::strcmp(spec.name, kShardFx[i]) == 0) {
+                Filter f{spec.mode, {}};
+                for (size_t p = 0; p < spec.params.size() && p < 5; ++p) {
+                    f.values[p] = spec.params[p].default_value;
+                }
+                sh.filter(f);
+                break;
+            }
+        }
         auto drag = std::make_shared<Drag>();
         makeDraggable(sh, drag);
         shards.push_back({&sh, drag,
@@ -1480,6 +1528,7 @@ int main(int argc, char** argv) {
 
     // ---- scene 3: the ui catalog, wired to live effects ------------------
     auto& g_ui = stage.group("uiScene");
+    g_ui.bounds({0, 0, kW, kH});
     auto& ui_bg = g_ui.image(camView(), Fit::Cover);
     auto& panel = g_ui.group("panel");
     panel.bounds({0, 0, 460, 300});
@@ -1682,6 +1731,15 @@ int main(int argc, char** argv) {
             }
             if (have_pip) {
                 pip.setImage({pip_w, pip_h, pip_rgba.data(), 0});
+            }
+            if (!pip_drag->active) {
+                Vec2 target{pip_home.x + 26 * std::sin(t * 0.5f),
+                            pip_home.y + 18 * std::sin(t * 0.83f + 1.2f)};
+                target.x = std::min(std::max(target.x, 170.0f), kW - 170.0f);
+                target.y = std::min(std::max(target.y, bar_h + 100.0f), kH - 100.0f);
+                pip_pos.x += (target.x - pip_pos.x) * 0.04f;
+                pip_pos.y += (target.y - pip_pos.y) * 0.04f;
+                pip.position(pip_pos);
             }
             if (fx_dirty) {
                 fx_dirty = false;
