@@ -24,6 +24,12 @@ find_package(rosbag2_storage REQUIRED)
 find_package(rosbag2_transport REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
+# rosbag2 0.26 (Jazzy) renamed SerializedBagMessage::time_stamp to
+# recv_timestamp; Humble (0.15) only has time_stamp.
+if(rosbag2_storage_VERSION VERSION_GREATER_EQUAL "0.26.0")
+  add_compile_definitions(FV_ROSBAG2_HAS_RECV_TIMESTAMP=1)
+endif()
+
 # Generate services and messages
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/StartRecording.srv"
