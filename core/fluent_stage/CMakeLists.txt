@@ -92,6 +92,17 @@ target_link_libraries(ripple_demo PRIVATE fluent_stage)
 add_executable(bench examples/bench.cpp)
 target_link_libraries(bench PRIVATE fluent_stage)
 
+# ---- stage_web: the Stage in a browser (MJPEG out, pointer events in) -------
+find_package(JPEG QUIET)
+if(JPEG_FOUND)
+  add_executable(stage_web tools/stage_web.cpp)
+  target_link_libraries(stage_web PRIVATE fluent_stage JPEG::JPEG)
+  find_package(Threads REQUIRED)
+  target_link_libraries(stage_web PRIVATE Threads::Threads)
+else()
+  message(STATUS "fluent_stage: stage_web disabled (needs libjpeg-dev)")
+endif()
+
 # ---- tests ------------------------------------------------------------------
 
 enable_testing()

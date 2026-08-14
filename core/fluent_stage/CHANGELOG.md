@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0 — 2026-08-14 (stage_web: ブラウザで触れる)
+
+- `tools/stage_web` — Stage の Surface を MJPEG で配信し、ブラウザの
+  mouse/touch/pointer イベントを論理座標に正規化して
+  `stage.pointerDown/Move/Up` へ逆流させる自己完結 Web アプリ
+  （POSIX ソケット + libjpeg のみ。ページ側 UI ロジックはゼロ）
+- デモ HUD: 収穫開始/停止・ライトスイッチ+インジケーター・速度スライダー・
+  モード segmented・プロファイル dropdown・バッテリーゲージ・検出枠・
+  ホバー波紋。Vulkan バックエンドで描画（無ければ CPU にフォールバック）
+- E2E 実証: HTTP 経由のポインタ注入だけで全コントロールが反応
+
 ## 0.5.0 — 2026-08-14 (Phase L1: Vulkan バックエンド)
 
 - `VulkanRenderer` — CPU リファレンスと同一出力の GPU 本番バックエンド。
