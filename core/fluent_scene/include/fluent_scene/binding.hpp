@@ -33,7 +33,7 @@ struct ValueMeta {
 
 // Typed payload for the MVP input families used by the stage-2 renderer.
 struct TypedValue {
-    enum class Kind { kImage, kDetections, kString, kCalibration };
+    enum class Kind { kImage, kDetections, kPoints, kString, kCalibration };
     Kind kind = Kind::kString;
 
     // kImage (owned RGBA8)
@@ -42,6 +42,7 @@ struct TypedValue {
     std::vector<uint8_t> pixels;
 
     std::vector<DetectionInstance> detections;  // kDetections
+    std::vector<Point2f> points;                // kPoints (points2d / polyline2d)
     std::string text;                           // kString
     std::string calibration_id;                 // kCalibration
 

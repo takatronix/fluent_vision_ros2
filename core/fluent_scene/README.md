@@ -17,6 +17,7 @@ ROS 2 配線** まで実行するランタイムコアです。設計書
 | 読むもの | 場所 |
 |---|---|
 | デモページ | <https://claude.ai/code/artifact/25d03136-2389-4b50-8cd9-eb50075f7970> |
+| ノードカタログ（全ノードの実描画サンプル+パラメータ表） | <https://claude.ai/code/artifact/688718ae-94a7-4c58-90f7-ad8bc899bcaa> |
 | 設計書（規範、日本語） | [docs/design/fluent_vision_architecture.ja.md](../../docs/design/fluent_vision_architecture.ja.md) |
 | Design spec (English) | [docs/design/fluent_vision_architecture.md](../../docs/design/fluent_vision_architecture.md) |
 | シーン例 (§11) | [examples/camera_detection_hud.fvs](examples/camera_detection_hud.fvs) |
@@ -94,8 +95,12 @@ ctest --test-dir build --output-on-failure
   `sha256:` digest を出力。
 - **構造化診断**: 安定コード（`parse.duplicate_key` など）・severity・phase・span・
   文脈 key/value・正準順序。golden テストで固定。
-- **MVP ノードレジストリ**（宣言的シグネチャ）:
-  `visual.image2d` / `visual.boxes2d` / `text.dynamic` / `composite.layers`。
+- **ノードレジストリ**（宣言的シグネチャ）:
+  `visual.image2d` / `visual.boxes2d` / `visual.circles2d` / `visual.polyline2d` /
+  `text.dynamic` / `composite.layers`。丸・折れ線は SDF（距離関数）レンダリングで、
+  インスタンス化した四角形1枚+ピクセル距離計算により AA 付き・拡大無劣化。
+  デモは [examples/primitives_demo.fvs](examples/primitives_demo.fvs)
+  (`fv_render examples/primitives_demo.fvs --out prim.ppm`)。
 - **Stage 4: 分離 binding schema + ROS 2 アダプター**:
   [binding_config.hpp](include/fluent_scene/binding_config.hpp)（ROS 非依存）が §12 の
   `fluent.binding/v1alpha1` 文書をシーン契約に対して検証（未知入力/未登録 converter/

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "fluent_scene/render/renderer.hpp"
+#include "render/box_smoother.hpp"
 #include "render/scene_model.hpp"
 #include "render/text_atlas.hpp"
 
@@ -63,6 +64,12 @@ public:
             return false;
         }
         const auto cpu_start = std::chrono::steady_clock::now();
+        if (has_last_frame_time_) {
+            frame_dt_ = std::clamp(
+                std::chrono::duration<double>(cpu_start - last_frame_time_).count(), 0.001, 0.1);
+        }
+        last_frame_time_ = cpu_start;
+        has_last_frame_time_ = true;
         std::fill(framebuffer_.begin(), framebuffer_.end(), 0);
         // Opaque black background (alpha 255) to match the GPU clear.
         for (size_t i = 3; i < framebuffer_.size(); i += 4) {
@@ -96,8 +103,34 @@ public:
                                                  static_cast<ptrdiff_t>(op.max_instances));
                         }
                     }
+                    if (op.smoothing > 0.0f) {
+                        detections = smoothers_[op.node_id].update(std::move(detections), frame_dt_,
+                                                                   op.smoothing, op.max_instances);
+                    }
                     for (const DetectionInstance& detection : detections) {
                         drawBoxOutline(detection.bbox, op.color);
+                    }
+                    ++stats_.buffer_uploads;
+                    break;
+                }
+                case render::DrawOp::Kind::kCircles:
+                case render::DrawOp::Kind::kPolyline: {
+                    auto it = inputs.points.find(op.source_input);
+                    if (it == inputs.points.end()) {
+                        break;
+                    }
+                    std::vector<Point2f> points = it->second;
+                    if (points.size() > op.max_points) {
+                        points.resize(op.max_points);  // declared truncate_end rule
+                    }
+                    if (op.kind == render::DrawOp::Kind::kCircles) {
+                        for (const Point2f& point : points) {
+                            drawCircle(point, op.radius, op.thickness, op.color);
+                        }
+                    } else {
+                        for (size_t s = 0; s + 1 < points.size(); ++s) {
+                            drawSegment(points[s], points[s + 1], op.thickness, op.color);
+                        }
                     }
                     ++stats_.buffer_uploads;
                     break;
@@ -231,6 +264,59 @@ private:
         }
     }
 
+    // Same SDF + smoothstep rules as the GPU shaders so both backends agree.
+    static float smoothCoverage(float distance) {
+        const float t = std::clamp((distance + 0.75f) / 1.5f, 0.0f, 1.0f);
+        return 1.0f - t * t * (3.0f - 2.0f * t);
+    }
+
+    void drawCircle(const Point2f& center, float radius, float thickness, const float* color) {
+        const float reach = radius + thickness * 0.5f + 1.5f;
+        const int x0 = static_cast<int>(std::floor(center.x - reach));
+        const int x1 = static_cast<int>(std::ceil(center.x + reach));
+        const int y0 = static_cast<int>(std::floor(center.y - reach));
+        const int y1 = static_cast<int>(std::ceil(center.y + reach));
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                const float dx = static_cast<float>(x) + 0.5f - center.x;
+                const float dy = static_cast<float>(y) + 0.5f - center.y;
+                float d = std::sqrt(dx * dx + dy * dy) - radius;
+                if (thickness > 0.0f) {
+                    d = std::fabs(d) - thickness * 0.5f;
+                }
+                const float coverage = smoothCoverage(d);
+                if (coverage > 0.0f) {
+                    blendPixel(x, y, color, coverage);
+                }
+            }
+        }
+    }
+
+    void drawSegment(const Point2f& a, const Point2f& b, float thickness, const float* color) {
+        const float reach = thickness * 0.5f + 1.5f;
+        const int x0 = static_cast<int>(std::floor(std::min(a.x, b.x) - reach));
+        const int x1 = static_cast<int>(std::ceil(std::max(a.x, b.x) + reach));
+        const int y0 = static_cast<int>(std::floor(std::min(a.y, b.y) - reach));
+        const int y1 = static_cast<int>(std::ceil(std::max(a.y, b.y) + reach));
+        const float bax = b.x - a.x;
+        const float bay = b.y - a.y;
+        const float len2 = std::max(bax * bax + bay * bay, 1e-6f);
+        for (int y = y0; y <= y1; ++y) {
+            for (int x = x0; x <= x1; ++x) {
+                const float px = static_cast<float>(x) + 0.5f - a.x;
+                const float py = static_cast<float>(y) + 0.5f - a.y;
+                const float h = std::clamp((px * bax + py * bay) / len2, 0.0f, 1.0f);
+                const float dx = px - bax * h;
+                const float dy = py - bay * h;
+                const float d = std::sqrt(dx * dx + dy * dy) - thickness * 0.5f;
+                const float coverage = smoothCoverage(d);
+                if (coverage > 0.0f) {
+                    blendPixel(x, y, color, coverage);
+                }
+            }
+        }
+    }
+
     void drawGlyph(const render::TextAtlas& atlas, const render::TextAtlas::GlyphQuad& quad,
                    const float* color, float offset_x, float offset_y) {
         const int w = static_cast<int>(quad.w);
@@ -277,6 +363,10 @@ private:
     bool loaded_ = false;
     std::vector<uint8_t> framebuffer_;
     std::map<std::string, std::unique_ptr<render::TextAtlas>> atlases_;
+    std::map<std::string, render::BoxSmoother> smoothers_;
+    std::chrono::steady_clock::time_point last_frame_time_;
+    bool has_last_frame_time_ = false;
+    double frame_dt_ = 1.0 / 30.0;
 };
 
 }  // namespace

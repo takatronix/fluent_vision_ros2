@@ -1,0 +1,109 @@
+# 2D primitive showcase: camera background, a smooth polyline path with
+# waypoint circles (SDF-rendered, anti-aliased), detection boxes, and text.
+schema: fluent.scene/v1alpha1
+kind: Scene
+metadata:
+  name: primitives_demo
+types:
+  Detection2D:
+    struct:
+      bbox: vec4f
+      score: f32
+      label: string
+inputs:
+  camera:
+    type: image.rgba8
+    required: true
+    update: per_frame
+  detections:
+    type: sequence<Detection2D, 128>
+    required: false
+    update: per_frame
+  path:
+    type: polyline2d
+    required: false
+    update: per_frame
+  markers:
+    type: points2d
+    required: false
+    update: per_frame
+  status_text:
+    type: string
+    required: false
+    update: on_change
+resources:
+  ui_font:
+    type: font
+    uri: builtin://fonts/default-cjk
+    glyph_capacity: 2048
+nodes:
+  - id: camera_layer
+    type: visual.image2d
+    inputs:
+      image: $inputs.camera
+    params:
+      fit: contain
+  - id: path_layer
+    type: visual.polyline2d
+    inputs:
+      points: $inputs.path
+    params:
+      color: [1.0, 0.62, 0.15, 0.9]
+      thickness: 6.0
+    bounds:
+      max_points: 256
+      overflow: truncate_end
+  - id: marker_layer
+    type: visual.circles2d
+    inputs:
+      points: $inputs.markers
+    params:
+      color: [0.1, 0.9, 0.7, 1.0]
+      radius: 16.0
+      thickness: 4.0
+    bounds:
+      max_points: 64
+      overflow: truncate_end
+  - id: detection_layer
+    type: visual.boxes2d
+    inputs:
+      detections: $inputs.detections
+    params:
+      color: [0.1, 0.9, 0.7, 1.0]
+      smoothing: 0.2   # 検出更新の間を滑らかに補間 (EMA 時定数, 秒)
+    bounds:
+      max_instances: 128
+      overflow: drop_lowest_score
+  - id: status_layer
+    type: text.dynamic
+    inputs:
+      text: $inputs.status_text
+    params:
+      font: $resources.ui_font
+      position: [24.0, 24.0]
+      shadow: true
+      default_text: "経路と目標点を表示中"
+    bounds:
+      max_glyphs: 128
+      overflow: truncate_end
+  - id: composite
+    type: composite.layers
+    inputs:
+      layers:
+        - $nodes.camera_layer.layer
+        - $nodes.path_layer.layer
+        - $nodes.marker_layer.layer
+        - $nodes.detection_layer.layer
+        - $nodes.status_layer.layer
+    params:
+      color_space: srgb
+outputs:
+  frame:
+    type: image.rgba8
+    source: $nodes.composite.image
+budgets:
+  max_width: 1920
+  max_height: 1080
+  max_gpu_bytes: 268435456
+  max_upload_bytes_per_frame: 33554432
+  max_frames_in_flight: 2

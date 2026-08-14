@@ -17,6 +17,8 @@ const char kSupportedPlanIdentity[] = "fluent.plan/v1alpha1";
 namespace {
 
 constexpr uint64_t kBoxInstanceBytes = 32;    // bbox vec4 + color + flags
+constexpr uint64_t kPointBytes = 8;           // vec2 circle center
+constexpr uint64_t kSegmentBytes = 16;        // vec4 polyline segment (a, b)
 constexpr uint64_t kGlyphQuadBytes = 16;      // position + uv + glyph index
 constexpr uint64_t kAtlasBytesPerGlyph = 1024;  // 32x32 R8 cell
 
@@ -441,6 +443,19 @@ private:
             const std::string source = portRef(node, "detections");
             draw.reads.push_back(ensureStreamedBuffer("buf." + node_id + ".instances",
                                                       draw.max_instances * kBoxInstanceBytes, source,
+                                                      inputUpdateOf(source)));
+            return true;
+        }
+        if (type == "visual.circles2d" || type == "visual.polyline2d") {
+            draw.op = type == "visual.circles2d" ? "draw_circles" : "draw_polyline";
+            draw.max_instances = boundsCount(node, "max_points");
+            const std::string source = portRef(node, "points");
+            // circles: vec2 per point; polyline: vec4 per segment (n-1 segments).
+            const uint64_t bytes = type == "visual.circles2d"
+                                       ? draw.max_instances * kPointBytes
+                                       : (draw.max_instances > 0 ? draw.max_instances - 1 : 0) *
+                                             kSegmentBytes;
+            draw.reads.push_back(ensureStreamedBuffer("buf." + node_id + ".points", bytes, source,
                                                       inputUpdateOf(source)));
             return true;
         }

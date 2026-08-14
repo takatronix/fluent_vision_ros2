@@ -74,6 +74,11 @@ NodeTypeSpec makeBoxes2d() {
     show_label.kind = ParamKind::kBool;
     show_label.default_value = JsonValue::makeBool(false);
     spec.params.push_back(std::move(show_label));
+    ParamSpec smoothing;  // EMA time constant in seconds; 0 = boxes jump to new data
+    smoothing.name = "smoothing";
+    smoothing.kind = ParamKind::kF32;
+    smoothing.default_value = JsonValue::makeFloat(0.0);
+    spec.params.push_back(std::move(smoothing));
     spec.outputs.push_back(OutputSpec{"layer", TypeKind::kLayer});
     spec.bounds.required = true;
     spec.bounds.count_key = "max_instances";
@@ -119,6 +124,56 @@ NodeTypeSpec makeTextDynamic() {
     return spec;
 }
 
+NodeTypeSpec makeCircles2d() {
+    NodeTypeSpec spec;
+    spec.name = "visual.circles2d";
+    spec.inputs.push_back(PortSpec{"points", PortPatternKind::kAnyPoints, TypeKind::kPoints2d, true});
+    ParamSpec color;
+    color.name = "color";
+    color.kind = ParamKind::kVec4f;
+    color.default_value = vecDefault({1.0, 1.0, 1.0, 1.0});
+    spec.params.push_back(std::move(color));
+    ParamSpec radius;
+    radius.name = "radius";
+    radius.kind = ParamKind::kF32;
+    radius.default_value = JsonValue::makeFloat(8.0);
+    spec.params.push_back(std::move(radius));
+    ParamSpec thickness;  // 0 = filled disc, > 0 = ring outline
+    thickness.name = "thickness";
+    thickness.kind = ParamKind::kF32;
+    thickness.default_value = JsonValue::makeFloat(0.0);
+    spec.params.push_back(std::move(thickness));
+    spec.outputs.push_back(OutputSpec{"layer", TypeKind::kLayer});
+    spec.bounds.required = true;
+    spec.bounds.count_key = "max_points";
+    spec.bounds.max_count = 4096;
+    spec.bounds.overflow_rules = {"truncate_end"};
+    return spec;
+}
+
+NodeTypeSpec makePolyline2d() {
+    NodeTypeSpec spec;
+    spec.name = "visual.polyline2d";
+    spec.inputs.push_back(
+        PortSpec{"points", PortPatternKind::kAnyPoints, TypeKind::kPolyline2d, true});
+    ParamSpec color;
+    color.name = "color";
+    color.kind = ParamKind::kVec4f;
+    color.default_value = vecDefault({1.0, 1.0, 1.0, 1.0});
+    spec.params.push_back(std::move(color));
+    ParamSpec thickness;
+    thickness.name = "thickness";
+    thickness.kind = ParamKind::kF32;
+    thickness.default_value = JsonValue::makeFloat(3.0);
+    spec.params.push_back(std::move(thickness));
+    spec.outputs.push_back(OutputSpec{"layer", TypeKind::kLayer});
+    spec.bounds.required = true;
+    spec.bounds.count_key = "max_points";
+    spec.bounds.max_count = 4096;
+    spec.bounds.overflow_rules = {"truncate_end"};
+    return spec;
+}
+
 NodeTypeSpec makeCompositeLayers() {
     NodeTypeSpec spec;
     spec.name = "composite.layers";
@@ -139,6 +194,8 @@ NodeRegistry NodeRegistry::builtinMvp() {
     NodeRegistry registry;
     registry.add(makeImage2d());
     registry.add(makeBoxes2d());
+    registry.add(makeCircles2d());
+    registry.add(makePolyline2d());
     registry.add(makeTextDynamic());
     registry.add(makeCompositeLayers());
     return registry;

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "fluent_scene/render/renderer.hpp"
+#include "render/box_smoother.hpp"
 #include "render/scene_model.hpp"
 #include "render/text_atlas.hpp"
 
@@ -43,6 +44,18 @@ static const uint32_t kTextVertSpv[] =
 static const uint32_t kTextFragSpv[] =
 #include "text.frag.inc"
     ;
+static const uint32_t kCirclesVertSpv[] =
+#include "circles.vert.inc"
+    ;
+static const uint32_t kCirclesFragSpv[] =
+#include "circles.frag.inc"
+    ;
+static const uint32_t kPolylineVertSpv[] =
+#include "polyline.vert.inc"
+    ;
+static const uint32_t kPolylineFragSpv[] =
+#include "polyline.frag.inc"
+    ;
 
 struct PcImage {
     float dst_rect[4];
@@ -60,7 +73,20 @@ struct PcText {
     float viewport[2];
     float offset[2];
 };
-static_assert(sizeof(PcImage) == 32 && sizeof(PcBoxes) == 32 && sizeof(PcText) == 32,
+struct PcCircles {
+    float color[4];
+    float viewport[2];
+    float radius;
+    float thickness;
+};
+struct PcPolyline {
+    float color[4];
+    float viewport[2];
+    float thickness;
+    float pad;
+};
+static_assert(sizeof(PcImage) == 32 && sizeof(PcBoxes) == 32 && sizeof(PcText) == 32 &&
+                  sizeof(PcCircles) == 32 && sizeof(PcPolyline) == 32,
               "push constant blocks must stay 32 bytes");
 
 struct TextVertex {
@@ -596,9 +622,19 @@ private:
         VkShaderModule boxes_frag = createShader(kBoxesFragSpv, sizeof(kBoxesFragSpv), diagnostics);
         VkShaderModule text_vert = createShader(kTextVertSpv, sizeof(kTextVertSpv), diagnostics);
         VkShaderModule text_frag = createShader(kTextFragSpv, sizeof(kTextFragSpv), diagnostics);
+        VkShaderModule circles_vert =
+            createShader(kCirclesVertSpv, sizeof(kCirclesVertSpv), diagnostics);
+        VkShaderModule circles_frag =
+            createShader(kCirclesFragSpv, sizeof(kCirclesFragSpv), diagnostics);
+        VkShaderModule polyline_vert =
+            createShader(kPolylineVertSpv, sizeof(kPolylineVertSpv), diagnostics);
+        VkShaderModule polyline_frag =
+            createShader(kPolylineFragSpv, sizeof(kPolylineFragSpv), diagnostics);
         const bool modules_ok = image_vert != VK_NULL_HANDLE && image_frag != VK_NULL_HANDLE &&
                                 boxes_vert != VK_NULL_HANDLE && boxes_frag != VK_NULL_HANDLE &&
-                                text_vert != VK_NULL_HANDLE && text_frag != VK_NULL_HANDLE;
+                                text_vert != VK_NULL_HANDLE && text_frag != VK_NULL_HANDLE &&
+                                circles_vert != VK_NULL_HANDLE && circles_frag != VK_NULL_HANDLE &&
+                                polyline_vert != VK_NULL_HANDLE && polyline_frag != VK_NULL_HANDLE;
         bool ok = modules_ok;
         if (ok) {
             ok = createPipeline(image_vert, image_frag, true, nullptr, {}, textured_pipeline_layout_,
@@ -619,8 +655,23 @@ private:
             ok = createPipeline(text_vert, text_frag, true, &vertex_binding, attributes,
                                 textured_pipeline_layout_, text_pipeline_, diagnostics);
         }
+        if (ok) {
+            VkVertexInputBindingDescription instance_binding{0, 8, VK_VERTEX_INPUT_RATE_INSTANCE};
+            std::vector<VkVertexInputAttributeDescription> attributes = {
+                {0, 0, VK_FORMAT_R32G32_SFLOAT, 0}};
+            ok = createPipeline(circles_vert, circles_frag, false, &instance_binding, attributes,
+                                plain_pipeline_layout_, circles_pipeline_, diagnostics);
+        }
+        if (ok) {
+            VkVertexInputBindingDescription instance_binding{0, 16, VK_VERTEX_INPUT_RATE_INSTANCE};
+            std::vector<VkVertexInputAttributeDescription> attributes = {
+                {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}};
+            ok = createPipeline(polyline_vert, polyline_frag, false, &instance_binding, attributes,
+                                plain_pipeline_layout_, polyline_pipeline_, diagnostics);
+        }
         for (VkShaderModule module :
-             {image_vert, image_frag, boxes_vert, boxes_frag, text_vert, text_frag}) {
+             {image_vert, image_frag, boxes_vert, boxes_frag, text_vert, text_frag, circles_vert,
+              circles_frag, polyline_vert, polyline_frag}) {
             if (module != VK_NULL_HANDLE) {
                 vkDestroyShaderModule(device_, module, nullptr);
             }
@@ -644,12 +695,20 @@ private:
         // Per-draw retained state and shared streaming buffers.
         uint64_t total_instances = 0;
         uint64_t total_glyph_vertices = 0;
+        uint64_t total_point_floats = 0;
         for (const render::DrawOp& draw : model_.draws) {
             DrawState state;
             state.op = &draw;
             if (draw.kind == render::DrawOp::Kind::kBoxes) {
                 state.instance_offset = total_instances;
                 total_instances += draw.max_instances;
+            } else if (draw.kind == render::DrawOp::Kind::kCircles) {
+                state.point_offset = total_point_floats;
+                total_point_floats += draw.max_points * 2;  // vec2 per point
+            } else if (draw.kind == render::DrawOp::Kind::kPolyline) {
+                state.point_offset = total_point_floats;
+                total_point_floats +=
+                    (draw.max_points > 0 ? draw.max_points - 1 : 0) * 4;  // vec4 per segment
             } else if (draw.kind == render::DrawOp::Kind::kText) {
                 state.vertex_offset = total_glyph_vertices;
                 total_glyph_vertices += draw.max_glyphs * 6;
@@ -687,6 +746,12 @@ private:
             !createBuffer(total_glyph_vertices * sizeof(TextVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                           true, text_vertex_buffer_, diagnostics)) {
+            return false;
+        }
+        if (total_point_floats > 0 &&
+            !createBuffer(total_point_floats * sizeof(float), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          true, point_buffer_, diagnostics)) {
             return false;
         }
 
@@ -793,6 +858,7 @@ private:
             }
             input_images_.clear();
             destroyBuffer(instance_buffer_);
+            destroyBuffer(point_buffer_);
             destroyBuffer(text_vertex_buffer_);
             destroyBuffer(staging_);
             destroyBuffer(readback_);
@@ -802,7 +868,8 @@ private:
             if (sampler_ != VK_NULL_HANDLE) {
                 vkDestroySampler(device_, sampler_, nullptr);
             }
-            for (VkPipeline pipeline : {image_pipeline_, boxes_pipeline_, text_pipeline_}) {
+            for (VkPipeline pipeline : {image_pipeline_, boxes_pipeline_, circles_pipeline_,
+                                        polyline_pipeline_, text_pipeline_}) {
                 if (pipeline != VK_NULL_HANDLE) {
                     vkDestroyPipeline(device_, pipeline, nullptr);
                 }
@@ -855,6 +922,10 @@ private:
         // boxes
         uint64_t instance_offset = 0;
         uint32_t instance_count = 0;
+        render::BoxSmoother smoother;
+        // circles / polyline (offset in floats within point_buffer_)
+        uint64_t point_offset = 0;
+        uint32_t point_instance_count = 0;
         // text
         uint64_t vertex_offset = 0;
         uint32_t vertex_count = 0;
@@ -869,6 +940,9 @@ private:
     render::SceneModel model_;
     RenderStats stats_;
     bool loaded_ = false;
+    std::chrono::steady_clock::time_point last_frame_time_;
+    bool has_last_frame_time_ = false;
+    double frame_dt_ = 1.0 / 30.0;
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
@@ -892,11 +966,14 @@ private:
     VkPipelineLayout plain_pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline image_pipeline_ = VK_NULL_HANDLE;
     VkPipeline boxes_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline circles_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline polyline_pipeline_ = VK_NULL_HANDLE;
     VkPipeline text_pipeline_ = VK_NULL_HANDLE;
     VkSampler sampler_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
 
     Buffer instance_buffer_;
+    Buffer point_buffer_;
     Buffer text_vertex_buffer_;
     Buffer staging_;
     Buffer readback_;
@@ -916,6 +993,14 @@ bool VulkanRenderer::renderFrame(const FrameInputs& inputs, DiagnosticList& diag
         return false;
     }
     const auto cpu_start = std::chrono::steady_clock::now();
+    // Wall-clock delta drives rate-independent smoothing; clamped so pauses
+    // and first frames stay well-behaved.
+    if (has_last_frame_time_) {
+        frame_dt_ = std::clamp(
+            std::chrono::duration<double>(cpu_start - last_frame_time_).count(), 0.001, 0.1);
+    }
+    last_frame_time_ = cpu_start;
+    has_last_frame_time_ = true;
 
     // ---- CPU snapshot phase: fill streaming buffers, decide uploads --------
     std::vector<std::pair<Image*, VkBufferImageCopy>> uploads;
@@ -1006,6 +1091,10 @@ bool VulkanRenderer::renderFrame(const FrameInputs& inputs, DiagnosticList& diag
                                      detections.end() - static_cast<ptrdiff_t>(op.max_instances));
                 }
             }
+            if (op.smoothing > 0.0f) {
+                detections = state.smoother.update(std::move(detections), frame_dt_, op.smoothing,
+                                                   op.max_instances);
+            }
             float* dst = static_cast<float*>(instance_buffer_.mapped) + state.instance_offset * 4;
             for (const DetectionInstance& detection : detections) {
                 std::memcpy(dst, detection.bbox, sizeof(float) * 4);
@@ -1013,6 +1102,38 @@ bool VulkanRenderer::renderFrame(const FrameInputs& inputs, DiagnosticList& diag
             }
             state.instance_count = static_cast<uint32_t>(detections.size());
             if (state.instance_count > 0) {
+                ++stats_.buffer_uploads;
+            }
+        } else if (op.kind == render::DrawOp::Kind::kCircles ||
+                   op.kind == render::DrawOp::Kind::kPolyline) {
+            std::vector<Point2f> points;
+            auto it = inputs.points.find(op.source_input);
+            if (it != inputs.points.end()) {
+                points = it->second;
+            }
+            if (points.size() > op.max_points) {
+                points.resize(op.max_points);  // declared truncate_end rule
+            }
+            float* dst = static_cast<float*>(point_buffer_.mapped) + state.point_offset;
+            if (op.kind == render::DrawOp::Kind::kCircles) {
+                for (const Point2f& point : points) {
+                    dst[0] = point.x;
+                    dst[1] = point.y;
+                    dst += 2;
+                }
+                state.point_instance_count = static_cast<uint32_t>(points.size());
+            } else {
+                const size_t segments = points.size() > 1 ? points.size() - 1 : 0;
+                for (size_t s = 0; s < segments; ++s) {
+                    dst[0] = points[s].x;
+                    dst[1] = points[s].y;
+                    dst[2] = points[s + 1].x;
+                    dst[3] = points[s + 1].y;
+                    dst += 4;
+                }
+                state.point_instance_count = static_cast<uint32_t>(segments);
+            }
+            if (state.point_instance_count > 0) {
                 ++stats_.buffer_uploads;
             }
         } else {
@@ -1140,6 +1261,37 @@ bool VulkanRenderer::submitFrame(const std::vector<std::pair<Image*, VkBufferIma
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc),
                                &pc);
             vkCmdDraw(frame_cmd_, 6, state.instance_count, 0, 0);
+        } else if (op.kind == render::DrawOp::Kind::kCircles ||
+                   op.kind == render::DrawOp::Kind::kPolyline) {
+            if (state.point_instance_count == 0) {
+                continue;
+            }
+            const bool is_circles = op.kind == render::DrawOp::Kind::kCircles;
+            vkCmdBindPipeline(frame_cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              is_circles ? circles_pipeline_ : polyline_pipeline_);
+            const VkDeviceSize offset = state.point_offset * sizeof(float);
+            vkCmdBindVertexBuffers(frame_cmd_, 0, 1, &point_buffer_.buffer, &offset);
+            if (is_circles) {
+                PcCircles pc{};
+                std::memcpy(pc.color, op.color, sizeof(pc.color));
+                pc.viewport[0] = viewport_w;
+                pc.viewport[1] = viewport_h;
+                pc.radius = op.radius;
+                pc.thickness = op.thickness;
+                vkCmdPushConstants(frame_cmd_, plain_pipeline_layout_,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                   sizeof(pc), &pc);
+            } else {
+                PcPolyline pc{};
+                std::memcpy(pc.color, op.color, sizeof(pc.color));
+                pc.viewport[0] = viewport_w;
+                pc.viewport[1] = viewport_h;
+                pc.thickness = op.thickness;
+                vkCmdPushConstants(frame_cmd_, plain_pipeline_layout_,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                   sizeof(pc), &pc);
+            }
+            vkCmdDraw(frame_cmd_, 6, state.point_instance_count, 0, 0);
         } else {
             if (state.vertex_count == 0) {
                 continue;

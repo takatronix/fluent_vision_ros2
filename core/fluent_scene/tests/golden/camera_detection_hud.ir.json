@@ -145,6 +145,10 @@
         {
           "name": "show_label",
           "value": true
+        },
+        {
+          "name": "smoothing",
+          "value": 0
         }
       ],
       "bounds": {

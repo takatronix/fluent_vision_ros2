@@ -15,7 +15,7 @@ namespace fluent_scene {
 namespace render {
 
 struct DrawOp {
-    enum class Kind { kImage, kBoxes, kText };
+    enum class Kind { kImage, kBoxes, kCircles, kPolyline, kText };
     Kind kind = Kind::kImage;
     std::string node_id;
     std::string source_input;  // scene input feeding this draw
@@ -28,6 +28,12 @@ struct DrawOp {
     uint64_t max_instances = 0;
     std::string overflow;  // drop_lowest_score | drop_oldest
     bool show_label = false;
+    float smoothing = 0.0f;  // EMA time constant (s); 0 = no interpolation
+
+    // kCircles / kPolyline
+    uint64_t max_points = 0;
+    float radius = 8.0f;      // kCircles
+    float thickness = 3.0f;   // kCircles: 0 = filled; kPolyline: stroke width
 
     // kText
     std::string font_uri;

@@ -699,9 +699,15 @@ private:
             i = text.size();
             return node;
         }
-        // Plain flow scalar: runs until a flow delimiter.
+        // Plain flow scalar: runs until a flow delimiter, or a mapping colon
+        // (':' followed by a space or delimiter — "builtin://x" stays intact).
         size_t end = i;
         while (end < text.size() && text[end] != ',' && text[end] != ']' && text[end] != '}') {
+            if (text[end] == ':' &&
+                (end + 1 >= text.size() || text[end + 1] == ' ' || text[end + 1] == ',' ||
+                 text[end + 1] == ']' || text[end + 1] == '}')) {
+                break;
+            }
             ++end;
         }
         std::string value = rtrim(text.substr(i, end - i));

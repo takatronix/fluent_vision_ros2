@@ -20,12 +20,16 @@ struct SyntheticFrame {
     uint32_t camera_width = 0;
     uint32_t camera_height = 0;
     std::vector<DetectionInstance> detections;
+    std::vector<Point2f> path;     // sine sweep, for polyline scenes
+    std::vector<Point2f> markers;  // waypoints along the path, for circle scenes
     std::string status_text;
 
     FrameInputs inputs() const {
         FrameInputs frame;
         frame.images["camera"] = CpuImageView{camera_width, camera_height, camera.data()};
         frame.detections["detections"] = detections;
+        frame.points["path"] = path;
+        frame.points["markers"] = markers;
         frame.strings["status_text"] = status_text;
         return frame;
     }
@@ -62,6 +66,20 @@ inline SyntheticFrame makeSyntheticFrame(uint32_t frame_index, uint32_t camera_w
         detection.score = 0.55f + 0.08f * static_cast<float>(i);
         detection.label = "aspara";
         frame.detections.push_back(detection);
+    }
+    // Animated sine path across the lower half plus waypoints every 8th vertex.
+    const float fw = static_cast<float>(output_width);
+    const float fh = static_cast<float>(output_height);
+    const float phase = static_cast<float>(frame_index) * 0.06f;
+    for (uint32_t i = 0; i <= 48; ++i) {
+        const float t = static_cast<float>(i) / 48.0f;
+        Point2f point;
+        point.x = fw * (0.04f + 0.92f * t);
+        point.y = fh * (0.72f + 0.14f * std::sin(t * 9.0f + phase));
+        frame.path.push_back(point);
+        if (i % 8 == 0) {
+            frame.markers.push_back(point);
+        }
     }
     frame.status_text = "映像を待っています — アスパラ検出中";
     return frame;

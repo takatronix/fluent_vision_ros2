@@ -1229,6 +1229,12 @@ private:
                 }
                 why = "expected layer";
                 return false;
+            case PortPatternKind::kAnyPoints:
+                if (type.kind == TypeKind::kPoints2d || type.kind == TypeKind::kPolyline2d) {
+                    return true;
+                }
+                why = "expected points2d or polyline2d";
+                return false;
         }
         return false;
     }

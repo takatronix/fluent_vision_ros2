@@ -34,6 +34,9 @@ TypedValue::Kind kindFromTypeName(const std::string& type_name, bool& supported)
     if (type_name.rfind("sequence<", 0) == 0) {
         return TypedValue::Kind::kDetections;
     }
+    if (type_name == "points2d" || type_name == "polyline2d") {
+        return TypedValue::Kind::kPoints;
+    }
     if (type_name == "string") {
         return TypedValue::Kind::kString;
     }
@@ -82,7 +85,8 @@ std::shared_ptr<const TypedValue> fallbackValueFromJson(const JsonValue& json,
             value->calibration_id = json.stringValue();
             break;
         case TypedValue::Kind::kImage:
-            // Images have no literal representation; unreachable by schema.
+        case TypedValue::Kind::kPoints:
+            // No literal representation; unreachable by schema.
             return nullptr;
     }
     return value;
@@ -114,6 +118,9 @@ FrameInputs FrameSnapshot::toFrameInputs() const {
                 break;
             case TypedValue::Kind::kDetections:
                 inputs.detections[name] = entry.value->detections;
+                break;
+            case TypedValue::Kind::kPoints:
+                inputs.points[name] = entry.value->points;
                 break;
             case TypedValue::Kind::kString:
                 inputs.strings[name] = entry.value->text;

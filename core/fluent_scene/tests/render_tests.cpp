@@ -17,6 +17,7 @@
 #include "fluent_scene/render/renderer.hpp"
 #include "fluent_scene/validator.hpp"
 #include "fluent_scene/yaml.hpp"
+#include "render/box_smoother.hpp"
 #include "render/test_pattern.hpp"
 
 namespace {
@@ -159,6 +160,90 @@ int main(int argc, char** argv) {
         fluent_scene::render::diffRgbaVsRgb(vulkan_pixels, cpu_rgb, mean_diff, max_diff);
         std::cout << "     vulkan-vs-cpu diff: mean " << mean_diff << ", max " << max_diff << '\n';
         check(mean_diff <= 10.0, "vulkan and cpu backends agree within a loose tolerance");
+    }
+
+    // --- box smoothing (EMA + nearest-neighbor association) -----------------
+    {
+        using fluent_scene::DetectionInstance;
+        fluent_scene::render::BoxSmoother smoother;
+        DetectionInstance det;
+        det.bbox[0] = 100;
+        det.bbox[1] = 100;
+        det.bbox[2] = 80;
+        det.bbox[3] = 60;
+        auto first = smoother.update({det}, 0.033, 0.15f, 128);
+        check(first.size() == 1 && first[0].bbox[0] == 100.0f,
+              "a new track starts exactly at its target (no pop-in)");
+        det.bbox[0] = 200;  // jump 100px to the right
+        auto second = smoother.update({det}, 0.033, 0.15f, 128);
+        check(second[0].bbox[0] > 100.0f && second[0].bbox[0] < 200.0f,
+              "a matched track moves smoothly toward the new position");
+        auto third = smoother.update({det}, 0.033, 0.15f, 128);
+        check(third[0].bbox[0] > second[0].bbox[0] && third[0].bbox[0] < 200.0f,
+              "successive frames keep converging on the target");
+        auto passthrough = smoother.update({det}, 0.033, 0.0f, 128);
+        check(passthrough[0].bbox[0] == 200.0f, "smoothing 0 passes detections through unchanged");
+        det.bbox[0] = 1500;  // far beyond the association gate
+        auto teleport = smoother.update({det}, 0.033, 0.15f, 128);
+        check(teleport[0].bbox[0] == 1500.0f,
+              "a distant detection is treated as a new object, not dragged across the screen");
+    }
+
+    // --- 2D primitives (circles + polyline) ---------------------------------
+    {
+        fluent_scene::DiagnosticList prim_diagnostics;
+        const fluent_scene::YamlNode prim_root =
+            fluent_scene::parseYaml(readFile("examples/primitives_demo.fvs"), prim_diagnostics);
+        fluent_scene::ValidationResult prim_scene;
+        fluent_scene::PlanResult prim_plan;
+        if (!prim_diagnostics.hasErrors()) {
+            const fluent_scene::NodeRegistry registry = fluent_scene::NodeRegistry::builtinMvp();
+            prim_scene = fluent_scene::validateScene(prim_root, registry, prim_diagnostics);
+            if (prim_scene.ok) {
+                prim_plan = fluent_scene::planScene(prim_scene, prim_diagnostics);
+            }
+        }
+        check(prim_plan.ok, "primitives scene compiles (circles2d + polyline2d)");
+        std::unique_ptr<fluent_scene::Renderer> prim_renderer =
+            fluent_scene::createVulkanRenderer(options, prim_diagnostics);
+        bool rendered = prim_renderer != nullptr &&
+                        prim_renderer->loadScene(prim_scene, prim_plan, prim_diagnostics);
+        const fluent_scene::render::SyntheticFrame prim_frame =
+            fluent_scene::render::makeSyntheticFrame(7, 640, 360, 1920, 1080);
+        for (int frame = 0; rendered && frame < 2; ++frame) {
+            rendered = prim_renderer->renderFrame(prim_frame.inputs(), prim_diagnostics);
+        }
+        if (!rendered) {
+            printDiagnostics(prim_diagnostics);
+        }
+        check(rendered, "primitives scene renders on the Vulkan backend");
+        if (rendered) {
+            check(prim_renderer->stats().pipeline_compiles == 5,
+                  "five pipelines (image/boxes/circles/polyline/text), all at loadScene");
+            std::vector<uint8_t> pixels;
+            uint32_t width = 0, height = 0;
+            prim_renderer->readback(pixels, width, height);
+            const std::string prim_golden = source_dir + "/tests/golden/primitives_demo.ppm";
+            if (regen) {
+                fluent_scene::render::writePpm(prim_golden, pixels, width, height);
+                std::cout << "regenerated primitives golden\n";
+            } else {
+                std::vector<uint8_t> golden;
+                uint32_t golden_w = 0, golden_h = 0;
+                double mean_diff = 0.0;
+                uint32_t max_diff = 0;
+                if (fluent_scene::render::readPpm(prim_golden, golden, golden_w, golden_h) &&
+                    golden_w == width && golden_h == height) {
+                    fluent_scene::render::diffRgbaVsRgb(pixels, golden, mean_diff, max_diff);
+                    std::cout << "     primitives golden diff: mean " << mean_diff << ", max "
+                              << max_diff << '\n';
+                    check(mean_diff <= 2.0 && max_diff <= 96,
+                          "primitives render matches the golden image within tolerance");
+                } else {
+                    check(false, "primitives golden exists and matches dimensions");
+                }
+            }
+        }
     }
 
     if (failures == 0) {

@@ -27,10 +27,16 @@ struct DetectionInstance {
     std::string label;
 };
 
+struct Point2f {
+    float x = 0.0f;
+    float y = 0.0f;
+};
+
 // Per-frame external values keyed by scene input name.
 struct FrameInputs {
     std::map<std::string, CpuImageView> images;
     std::map<std::string, std::vector<DetectionInstance>> detections;
+    std::map<std::string, std::vector<Point2f>> points;  // points2d / polyline2d
     std::map<std::string, std::string> strings;
 };
 

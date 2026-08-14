@@ -194,6 +194,26 @@ bool buildSceneModel(const ValidationResult& scene, const PlanResult& plan, Scen
             draw.show_label = readBool(paramLiteral(ir, *node, "show_label"), false);
             draw.max_instances = boundsCount(*node, "max_instances");
             draw.overflow = boundsOverflow(*node);
+            const JsonValue* smoothing = paramLiteral(ir, *node, "smoothing");
+            if (smoothing != nullptr) {
+                draw.smoothing = static_cast<float>(smoothing->floatValue());
+            }
+        } else if (op == "draw_circles" || op == "draw_polyline") {
+            draw.kind = op == "draw_circles" ? DrawOp::Kind::kCircles : DrawOp::Kind::kPolyline;
+            const std::vector<std::string> parts = refParts(portRef(*node, "points"));
+            draw.source_input = parts.size() == 2 ? parts[1] : "";
+            readVec(paramLiteral(ir, *node, "color"), draw.color, 4);
+            draw.max_points = boundsCount(*node, "max_points");
+            const JsonValue* thickness = paramLiteral(ir, *node, "thickness");
+            if (thickness != nullptr) {
+                draw.thickness = static_cast<float>(thickness->floatValue());
+            }
+            if (draw.kind == DrawOp::Kind::kCircles) {
+                const JsonValue* radius = paramLiteral(ir, *node, "radius");
+                if (radius != nullptr) {
+                    draw.radius = static_cast<float>(radius->floatValue());
+                }
+            }
         } else if (op == "draw_text") {
             draw.kind = DrawOp::Kind::kText;
             const std::vector<std::string> parts = refParts(portRef(*node, "text"));

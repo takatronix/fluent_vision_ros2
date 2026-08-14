@@ -17,6 +17,7 @@ enum class PortPatternKind {
     kAnyImage,           // any image.* type
     kDetectionSequence,  // sequence<struct{bbox: vec4f, score: f32, label: string, ...}, N>
     kLayerList,          // list of `layer`-typed references
+    kAnyPoints,          // points2d or polyline2d
 };
 
 struct PortSpec {
