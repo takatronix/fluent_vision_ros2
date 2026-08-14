@@ -1,0 +1,16 @@
+schema: fluent.scene/v1alpha2
+inputs:
+  camera:     { type: image.rgba8, update: per_frame }
+  detections: { type: "sequence<Detection2D, 128>", update: per_frame }
+layers:
+  - content: { image: { source: $inputs.camera } }
+  - content: { boxes: { source: $inputs.detections,
+                        color: [0.1, 0.9, 0.7, 1], smoothing: 0.2 } }
+  - id: hud
+    position: [24, 24]
+    opacity: 0.9
+    shadow: {}
+    sublayers:
+      - content: { rect: { size: [340, 96], corner_radius: 12,
+                           color: [0, 0, 0, 0.45] } }
+      - content: { text: { text: "走行中", position: [16, 12], size: 28 } }
