@@ -12,8 +12,8 @@
 //             [--ripple layer_id] attach the refraction ripple (fx::Ripple)
 //                                 to a layer: hover = wake, click = splash
 //
-//   GET /        minimal viewer page (stream + status readout)
-//   GET /stream  MJPEG of the live scene
+//   GET /        viewer page (H.264 over WebSocket; self-paced /frame fallback)
+//   GET /ws      video down (raw AUs; ?fmt=mp4 for MSE) + pointer/webcam up
 //   GET /status  JSON: digest, reload counter, errors, lint warnings
 //
 // `--image camera=/aspa/d405/color_compressed` feeds a ROS 2 CompressedImage
@@ -45,6 +45,8 @@
 #include <vector>
 
 #include <jpeglib.h>
+
+#include "wsvideo.hpp"
 
 #include <fluent_stage/cpu_renderer.hpp>
 #include <fluent_stage/effects.hpp>
@@ -86,6 +88,9 @@ std::string g_status_json = "{}";
 std::mutex g_webcam_mutex;
 std::vector<uint8_t> g_webcam_jpeg;
 uint64_t g_webcam_seq = 0;
+
+// Encoded output geometry (fMP4 init segment needs it).
+uint32_t g_ws_out_w = 854, g_ws_out_h = 480;
 
 // ---- pointer injection (§10-3): HTTP → queue → render thread ---------------
 // The Stage is single-thread owned, so HTTP handlers only enqueue; the
@@ -145,121 +150,388 @@ void sendResponse(int fd, const char* status, const char* type, const std::strin
     sendAll(fd, body.data(), body.size());
 }
 
-void streamMjpeg(int fd) {
-    const char* head =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=fsframe\r\n"
-        "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
-    if (!sendAll(fd, head, std::strlen(head))) {
-        return;
-    }
-    uint64_t last_seq = 0;
-    std::vector<uint8_t> jpeg;
-    while (g_running) {
-        {
-            std::unique_lock<std::mutex> lock(g_frame_mutex);
-            g_frame_cv.wait_for(lock, std::chrono::milliseconds(500),
-                                [&] { return g_frame_seq != last_seq || !g_running; });
-            if (g_frame_seq == last_seq) {
-                continue;
-            }
-            last_seq = g_frame_seq;
-            jpeg = g_jpeg;
-        }
-        char part[128];
-        const int n = std::snprintf(part, sizeof part,
-                                    "--fsframe\r\nContent-Type: image/jpeg\r\n"
-                                    "Content-Length: %zu\r\n\r\n",
-                                    jpeg.size());
-        if (!sendAll(fd, part, static_cast<size_t>(n)) ||
-            !sendAll(fd, jpeg.data(), jpeg.size()) || !sendAll(fd, "\r\n", 2)) {
-            break;
-        }
-    }
-}
 
-// The page is a viewer, nothing more: the picture is the product, and the
-// status line just mirrors /status so a broken save is legible from the
-// browser too.
+// The page is a pane of glass: H.264 video out (WebCodecs, MSE, then a
+// self-paced still-frame pull as the last resort — never an unbounded
+// stream), pointer + webcam in, preferably all over one WebSocket.
 const char* kPage = R"HTML(<!doctype html>
-<meta charset="utf-8"><title>fluent scene — live</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>fluent scene — live</title>
 <style>
   body { margin: 0; background: #0b0d10; color: #dfe5ec;
          font: 14px/1.5 system-ui, sans-serif; }
-  img { display: block; width: 100vw; height: auto; }
+  #v { display: block; width: 100vw; height: auto; background: #000;
+       touch-action: none; user-select: none; -webkit-user-select: none; }
   #bar { padding: 8px 14px; white-space: pre-wrap;
          font-family: ui-monospace, monospace; color: #9aa7b4; }
   #bar.err { color: #ff8a80; }
 </style>
-<img id="v" src="/stream" draggable="false">
-<div id="bar">…</div>
+<canvas id="v" width="854" height="480"></canvas>
+<div id="bar">connecting…</div>
 <script>
-// Pointer forwarding (§10-3): browser events → logical stage coordinates →
-// GET /pointer. The picture and every reaction stay on the robot.
-const v = document.getElementById('v');
-let lastMove = 0;
-function send(e, ev) {
-  const r = v.getBoundingClientRect();
-  const sx = (v.naturalWidth || r.width) / r.width;
-  const sy = (v.naturalHeight || r.height) / r.height;
-  const x = (ev.clientX - r.left) * sx;
-  const y = (ev.clientY - r.top) * sy;
-  fetch('/pointer?e=' + e + '&x=' + x.toFixed(1) + '&y=' + y.toFixed(1))
-      .catch(() => {});
-}
-v.addEventListener('pointerdown', ev => { v.setPointerCapture(ev.pointerId); send('down', ev); });
-v.addEventListener('pointermove', ev => {
-  const now = performance.now();
-  if (now - lastMove > 33) { lastMove = now; send('move', ev); }
-});
-v.addEventListener('pointerup', ev => send('up', ev));
+let view = document.getElementById('v');
+const bar = document.getElementById('bar');
+const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+let sendMsg = null;   // pointer text up (WS when open, HTTP fallback)
+let sendCam = null;   // webcam JPEG up (WS binary when open, POST fallback)
 
-// Webcam → POST /camera (JPEG, ~12fps). Needs a secure context (https or
-// localhost); the bar shows why when capture is unavailable.
+function hookPointer(el) {
+  let down = false, pending = null, last = 0;
+  const send = (phase, e) => {
+    const r = el.getBoundingClientRect();
+    const x = ((e.clientX - r.left) / r.width * (el.width || r.width)).toFixed(1);
+    const y = ((e.clientY - r.top) / r.height * (el.height || r.height)).toFixed(1);
+    if (sendMsg) { sendMsg(phase + ' ' + x + ' ' + y); }
+    else { fetch('/pointer?e=' + (phase === 'd' ? 'down' : phase === 'u' ? 'up' : 'move')
+                 + '&x=' + x + '&y=' + y).catch(() => {}); }
+  };
+  const loop = ts => {
+    if (pending && ts - last >= 16) { send(down ? 'm' : 'h', pending); pending = null; last = ts; }
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+  el.addEventListener('pointerdown', e => { down = true; el.setPointerCapture(e.pointerId); send('d', e); e.preventDefault(); });
+  el.addEventListener('pointermove', e => { pending = e; });
+  el.addEventListener('pointerup',   e => { down = false; send('u', e); });
+  el.addEventListener('pointercancel', e => { down = false; send('u', e); });
+}
+
+function openWs(fmt, onBinary, onOpen, onDead) {
+  const ws = new WebSocket(wsProto + '://' + location.host + '/ws' + (fmt ? '?fmt=' + fmt : ''));
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    sendMsg = t => { try { ws.send(t); } catch (e) {} };
+    sendCam = b => { try { ws.send(b); } catch (e) {} };
+    if (onOpen) onOpen(ws);
+  };
+  ws.onclose = () => { sendMsg = null; sendCam = null; if (onDead) onDead(); };
+  ws.onmessage = e => { if (typeof e.data !== 'string') onBinary(e.data); };
+  return ws;
+}
+
+function framePullFallback(reason) {
+  // Latency-bounded still frames: exactly one in flight, pulled only after
+  // the previous one painted. Slow links drop rate, never grow a queue.
+  bar.textContent = 'frame-pull fallback (' + reason + ')';
+  const img = document.createElement('img');
+  img.id = 'v'; img.draggable = false;
+  view.replaceWith(img); view = img;
+  hookPointer(img);
+  (async () => {
+    let url = null;
+    while (true) {
+      try {
+        const r = await fetch('/frame', {cache: 'no-store'});
+        const b = await r.blob();
+        const next = URL.createObjectURL(b);
+        await new Promise(res => { img.onload = res; img.onerror = res; img.src = next; });
+        if (url) URL.revokeObjectURL(url);
+        url = next;
+      } catch (e) { await new Promise(res => setTimeout(res, 300)); }
+    }
+  })();
+}
+
+function webcodecsPath() {
+  const ctx = view.getContext('2d');
+  let frames = 0, seq = 0, sized = false;
+  const decoder = new VideoDecoder({
+    output: f => {
+      if (!sized) { view.width = f.displayWidth; view.height = f.displayHeight; sized = true; }
+      ctx.drawImage(f, 0, 0, view.width, view.height);
+      f.close(); ++frames;
+    },
+    error: e => framePullFallback(e.message),
+  });
+  decoder.configure({codec: 'avc1.42e01e', optimizeForLatency: true});
+  openWs('', data => {
+    const bytes = new Uint8Array(data);
+    decoder.decode(new EncodedVideoChunk({
+      type: bytes[0] === 1 ? 'key' : 'delta',
+      timestamp: (seq++) * 16666,
+      data: bytes.subarray(1),
+    }));
+  }, () => hookPointer(view), () => bar.textContent = 'disconnected — reload');
+  setInterval(() => { bar.textContent = statusLine('h264/webcodecs ' + frames + ' fps'); frames = 0; }, 1000);
+}
+
+function msePath() {
+  const video = document.createElement('video');
+  video.id = 'v'; video.muted = true; video.autoplay = true; video.playsInline = true;
+  view.replaceWith(video); view = video;
+  const ms = new MediaSource();
+  video.src = URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen', () => {
+    const sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42e01e"');
+    const q = [];
+    const pump = () => {
+      if (sb.updating || !q.length) return;
+      let total = 0;
+      for (const b of q) total += b.byteLength;
+      const merged = new Uint8Array(total);
+      let off = 0;
+      for (const b of q) { merged.set(new Uint8Array(b), off); off += b.byteLength; }
+      q.length = 0;
+      sb.appendBuffer(merged);
+    };
+    sb.addEventListener('updateend', () => {
+      pump();
+      if (!video.buffered.length) return;
+      const lag = video.buffered.end(video.buffered.length - 1) - video.currentTime;
+      if (lag > 0.25) video.currentTime = video.buffered.end(video.buffered.length - 1) - 0.03;
+      video.playbackRate = lag > 0.1 ? 1.08 : 1.0;
+      if (video.paused) video.play();
+      bar.textContent = statusLine('h264/mse lag ' + Math.max(lag, 0).toFixed(2) + 's');
+    });
+    openWs('mp4', data => { q.push(data); pump(); },
+           () => { hookPointer(video); video.play(); },
+           () => bar.textContent = 'disconnected — reload');
+  });
+}
+
+let statusTail = '';
+function statusLine(head) { return head + statusTail; }
+async function pollStatus() {
+  try {
+    const s = await (await fetch('/status')).json();
+    statusTail = '  digest ' + s.digest.slice(0, 12) + '  reloads ' + s.reloads +
+        (s.errors.length ? '\n' + s.errors.join('\n') : '') +
+        (s.warnings.length ? '\n' + s.warnings.join('\n') : '') +
+        (s.events.length ? '\nui: ' + s.events.join('  ') : '');
+    bar.className = s.errors.length ? 'err' : '';
+    if (!('VideoDecoder' in window)) bar.textContent = statusLine('');
+  } catch (e) {}
+  setTimeout(pollStatus, 1000);
+}
+pollStatus();
+
+// Webcam capture (secure context) — frames go up the WS when it is open,
+// else POST /camera on a kept-alive connection.
 async function startWebcam() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    document.getElementById('bar').textContent =
-        'webcam needs https or localhost (secure context)';
+    statusTail += '\nwebcam needs https or localhost';
     return;
   }
   try {
     const stream = await navigator.mediaDevices.getUserMedia(
         {video: {width: 640, height: 480}, audio: false});
     const video = document.createElement('video');
-    video.srcObject = stream;
-    video.muted = true;
+    video.srcObject = stream; video.muted = true;
     await video.play();
     const canvas = document.createElement('canvas');
-    canvas.width = 640;
-    canvas.height = 480;
+    canvas.width = 640; canvas.height = 480;
     const ctx = canvas.getContext('2d');
     setInterval(() => {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      canvas.toBlob(b => {
-        if (b) fetch('/camera', {method: 'POST', body: b}).catch(() => {});
+      canvas.toBlob(async b => {
+        if (!b) return;
+        if (sendCam) sendCam(await b.arrayBuffer());
+        else fetch('/camera', {method: 'POST', body: b}).catch(() => {});
       }, 'image/jpeg', 0.7);
     }, 83);
-  } catch (e) {
-    document.getElementById('bar').textContent = 'webcam: ' + e;
-  }
+  } catch (e) { statusTail += '\nwebcam: ' + e; }
 }
 startWebcam();
-async function tick() {
-  try {
-    const s = await (await fetch('/status')).json();
-    const bar = document.getElementById('bar');
-    bar.className = s.errors.length ? 'err' : '';
-    bar.textContent = 'digest ' + s.digest.slice(0, 12) +
-        '  reloads ' + s.reloads +
-        (s.errors.length ? '\n' + s.errors.join('\n') : '') +
-        (s.warnings.length ? '\n' + s.warnings.join('\n') : '') +
-        (s.events.length ? '\nui: ' + s.events.join('  ') : '');
-  } catch (e) {}
-  setTimeout(tick, 1000);
+
+if ('VideoDecoder' in window) {
+  webcodecsPath();
+} else if (window.MediaSource && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42e01e"')) {
+  msePath();
+} else {
+  framePullFallback('no decoder');
 }
-tick();
 </script>
 )HTML";
+
+
+
+/// Parses a pointer text message ("d x y" | "m x y" | "h x y" | "u x y")
+/// into the injection queue.
+void handlePointerText(const char* text, size_t len) {
+    if (len < 3) {
+        return;
+    }
+    const char phase_c = text[0];
+    const int phase = phase_c == 'd' ? 0 : phase_c == 'u' ? 2 : 1;
+    float x = 0, y = 0;
+    if (std::sscanf(text + 1, "%f %f", &x, &y) != 2) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_pointer_mutex);
+    if (g_pointer_queue.size() < 256) {
+        g_pointer_queue.push_back({phase, x, y});
+    }
+}
+
+/// One WebSocket client: H.264 access units go down (raw, key-prefixed for
+/// WebCodecs; fMP4 fragments for ?fmt=mp4), pointer text and webcam JPEG
+/// binaries come up. Bounded queue + skip-to-keyframe (wsvideo) keeps
+/// latency from ever accumulating on a slow link.
+void serveWs(int fd, const std::string& request) {
+    const size_t key_at = request.find("Sec-WebSocket-Key:");
+    if (key_at == std::string::npos) {
+        return;
+    }
+    size_t begin = key_at + 18;
+    while (begin < request.size() && request[begin] == ' ') {
+        ++begin;
+    }
+    const size_t end = request.find("\r\n", begin);
+    const std::string accept_src =
+        request.substr(begin, end - begin) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    uint8_t digest[20];
+    wsvideo::sha1(reinterpret_cast<const uint8_t*>(accept_src.data()), accept_src.size(),
+                  digest);
+    const std::string resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                             "Connection: Upgrade\r\nSec-WebSocket-Accept: " +
+                             wsvideo::base64(digest, 20) + "\r\n\r\n";
+    if (!sendAll(fd, resp.data(), resp.size())) {
+        return;
+    }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+
+    auto client = std::make_shared<wsvideo::VideoClient>();
+    client->mp4 = request.find("fmt=mp4") != std::string::npos;
+    {
+        std::lock_guard<std::mutex> lock(wsvideo::g_clients_mutex);
+        wsvideo::g_clients.push_back(client);
+    }
+
+    std::thread sender([fd, client] {
+        wsvideo::Mp4Muxer muxer;
+        bool init_sent = false;
+        uint32_t seq = 1;
+        uint64_t dts = 0;
+        uint64_t prev_t_us = 0;
+        std::vector<uint8_t> frame;
+        while (g_running) {
+            wsvideo::AuPtr au;
+            {
+                std::unique_lock<std::mutex> lock(client->mutex);
+                client->cv.wait_for(lock, std::chrono::milliseconds(500),
+                                    [&] { return !client->queue.empty() || client->dead; });
+                if (client->dead) {
+                    return;
+                }
+                if (client->queue.empty()) {
+                    continue;
+                }
+                au = client->queue.front();
+                client->queue.pop_front();
+                client->queued_bytes -= au->data.size();
+            }
+            bool ok;
+            if (client->mp4) {
+                if (!init_sent) {
+                    if (!au->key || !muxer.prime(au->data)) {
+                        continue;
+                    }
+                    const auto init = muxer.initSegment(g_ws_out_w, g_ws_out_h);
+                    if (!wsvideo::wsSendBinary(fd, init.data(), init.size())) {
+                        break;
+                    }
+                    init_sent = true;
+                }
+                uint32_t duration = wsvideo::Mp4Muxer::kTimescale / 30;
+                if (prev_t_us != 0 && au->t_us > prev_t_us) {
+                    const uint64_t d =
+                        (au->t_us - prev_t_us) * wsvideo::Mp4Muxer::kTimescale / 1000000ull;
+                    duration = static_cast<uint32_t>(
+                        std::min<uint64_t>(std::max<uint64_t>(d, 900), 30000));
+                }
+                prev_t_us = au->t_us;
+                const auto frag = muxer.fragment(au->data, au->key, seq++, dts, duration);
+                dts += duration;
+                ok = wsvideo::wsSendBinary(fd, frag.data(), frag.size());
+            } else {
+                frame.clear();
+                frame.push_back(au->key ? 1 : 0);
+                frame.insert(frame.end(), au->data.begin(), au->data.end());
+                ok = wsvideo::wsSendBinary(fd, frame.data(), frame.size());
+            }
+            if (!ok) {
+                break;
+            }
+        }
+        std::lock_guard<std::mutex> lock(client->mutex);
+        client->dead = true;
+    });
+
+    // Upstream: text = pointer, binary = webcam JPEG.
+    std::vector<uint8_t> buf;
+    uint8_t chunk[8192];
+    while (g_running) {
+        const ssize_t n = ::recv(fd, chunk, sizeof chunk, 0);
+        if (n <= 0) {
+            break;
+        }
+        buf.insert(buf.end(), chunk, chunk + n);
+        while (buf.size() >= 2) {
+            const uint8_t opcode = buf[0] & 0x0f;
+            const bool masked = (buf[1] & 0x80) != 0;
+            uint64_t len = buf[1] & 0x7f;
+            size_t at = 2;
+            if (len == 126) {
+                if (buf.size() < 4) {
+                    break;
+                }
+                len = (static_cast<uint64_t>(buf[2]) << 8) | buf[3];
+                at = 4;
+            } else if (len == 127) {
+                if (buf.size() < 10) {
+                    break;
+                }
+                len = 0;
+                for (int i = 0; i < 8; ++i) {
+                    len = (len << 8) | buf[2 + i];
+                }
+                at = 10;
+            }
+            const size_t mask_at = at;
+            if (masked) {
+                at += 4;
+            }
+            if (buf.size() < at + len) {
+                break;
+            }
+            if (masked) {
+                for (uint64_t i = 0; i < len; ++i) {
+                    buf[at + i] ^= buf[mask_at + (i & 3)];
+                }
+            }
+            if (opcode == 1) {
+                handlePointerText(reinterpret_cast<const char*>(&buf[at]), len);
+            } else if (opcode == 2) {
+                std::lock_guard<std::mutex> lock(g_webcam_mutex);
+                g_webcam_jpeg.assign(buf.begin() + static_cast<long>(at),
+                                     buf.begin() + static_cast<long>(at + len));
+                ++g_webcam_seq;
+            } else if (opcode == 9) {
+                uint8_t pong[2] = {0x8a, 0};
+                sendAll(fd, pong, 2);
+            } else if (opcode == 8) {
+                goto done;
+            }
+            buf.erase(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(at + len));
+        }
+    }
+done:
+    {
+        std::lock_guard<std::mutex> lock(client->mutex);
+        client->dead = true;
+    }
+    client->cv.notify_all();
+    sender.join();
+    std::lock_guard<std::mutex> lock(wsvideo::g_clients_mutex);
+    for (auto it = wsvideo::g_clients.begin(); it != wsvideo::g_clients.end(); ++it) {
+        if (it->get() == client.get()) {
+            wsvideo::g_clients.erase(it);
+            break;
+        }
+    }
+}
 
 void serverLoop(uint16_t port) {
     const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -340,8 +612,19 @@ void serverLoop(uint16_t port) {
                     ++g_webcam_seq;
                 }
                 sendResponse(fd, "200 OK", "text/plain", "ok\n");
-            } else if (req.rfind("GET /stream", 0) == 0) {
-                streamMjpeg(fd);
+            } else if (req.rfind("GET /frame", 0) == 0) {
+                // One latest frame per request: the page pulls the next only
+                // after painting this one, so exactly one frame is ever in
+                // flight and proxy buffers cannot grow a queue.
+                std::string jpeg;
+                {
+                    std::unique_lock<std::mutex> lock(g_frame_mutex);
+                    g_frame_cv.wait_for(lock, std::chrono::milliseconds(500));
+                    jpeg.assign(g_jpeg.begin(), g_jpeg.end());
+                }
+                sendResponse(fd, "200 OK", "image/jpeg", jpeg);
+            } else if (req.rfind("GET /ws", 0) == 0) {
+                serveWs(fd, req.substr(0, header_end + 4));
                 ::close(fd);
                 return;
             } else if (req.rfind("GET /inspect", 0) == 0) {
@@ -676,7 +959,7 @@ int main(int argc, char** argv) {
     uint16_t port = 8791;
     float fps = 30;
     std::string events_topic;
-    uint32_t out_w = 0, out_h = 0;
+    uint32_t out_w = 854, out_h = 480;
     std::string webcam_input;
     std::string ripple_layer;
     std::vector<std::pair<std::string, std::string>> image_feeds;  // input → topic
@@ -797,6 +1080,34 @@ int main(int argc, char** argv) {
 #endif
     std::fflush(stdout);
 
+    // ---- H.264 encoder + AU fan-out (wsvideo, the stage_web lesson) -------
+    g_ws_out_w = out_w;
+    g_ws_out_h = out_h;
+    bool nvenc = true;
+    wsvideo::Encoder encoder = wsvideo::spawnEncoder(true, out_w, out_h,
+                                                     static_cast<int>(fps));
+    std::atomic<bool> encoder_alive{true};
+    auto reader_fn = [&encoder, &encoder_alive] {
+        wsvideo::AuSplitter splitter;
+        uint8_t chunk[65536];
+        while (g_running) {
+            const ssize_t n = ::read(encoder.stdout_fd, chunk, sizeof chunk);
+            if (n <= 0) {
+                encoder_alive = false;
+                return;
+            }
+            splitter.feed(chunk, static_cast<size_t>(n), [](wsvideo::AuPtr au) {
+                auto stamped = std::make_shared<wsvideo::AccessUnit>(*au);
+                stamped->t_us = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+                wsvideo::broadcastAu(std::move(stamped));
+            });
+        }
+    };
+    std::thread au_reader(reader_fn);
+
     // The refraction ripple rides a named layer (hover = wake, click =
     // splash). Recreated on every reload — the layer pointer changes.
     std::unique_ptr<fx::Ripple> ripple;
@@ -822,6 +1133,7 @@ int main(int argc, char** argv) {
 
     time_t last_mtime = fileMtime(path);
     int inspect_tick = 0;
+    uint32_t frame_tick = 0;
     const auto frame_time = std::chrono::duration<double>(1.0 / fps);
     auto next = std::chrono::steady_clock::now();
     auto last_frame = next;
@@ -954,10 +1266,31 @@ int main(int argc, char** argv) {
             ripple->tick(dt);
         }
         Stage& stage = live ? live->stage() : *empty_stage;
-        const Surface& frame = (out_w != 0 && out_h != 0)
-                                   ? renderer->render(stage, out_w, out_h, dt)
-                                   : renderer->render(stage, dt);
-        {
+        const Surface& frame = renderer->render(stage, out_w, out_h, dt);
+
+        // H.264 out (nvenc; one-shot fallback to libx264).
+        if (!encoder_alive && nvenc) {
+            close(encoder.stdin_fd);
+            au_reader.join();
+            close(encoder.stdout_fd);
+            waitpid(encoder.pid, nullptr, 0);
+            nvenc = false;
+            encoder = wsvideo::spawnEncoder(false, out_w, out_h, static_cast<int>(fps));
+            encoder_alive = true;
+            au_reader = std::thread(reader_fn);
+            std::printf("scene_web: nvenc unavailable, using libx264\n");
+            std::fflush(stdout);
+        }
+        if (encoder_alive) {
+            for (uint32_t y = 0; y < frame.height; ++y) {
+                if (!wsvideo::writeAll(encoder.stdin_fd, frame.row(y), frame.width * 4)) {
+                    encoder_alive = false;
+                    break;
+                }
+            }
+        }
+        // Still frames for the /frame fallback, at half rate.
+        if ((frame_tick++ & 1) == 0) {
             std::lock_guard<std::mutex> lock(g_frame_mutex);
             encodeJpeg(frame, g_jpeg);
             ++g_frame_seq;
@@ -988,6 +1321,10 @@ int main(int argc, char** argv) {
     }
 
     g_frame_cv.notify_all();
+    close(encoder.stdin_fd);
+    au_reader.join();
+    close(encoder.stdout_fd);
+    waitpid(encoder.pid, nullptr, 0);
     server.detach();
 #ifdef FS_HAVE_ROS
     spin.join();
