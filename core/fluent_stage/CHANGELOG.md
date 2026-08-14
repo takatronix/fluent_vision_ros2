@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.8.0 — 2026-08-14 (Phase L2: Scene 宣言層)
+
+- **Scene v1alpha2**（`fluent_stage::scene`）: レイヤーツリー YAML（.fvs）
+  → Stage 構築。§1.3 の契約を実装 — 型検査・未知キー拒否・`$inputs` /
+  `$params` 参照解決・必須/排他フィールド検査を**実行前に全て**行う
+  （`parseScene` が ok なら compile は資源上限以外で失敗しない）
+- **同一出力の契約**: コンパイラは C++ 著者と同じ Layer API で木を組み、
+  明示されたフィールドだけを適用する（既定値の定義は C++ 側に一度だけ）。
+  §2 の canonical 例を YAML と C++ の両方で描き**ピクセル一致**を
+  scene_tests の golden で検証
+- **並べ替え不変 digest + 正準フォーマッタ**（§13-8）: 正準形は一つ
+  （表順のキー・明示フィールドのみ・安定数値表記）。digest はその
+  SHA-256。マッピング順・コメント・空白の変更では変わらない
+- **単一定義のメタデータ表**: `shared/contents_def.h`（content 13種の
+  フィールド/型/既定値）と `shared/attributes_def.h`（§6.2 属性15種)を
+  新設 — filters_def.h 方式。validation・describe・fmt の語彙は全て
+  ここから導出、既定値は C++ 構造体とテストで突き合わせ
+- **`fvsc` CLI**: `validate`（型検査+リンター+digest）/ `preview`
+  （PPM レンダリング。未接続の image 入力は入力名入りプレースホルダー）/
+  `fmt` / `digest` / `describe --json`
+- **能力の自己記述**（§13-1）: `describe --json` が content/属性/
+  フィルタ30種/入力・パラメータ型/上限を機械可読カタログで返す
+- **デザインリンター**（§13-2）: コントラスト比 4.5:1（実レンダリング
+  ピクセルに対して測定）・テキストはみ出し・完全遮蔽（protected の
+  遮蔽はエラー = §13-4）・画面外配置
+- **ランタイム表面**: `CompiledScene` — `setImage/setText/setPoints/
+  setBoxes`（宣言型チェック+容量クランプ）と `setParam`（§9 の animate
+  宣言 → Transaction、layer transition フォールバック）。image 入力の
+  fallback は placeholder / hide / hold
+- YAML パーサ（依存ゼロの有界サブセット・fluent_scene から移植）に
+  複数行フローコレクション対応を追加（§2 の canonical レイアウト）
+- 設計書 §2 の YAML 例を修正: テキスト位置は content の `position`
+  フィールドへ（レイヤー属性 position は anchor 配置なので同じ絵に
+  ならない — golden が機械検証）
+
 ## 0.7.0 — 2026-08-14 (本物の水面屈折波紋)
 
 - `fs_ripple` フィルタ（filters_shared.h、30種目）: 拡大する波面の周りの

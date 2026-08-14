@@ -21,6 +21,15 @@ add_library(fluent_stage
   src/cpu_renderer.cpp
   src/ui.cpp
   src/effects.cpp
+  src/scene/diagnostics.cpp
+  src/scene/sha256.cpp
+  src/scene/yaml_parser.cpp
+  src/scene/schema.cpp
+  src/scene/parser.cpp
+  src/scene/writer.cpp
+  src/scene/compiler.cpp
+  src/scene/describe.cpp
+  src/scene/linter.cpp
 )
 target_include_directories(fluent_stage PUBLIC include)
 target_link_libraries(fluent_stage PRIVATE PkgConfig::FS_TEXT)
@@ -92,6 +101,11 @@ target_link_libraries(ripple_demo PRIVATE fluent_stage)
 add_executable(bench examples/bench.cpp)
 target_link_libraries(bench PRIVATE fluent_stage)
 
+# ---- fvsc: the Scene compiler CLI (§13) -------------------------------------
+
+add_executable(fvsc tools/fvsc.cpp)
+target_link_libraries(fvsc PRIVATE fluent_stage)
+
 # ---- stage_web: live camera effects in a browser ----------------------------
 # H.264(NVENC)/WebSocket out, pointer events in. ROS 2 input is optional:
 # configure with the ROS environment sourced to get the live camera topic.
@@ -124,6 +138,11 @@ add_test(NAME stage_tests COMMAND stage_tests)
 add_executable(ui_tests tests/ui_tests.cpp)
 target_link_libraries(ui_tests PRIVATE fluent_stage)
 add_test(NAME ui_tests COMMAND ui_tests)
+
+# L2 Scene layer: validation, digest, fmt, YAML↔C++ parity, linter (§14 L2).
+add_executable(scene_tests tests/scene_tests.cpp)
+target_link_libraries(scene_tests PRIVATE fluent_stage)
+add_test(NAME scene_tests COMMAND scene_tests)
 
 # Image-level golden tests. `./golden_tests --update` regenerates the
 # references in tests/golden/ from the current build.

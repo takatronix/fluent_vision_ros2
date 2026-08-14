@@ -114,9 +114,15 @@ layers:
     sublayers:
       - content: { rect: { size: [340, 96], corner_radius: 12,
                            color: [0, 0, 0, 0.45] } }
-      - position: [16, 12]
-        content: { text: { text: "走行中", size: 28 } }
+      - content: { text: { text: "走行中", position: [16, 12], size: 28 } }
 ```
+
+> 補足（L2 実装時の修正）: テキストの位置は content の `position` フィールドに
+> 書く。初稿はレイヤー属性 `position: [16, 12]` としていたが、レイヤー属性の
+> position は **anchor の親座標配置**（§3.1 の CALayer 準拠）であり、C++ 側の
+> `text("走行中", {16, 12})`（内容の基準点）と同じ絵にならない。§2 の
+> 「どちらでも完全に同じ絵」契約は scene_tests の YAML↔C++ ピクセル一致
+> golden で機械検証されている。
 
 | | C++（Stage） | Scene（.fvs） |
 |---|---|---|

@@ -14,9 +14,10 @@ stage.group("hud").position(24, 24).shadow()
      .rect({0, 0, 340, 96}).cornerRadius(12).color({0, 0, 0, 0.45f});
 ```
 
-同じ画面は宣言文書（Scene / YAML, Phase L2）でも書けるようになります —
-型検査・digest・予算ゲートを通るため、**AI が実行中の画面を安全に生成・
-編集**できます:
+同じ画面は宣言文書（Scene / YAML）でも書けます — 型検査・参照解決・digest
+が実行前に全て走るため、**AI が実行中の画面を安全に生成・編集**できます。
+検証と描画は `fvsc` CLI 一本（`validate` / `preview` / `fmt` / `digest` /
+`describe --json`）:
 
 ```yaml
 layers:
@@ -99,7 +100,7 @@ fluent_vision の実行層です。**Scene（宣言/.fvs）→ Stage（実行時
 |---|---|---|
 | L0 | Stage API + CPUリファレンス + Transaction + golden | **完了** |
 | L1 | Vulkan バックエンド（CPU と同一出力） | **完了** — 全goldenをGPUで通過、1080pで 5.6ms/frame（CPU比 ~17倍、読み戻し込み） |
-| L2 | Scene v1alpha2（YAML→Stage）+ describe --json + リンター | 未着手 |
+| L2 | Scene v1alpha2（YAML→Stage）+ describe --json + リンター | **完了** — YAML↔C++ ピクセル一致 golden、並べ替え不変 digest、`fvsc` CLI |
 | L3 | ROS binding / インスペクター | 未着手 |
 | L4 | UI コントロール（ポインタ注入 + 6コントロール先行実装済） | ほぼ完了 |
 

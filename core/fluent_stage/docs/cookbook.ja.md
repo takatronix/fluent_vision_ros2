@@ -211,6 +211,42 @@ const Surface& full    = renderer.render(stage, 3840, 2160, dt); // 同じ木
 （テキストのみアトラス拡大、SDF テキストは将来）。アスペクトが違うときの
 方針は `stage.fit(Fit::Contain / Cover / Fill)`。
 
+## YAML の画面を実行中に調整する（$params + animate）
+
+Scene 文書に `params` を宣言し属性へ束縛すると、`setParam` 1回で束縛先が
+まとめて変わります。`animate` を宣言しておけば **setParam が曲線で効く**
+（§9 の implicit animation。宣言が無ければレイヤーの `transition`、
+それも無ければ即時）:
+
+```yaml
+schema: fluent.scene/v1alpha2
+params:
+  hud_alpha: { type: f32, default: 1.0, runtime_mutable: true,
+               animate: { duration: 0.3, ease: ease_in_out } }
+layers:
+  - id: hud
+    opacity: $params.hud_alpha
+    content: { rect: { size: [340, 96], color: [0, 0, 0, 0.45] } }
+```
+
+```cpp
+compiled.scene->setParam("hud_alpha", 0.0f);   // 0.3s かけてフェードアウト
+```
+
+## AI に画面を書かせる（describe → validate → preview）
+
+```bash
+./build/fvsc describe --json   # このビルドの全語彙: content/属性/フィルタ/型/上限
+./build/fvsc validate scene.fvs --strict   # 型検査 + デザインリンター（警告も失敗に）
+./build/fvsc preview scene.fvs -o check.ppm
+```
+
+リンター（§13-2）は「正しいが悪い」画面を警告します: テキストの
+コントラスト比 4.5:1 未満（**実際に描いた背景ピクセル**に対して測定）、
+宣言 bounds からのテキストはみ出し、後段の不透明レイヤーによる完全遮蔽
+（`protected: true` の遮蔽はエラー）、キャンバス外配置。生成 → validate →
+直す、のループがそのまま品質ループになります。
+
 ## 既知の L0 制限（正直リスト）
 
 - `dash()` が効くのは line / polyline / polygon枠線。arc の破線は未対応

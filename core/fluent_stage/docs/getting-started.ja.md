@@ -82,7 +82,56 @@ renderer.render(stage, dt);                  // 毎フレーム進める
 |---|---|---|
 | ![t0](images/transaction_t000.png) | ![t015](images/transaction_t015.png) | ![t030](images/transaction_t030.png) |
 
-## 5. 次へ
+## 5. 同じ画面を YAML で — Scene 文書 (.fvs)
+
+ビルドせずに画面を書き替えたいとき（現場調整・遠隔更新・AI 生成）は、
+同じ画面を **Scene 文書**として宣言できます。C++ と**完全に同じ絵**が
+出ることが契約です（scene_tests がピクセル一致で検証しています）。
+
+```yaml
+# hud.fvs
+schema: fluent.scene/v1alpha2
+inputs:
+  camera: { type: image.rgba8, update: per_frame }
+layers:
+  - content: { image: { source: $inputs.camera } }
+  - id: hud
+    position: [24, 24]
+    opacity: 0.9
+    shadow: {}
+    sublayers:
+      - content: { rect: { size: [340, 96], corner_radius: 12,
+                           color: [0, 0, 0, 0.45] } }
+      - content: { text: { text: "走行中", position: [16, 12], size: 28 } }
+```
+
+検証・プレビューは `fvsc` CLI:
+
+```bash
+./build/fvsc validate hud.fvs        # 型検査 + デザインリンター + digest
+./build/fvsc preview  hud.fvs -o out.ppm --size 960x540
+./build/fvsc fmt      hud.fvs        # 正準フォーマット（並べ替え・空白を正規化）
+./build/fvsc describe --json         # このビルドが理解する全語彙（AI 向けカタログ）
+```
+
+C++ からは `parseScene` → `compile` で同じ Stage が得られ、宣言した
+`$inputs` / `$params` を型安全に流し込めます:
+
+```cpp
+#include <fluent_stage/scene/compiler.hpp>
+#include <fluent_stage/scene/document.hpp>
+namespace fs = fluent_stage::scene;
+
+auto parsed = fs::parseScene(yaml_text);      // 誤りは全部ここで拒否
+auto compiled = fs::compile(parsed.doc);       // → Stage（同じ描画コード）
+compiled.scene->setImage("camera", camera);    // 宣言済み入力へ型チェック付きで
+renderer.render(compiled.scene->stage(), dt);
+```
+
+まだデータが来ていない image 入力は「$inputs.名前」と格子を描いた
+プレースホルダーパネルになります（`fallback: hide | hold` で変更可）。
+
+## 6. 次へ
 
 - [cookbook.ja.md](cookbook.ja.md) — PiP、経路、HUD、ゲージ、フィルタ、検出枠…
 - [examples/](../examples/) — 全てビルド・実行可能（CIで常時実行）
