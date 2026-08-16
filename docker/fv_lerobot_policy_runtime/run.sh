@@ -9,8 +9,7 @@ docker run -d --rm \
   --env-file /home/aspa/daihen-physical-ai/data/.env \
   -e DPEX_PORT=8010 \
   -e DPEX_LOAD_ON_START=true \
-  -e DPEX_DEFAULT_POLICY_ID=pi05_week19_morikawa_all_20k \
-  -e 'DPEX_POLICY_SPECS=pi05_week19_morikawa_all_20k:pi05:/data/models/669ce87f-8cfa-5836-8f29-b9c3f6e650cf;pi05_week19_morikawa_all_10k:pi05:/data/models/1dc2af59-2d87-52f9-99af-fae7c6335bcf' \
+  -e "DPEX_POLICY_SPECS=${DPEX_POLICY_SPECS:-}" \
   -e 'DPEX_CAMERA_ALIASES=cam_high=top_camera,top=top_camera,top_camera=top_camera,cam_left_wrist=arm_camera,cam_right_wrist=arm_camera,arm=arm_camera,arm_camera=arm_camera' \
   -e HF_HOME=/data/.cache/huggingface \
   -e TRANSFORMERS_CACHE=/data/.cache/huggingface \

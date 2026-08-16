@@ -181,11 +181,11 @@ def _parse_policy_specs() -> dict[str, PolicyBundle]:
     if specs:
         return specs
 
-    model_path = os.environ.get(
-        "DPEX_MODEL_PATH",
-        "/data/models/4734b5bf-be26-511a-85cb-4e2574baa0d4",
-    )
-    policy_id = os.environ.get("DPEX_DEFAULT_POLICY_ID", "pi05_week19_morikawa_all_30k")
+    model_path = os.environ.get("DPEX_MODEL_PATH", "").strip()
+    if not model_path:
+        # 既定ではモデルを積まない。DPEX_POLICY_SPECS か DPEX_MODEL_PATH で明示する。
+        return {}
+    policy_id = os.environ.get("DPEX_DEFAULT_POLICY_ID", "default")
     policy_type = os.environ.get("DPEX_POLICY_TYPE", "pi05")
     return {
         policy_id: PolicyBundle(
@@ -354,11 +354,11 @@ class DpexPolicyHandler(BaseHTTPRequestHandler):
         try:
             content_len = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(content_len).decode("utf-8"))
-            default_policy_id = os.environ.get("DPEX_DEFAULT_POLICY_ID") or next(iter(POLICIES.keys()))
+            default_policy_id = os.environ.get("DPEX_DEFAULT_POLICY_ID") or next(iter(POLICIES.keys()), "")
             policy_id = str(payload.get("policy_id") or default_policy_id).strip()
             bundle = POLICIES.get(policy_id)
             if bundle is None:
-                raise ValueError(f"unknown policy_id='{policy_id}'")
+                raise ValueError(f"unknown policy_id='{policy_id}' (loaded: {sorted(POLICIES)})")
             self._write_json(HTTPStatus.OK, _infer(payload, bundle))
         except Exception as exc:  # pragma: no cover - runtime path
             self._write_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
