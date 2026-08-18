@@ -27,6 +27,8 @@ Design notes
   at-or-before the tick). Camera frames use nearest-in-time selection with a
   reuse fallback when no frame is within ``0.5/fps`` of the tick.
 * Depth cameras are skipped entirely in v1.
+* Episodes are materialized one at a time (decode -> write -> release) so the
+  peak RSS stays at ~one episode regardless of the episode count.
 """
 
 from __future__ import annotations
@@ -385,6 +387,42 @@ def _nearest_image(cam: CameraSource, tick_ns: int, fps: int) -> np.ndarray:
     return cam.images[idx]
 
 
+def _select_cameras(
+    episode_dir: Path, meta: dict, camera_map: Dict[str, str]
+) -> Tuple[List[Tuple[str, str, Path, Path]], List[str]]:
+    """meta.json からデコード対象の (color) カメラを選別する。デコードはしない。
+
+    実ロード (Episode.load) と materialize() の事前検証の両方がこの関数を使う。
+    判定を 1 箇所に集約しているのは、事前検証と実ロードで判定がずれると
+    「検証は通ったのに書き込み途中でカメラ不一致になる」ため。二重実装禁止。
+
+    Returns ``(selected, skipped)`` — selected の各要素は
+    ``(fv_name, lerobot_key, cam_video_dir, sidecar_path)``、skipped は表示用ラベル。
+    """
+    selected: List[Tuple[str, str, Path, Path]] = []
+    skipped: List[str] = []
+    for cam in meta.get("cameras", []):
+        name = cam.get("name")
+        kind = cam.get("kind")
+        if kind in DEPTH_KINDS:
+            skipped.append(f"{name} (depth:{kind})")
+            continue
+        video_dir = cam.get("video_dir")
+        sidecar = cam.get("sidecar_file")
+        frame_count = int(cam.get("frame_count") or 0)
+        if not video_dir or not sidecar or frame_count <= 0:
+            skipped.append(f"{name} (no frames)")
+            continue
+        sidecar_path = episode_dir / "videos" / sidecar
+        cam_dir = episode_dir / "videos" / str(video_dir)
+        if not sidecar_path.exists():
+            skipped.append(f"{name} (missing sidecar)")
+            continue
+        lerobot_key = camera_map.get(str(name), str(name))
+        selected.append((str(name), lerobot_key, cam_dir, sidecar_path))
+    return selected, skipped
+
+
 class Episode:
     def __init__(self, episode_dir: Path):
         self.dir = episode_dir
@@ -397,28 +435,10 @@ class Episode:
 
     def load(self, camera_map: Dict[str, str], state_topic: str, action_topic: str) -> None:
         # --- cameras ---
-        skipped: List[str] = []
-        for cam in self.meta.get("cameras", []):
-            name = cam.get("name")
-            kind = cam.get("kind")
-            if kind in DEPTH_KINDS:
-                skipped.append(f"{name} (depth:{kind})")
-                continue
-            video_dir = cam.get("video_dir")
-            sidecar = cam.get("sidecar_file")
-            frame_count = int(cam.get("frame_count") or 0)
-            if not video_dir or not sidecar or frame_count <= 0:
-                skipped.append(f"{name} (no frames)")
-                continue
-            sidecar_path = self.dir / "videos" / sidecar
-            cam_dir = self.dir / "videos" / str(video_dir)
-            if not sidecar_path.exists():
-                skipped.append(f"{name} (missing sidecar)")
-                continue
-            lerobot_key = camera_map.get(name, name)
+        selected, skipped = _select_cameras(self.dir, self.meta, camera_map)
+        for fv_name, lerobot_key, cam_dir, sidecar_path in selected:
             stamps, images = load_camera_frames(cam_dir, sidecar_path)
-            src = CameraSource(name, lerobot_key, stamps, images)
-            self.cameras.append(src)
+            self.cameras.append(CameraSource(fv_name, lerobot_key, stamps, images))
         self.skipped_cameras = skipped
 
         if not self.cameras:
@@ -443,6 +463,21 @@ class Episode:
         t0, t_end = int(stamps[0]), int(stamps[-1])
         n = int(math.floor((t_end - t0) / 1e9 * fps)) + 1
         return [t0 + int(round(k / fps * 1e9)) for k in range(max(n, 1))]
+
+    def release(self) -> None:
+        """デコード済み画像と関節系列を解放する。
+
+        materialize() が save_episode 直後に呼ぶ。次のエピソードのデコードが
+        始まる前に確実に手放すことで、ピーク RSS を常に「1 エピソード分」に
+        保つ。全エピソード保持だと RSS がエピソード数に比例して伸び、実測で
+        60EP (~40k フレーム、カメラ 2 本 640x480) が 65GB に達して OOM kill
+        された — この解放を外してはいけない。
+        """
+        for cam in self.cameras:
+            cam.images = []
+            cam.stamps = np.empty(0, dtype=np.int64)
+        self.state_series = []
+        self.action_series = []
 
 
 # ===========================================================================
@@ -496,8 +531,38 @@ def materialize(
 ) -> dict:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    # --- load all episodes up front (validates cameras, decodes video) ---
-    episodes: List[Episode] = []
+    # --- 事前検証: meta.json のみ・動画はデコードしない ---
+    # かつては全エピソードをここで一括ロード (全フレームデコード) してから
+    # カメラ集合を検証していたが、それだとピーク RSS がエピソード数に比例して
+    # 伸びる (実測: 60EP/~40k フレームで 65GB → OOM kill)。カメラ集合の検証は
+    # meta.json だけで済むので、書き込み開始前にデコード無しで先に済ませる。
+    canonical_keys: Optional[List[str]] = None
+    for ep_dir in episode_dirs:
+        meta = json.loads((ep_dir / "meta.json").read_text())
+        selected, _ = _select_cameras(ep_dir, meta, camera_map)
+        keys = [lerobot_key for _, lerobot_key, _, _ in selected]
+        if not keys:
+            raise RuntimeError(f"episode {ep_dir} has no usable (color) cameras")
+        if canonical_keys is None:
+            canonical_keys = keys  # 集合の基準は先頭エピソード (従来通り)
+        elif keys != canonical_keys:
+            raise RuntimeError(
+                f"camera set mismatch: {ep_dir} has {keys}, expected {canonical_keys}"
+            )
+
+    if out_root.exists() and any(out_root.iterdir()):
+        raise RuntimeError(f"output root {out_root} already exists and is not empty")
+
+    # --- 1 エピソードずつ: デコード → 書き込み → 即解放 ---
+    # ピーク RSS を「1 エピソード分 + 一定バッファ」に保つための構造。
+    # dataset の生成は先頭エピソードのロード後 (features に画像の実寸が必要)。
+    # [load] / [episode] の行フォーマットは datagen / sim_eval の
+    # parse_materializer_progress が読むので変えないこと。ストリーミング化で
+    # 両者の出現順が交互になるが、あちらは行頭前綴りを数えるだけなので無害。
+    dataset = None
+    total_frames = 0
+    episode_count = 0
+    per_camera_reuse: Dict[str, Dict[str, int]] = {}
     for ep_dir in episode_dirs:
         print(f"[load] {ep_dir}")
         ep = Episode(ep_dir)
@@ -508,35 +573,19 @@ def materialize(
             f"  cameras: {[(c.fv_name, c.lerobot_key, c.width, c.height) for c in ep.cameras]}"
             f"  state_msgs={len(ep.state_series)} action_msgs={len(ep.action_series)}"
         )
-        episodes.append(ep)
 
-    # canonical camera key set comes from the first episode
-    canonical_keys = [c.lerobot_key for c in episodes[0].cameras]
-    for ep in episodes[1:]:
-        keys = [c.lerobot_key for c in ep.cameras]
-        if keys != canonical_keys:
-            raise RuntimeError(
-                f"camera set mismatch: {ep.dir} has {keys}, expected {canonical_keys}"
+        if dataset is None:
+            features = build_features(ep.cameras, use_videos=True)
+            print(f"[features] {json.dumps({k: {kk: (list(vv) if isinstance(vv, tuple) else vv) for kk, vv in v.items()} for k, v in features.items()})}")
+            dataset = LeRobotDataset.create(
+                repo_id=repo_id,
+                fps=fps,
+                features=features,
+                root=str(out_root),
+                robot_type="piper",
+                use_videos=True,
             )
 
-    features = build_features(episodes[0].cameras, use_videos=True)
-    print(f"[features] {json.dumps({k: {kk: (list(vv) if isinstance(vv, tuple) else vv) for kk, vv in v.items()} for k, v in features.items()})}")
-
-    if out_root.exists() and any(out_root.iterdir()):
-        raise RuntimeError(f"output root {out_root} already exists and is not empty")
-
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=fps,
-        features=features,
-        root=str(out_root),
-        robot_type="piper",
-        use_videos=True,
-    )
-
-    total_frames = 0
-    per_camera_reuse: Dict[str, Dict[str, int]] = {}
-    for ep in episodes:
         task = task_override or ep.task or "recording"
         ticks = ep.timeline(fps)
         for tick_ns in ticks:
@@ -553,17 +602,21 @@ def materialize(
             dataset.add_frame(frame)
         dataset.save_episode()
         total_frames += len(ticks)
+        episode_count += 1
         for cam in ep.cameras:
             acc = per_camera_reuse.setdefault(cam.lerobot_key, {"used": 0, "reused": 0, "src_frames": 0})
             acc["used"] += cam.used
             acc["reused"] += cam.reused
             acc["src_frames"] += len(cam.stamps)
         print(f"[episode] {ep.dir.name}: {len(ticks)} frames, task='{task}'")
+        # save_episode 済みの画像はもう使わない。次のデコードが始まる前に解放
+        ep.release()
 
+    assert dataset is not None  # episode_dirs は argparse nargs="+" で必ず 1 件以上
     dataset.finalize()
 
     return {
-        "episodes": len(episodes),
+        "episodes": episode_count,
         "total_frames": total_frames,
         "per_camera": per_camera_reuse,
         "root": str(out_root),
