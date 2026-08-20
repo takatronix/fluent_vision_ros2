@@ -867,7 +867,13 @@
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(retentionPolicy),
       });
-      if (r.ok) retentionPolicy = await r.json();
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${r.status}`);
+      }
+      retentionPolicy = await r.json();
+    } catch (e: any) {
+      alert('ポリシー保存失敗: ' + (e.message || e));
     } finally { retentionBusy = false; }
   }
   async function previewRetention() {
