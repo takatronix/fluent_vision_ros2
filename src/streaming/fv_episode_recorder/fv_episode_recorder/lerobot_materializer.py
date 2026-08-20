@@ -420,6 +420,21 @@ def _select_cameras(
             continue
         lerobot_key = camera_map.get(str(name), str(name))
         selected.append((str(name), lerobot_key, cam_dir, sidecar_path))
+    # 視覚 feature の並びを teleop 収録 (session_recorder) と同一に固定する:
+    # arm 系カメラが先頭、次に top、その他は名前順。並びは LeRobot の
+    # info.json features 順 = ポリシーの視覚スロット割当になるため、録画元
+    # (meta.json cameras の記載順 = recorder 設定順) 任せにすると teleop
+    # データセットとスロットが入れ替わる (2026-08-20 W40 監査: datagen
+    # データセットだけ top が第1スロットになり学習条件のパリティが崩れた)。
+    def _slot_order(item: Tuple[str, str, Path, Path]) -> Tuple[int, str]:
+        key = item[1]
+        if key.startswith("arm"):
+            return (0, key)
+        if key.startswith("top"):
+            return (1, key)
+        return (2, key)
+
+    selected.sort(key=_slot_order)
     return selected, skipped
 
 
