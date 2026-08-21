@@ -396,6 +396,11 @@ def _select_cameras(
     判定を 1 箇所に集約しているのは、事前検証と実ロードで判定がずれると
     「検証は通ったのに書き込み途中でカメラ不一致になる」ため。二重実装禁止。
 
+    末尾のソートにより EP 間でカメラの「順序だけ」が異なるケースは
+    camera set mismatch にならず黙って canonical 順に正規化される (意図的:
+    recorder 設定順に依存しない出力が目的)。集合の差 (欠落/余剰/別名) は
+    引き続き検出される。
+
     Returns ``(selected, skipped)`` — selected の各要素は
     ``(fv_name, lerobot_key, cam_video_dir, sidecar_path)``、skipped は表示用ラベル。
     """
@@ -426,6 +431,13 @@ def _select_cameras(
     # (meta.json cameras の記載順 = recorder 設定順) 任せにすると teleop
     # データセットとスロットが入れ替わる (2026-08-20 W40 監査: datagen
     # データセットだけ top が第1スロットになり学習条件のパリティが崩れた)。
+    # 「順=スロット」の根拠 (lerobot 側): 学習時 config.input_features は
+    # データセット features 順から充填され (policies/factory.py の
+    # dataset_to_policy_features)、pi05 は config.image_features の反復順で
+    # 画像トークンを連結する (policies/pi05/modeling_pi05.py の
+    # _preprocess_images / embed_prefix)。位置=スロットで名前引きは無い。
+    # daihen-physical-ai 側の同一規則:
+    # percus_ai/vlabor/lerobot_streams.py の camera_slot_order。変更時は両方を揃えること。
     def _slot_order(item: Tuple[str, str, Path, Path]) -> Tuple[int, str]:
         key = item[1]
         if key.startswith("arm"):
@@ -627,7 +639,11 @@ def materialize(
         # save_episode 済みの画像はもう使わない。次のデコードが始まる前に解放
         ep.release()
 
-    assert dataset is not None  # episode_dirs は argparse nargs="+" で必ず 1 件以上
+    if dataset is None:
+        # CLI 経由は argparse nargs="+" で 1 件以上が保証されるが、
+        # materialize() をライブラリとして空リストで呼ぶ経路を塞ぐ
+        # (assert は python -O で消える)。
+        raise RuntimeError("no episodes to materialize")
     dataset.finalize()
 
     return {
