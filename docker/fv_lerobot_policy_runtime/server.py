@@ -332,7 +332,10 @@ class DpexPolicyHandler(BaseHTTPRequestHandler):
             }
             for key, bundle in POLICIES.items()
         }
-        ok = any(bundle.ready for bundle in POLICIES.values())
+        # ポリシー 0 件は正常な既定状態 (明示指定が無ければ何もロードしない)
+        # なので unhealthy にしない。ロード済みが 1 件以上ある場合のみ
+        # 「全滅 (ready ゼロ)」を異常とみなす。
+        ok = not POLICIES or any(bundle.ready for bundle in POLICIES.values())
         if parsed.path == "/models":
             ok = True
         status = HTTPStatus.OK if ok else HTTPStatus.SERVICE_UNAVAILABLE
@@ -371,6 +374,11 @@ def main() -> int:
     host = os.environ.get("DPEX_LISTEN_HOST", "0.0.0.0")
     port = int(os.environ.get("DPEX_PORT", "8010"))
     print(f"fv-lerobot-policy-runtime listening on {host}:{port} policies={list(POLICIES)}", flush=True)
+    if not POLICIES:
+        print(
+            "no policies loaded — set DPEX_POLICY_SPECS or DPEX_MODEL_PATH to serve /infer",
+            flush=True,
+        )
     ThreadingHTTPServer((host, port), DpexPolicyHandler).serve_forever()
     return 0
 
