@@ -1,0 +1,86 @@
+# Render-test scene: same shape as the section-11 example at 640x360 so the
+# golden image stays small. Input names match render::makeSyntheticFrame.
+schema: fluent.scene/v1alpha1
+kind: Scene
+metadata:
+  name: render_scene_fixture
+params:
+  accent_color:
+    type: vec4f
+    default: [0.1, 0.9, 0.7, 1.0]
+    runtime_mutable: true
+types:
+  Detection2D:
+    struct:
+      bbox: vec4f
+      score: f32
+      label: string
+inputs:
+  camera:
+    type: image.rgba8
+    required: true
+    update: per_frame
+  detections:
+    type: sequence<Detection2D, 128>
+    required: false
+    update: per_frame
+  status_text:
+    type: string
+    required: false
+    update: on_change
+    constraints:
+      max_utf8_bytes: 256
+resources:
+  ui_font:
+    type: font
+    uri: builtin://fonts/default-cjk
+    glyph_capacity: 2048
+nodes:
+  - id: camera_layer
+    type: visual.image2d
+    inputs:
+      image: $inputs.camera
+    params:
+      fit: contain
+  - id: detection_layer
+    type: visual.boxes2d
+    inputs:
+      detections: $inputs.detections
+    params:
+      color: $params.accent_color
+      show_label: true
+    bounds:
+      max_instances: 128
+      overflow: drop_lowest_score
+  - id: status_layer
+    type: text.dynamic
+    inputs:
+      text: $inputs.status_text
+    params:
+      font: $resources.ui_font
+      position: [16.0, 12.0]
+      color: [1.0, 1.0, 1.0, 1.0]
+      shadow: true
+      default_text: "映像を待っています"
+    bounds:
+      max_glyphs: 128
+      overflow: truncate_end
+  - id: composite
+    type: composite.layers
+    inputs:
+      layers:
+        - $nodes.camera_layer.layer
+        - $nodes.detection_layer.layer
+        - $nodes.status_layer.layer
+    params:
+      color_space: srgb
+outputs:
+  frame:
+    type: image.rgba8
+    source: $nodes.composite.image
+budgets:
+  max_width: 640
+  max_height: 360
+  max_gpu_bytes: 67108864
+  max_upload_bytes_per_frame: 8388608
+  max_frames_in_flight: 2

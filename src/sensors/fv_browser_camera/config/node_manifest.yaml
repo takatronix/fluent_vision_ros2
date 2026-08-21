@@ -1,0 +1,27 @@
+# node_manifest.yaml — fv_browser_camera
+# Browser webcam bridge (WS in → Image out, overlay back to browser)
+
+nodes:
+  - key: fv_browser_camera
+    package: fv_browser_camera
+    exec: browser_camera_node
+    category: sensors
+    label: "Browser Camera"
+
+    inputs: []
+
+    outputs:
+      - param: models.coco.input_topic
+        type: image
+      - param: models.yoloe.input_topic
+        type: image
+
+    default_parameters:
+      port: 8096
+      models.coco.input_topic: /fv/browser_cam/coco/image_raw
+      models.coco.overlay_topic: /fv/browser_demo/coco/overlay
+      models.yoloe.input_topic: /fv/browser_cam/yoloe/image_raw
+      models.yoloe.overlay_topic: /fv/browser_demo/yoloe/overlay/compressed
+      yoloe_prompt_topic: /fv/yoloe_1/set_prompt
+      default_model: coco
+      max_fps: 15.0

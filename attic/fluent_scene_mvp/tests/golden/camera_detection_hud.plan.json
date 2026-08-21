@@ -1,0 +1,144 @@
+{
+  "schema": "fluent.plan/v1alpha1",
+  "scene": "camera_detection_hud",
+  "scene_digest": "sha256:4b68721b0b890561873fd5e198ae691c17f9abad8f65fffae66390147cd53c7d",
+  "passes": [
+    {
+      "id": "pass.upload",
+      "kind": "upload",
+      "index": 0,
+      "writes": [
+        "buf.detection_layer.instances",
+        "buf.status_layer.glyphs",
+        "img.in.camera"
+      ],
+      "bytes_per_frame": 8298496
+    },
+    {
+      "id": "pass.render.composite",
+      "kind": "render",
+      "index": 1,
+      "target": "img.node.composite",
+      "writes": [
+        "img.node.composite"
+      ],
+      "draws": [
+        {
+          "node": "camera_layer",
+          "op": "draw_image",
+          "reads": [
+            "img.in.camera"
+          ]
+        },
+        {
+          "node": "detection_layer",
+          "op": "draw_boxes",
+          "reads": [
+            "buf.detection_layer.instances"
+          ],
+          "max_instances": 128
+        },
+        {
+          "node": "status_layer",
+          "op": "draw_text",
+          "reads": [
+            "atlas.ui_font",
+            "buf.status_layer.glyphs"
+          ],
+          "max_glyphs": 128
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "id": "atlas.ui_font",
+      "kind": "font_atlas",
+      "format": "r8",
+      "glyphs": 2048,
+      "bytes": 2097152,
+      "residency": "device",
+      "update": "on_change",
+      "source": "$resources.ui_font",
+      "first_use": 1,
+      "last_use": 1,
+      "exported": false,
+      "aliasable": false
+    },
+    {
+      "id": "buf.detection_layer.instances",
+      "kind": "buffer",
+      "bytes": 4096,
+      "residency": "device",
+      "update": "per_frame",
+      "source": "$inputs.detections",
+      "first_use": 0,
+      "last_use": 1,
+      "exported": false,
+      "aliasable": false
+    },
+    {
+      "id": "buf.status_layer.glyphs",
+      "kind": "buffer",
+      "bytes": 2048,
+      "residency": "device",
+      "update": "on_change",
+      "source": "$inputs.status_text",
+      "first_use": 0,
+      "last_use": 1,
+      "exported": false,
+      "aliasable": false
+    },
+    {
+      "id": "img.in.camera",
+      "kind": "image",
+      "format": "rgba8",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 8294400,
+      "residency": "device",
+      "update": "per_frame",
+      "source": "$inputs.camera",
+      "first_use": 0,
+      "last_use": 1,
+      "exported": false,
+      "aliasable": false
+    },
+    {
+      "id": "img.node.composite",
+      "kind": "image",
+      "format": "rgba8",
+      "width": 1920,
+      "height": 1080,
+      "bytes": 8294400,
+      "residency": "device",
+      "source": "$nodes.composite.image",
+      "first_use": 1,
+      "last_use": 1,
+      "exported": true,
+      "aliasable": false
+    },
+    {
+      "id": "staging.upload",
+      "kind": "staging_pool",
+      "bytes": 33554432,
+      "residency": "host",
+      "first_use": 0,
+      "last_use": 0,
+      "exported": false,
+      "aliasable": false
+    }
+  ],
+  "outputs": [
+    {
+      "name": "frame",
+      "resource": "img.node.composite"
+    }
+  ],
+  "budgets": {
+    "gpu_bytes_budget": 268435456,
+    "gpu_bytes_planned": 18692096,
+    "upload_bytes_per_frame_budget": 33554432,
+    "upload_bytes_per_frame_planned": 8298496
+  }
+}

@@ -1,0 +1,77 @@
+# Mirrors the separate ROS 2 binding example in
+# docs/design/fluent_vision_architecture.md section 12 (ja: 第12節).
+# This is NOT part of .fvs; the core parses it only as bounded YAML data.
+schema: fluent.binding/v1alpha1
+kind: Binding
+metadata:
+  name: camera_detection_hud_ros2
+scene:
+  name: camera_detection_hud
+bindings:
+  camera:
+    source:
+      adapter: ros2
+      topic: /camera/color/image_raw
+      message_type: sensor_msgs/msg/Image
+      qos: sensor_data
+    converter: ros_image_to_rgba8
+    metadata:
+      timestamp: header.stamp
+      frame: header.frame_id
+      clock: ros_time
+      calibration: camera_calibration
+  depth:
+    source:
+      adapter: ros2
+      topic: /camera/depth/image_rect
+      message_type: sensor_msgs/msg/Image
+      qos: sensor_data
+    converter: ros_depth_to_depth32f_meters
+    metadata:
+      timestamp: header.stamp
+      frame: header.frame_id
+      clock: ros_time
+      calibration: camera_calibration
+      depth:
+        unit: meter
+        invalid: nan
+        registered_to: camera
+  detections:
+    source:
+      adapter: ros2
+      topic: /perception/detections
+      message_type: vision_msgs/msg/Detection2DArray
+      qos: sensor_data
+    converter: ros_detections_to_Detection2D
+    metadata:
+      timestamp: header.stamp
+      frame: header.frame_id
+      clock: ros_time
+  status_text:
+    source:
+      adapter: ros2
+      topic: /ui/status_text
+      message_type: std_msgs/msg/String
+      qos: transient_local
+    converter: ros_string_to_utf8
+  camera_calibration:
+    source:
+      adapter: ros2
+      topic: /camera/color/camera_info
+      message_type: sensor_msgs/msg/CameraInfo
+      qos: transient_local
+    converter: ros_camera_info_to_calibration
+synchronization:
+  sensor_frame:
+    policy: approximate
+    tolerance_ms: 12
+    queue_capacity: 4
+    overflow: drop_oldest
+outputs:
+  frame:
+    sink:
+      adapter: ros2
+      topic: /visualization/composite
+      message_type: sensor_msgs/msg/Image
+      qos: sensor_data
+    converter: rgba8_to_ros_image

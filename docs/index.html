@@ -620,27 +620,27 @@
   <div class="container">
     <div class="section-head">
       <div class="kicker">SHOWCASE</div>
-      <h2>Twelve pipelines, one launch command.</h2>
-      <p>Each ships in <code style="font-family:var(--mono);color:var(--accent);background:rgba(94,234,212,0.08);padding:2px 8px;border-radius:5px">pipelines/</code>. Swap, fork, extend — it's just YAML.</p>
+      <h2>Eleven pipelines, one click away.</h2>
+      <p>Each ships in <code style="font-family:var(--mono);color:var(--accent);background:rgba(94,234,212,0.08);padding:2px 8px;border-radius:5px">pipelines/</code> and loads as a built-in template in the editor. Swap, fork, extend — it's just YAML.</p>
     </div>
     <div class="grid">
       <div class="pipeline-card">
         <div class="badge">YOLOE</div>
         <h3>📦 Open-vocabulary detection</h3>
         <p>Tell it what to find with a text prompt — no retraining required.</p>
-        <code>ros2 launch fluent_vision_system run.launch.py pipeline:=pipelines/object_detection.yaml</code>
+        <code>editor :8095 → Load object_detection.yaml → Run</code>
       </div>
       <div class="pipeline-card">
         <div class="badge">YOLO-SEG · OBB</div>
         <h3>🟪 Instance seg → 3D boxes</h3>
         <p>Segmentation masks fused with depth into oriented 3D bounding boxes for grasp planning.</p>
-        <code>ros2 launch fluent_vision_system run.launch.py pipeline:=pipelines/instance_segmentation.yaml</code>
+        <code>editor :8095 → Load instance_segmentation.yaml → Run</code>
       </div>
       <div class="pipeline-card">
         <div class="badge">DEPTH ANYTHING V3</div>
         <h3>🌊 Monocular depth</h3>
         <p>ONNX Runtime or TensorRT backend, arm64 or x64. Drop in any RGB camera.</p>
-        <code>ros2 launch fluent_vision_system run.launch.py pipeline:=pipelines/depth_anything.yaml</code>
+        <code>editor :8095 → Load depth_anything.yaml → Run</code>
       </div>
       <div class="pipeline-card">
         <div class="badge">APRILTAG</div>
@@ -652,13 +652,13 @@
         <div class="badge">EPISODE</div>
         <h3>📼 rosbag + MP4 + markers</h3>
         <p>Sync-recorded episodes for LeRobot / Pi0.5 workflows with preflight + lock + retention.</p>
-        <code>ros2 run fv_episode_recorder fv_episode_recorder</code>
+        <code>ros2 run fv_episode_recorder recorder_node</code>
       </div>
       <div class="pipeline-card">
-        <div class="badge">MJPEG</div>
+        <div class="badge">HTTP · WS</div>
         <h3>🎥 Browser-friendly stream</h3>
-        <p>Open <code style="font-family:var(--mono);color:var(--accent)">http://&lt;robot&gt;:8080/stream</code> from any device.</p>
-        <code>ros2 launch fluent_vision_system run.launch.py pipeline:=pipelines/mjpeg_streaming.yaml</code>
+        <p>Open <code style="font-family:var(--mono);color:var(--accent)">http://&lt;robot&gt;:8080/image.jpg</code> from any device, or subscribe over WebSocket (:8765).</p>
+        <code>ros2 run fv_image_distributor fv_image_distributor_node</code>
       </div>
     </div>
   </div>

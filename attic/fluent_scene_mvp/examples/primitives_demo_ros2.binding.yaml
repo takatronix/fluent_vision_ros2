@@ -1,0 +1,71 @@
+# ROS 2 binding for examples/primitives_demo.fvs: camera, detections, a
+# nav_msgs/Path polyline, PoseArray waypoint markers, and a status string.
+# Path/PoseArray positions pass through as-is (x, y in message units); the
+# publisher owns projection into output-pixel space — coordinate conversion
+# is never implicit (spec section 4.2).
+schema: fluent.binding/v1alpha1
+kind: Binding
+metadata:
+  name: primitives_demo_ros2
+scene:
+  name: primitives_demo
+bindings:
+  camera:
+    source:
+      adapter: ros2
+      topic: /camera/color/image_raw
+      message_type: sensor_msgs/msg/Image
+      qos: sensor_data
+    converter: ros_image_to_rgba8
+    metadata:
+      timestamp: header.stamp
+      frame: header.frame_id
+      clock: ros_time
+  detections:
+    source:
+      adapter: ros2
+      topic: /perception/detections
+      message_type: vision_msgs/msg/Detection2DArray
+      qos: sensor_data
+    converter: ros_detections_to_Detection2D
+    metadata:
+      timestamp: header.stamp
+      frame: header.frame_id
+      clock: ros_time
+  path:
+    source:
+      adapter: ros2
+      topic: /ui/path_px
+      message_type: nav_msgs/msg/Path
+      qos: sensor_data
+    converter: ros_path_to_polyline2d
+    metadata:
+      timestamp: header.stamp
+      frame: header.frame_id
+      clock: ros_time
+  markers:
+    source:
+      adapter: ros2
+      topic: /ui/waypoints_px
+      message_type: geometry_msgs/msg/PoseArray
+      qos: sensor_data
+    converter: ros_pose_array_to_points2d
+    metadata:
+      timestamp: header.stamp
+      frame: header.frame_id
+      clock: ros_time
+  status_text:
+    source:
+      adapter: ros2
+      topic: /ui/status_text
+      message_type: std_msgs/msg/String
+      qos: transient_local
+    converter: ros_string_to_utf8
+outputs:
+  frame:
+    sink:
+      adapter: ros2
+      topic: /visualization/composite
+      message_type: sensor_msgs/msg/Image
+      qos: sensor_data
+    converter: rgba8_to_ros_image

@@ -1,0 +1,25 @@
+schema: fluent.scene/v1alpha1
+kind: Scene
+metadata:
+  name: duplicate_key_fixture
+nodes:
+  - id: camera_layer
+    type: visual.image2d
+    inputs:
+      image: $inputs.camera
+inputs:
+  camera:
+    type: image.rgba8
+    required: true
+    update: per_frame
+outputs:
+  frame:
+    type: layer
+    source: $nodes.camera_layer.layer
+budgets:
+  max_width: 1920
+  max_width: 1280
+  max_height: 1080
+  max_gpu_bytes: 268435456
+  max_upload_bytes_per_frame: 33554432
+  max_frames_in_flight: 2
