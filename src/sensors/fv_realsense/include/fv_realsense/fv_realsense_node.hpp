@@ -81,6 +81,18 @@ private:
         bool enable_depth_compressed = false;
     };
 
+    // depth の一部だけを別トピックへ出すための設定 (帯域削減)。
+    // 光軸まわりの数十画素しか要らない購読者 (安全 ToF 等) が、フル解像度の
+    // depth を丸ごと受け取らずに済むようにする。
+    struct DepthRoiConfig
+    {
+        bool enabled = false;
+        int width = 32;
+        int height = 32;
+        int center_x = -1;   // < 0 なら depth 主点 (ppx)
+        int center_y = -1;   // < 0 なら depth 主点 (ppy)
+    };
+
     struct ServicesConfig
     {
         bool get_distance_enabled = true;
@@ -106,6 +118,8 @@ private:
         std::string pointcloud = "depth/color/points";
         std::string color_camera_info = "color/camera_info";
         std::string depth_camera_info = "depth/camera_info";
+        std::string depth_roi = "depth/roi/image_rect_raw";
+        std::string depth_roi_camera_info = "depth/roi/camera_info";
         std::string registered_points = ""; // organized cloud topic（空なら無効）
     };
 
@@ -115,6 +129,7 @@ private:
     CameraConfig camera_config_;
     StreamConfig stream_config_;
     CameraInfoConfig camera_info_config_;
+    DepthRoiConfig depth_roi_config_;
     ServicesConfig services_config_;
     TFConfig tf_config_;
     TopicConfig topic_config_;
@@ -174,6 +189,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr registered_points_pub_;
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr color_info_pub_;
     rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr depth_info_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr depth_roi_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr depth_roi_info_pub_;
 
     // Compressed image publisher
     rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr color_compressed_pub_;
@@ -286,6 +303,9 @@ private:
     rclcpp::Time stampFromDeviceTime(const rs2::frame& frame, double device_ts_ms);
     void publishFrames(const rs2::frame& color_frame, const rs2::frame& depth_frame, const rclcpp::Time& stamp);
     void publishPointCloud(const rs2::frame& color_frame, const rs2::frame& depth_frame);
+    // depth_roi_config_ と depth 内部パラメータから切り出し矩形を決める。
+    // 画像内へクランプ済みなので、返り値はそのまま cv::Mat の部分行列に使える。
+    cv::Rect resolveDepthRoi() const;
     cv::Mat createDepthColormap(const rs2::frame& depth_frame);
     void publishTF();
     

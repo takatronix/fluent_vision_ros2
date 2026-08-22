@@ -20,7 +20,9 @@
 #include <opencv2/opencv.hpp>
 #include <rclcpp/qos.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
@@ -273,6 +275,21 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("camera_info.compressed_quality", 85);
     camera_info_config_.enable_depth_compressed = 
         this->declare_parameter("camera_info.enable_depth_compressed", false);
+
+    // depth ROI — 光軸まわりの小窓だけを別トピックへ出す (既定 OFF)。
+    // 1280x720@30 の depth は 442 Mbps あるが、安全 ToF のような購読者は
+    // 主点まわりの数十画素しか読まない。小窓を別トピックにすると同じ情報が
+    // 0.5 Mbps で渡せる。フル解像度 depth は従来どおり残る。
+    depth_roi_config_.enabled =
+        this->declare_parameter("depth_roi.enabled", false);
+    depth_roi_config_.width =
+        this->declare_parameter("depth_roi.width", 32);
+    depth_roi_config_.height =
+        this->declare_parameter("depth_roi.height", 32);
+    depth_roi_config_.center_x =
+        this->declare_parameter("depth_roi.center_x", -1);
+    depth_roi_config_.center_y =
+        this->declare_parameter("depth_roi.center_y", -1);
     
     // QoS設定の読み込み
     int qos_queue_size = this->declare_parameter("qos.queue_size", 1);
@@ -315,6 +332,10 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("topics.color_camera_info", "color/camera_info");
     topic_config_.depth_camera_info = 
         this->declare_parameter("topics.depth_camera_info", "depth/camera_info");
+    topic_config_.depth_roi = 
+        this->declare_parameter("topics.depth_roi", "depth/roi/image_rect_raw");
+    topic_config_.depth_roi_camera_info = 
+        this->declare_parameter("topics.depth_roi_camera_info", "depth/roi/camera_info");
     topic_config_.registered_points = 
         this->declare_parameter("topics.registered_points", "");
     
@@ -949,6 +970,23 @@ void FVDepthCameraNode::initializePublishers()
         depth_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
             topic_config_.depth, qos);
     }
+
+    if (stream_config_.depth_enabled && depth_roi_config_.enabled) {
+        depth_roi_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
+            topic_config_.depth_roi, qos);
+        if (camera_info_config_.enable_camera_info) {
+            // ROI 用の CameraInfo は「その小画像そのものの内部パラメータ」を出す
+            // (width/height = ROI 寸法、cx/cy は ROI 原点ぶん平行移動済み)。
+            // roi フィールドは 0 のまま = この画像は自分自身の全体、という意味。
+            // 素朴な購読者が k[] をそのまま使って正しく動くことを優先する。
+            depth_roi_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>(
+                topic_config_.depth_roi_camera_info, qos);
+        }
+        RCLCPP_INFO(this->get_logger(),
+            "🪟 Depth ROI publisher created: %s (%dx%d)",
+            topic_config_.depth_roi.c_str(),
+            depth_roi_config_.width, depth_roi_config_.height);
+    }
     
     if (stream_config_.depth_colormap_enabled) {
         depth_colormap_pub_ = this->create_publisher<sensor_msgs::msg::Image>(
@@ -1434,15 +1472,32 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
     }
     
     // Publish depth frame (モード2のみ配信)
-    if (current_mode == 2 && stream_config_.depth_enabled && depth_frame && depth_pub_) {
+    if (current_mode == 2 && stream_config_.depth_enabled && depth_frame) {
         cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), 
                            CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
         
-        auto depth_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "16UC1", depth_image).toImageMsg();
-        depth_msg->header.stamp = now;
-        depth_msg->header.frame_id = tf_config_.depth_optical_frame;
-        depth_pub_->publish(*depth_msg);
-        depth_pub_count_.fetch_add(1, std::memory_order_relaxed);
+        // 購読者が居る時だけ実際に出す。16bit depth は 1280x720 で 1.8MB/枚あり、
+        // メッセージ化 + シリアライズの複製が 30fps で効いてくる (点群の
+        // publishPointCloud と同じ需要駆動)。Stats の pub(depth=0) は
+        // 「誰も見ていない」であって、故障ではない — cb(depth=..) の方が受信数。
+        if (depth_pub_ && depth_pub_->get_subscription_count() != 0) {
+            auto depth_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "16UC1", depth_image).toImageMsg();
+            depth_msg->header.stamp = now;
+            depth_msg->header.frame_id = tf_config_.depth_optical_frame;
+            depth_pub_->publish(*depth_msg);
+            depth_pub_count_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // ROI (小窓) — フル解像度を要らない購読者のための別トピック。
+        if (depth_roi_pub_ && depth_roi_pub_->get_subscription_count() != 0) {
+            const cv::Rect roi = resolveDepthRoi();
+            // clone(): 部分行列は行が連続しないので、メッセージ化の前に詰める。
+            auto roi_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "16UC1",
+                                              depth_image(roi).clone()).toImageMsg();
+            roi_msg->header.stamp = now;
+            roi_msg->header.frame_id = tf_config_.depth_optical_frame;
+            depth_roi_pub_->publish(*roi_msg);
+        }
 
         if (cache_latest_frames_enabled_) {
             try {
@@ -1604,6 +1659,42 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
             
             depth_info_pub_->publish(depth_info);
         }
+
+        // ROI 用 CameraInfo — 小画像そのものの内部パラメータ。
+        // width/height は ROI 寸法、cx/cy は ROI 原点ぶん引いてある。roi フィールドは
+        // 0 のまま (= この画像の全体) で、二重にオフセットされる事故を避ける。
+        if (depth_roi_info_pub_ && depth_frame &&
+            depth_roi_info_pub_->get_subscription_count() != 0) {
+            const cv::Rect roi = resolveDepthRoi();
+            sensor_msgs::msg::CameraInfo roi_info;
+            roi_info.header.stamp = now;
+            roi_info.header.frame_id = tf_config_.depth_optical_frame;
+            roi_info.width = static_cast<uint32_t>(roi.width);
+            roi_info.height = static_cast<uint32_t>(roi.height);
+            roi_info.distortion_model = "plumb_bob";
+
+            const double roi_ppx = depth_intrinsics_.ppx - roi.x;
+            const double roi_ppy = depth_intrinsics_.ppy - roi.y;
+
+            roi_info.k[0] = depth_intrinsics_.fx;
+            roi_info.k[2] = roi_ppx;
+            roi_info.k[4] = depth_intrinsics_.fy;
+            roi_info.k[5] = roi_ppy;
+            roi_info.k[8] = 1.0;
+
+            roi_info.p[0] = depth_intrinsics_.fx;
+            roi_info.p[2] = roi_ppx;
+            roi_info.p[5] = depth_intrinsics_.fy;
+            roi_info.p[6] = roi_ppy;
+            roi_info.p[10] = 1.0;
+
+            roi_info.d.resize(5);
+            for (int i = 0; i < 5; i++) {
+                roi_info.d[i] = depth_intrinsics_.coeffs[i];
+            }
+
+            depth_roi_info_pub_->publish(roi_info);
+        }
     }
 
     // Optional point cloud (requires both frames)
@@ -1622,6 +1713,31 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
 void FVDepthCameraNode::drawHUD(cv::Mat& frame) const
 {
     (void)frame; // HUD disabled per user request
+}
+
+cv::Rect FVDepthCameraNode::resolveDepthRoi() const
+{
+    const int img_w = depth_intrinsics_.width;
+    const int img_h = depth_intrinsics_.height;
+
+    const int w = std::max(1, std::min(depth_roi_config_.width, img_w));
+    const int h = std::max(1, std::min(depth_roi_config_.height, img_h));
+
+    // center 未指定 (<0) なら主点。光軸まわりを見る用途がいちばん多く、
+    // 解像度を変えても勝手に追従してほしいため。
+    const double cx = (depth_roi_config_.center_x >= 0)
+                          ? static_cast<double>(depth_roi_config_.center_x)
+                          : depth_intrinsics_.ppx;
+    const double cy = (depth_roi_config_.center_y >= 0)
+                          ? static_cast<double>(depth_roi_config_.center_y)
+                          : depth_intrinsics_.ppy;
+
+    int x = static_cast<int>(std::lround(cx)) - w / 2;
+    int y = static_cast<int>(std::lround(cy)) - h / 2;
+    x = std::max(0, std::min(x, img_w - w));
+    y = std::max(0, std::min(y, img_h - h));
+
+    return cv::Rect(x, y, w, h);
 }
 
 void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const rs2::frame& depth_frame)
