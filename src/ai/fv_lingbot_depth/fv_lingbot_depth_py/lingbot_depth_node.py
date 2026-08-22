@@ -22,6 +22,8 @@ from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
+from fv_lingbot_depth_py.demand_gate import InputSubscriptionGate
+
 
 def _ensure_xformers_free_attention() -> None:
     """Allow inference without xFormers (e.g. Jetson/ARM64).
@@ -213,9 +215,66 @@ class FvLingbotDepthNode(Node):
                 f"inference gated by {self.depth_source_topic} "
                 "(paused until it selects the refined stream)")
 
+        # 入力購読は**需要駆動**にする。出力を誰も読んでいない間は購読ごと
+        # 落とす。推論だけ止めても購読が生きていると、DDS は購読者ごとに
+        # 別コピーを送るので線に乗る量は変わらない (2026-08-23 実測:
+        # 生color 573 + 生depth 387 = 960 Mbps を受信して捨て、CPU 62%)。
+        self.color_sub = None
+        self.depth_sub = None
+        self.info_sub = None
+        self.sync = None
+        self._input_gate = InputSubscriptionGate(
+            start=self._start_input_subs,
+            stop=self._stop_input_subs,
+            log=lambda m: self.get_logger().info(m))
+
+        # On-demand capture: its own callback group so the (blocking) service
+        # handler can wait while the sync callback runs on the default group
+        # (needs the MultiThreadedExecutor in main()).
+        self._capture_lock = threading.Lock()
+        self._capture_pending = 0
+        self._capture_event = threading.Event()
+        self._capture_result: dict = {}
+        self._capture_srv = self.create_service(
+            Trigger, "~/capture", self._on_capture,
+            callback_group=MutuallyExclusiveCallbackGroup())
+
+        # 需要の追従周期。短いほど反応が良いが、出力購読者が現れては消える
+        # 使い方だと購読がばたつく。1秒は「UIでレイヤを入れてから絵が出る
+        # までの待ち」として許容できる上限。
+        self.declare_parameter("demand_poll_sec", 1.0)
+        self._demand_poll_sec = max(
+            0.2, float(self.get_parameter("demand_poll_sec").value))
+        self._demand_timer = self.create_timer(
+            self._demand_poll_sec, self._reconcile_input)
+        # 起動直後に一度合わせる (既に購読者がいるなら待たせない)。
+        self._reconcile_input()
+
+        self._frame_counter = 0
+        self._proc_ms_acc = 0.0
+
+        # Runtime tuning: `ros2 param set` (or the dashboard quality button)
+        # can adjust the inference resolution without a node restart — the
+        # level is sent to the worker per request anyway.
+        self.add_on_set_parameters_callback(self._on_param_update)
+
+        model_source = self.local_model_path if self.local_model_path else self.model_id
+        self.get_logger().info(
+            f"fv_lingbot_depth started color={self.color_topic} depth={self.depth_topic} "
+            f"info={self.camera_info_topic} out_depth={self.refined_depth_topic} "
+            f"out_points={self.pointcloud_topic} backend={self.backend} model={model_source} "
+            f"input=demand-driven({self._demand_poll_sec:g}s)"
+        )
+
+    # ---- 入力購読の需要駆動 (demand_gate.InputSubscriptionGate) ----------
+
+    def _start_input_subs(self) -> None:
+        """color/depth(/camera_info) を購読し、同期器を張る。"""
         qos = self._sensor_qos_profile()
-        self.color_sub = Subscriber(self, Image, self.color_topic, qos_profile=qos)
-        self.depth_sub = Subscriber(self, Image, self.depth_topic, qos_profile=qos)
+        self.color_sub = Subscriber(self, Image, self.color_topic,
+                                    qos_profile=qos)
+        self.depth_sub = Subscriber(self, Image, self.depth_topic,
+                                    qos_profile=qos)
         if self._static_intr is not None:
             # No camera_info stream: sync color+depth only, intrinsics come
             # from the static_intrinsics parameter.
@@ -238,31 +297,36 @@ class FvLingbotDepthNode(Node):
             )
             self.sync.registerCallback(self._on_synced)
 
-        # On-demand capture: its own callback group so the (blocking) service
-        # handler can wait while the sync callback runs on the default group
-        # (needs the MultiThreadedExecutor in main()).
-        self._capture_lock = threading.Lock()
-        self._capture_pending = 0
-        self._capture_event = threading.Event()
-        self._capture_result: dict = {}
-        self._capture_srv = self.create_service(
-            Trigger, "~/capture", self._on_capture,
-            callback_group=MutuallyExclusiveCallbackGroup())
+    def _stop_input_subs(self) -> None:
+        """購読を捨てる。同期器の参照も切って溜まったバッファを解放する。"""
+        # 先に同期器を切る。購読だけ消して同期器を残すと、次に張った購読が
+        # 古いキューの上に乗って「時刻の合わないペア」を作る。
+        self.sync = None
+        for name in ("color_sub", "depth_sub", "info_sub"):
+            sub = getattr(self, name, None)
+            setattr(self, name, None)
+            if sub is None:
+                continue
+            # message_filters.Subscriber は rclpy の購読を .sub に持つ
+            # (Jazzy には unregister() が無い)。
+            inner = getattr(sub, "sub", None)
+            if inner is not None:
+                self.destroy_subscription(inner)
 
-        self._frame_counter = 0
-        self._proc_ms_acc = 0.0
+    def _input_demanded(self) -> bool:
+        """入力を受け取る理由があるか。
 
-        # Runtime tuning: `ros2 param set` (or the dashboard quality button)
-        # can adjust the inference resolution without a node restart — the
-        # level is sent to the worker per request anyway.
-        self.add_on_set_parameters_callback(self._on_param_update)
+        出力に購読者がいるか、capture 要求が来ているか。capture は購読が
+        無い状態から1枚だけ処理する口なので、ここに含めないと永遠に
+        タイムアウトする。
+        """
+        if self._demanded():
+            return True
+        with self._capture_lock:
+            return self._capture_pending > 0
 
-        model_source = self.local_model_path if self.local_model_path else self.model_id
-        self.get_logger().info(
-            f"fv_lingbot_depth started color={self.color_topic} depth={self.depth_topic} "
-            f"info={self.camera_info_topic} out_depth={self.refined_depth_topic} "
-            f"out_points={self.pointcloud_topic} backend={self.backend} model={model_source}"
-        )
+    def _reconcile_input(self) -> None:
+        self._input_gate.reconcile(self._input_demanded())
 
     def _on_param_update(self, params) -> SetParametersResult:
         for p in params:
@@ -352,6 +416,9 @@ class FvLingbotDepthNode(Node):
             if self._capture_pending <= 0:
                 self._capture_event.clear()
                 self._capture_pending = 1
+        # 購読が落ちている状態からの capture。タイマ (既定1秒) を待たずに
+        # ここで上げる — 待つと capture_timeout_sec を無駄に食う。
+        self._reconcile_input()
         if self._capture_event.wait(self.capture_timeout_sec):
             response.success = True
             response.message = json.dumps(self._capture_result)
@@ -378,6 +445,14 @@ class FvLingbotDepthNode(Node):
         Without this the node burns a ViT-L inference on every D405 frame
         forever, even when no subscriber exists -- which is what it did when
         the selector gate was disabled to make it run at all.
+
+        2026-08-23: this gate covered the GPU but **not the subscriptions**.
+        The node kept receiving 960 Mbps of raw color+depth and threw it
+        away (62% of a core, measured on aspa1 over 8 days). The input
+        subscriptions are now gated too -- see `_reconcile_input` and
+        `demand_gate.InputSubscriptionGate`. This predicate stays the
+        source of truth for "does anyone want the refined stream"; the
+        capture service adds its own demand on top.
         """
         pubs = [self.depth_pub, self.mask_pub]
         if self.points_pub is not None:
