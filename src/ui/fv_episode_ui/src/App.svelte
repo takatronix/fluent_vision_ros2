@@ -761,6 +761,108 @@
     if (next.has(id)) next.delete(id); else next.add(id);
     expandedBatches = next;
   }
+  // ---- Distribution overlay (batch trajectory fan) ----
+  // Data: GET /batches/{id}/metrics — generation-time quality_metrics.
+  // tcp_path is a world-frame polyline [m]; the view is a top-down XY plot
+  // so the operator can see path diversity / placement coverage at a glance.
+  type DistEp = {
+    episode_id: string;
+    task_description: string;
+    outcome: string | null;
+    duration_s: number | null;
+    tags: string[];
+    quality_metrics: {
+      gen?: { seed?: number; variant?: string; rms_vs_demo_deg?: number };
+      judge?: { ok?: boolean; reason?: string };
+      duration_s?: number;
+      tcp_path?: number[][];
+      pick_xy?: number[] | null;
+      place_xy?: number[] | null;
+      object_init?: Record<string, number[]> | null;
+    } | null;
+  };
+  let distBatchId = $state<string | null>(null);
+  let distEps = $state<DistEp[]>([]);
+  let distLoading = $state(false);
+  let distError = $state<string | null>(null);
+  let distHover = $state<string | null>(null);
+
+  async function openDist(batchId: string, e?: Event) {
+    e?.stopPropagation();
+    distBatchId = batchId;
+    distLoading = true;
+    distError = null;
+    distEps = [];
+    try {
+      const r = await fetch(`${API}/batches/${encodeURIComponent(batchId)}/metrics`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      distEps = (await r.json()).episodes ?? [];
+    } catch (err) {
+      distError = String(err);
+    } finally {
+      distLoading = false;
+    }
+  }
+  function closeDist() { distBatchId = null; distEps = []; distHover = null; }
+
+  const DIST_COLORS = ['#22d3ee', '#a78bfa', '#f59e0b', '#34d399', '#f472b6', '#60a5fa', '#c084fc', '#facc15'];
+  const distPlot = $derived.by(() => {
+    const eps = distEps.filter((e) => e.quality_metrics?.tcp_path?.length);
+    if (!eps.length) return null;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    const feed = (x: number, y: number) => {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    };
+    for (const e of eps) {
+      const qm = e.quality_metrics!;
+      for (const p of qm.tcp_path!) feed(p[0], p[1]);
+      if (qm.pick_xy) feed(qm.pick_xy[0], qm.pick_xy[1]);
+      if (qm.place_xy) feed(qm.place_xy[0], qm.place_xy[1]);
+      for (const p of Object.values(qm.object_init ?? {})) feed(p[0], p[1]);
+    }
+    const pad = Math.max(maxX - minX, maxY - minY, 0.05) * 0.07;
+    minX -= pad; maxX += pad; minY -= pad; maxY += pad;
+    const W = 640, H = 480;
+    const s = Math.min(W / (maxX - minX), H / (maxY - minY));
+    const ox = (W - (maxX - minX) * s) / 2;
+    const oy = (H - (maxY - minY) * s) / 2;
+    // Top view: world +X → right, +Y → up (screen Y flipped), uniform scale.
+    const px = (x: number) => ox + (x - minX) * s;
+    const py = (y: number) => H - oy - (y - minY) * s;
+    const variants = [...new Set(eps.map((e) => e.quality_metrics?.gen?.variant ?? '—'))];
+    const colorOf = (v: string) => DIST_COLORS[Math.max(0, variants.indexOf(v)) % DIST_COLORS.length];
+    const rows = eps.map((e) => {
+      const qm = e.quality_metrics!;
+      const v = qm.gen?.variant ?? '—';
+      return {
+        id: e.episode_id,
+        ok: e.outcome === 'success',
+        variant: v,
+        color: colorOf(v),
+        seed: qm.gen?.seed,
+        reason: qm.judge?.reason,
+        durS: qm.duration_s ?? e.duration_s,
+        points: qm.tcp_path!.map((p) => `${px(p[0]).toFixed(1)},${py(p[1]).toFixed(1)}`).join(' '),
+        pick: qm.pick_xy ? [px(qm.pick_xy[0]), py(qm.pick_xy[1])] : null,
+        place: qm.place_xy ? [px(qm.place_xy[0]), py(qm.place_xy[1])] : null,
+        objs: Object.entries(qm.object_init ?? {}).map(([name, p]) => ({ name, x: px(p[0]), y: py(p[1]) })),
+      };
+    });
+    const varCounts = variants.map((v) => ({
+      v,
+      color: colorOf(v),
+      n: eps.filter((e) => (e.quality_metrics?.gen?.variant ?? '—') === v).length,
+    }));
+    return {
+      W, H, rows, varCounts,
+      nOk: eps.filter((e) => e.outcome === 'success').length,
+      nNg: eps.filter((e) => e.outcome !== 'success').length,
+      nNoMetrics: distEps.length - eps.length,
+      scaleW: 0.1 * s,  // 10cm reference bar
+    };
+  });
+
   function computeBatchStats(eps: Episode[]): BatchStats {
     const rawTask = (eps[0]?.task_description || '').replace(/\s+#\d+\/\d+$/, '');
     const success = eps.filter(e => e.outcome === 'success').length;
@@ -1504,6 +1606,12 @@
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{s.totalMarkers}</td>
                 <td class="px-2 py-2.5 text-right whitespace-nowrap">
                   <button
+                    onclick={(e) => openDist(row.batchId, e)}
+                    class="opacity-0 group-hover:opacity-100 text-(--color-text-mute) hover:text-(--color-accent) transition p-1 rounded hover:bg-cyan-500/10 mr-1"
+                    title="分布ビュー — 経路の多様性を重ね描き">
+                    🗺
+                  </button>
+                  <button
                     onclick={(e) => togglePinBatch(row.batchId, row.eps, e)}
                     class="{anyPinned ? 'opacity-100 text-amber-400' : 'opacity-0 group-hover:opacity-100 text-(--color-text-mute)'} hover:text-amber-400 transition p-1 rounded hover:bg-amber-500/10 mr-1"
                     title={allPinned ? `バッチ全体 ${s.count} 件を unpin` : anyPinned ? `バッチを完全 pin (現状 ${row.eps.filter(x => x.pinned).length}/${s.count} pinned)` : `バッチ全体 ${s.count} 件を 📌 pin (retention 保護)`}>
@@ -2202,6 +2310,108 @@
         <button onclick={() => (attrEditor = null)} class="px-3 py-1.5 text-sm rounded bg-(--color-bg-3) text-(--color-text-dim) hover:text-white">キャンセル</button>
         <button onclick={saveAttrs} class="px-4 py-1.5 text-sm rounded bg-(--color-accent) text-(--color-bg) font-semibold hover:brightness-110">保存</button>
       </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Distribution overlay — batch trajectory fan (top view, world XY [m]) -->
+{#if distBatchId}
+  <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 backdrop-blur-sm p-4"
+       onclick={(e) => { if (e.target === e.currentTarget) closeDist(); }}
+       onkeydown={(e) => { if (e.key === 'Escape') closeDist(); }}
+       role="dialog"
+       tabindex="-1">
+    <div class="card w-full max-w-5xl p-5 flex flex-col" style="max-height: 92vh;">
+      <header class="flex items-start justify-between mb-3 shrink-0">
+        <div>
+          <h2 class="text-base font-semibold text-white">🗺 分布ビュー <span class="text-xs font-normal text-(--color-text-mute)">上面図 (world XY) — TCP 経路の重ね描き</span></h2>
+          <p class="text-xs text-(--color-text-mute) mt-1 font-mono">batch:{distBatchId}</p>
+        </div>
+        <button onclick={closeDist} class="text-(--color-text-mute) hover:text-white text-2xl leading-none">×</button>
+      </header>
+      {#if distLoading}
+        <p class="text-sm text-(--color-text-dim) py-8 text-center">読込中…</p>
+      {:else if distError}
+        <p class="text-sm text-red-400 py-8 text-center">取得失敗: {distError}</p>
+      {:else if !distPlot}
+        <p class="text-sm text-(--color-text-dim) py-8 text-center">
+          このバッチには軌道メトリクス (quality_metrics.tcp_path) がありません。<br />
+          自動生成 (datagen) エピソード、またはバックフィル済みのエピソードで利用できます。
+        </p>
+      {:else}
+        <div class="flex gap-4 min-h-0 overflow-auto flex-wrap md:flex-nowrap">
+          <svg viewBox={`0 0 ${distPlot.W} ${distPlot.H}`}
+               class="flex-1 min-w-[320px] rounded border border-(--color-border) bg-(--color-bg-2)"
+               style="max-height: 70vh;">
+            <!-- object initial placements (faint dots, drawn under paths) -->
+            {#each distPlot.rows as r (r.id + ':obj')}
+              {#each r.objs as o}
+                <circle cx={o.x} cy={o.y} r="3" fill={r.color} opacity="0.25" />
+              {/each}
+            {/each}
+            {#each distPlot.rows as r (r.id)}
+              <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+              <g style="cursor: pointer"
+                 opacity={distHover && distHover !== r.id ? 0.12 : 1}
+                 onmouseenter={() => (distHover = r.id)}
+                 onmouseleave={() => (distHover = null)}
+                 onclick={() => openPlay({ episode_id: r.id, duration_s: r.durS } as any)}>
+                <polyline points={r.points}
+                          fill="none"
+                          stroke={r.ok ? r.color : '#f87171'}
+                          stroke-width={distHover === r.id ? 2.5 : 1.2}
+                          opacity={r.ok ? 0.7 : 0.55}
+                          stroke-dasharray={r.ok ? null : '4 3'} />
+                {#if r.pick}
+                  <circle cx={r.pick[0]} cy={r.pick[1]} r={distHover === r.id ? 5 : 3.5}
+                          fill="none" stroke={r.ok ? r.color : '#f87171'} stroke-width="1.5" />
+                {/if}
+                {#if r.place}
+                  <rect x={r.place[0] - 3.5} y={r.place[1] - 3.5} width="7" height="7"
+                        fill={r.ok ? r.color : '#f87171'} opacity="0.85" />
+                {/if}
+              </g>
+            {/each}
+            <!-- 10cm scale bar -->
+            <g transform={`translate(16, ${distPlot.H - 20})`}>
+              <line x1="0" y1="0" x2={distPlot.scaleW} y2="0" stroke="#9ca3af" stroke-width="2" />
+              <text x={distPlot.scaleW / 2} y="-6" text-anchor="middle" fill="#9ca3af" font-size="11">10cm</text>
+            </g>
+          </svg>
+          <div class="w-full md:w-56 shrink-0 text-xs space-y-3">
+            <div class="rounded border border-(--color-border) bg-(--color-bg-2) p-3 space-y-1.5">
+              <div class="text-(--color-text-dim)">エピソード <span class="text-white font-mono">{distPlot.nOk + distPlot.nNg}</span></div>
+              <div><span class="text-emerald-400 font-mono">✓ {distPlot.nOk}</span> <span class="text-red-400 font-mono ml-2">✗ {distPlot.nNg}</span></div>
+              {#if distPlot.nNoMetrics > 0}
+                <div class="text-(--color-text-mute)">メトリクス無し {distPlot.nNoMetrics} 件 (非表示)</div>
+              {/if}
+            </div>
+            <div class="rounded border border-(--color-border) bg-(--color-bg-2) p-3 space-y-1">
+              <div class="text-(--color-text-dim) mb-1.5">変種 (色分け)</div>
+              {#each distPlot.varCounts as vc (vc.v)}
+                <div class="flex items-center gap-2">
+                  <span class="inline-block size-2.5 rounded-full" style={`background:${vc.color}`}></span>
+                  <span class="text-(--color-text) truncate flex-1">{vc.v}</span>
+                  <span class="font-mono text-(--color-text-dim)">×{vc.n}</span>
+                </div>
+              {/each}
+              <div class="text-[10px] text-(--color-text-mute) pt-1.5 border-t border-(--color-border) mt-1.5">
+                ○ = 把持点 ■ = 設置点 · 破線赤 = 失敗 EP<br />経路クリックで再生
+              </div>
+            </div>
+            {#if distHover}
+              {@const hr = distPlot.rows.find((r) => r.id === distHover)}
+              {#if hr}
+                <div class="rounded border border-(--color-accent)/40 bg-(--color-bg-2) p-3 space-y-1">
+                  <div class="font-mono text-(--color-accent)">…{hr.id.slice(-8)}</div>
+                  <div class="text-(--color-text)">{hr.variant} {hr.seed != null ? `· seed${hr.seed}` : ''}</div>
+                  <div class="text-(--color-text-dim)">{hr.ok ? '成功' : `失敗: ${hr.reason ?? '?'}`} {hr.durS != null ? `· ${Number(hr.durS).toFixed(1)}s` : ''}</div>
+                </div>
+              {/if}
+            {/if}
+          </div>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}

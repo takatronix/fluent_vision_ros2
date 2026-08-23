@@ -12,6 +12,7 @@ Other endpoints (markers, replay, export, disk, retention) land in later steps.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -119,6 +120,8 @@ def build_app(
     app.router.add_get("/api/v1/episodes/{episode_id}/depth_preview/{camera}/{frame}", _depth_preview)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints", _episode_joints)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints.csv", _episode_joints_csv)
+    # Bulk quality_metrics for one batch (distribution overlay in the UI).
+    app.router.add_get("/api/v1/batches/{batch_id}/metrics", _batch_metrics)
     # Batch loop (LeRobot-style auto-cycle) so the operator clicks once for 100 runs.
     app.router.add_post("/api/v1/episodes/batch_start", _batch_start)
     app.router.add_get("/api/v1/episodes/batch_status", _batch_status)
@@ -668,6 +671,47 @@ async def _list_episodes(request: web.Request) -> web.Response:
         "next_cursor": next_cursor,
         "total": total,
     })
+
+
+async def _batch_metrics(request: web.Request) -> web.Response:
+    """Bulk quality_metrics for one batch (distribution overlay).
+
+    One request instead of N x GET /episodes/{id}: episode dirs come from
+    the sqlite index (no filesystem glob) and the meta.json reads happen
+    off the event loop. Episodes without quality_metrics report null so
+    the UI can distinguish "no metrics yet" from an empty payload.
+    """
+    batch_id = request.match_info["batch_id"]
+    store: EpisodeStore = request.app["store"]
+    rows, _cursor, _total = store.list_episodes_indexed(
+        limit=500, cursor=None, profile=None,
+        batch_id=batch_id, pinned_only=False, env=None)
+
+    def _collect() -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            qm = None
+            ep_dir = r.get("ep_dir")
+            if ep_dir:
+                try:
+                    with (Path(ep_dir) / "meta.json").open() as f:
+                        qm = json.load(f).get("quality_metrics")
+                except (OSError, ValueError):
+                    qm = None
+            out.append({
+                "episode_id": r["episode_id"],
+                "task_description": r["task_description"],
+                "outcome": r.get("outcome"),
+                "duration_s": r.get("duration_s"),
+                "tags": r.get("tags") or [],
+                "quality_metrics": qm,
+            })
+        return out
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    episodes = await loop.run_in_executor(None, _collect)
+    return web.json_response({"batch_id": batch_id, "episodes": episodes})
 
 
 def _summarize_controller(snap: Optional[dict[str, Any]]) -> Optional[str]:
