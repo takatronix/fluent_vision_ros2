@@ -500,6 +500,10 @@
   type JointSeries = { topic: string; names: string[]; t_ms: number[]; q: number[][] };
   let jointData = $state<JointSeries[]>([]);
   let jointSelectedTopic = $state<string>('');
+  // チャートはコンテナ実幅で 1:1 描画する (固定 viewBox +
+  // preserveAspectRatio=none だと横だけ引き伸ばされ、軸ラベルの文字まで
+  // 太る + 見た目の縦横比が画面幅依存になる)
+  let jointChartW = $state(1100);
   let jointLoading = $state(false);
 
   async function fetchJoints(epId: string) {
@@ -2257,7 +2261,7 @@
         {#if series && series.t_ms.length > 0}
           {@const totalMs = (maxDuration || 1) * 1000}
           {@const numJoints = series.names.length || (series.q[0]?.length ?? 0)}
-          {@const W = 1100}
+          {@const W = Math.max(320, jointChartW)}
           {@const H = 140}
           {@const PAD_L = 40}
           {@const PAD_R = 8}
@@ -2275,7 +2279,7 @@
           {@const xOf = (t_ms: number) => PAD_L + (t_ms / totalMs) * innerW}
           {@const yOf = (val_rad: number) => PAD_T + innerH - ((val_rad * 180 / Math.PI - yMin) / ySpan) * innerH}
           {@const palette = ['#22dd88','#00d9ff','#ffaa33','#ff6688','#bb88ff','#88ccff','#ffcc44','#66e0c0']}
-          <div class="shrink-0 mt-3 pt-3 border-t border-(--color-border)">
+          <div class="shrink-0 mt-3 pt-3 border-t border-(--color-border)" bind:clientWidth={jointChartW}>
             <div class="flex items-center gap-3 text-[11px] text-(--color-text-mute) mb-1.5">
               <span class="text-(--color-text-dim) font-medium">ジョイント角 (deg)</span>
               {#if jointData.length > 1}
