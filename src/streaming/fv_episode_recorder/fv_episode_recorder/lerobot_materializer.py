@@ -23,9 +23,17 @@ Design notes
   aliases and namespaces), mirroring
   ``percus_ai.vlabor.lerobot_streams.ArmStream.joint_values_in_profile_order``.
 * Frames are resampled onto a uniform ``k/fps`` grid anchored at the first frame
-  of the primary camera. State/action use zero-order-hold (latest sample
-  at-or-before the tick). Camera frames use nearest-in-time selection with a
-  reuse fallback when no frame is within ``0.5/fps`` of the tick.
+  of the primary camera, then aligned the same way ``session_recorder.py`` does:
+  the primary camera's nearest frame defines the pairing stamp, and state /
+  action / secondary cameras are all sampled at-or-before that same stamp
+  (zero-order hold). A tick whose nearest primary frame is farther than
+  ``max(0.2s, 2/fps)`` is skipped, mirroring the recorder's staleness gate.
+* The tick range is clipped to the overlap of the camera span and the recorded
+  state/action spans. Without the clip, every episode ends with a band where the
+  action stream has already stopped (episode judgement, bag teardown) but the
+  cameras keep rolling — the last command would be zero-order-held under moving
+  video for ~2-3s per episode, which is exactly the kind of frame/action
+  misalignment the teleop recorder never writes.
 * Depth cameras are skipped entirely in v1.
 * Episodes are materialized one at a time (decode -> write -> release) so the
   peak RSS stays at ~one episode regardless of the episode count.
@@ -374,14 +382,33 @@ def _sample_zoh(series: List[Tuple[int, np.ndarray]], tick_ns: int) -> np.ndarra
     return series[idx][1]
 
 
-def _nearest_image(cam: CameraSource, tick_ns: int, fps: int) -> np.ndarray:
-    """Nearest camera frame; reuse previous frame if none within 0.5/fps."""
-    if len(cam.stamps) == 0:
-        cam.reused += 1
-        return cam.images[-1] if cam.images else np.zeros((cam.height, cam.width, 3), np.uint8)
-    idx = int(np.argmin(np.abs(cam.stamps - tick_ns)))
-    dist_ns = abs(int(cam.stamps[idx]) - tick_ns)
-    if dist_ns > (0.5 / fps) * 1e9:
+def _nearest_index(cam: CameraSource, tick_ns: int) -> int:
+    """Index of the camera frame whose stamp is nearest to ``tick_ns``."""
+    return int(np.argmin(np.abs(cam.stamps - tick_ns)))
+
+
+def _floor_index(cam: CameraSource, stamp_ns: int) -> int:
+    """Index of the latest frame at-or-before ``stamp_ns`` (clamped to 0).
+
+    Secondary cameras use this so every modality of a frame refers to the same
+    pairing stamp, matching session_recorder's floor selection. The clamp only
+    fires for ticks before the camera's first frame (episode head).
+    """
+    idx = int(np.searchsorted(cam.stamps, stamp_ns, side="right")) - 1
+    return max(idx, 0)
+
+
+def _pick_image(
+    cam: CameraSource, idx: int, pair_stamp_ns: int, slack_ns: int
+) -> np.ndarray:
+    """Fetch frame ``idx``; count it as reused when farther than ``slack_ns``.
+
+    The slack differs by selection mode: nearest (primary) is normally within
+    half a frame period, floor (secondaries) within a full period — only
+    distances beyond that indicate an actual source gap (frozen image).
+    """
+    dist_ns = abs(int(cam.stamps[idx]) - pair_stamp_ns)
+    if dist_ns > slack_ns:
         cam.reused += 1
     cam.used += 1
     return cam.images[idx]
@@ -475,9 +502,14 @@ class Episode:
         self.primary = next((c for c in self.cameras if c.fv_name == "top_camera"), self.cameras[0])
 
         # --- state / action series (raw ROS values, then scaled to degrees) ---
+        # Both series use header stamps (publish time), the same domain
+        # session_recorder aligns on. The bag receive stamp adds transport +
+        # sqlite-write latency (measured 0.3-2.3ms) and mixes domains between
+        # state and action for no benefit. _fold_carry sorts by stamp, so
+        # slight header-order inversions on the merged topic are tolerated.
         bag_dir = self.dir / str(self.meta.get("bag_path", "bag/")).rstrip("/")
         self.state_series = self._scale(read_joint_series(bag_dir, state_topic, "header"))
-        self.action_series = self._scale(read_joint_series(bag_dir, action_topic, "recv"))
+        self.action_series = self._scale(read_joint_series(bag_dir, action_topic, "header"))
 
     @staticmethod
     def _scale(series: List[Tuple[int, np.ndarray]]) -> List[Tuple[int, np.ndarray]]:
@@ -490,6 +522,33 @@ class Episode:
         t0, t_end = int(stamps[0]), int(stamps[-1])
         n = int(math.floor((t_end - t0) / 1e9 * fps)) + 1
         return [t0 + int(round(k / fps * 1e9)) for k in range(max(n, 1))]
+
+    def aligned_span(self) -> Tuple[int, int]:
+        """Overlap of camera / state / action recordings, in stamp ns.
+
+        The bag subscribes late (~0.5s) and stops publishing actions before the
+        cameras stop (episode judgement runs while recording); ticks outside
+        this overlap would be filled by extrapolated zero-order hold — a frozen
+        action under moving video at the tail, a future-value backfill at the
+        head. The teleop recorder never emits either, so neither do we.
+        """
+        if not self.state_series or not self.action_series:
+            raise RuntimeError(f"episode {self.dir} has an empty state or action series")
+        start = max(
+            int(self.primary.stamps[0]),
+            self.state_series[0][0],
+            self.action_series[0][0],
+        )
+        end = min(
+            int(self.primary.stamps[-1]),
+            self.state_series[-1][0],
+            self.action_series[-1][0],
+        )
+        if end <= start:
+            raise RuntimeError(
+                f"episode {self.dir}: camera/state/action spans do not overlap"
+            )
+        return start, end
 
     def release(self) -> None:
         """デコード済み画像と関節系列を解放する。
@@ -589,6 +648,9 @@ def materialize(
     dataset = None
     total_frames = 0
     episode_count = 0
+    total_skipped_stale = 0
+    total_head_trim_s = 0.0
+    total_tail_trim_s = 0.0
     per_camera_reuse: Dict[str, Dict[str, int]] = {}
     for ep_dir in episode_dirs:
         print(f"[load] {ep_dir}")
@@ -614,28 +676,61 @@ def materialize(
             )
 
         task = task_override or ep.task or "recording"
-        ticks = ep.timeline(fps)
+        span_start, span_end = ep.aligned_span()
+        all_ticks = ep.timeline(fps)
+        ticks = [t for t in all_ticks if span_start <= t <= span_end]
+        head_trim_s = (span_start - all_ticks[0]) / 1e9 if all_ticks else 0.0
+        tail_trim_s = (all_ticks[-1] - span_end) / 1e9 if all_ticks else 0.0
+
+        # Alignment mirrors session_recorder: the primary camera's frame stamp
+        # is the pairing stamp for the whole tuple, and a tick with no primary
+        # frame within the staleness bound is skipped instead of padded.
+        stale_ns = int(max(0.2, 2.0 / fps) * 1e9)
+        written = 0
+        skipped_stale = 0
         for tick_ns in ticks:
-            state = _sample_zoh(ep.state_series, tick_ns).astype(np.float32)
-            action = _sample_zoh(ep.action_series, tick_ns).astype(np.float32)
+            p_idx = _nearest_index(ep.primary, tick_ns)
+            pair_ns = int(ep.primary.stamps[p_idx])
+            if abs(pair_ns - tick_ns) > stale_ns:
+                skipped_stale += 1
+                continue
+            state = _sample_zoh(ep.state_series, pair_ns).astype(np.float32)
+            action = _sample_zoh(ep.action_series, pair_ns).astype(np.float32)
             frame: dict = {
                 "observation.state": state,
                 "action": action,
                 "task": task,
             }
             for cam in ep.cameras:
-                img = _nearest_image(cam, tick_ns, fps)
+                if cam is ep.primary:
+                    idx, slack_ns = p_idx, int(0.5 / fps * 1e9)
+                else:
+                    idx, slack_ns = _floor_index(cam, pair_ns), int(1.0 / fps * 1e9)
+                img = _pick_image(cam, idx, pair_ns, slack_ns)
                 frame[f"observation.images.{cam.lerobot_key}"] = np.ascontiguousarray(img)
             dataset.add_frame(frame)
+            written += 1
+        if written == 0:
+            raise RuntimeError(
+                f"episode {ep.dir}: no frames survived alignment "
+                f"(ticks={len(ticks)}, stale_skipped={skipped_stale})"
+            )
         dataset.save_episode()
-        total_frames += len(ticks)
+        total_frames += written
+        total_skipped_stale += skipped_stale
+        total_head_trim_s += max(head_trim_s, 0.0)
+        total_tail_trim_s += max(tail_trim_s, 0.0)
         episode_count += 1
         for cam in ep.cameras:
             acc = per_camera_reuse.setdefault(cam.lerobot_key, {"used": 0, "reused": 0, "src_frames": 0})
             acc["used"] += cam.used
             acc["reused"] += cam.reused
             acc["src_frames"] += len(cam.stamps)
-        print(f"[episode] {ep.dir.name}: {len(ticks)} frames, task='{task}'")
+        print(
+            f"[episode] {ep.dir.name}: {written} frames "
+            f"(trim head {head_trim_s:.2f}s / tail {tail_trim_s:.2f}s, "
+            f"stale_skipped={skipped_stale}), task='{task}'"
+        )
         # save_episode 済みの画像はもう使わない。次のデコードが始まる前に解放
         ep.release()
 
@@ -649,6 +744,9 @@ def materialize(
     return {
         "episodes": episode_count,
         "total_frames": total_frames,
+        "skipped_stale": total_skipped_stale,
+        "head_trim_s": round(total_head_trim_s, 3),
+        "tail_trim_s": round(total_tail_trim_s, 3),
         "per_camera": per_camera_reuse,
         "root": str(out_root),
     }
@@ -693,6 +791,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"episodes         : {summary['episodes']}")
     print(f"total frames     : {summary['total_frames']}")
     print(f"dataset fps      : {args.fps}")
+    print(
+        f"alignment        : stale_skipped={summary['skipped_stale']} "
+        f"head_trim={summary['head_trim_s']}s tail_trim={summary['tail_trim_s']}s"
+    )
     print("per-camera stats :")
     for key, acc in summary["per_camera"].items():
         print(
