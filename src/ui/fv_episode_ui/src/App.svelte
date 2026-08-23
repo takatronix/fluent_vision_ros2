@@ -806,35 +806,46 @@
   function closeDist() { distBatchId = null; distEps = []; distHover = null; }
 
   const DIST_COLORS = ['#22d3ee', '#a78bfa', '#f59e0b', '#34d399', '#f472b6', '#60a5fa', '#c084fc', '#facc15'];
+  // 3D orbit view (DPEX 風): tcp_path は world [x,y,z][m] なので投影は
+  // 描画側で行う。ドラッグ=回転 / ホイール=ズーム / ボタンで上面⇔3D。
+  const DIST_VIEW_3D = { yaw: -0.7, pitch: 0.95, zoom: 1 };   // pitch π/2 = 真上
+  const DIST_VIEW_TOP = { yaw: 0, pitch: Math.PI / 2, zoom: 1 };
+  let distView = $state({ ...DIST_VIEW_3D });
+  let distCanvas = $state<HTMLCanvasElement | null>(null);
+  let _distDrag: { x: number; y: number } | null = null;
+
   const distPlot = $derived.by(() => {
     const eps = distEps.filter((e) => e.quality_metrics?.tcp_path?.length);
     if (!eps.length) return null;
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    const feed = (x: number, y: number) => {
-      if (x < minX) minX = x; if (x > maxX) maxX = x;
-      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity,
+        minZ = Infinity, maxZ = -Infinity;
+    const feed = (p: number[]) => {
+      if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
+      if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1];
+      const z = p[2] ?? 0;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
     };
     for (const e of eps) {
       const qm = e.quality_metrics!;
-      for (const p of qm.tcp_path!) feed(p[0], p[1]);
-      if (qm.pick_xy) feed(qm.pick_xy[0], qm.pick_xy[1]);
-      if (qm.place_xy) feed(qm.place_xy[0], qm.place_xy[1]);
-      for (const p of Object.values(qm.object_init ?? {})) feed(p[0], p[1]);
+      for (const p of qm.tcp_path!) feed(p);
+      for (const p of Object.values(qm.object_init ?? {})) feed(p);
     }
-    const pad = Math.max(maxX - minX, maxY - minY, 0.05) * 0.07;
-    minX -= pad; maxX += pad; minY -= pad; maxY += pad;
-    const W = 640, H = 480;
-    const s = Math.min(W / (maxX - minX), H / (maxY - minY));
-    const ox = (W - (maxX - minX) * s) / 2;
-    const oy = (H - (maxY - minY) * s) / 2;
-    // Top view: world +X → right, +Y → up (screen Y flipped), uniform scale.
-    const px = (x: number) => ox + (x - minX) * s;
-    const py = (y: number) => H - oy - (y - minY) * s;
     const variants = [...new Set(eps.map((e) => e.quality_metrics?.gen?.variant ?? '—'))];
     const colorOf = (v: string) => DIST_COLORS[Math.max(0, variants.indexOf(v)) % DIST_COLORS.length];
     const rows = eps.map((e) => {
       const qm = e.quality_metrics!;
       const v = qm.gen?.variant ?? '—';
+      const path = qm.tcp_path as number[][];
+      // pick/place は XY のみ保存 (schema 1) — z は経路の最寄り点から補間
+      const at3d = (xy: number[] | null | undefined): number[] | null => {
+        if (!xy) return null;
+        let bz = path[0][2] ?? 0, bd = Infinity;
+        for (const p of path) {
+          const d = (p[0] - xy[0]) ** 2 + (p[1] - xy[1]) ** 2;
+          if (d < bd) { bd = d; bz = p[2] ?? 0; }
+        }
+        return [xy[0], xy[1], bz];
+      };
       return {
         id: e.episode_id,
         ok: e.outcome === 'success',
@@ -843,10 +854,10 @@
         seed: qm.gen?.seed,
         reason: qm.judge?.reason,
         durS: qm.duration_s ?? e.duration_s,
-        points: qm.tcp_path!.map((p) => `${px(p[0]).toFixed(1)},${py(p[1]).toFixed(1)}`).join(' '),
-        pick: qm.pick_xy ? [px(qm.pick_xy[0]), py(qm.pick_xy[1])] : null,
-        place: qm.place_xy ? [px(qm.place_xy[0]), py(qm.place_xy[1])] : null,
-        objs: Object.entries(qm.object_init ?? {}).map(([name, p]) => ({ name, x: px(p[0]), y: py(p[1]) })),
+        path,
+        pick: at3d(qm.pick_xy),
+        place: at3d(qm.place_xy),
+        objs: Object.values(qm.object_init ?? {}).map((p) => [p[0], p[1], p[2] ?? minZ]),
       };
     });
     const varCounts = variants.map((v) => ({
@@ -854,14 +865,168 @@
       color: colorOf(v),
       n: eps.filter((e) => (e.quality_metrics?.gen?.variant ?? '—') === v).length,
     }));
+    const center = [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
+    const radius = Math.max((maxX - minX) / 2, (maxY - minY) / 2, (maxZ - minZ) / 2, 0.05);
     return {
-      W, H, rows, varCounts,
+      rows, varCounts, center, radius, groundZ: minZ,
+      bounds: { minX, maxX, minY, maxY },
       nOk: eps.filter((e) => e.outcome === 'success').length,
       nNg: eps.filter((e) => e.outcome !== 'success').length,
       nNoMetrics: distEps.length - eps.length,
-      scaleW: 0.1 * s,  // 10cm reference bar
     };
   });
+
+  function _distProject(p: number[], W: number, H: number): [number, number] {
+    const plot = distPlot!;
+    const { yaw, pitch, zoom } = distView;
+    const x = p[0] - plot.center[0], y = p[1] - plot.center[1],
+          z = (p[2] ?? 0) - plot.center[2];
+    const cy0 = Math.cos(yaw), sy0 = Math.sin(yaw);
+    const x1 = x * cy0 - y * sy0;
+    const y1 = x * sy0 + y * cy0;
+    const sp = Math.sin(pitch), cp = Math.cos(pitch);
+    // pitch=π/2 → 真上 (画面上=+Y) / pitch→0 → 真横 (画面上=+Z)。正射影。
+    const sx = x1;
+    const sy = y1 * sp + z * cp;
+    const s = (Math.min(W, H) * 0.42 * zoom) / plot.radius;
+    return [W / 2 + sx * s, H / 2 - sy * s];
+  }
+
+  function _distDraw() {
+    const cv = distCanvas, plot = distPlot;
+    if (!cv || !plot) return;
+    const rect = cv.getBoundingClientRect();
+    if (rect.width < 10 || rect.height < 10) return;
+    const dpr = window.devicePixelRatio || 1;
+    const bw = Math.round(rect.width * dpr), bh = Math.round(rect.height * dpr);
+    if (cv.width !== bw || cv.height !== bh) { cv.width = bw; cv.height = bh; }
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const W = rect.width, H = rect.height;
+    ctx.clearRect(0, 0, W, H);
+    // 床グリッド (作業面 z): 5cm ピッチ、10cm 毎に濃く — スケール感の基準
+    const b = plot.bounds, gz = plot.groundZ;
+    const x0 = Math.floor(b.minX / 0.05) * 0.05, x1g = Math.ceil(b.maxX / 0.05) * 0.05;
+    const y0 = Math.floor(b.minY / 0.05) * 0.05, y1g = Math.ceil(b.maxY / 0.05) * 0.05;
+    ctx.lineWidth = 1;
+    for (let gx = x0; gx <= x1g + 1e-9; gx += 0.05) {
+      const major = Math.abs(Math.round(gx / 0.1) * 0.1 - gx) < 1e-9;
+      ctx.strokeStyle = major ? 'rgba(148,163,184,0.28)' : 'rgba(148,163,184,0.12)';
+      ctx.beginPath();
+      let [ax, ay] = _distProject([gx, y0, gz], W, H);
+      ctx.moveTo(ax, ay);
+      [ax, ay] = _distProject([gx, y1g, gz], W, H);
+      ctx.lineTo(ax, ay);
+      ctx.stroke();
+    }
+    for (let gy = y0; gy <= y1g + 1e-9; gy += 0.05) {
+      const major = Math.abs(Math.round(gy / 0.1) * 0.1 - gy) < 1e-9;
+      ctx.strokeStyle = major ? 'rgba(148,163,184,0.28)' : 'rgba(148,163,184,0.12)';
+      ctx.beginPath();
+      let [ax, ay] = _distProject([x0, gy, gz], W, H);
+      ctx.moveTo(ax, ay);
+      [ax, ay] = _distProject([x1g, gy, gz], W, H);
+      ctx.lineTo(ax, ay);
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(148,163,184,0.6)';
+    ctx.font = '11px sans-serif';
+    ctx.fillText('グリッド 5cm (濃線 10cm)', 10, H - 10);
+    // 物体初期位置 (淡い点) → 経路 → 把持○ / 設置■ の順に重ねる
+    for (const r of plot.rows) {
+      const dim = distHover && distHover !== r.id;
+      const col = r.ok ? r.color : '#f87171';
+      ctx.globalAlpha = dim ? 0.10 : 0.30;
+      ctx.fillStyle = col;
+      for (const o of r.objs) {
+        const [ox, oy] = _distProject(o, W, H);
+        ctx.beginPath(); ctx.arc(ox, oy, 3, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.globalAlpha = dim ? 0.10 : (r.ok ? 0.75 : 0.6);
+      ctx.strokeStyle = col;
+      ctx.lineWidth = distHover === r.id ? 2.5 : 1.2;
+      ctx.setLineDash(r.ok ? [] : [5, 4]);
+      ctx.beginPath();
+      r.path.forEach((p, i) => {
+        const [ax, ay] = _distProject(p, W, H);
+        if (i === 0) ctx.moveTo(ax, ay); else ctx.lineTo(ax, ay);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (r.pick) {
+        const [ax, ay] = _distProject(r.pick, W, H);
+        ctx.beginPath(); ctx.arc(ax, ay, distHover === r.id ? 5.5 : 4, 0, Math.PI * 2);
+        ctx.lineWidth = 1.6; ctx.stroke();
+      }
+      if (r.place) {
+        const [ax, ay] = _distProject(r.place, W, H);
+        ctx.fillRect(ax - 3.5, ay - 3.5, 7, 7);
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function _distPick(ev: PointerEvent | MouseEvent): string | null {
+    const cv = distCanvas, plot = distPlot;
+    if (!cv || !plot) return null;
+    const rect = cv.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    let best: string | null = null, bd = 8 * 8;  // 8px 以内
+    for (const r of plot.rows) {
+      let prev: [number, number] | null = null;
+      for (const p of r.path) {
+        const q = _distProject(p, rect.width, rect.height);
+        if (prev) {
+          const dx = q[0] - prev[0], dy = q[1] - prev[1];
+          const len2 = dx * dx + dy * dy;
+          const t = len2 > 0 ? Math.max(0, Math.min(1,
+            ((mx - prev[0]) * dx + (my - prev[1]) * dy) / len2)) : 0;
+          const ex = prev[0] + t * dx - mx, ey = prev[1] + t * dy - my;
+          const d = ex * ex + ey * ey;
+          if (d < bd) { bd = d; best = r.id; }
+        }
+        prev = q;
+      }
+    }
+    return best;
+  }
+
+  function distPointerDown(ev: PointerEvent) {
+    _distDrag = { x: ev.clientX, y: ev.clientY };
+    (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
+  }
+  function distPointerMove(ev: PointerEvent) {
+    if (_distDrag) {
+      const dx = ev.clientX - _distDrag.x, dy = ev.clientY - _distDrag.y;
+      _distDrag = { x: ev.clientX, y: ev.clientY };
+      distView = {
+        ...distView,
+        yaw: distView.yaw - dx * 0.008,
+        pitch: Math.max(0.08, Math.min(Math.PI / 2, distView.pitch + dy * 0.008)),
+      };
+    } else {
+      distHover = _distPick(ev);
+    }
+  }
+  function distPointerUp(ev: PointerEvent) {
+    _distDrag = null;
+    try { (ev.currentTarget as HTMLElement).releasePointerCapture(ev.pointerId); } catch {}
+  }
+  function distWheel(ev: WheelEvent) {
+    ev.preventDefault();
+    const z = distView.zoom * Math.exp(-ev.deltaY * 0.0012);
+    distView = { ...distView, zoom: Math.max(0.25, Math.min(8, z)) };
+  }
+  function distClick(ev: MouseEvent) {
+    const id = _distPick(ev);
+    if (id) {
+      const row = distPlot?.rows.find((r) => r.id === id);
+      openPlay({ episode_id: id, duration_s: row?.durS } as any);
+    }
+  }
+  // 再描画: ビュー/ホバー/データが変わるたび (canvas は宣言的でないため)
+  $effect(() => { void distView; void distHover; void distPlot; void distCanvas; _distDraw(); });
 
   function computeBatchStats(eps: Episode[]): BatchStats {
     const rawTask = (eps[0]?.task_description || '').replace(/\s+#\d+\/\d+$/, '');
@@ -2324,7 +2489,7 @@
     <div class="card w-full max-w-5xl p-5 flex flex-col" style="max-height: 92vh;">
       <header class="flex items-start justify-between mb-3 shrink-0">
         <div>
-          <h2 class="text-base font-semibold text-white">🗺 分布ビュー <span class="text-xs font-normal text-(--color-text-mute)">上面図 (world XY) — TCP 経路の重ね描き</span></h2>
+          <h2 class="text-base font-semibold text-white">🗺 分布ビュー <span class="text-xs font-normal text-(--color-text-mute)">TCP 経路の 3D 重ね描き (world) — ドラッグで回転</span></h2>
           <p class="text-xs text-(--color-text-mute) mt-1 font-mono">batch:{distBatchId}</p>
         </div>
         <button onclick={closeDist} class="text-(--color-text-mute) hover:text-white text-2xl leading-none">×</button>
@@ -2340,44 +2505,26 @@
         </p>
       {:else}
         <div class="flex gap-4 min-h-0 overflow-auto flex-wrap md:flex-nowrap">
-          <svg viewBox={`0 0 ${distPlot.W} ${distPlot.H}`}
-               class="flex-1 min-w-[320px] rounded border border-(--color-border) bg-(--color-bg-2)"
-               style="max-height: 70vh;">
-            <!-- object initial placements (faint dots, drawn under paths) -->
-            {#each distPlot.rows as r (r.id + ':obj')}
-              {#each r.objs as o}
-                <circle cx={o.x} cy={o.y} r="3" fill={r.color} opacity="0.25" />
-              {/each}
-            {/each}
-            {#each distPlot.rows as r (r.id)}
-              <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-              <g style="cursor: pointer"
-                 opacity={distHover && distHover !== r.id ? 0.12 : 1}
-                 onmouseenter={() => (distHover = r.id)}
-                 onmouseleave={() => (distHover = null)}
-                 onclick={() => openPlay({ episode_id: r.id, duration_s: r.durS } as any)}>
-                <polyline points={r.points}
-                          fill="none"
-                          stroke={r.ok ? r.color : '#f87171'}
-                          stroke-width={distHover === r.id ? 2.5 : 1.2}
-                          opacity={r.ok ? 0.7 : 0.55}
-                          stroke-dasharray={r.ok ? null : '4 3'} />
-                {#if r.pick}
-                  <circle cx={r.pick[0]} cy={r.pick[1]} r={distHover === r.id ? 5 : 3.5}
-                          fill="none" stroke={r.ok ? r.color : '#f87171'} stroke-width="1.5" />
-                {/if}
-                {#if r.place}
-                  <rect x={r.place[0] - 3.5} y={r.place[1] - 3.5} width="7" height="7"
-                        fill={r.ok ? r.color : '#f87171'} opacity="0.85" />
-                {/if}
-              </g>
-            {/each}
-            <!-- 10cm scale bar -->
-            <g transform={`translate(16, ${distPlot.H - 20})`}>
-              <line x1="0" y1="0" x2={distPlot.scaleW} y2="0" stroke="#9ca3af" stroke-width="2" />
-              <text x={distPlot.scaleW / 2} y="-6" text-anchor="middle" fill="#9ca3af" font-size="11">10cm</text>
-            </g>
-          </svg>
+          <div class="flex-1 min-w-[320px] relative">
+            <canvas bind:this={distCanvas}
+                    class="w-full rounded border border-(--color-border) bg-(--color-bg-2)"
+                    style="height: min(62vh, 560px); touch-action: none; cursor: {_distDrag ? 'grabbing' : distHover ? 'pointer' : 'grab'};"
+                    onpointerdown={distPointerDown}
+                    onpointermove={distPointerMove}
+                    onpointerup={distPointerUp}
+                    onpointercancel={distPointerUp}
+                    onwheel={distWheel}
+                    onclick={distClick}></canvas>
+            <div class="absolute top-2 right-2 flex gap-1">
+              <button onclick={() => (distView = { ...DIST_VIEW_3D })}
+                      class="px-2 py-1 rounded text-[11px] border {distView.pitch < Math.PI / 2 - 0.01 ? 'border-(--color-accent) text-(--color-accent)' : 'border-(--color-border) text-(--color-text-mute)'} bg-(--color-bg)/70 hover:text-(--color-accent)">3D</button>
+              <button onclick={() => (distView = { ...DIST_VIEW_TOP, zoom: distView.zoom })}
+                      class="px-2 py-1 rounded text-[11px] border {distView.pitch >= Math.PI / 2 - 0.01 ? 'border-(--color-accent) text-(--color-accent)' : 'border-(--color-border) text-(--color-text-mute)'} bg-(--color-bg)/70 hover:text-(--color-accent)">⬆ 上面</button>
+            </div>
+            <div class="absolute bottom-2 right-2 text-[10px] text-(--color-text-mute) pointer-events-none">
+              ドラッグ=回転 · ホイール=ズーム
+            </div>
+          </div>
           <div class="w-full md:w-56 shrink-0 text-xs space-y-3">
             <div class="rounded border border-(--color-border) bg-(--color-bg-2) p-3 space-y-1.5">
               <div class="text-(--color-text-dim)">エピソード <span class="text-white font-mono">{distPlot.nOk + distPlot.nNg}</span></div>
