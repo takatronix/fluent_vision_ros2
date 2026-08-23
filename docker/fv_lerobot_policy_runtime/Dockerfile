@@ -101,8 +101,9 @@ RUN chmod +x /opt/fv-lerobot-policy-runtime/entrypoint.sh
 ENV PYTHONPATH=/opt/percus_ai:/opt/lerobot/src
 ENV DPEX_PORT=8010
 ENV DPEX_LOAD_ON_START=true
-ENV DPEX_DEFAULT_POLICY_ID=pi05_week19_morikawa_all_20k
-ENV DPEX_POLICY_SPECS=pi05_week19_morikawa_all_20k:pi05:/data/models/669ce87f-8cfa-5836-8f29-b9c3f6e650cf;pi05_week19_morikawa_all_10k:pi05:/data/models/1dc2af59-2d87-52f9-99af-fae7c6335bcf
+# 既定ではモデルを積まない。DPEX_POLICY_SPECS(key:policy_type:/data/models/<model_id>;...)
+# を起動時に指定したモデルだけがロードされる。
+ENV DPEX_POLICY_SPECS=
 ENV DPEX_CAMERA_ALIASES=cam_high=top_camera,top=top_camera,top_camera=top_camera,cam_left_wrist=arm_camera,cam_right_wrist=arm_camera,arm=arm_camera,arm_camera=arm_camera
 ENV HF_HOME=/data/.cache/huggingface
 ENV TRANSFORMERS_CACHE=/data/.cache/huggingface

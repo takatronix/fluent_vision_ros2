@@ -313,7 +313,7 @@ stage.boxes(detections).color(Color::Teal).smoothing(0.2f);
 | `foundationpose_runtime` | `fv_foundationpose_bridge` | [`pipelines/foundationpose_bridge.yaml`](pipelines/foundationpose_bridge.yaml) |
 | `lingbot_depth_worker` | `fv_lingbot_depth` | [`pipelines/lingbot_depth_http.yaml`](pipelines/lingbot_depth_http.yaml) |
 | `openpi_runtime` | `fv_policy_runner` | [`pipelines/openpi_policy_runner.yaml`](pipelines/openpi_policy_runner.yaml) |
-| `fv_lerobot_policy_runtime` | `fv_policy_runner` | [`src/system/fluent_vision_system/config/fv_policy_runner_pi05_morikawa.yaml`](src/system/fluent_vision_system/config/fv_policy_runner_pi05_morikawa.yaml)（パラメータファイル） |
+| `fv_lerobot_policy_runtime` | `fv_policy_runner` | [`src/system/fluent_vision_system/config/fluent_vision_system.policy_runner.sample.yaml`](src/system/fluent_vision_system/config/fluent_vision_system.policy_runner.sample.yaml)（パラメータファイル） |
 
 ---
 
