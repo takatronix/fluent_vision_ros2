@@ -406,10 +406,27 @@
     target.style.cursor = dragging ? 'grabbing' : markerCursor(e, m);
   }
 
+  // ---- 実時間タイムラインとカメラ毎の実尺写像 ----
+  // mp4 は公称 fps の CFR で書かれるため、フレーム落ちしたカメラ (sim の
+  // 仮想カメラ等) は実尺が実時間より短くなり、そのまま再生すると映像だけ
+  // 早回しになってジョイントチャート (実時間) とズレる。タイムライン
+  // (sharedTime) は wall 秒で統一し、各 video へは「実時間 ÷ その mp4 実尺」
+  // の比で写像する。学習データ側は frames.parquet が真のタイムスタンプを
+  // 持っているのでこの補正は表示専用。
+  function camFactor(camName: string): number {
+    const v = videoEls[camName];
+    const span = playEpisode?.duration_s || 0;
+    if (!v || !isFinite(v.duration) || v.duration <= 0 || span <= 0) return 1;
+    return span / v.duration;
+  }
+
   function onVideoMetadata(camName: string) {
     const v = videoEls[camName];
     if (!v) return;
-    if (v.duration > maxDuration) maxDuration = v.duration;
+    // タイムライン長は duration_s (wall) が正。無い旧エピソードだけ
+    // mp4 実尺で代用する
+    if (!playEpisode?.duration_s && v.duration > maxDuration) maxDuration = v.duration;
+    applyPlaybackRate();  // 実尺が確定したこのタイミングでペーシング反映
   }
 
   function syncPlayFrom(camName: string) {
@@ -435,10 +452,12 @@
     _isSyncing = true;
     const src = videoEls[camName];
     if (src) {
-      sharedTime = src.currentTime;
+      sharedTime = src.currentTime * camFactor(camName);
       for (const [n, v] of Object.entries(videoEls)) {
-        if (n !== camName && v && Math.abs(v.currentTime - src.currentTime) > 0.1) {
-          try { v.currentTime = src.currentTime; } catch {}
+        if (n === camName || !v) continue;
+        const want = sharedTime / camFactor(n);
+        if (Math.abs(v.currentTime - want) > 0.1) {
+          try { v.currentTime = want; } catch {}
         }
       }
     }
@@ -449,7 +468,7 @@
     const firstKey = Object.keys(videoEls)[0];
     if (camName === firstKey) {
       const v = videoEls[firstKey];
-      if (v) sharedTime = v.currentTime;
+      if (v) sharedTime = v.currentTime * camFactor(firstKey);
     }
   }
   function togglePlayAll() {
@@ -464,11 +483,17 @@
   function seekAll(t: number) {
     sharedTime = t;
     _isSyncing = true;
-    for (const v of Object.values(videoEls)) { if (v) { try { v.currentTime = t; } catch {} } }
+    for (const [n, v] of Object.entries(videoEls)) {
+      if (v) { try { v.currentTime = t / camFactor(n); } catch {} }
+    }
     _isSyncing = false;
   }
   function applyPlaybackRate() {
-    for (const v of Object.values(videoEls)) { if (v) v.playbackRate = playbackRate; }
+    // 1× = 実時間ペース。実尺の短い (フレーム落ちした) カメラは
+    // その分ゆっくり回して壁時計と歩調を合わせる
+    for (const [n, v] of Object.entries(videoEls)) {
+      if (v) v.playbackRate = playbackRate / camFactor(n);
+    }
   }
 
   // -------- Joint chart (Phase 3a) --------
