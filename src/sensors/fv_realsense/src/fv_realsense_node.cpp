@@ -130,7 +130,10 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
         
     } catch (const std::exception& e) {
         RCLCPP_ERROR(this->get_logger(), "❌ Exception during initialization: %s", e.what());
-        running_ = false;
+        {
+            std::lock_guard<std::mutex> lock(publish_mutex_);
+            running_.store(false, std::memory_order_relaxed);
+        }
         sync_cv_.notify_all();
         publish_cv_.notify_all();
         try {
@@ -161,7 +164,10 @@ FVDepthCameraNode::~FVDepthCameraNode()
     RCLCPP_INFO(this->get_logger(), "🛑 Shutting down FV Depth Camera...");
     
     // ===== 処理スレッドの停止 =====
-    running_ = false;
+    {
+        std::lock_guard<std::mutex> lock(publish_mutex_);
+        running_.store(false, std::memory_order_relaxed);
+    }
     sync_cv_.notify_all();
     publish_cv_.notify_all();
     // Stop sensors to release USB resources quickly
@@ -172,7 +178,6 @@ FVDepthCameraNode::~FVDepthCameraNode()
     if (processing_thread_.joinable()) {
         processing_thread_.join();
     }
-    publish_cv_.notify_all();
     if (publisher_thread_.joinable()) {
         publisher_thread_.join();
     }
