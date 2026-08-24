@@ -13,6 +13,7 @@ endif()
 
 # Find dependencies
 find_package(ament_cmake REQUIRED)
+find_package(Threads REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -52,6 +53,7 @@ set(FLUENT_LIB_SOURCES
   src/fluent_image.cpp
   src/fluent_cloud_impl.cpp
   src/fluent_utils.cpp
+  src/ros_io_thread.cpp
   # Always provide fluent::text symbols.  Without opencv_contrib/freetype the
   # implementation falls back to cv::putText; omitting this source made every
   # downstream overlay node fail at link time.
@@ -82,6 +84,7 @@ ament_target_dependencies(${PROJECT_NAME}
 
 # Link libraries
 target_link_libraries(${PROJECT_NAME}
+  Threads::Threads
   ${OpenCV_LIBRARIES}
   ${PCL_LIBRARIES}
   yaml-cpp
@@ -109,6 +112,10 @@ install(TARGETS ${PROJECT_NAME}
   ARCHIVE DESTINATION lib
   RUNTIME DESTINATION bin
 )
+install(
+  PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup_dds_receive_buffer.sh
+  DESTINATION bin
+)
 
 # Export targets
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
@@ -132,8 +139,20 @@ endif()
 
 # Lint and test
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(test_ros_io_thread
+    test/test_ros_io_thread.cpp
+  )
+  target_include_directories(test_ros_io_thread PRIVATE src)
+  target_link_libraries(test_ros_io_thread ${PROJECT_NAME} Threads::Threads)
+
+  add_test(
+    NAME test_setup_dds_receive_buffer
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_setup_dds_receive_buffer.sh
+  )
 endif()
 
 ament_package()

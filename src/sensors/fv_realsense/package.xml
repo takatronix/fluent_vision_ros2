@@ -38,7 +38,6 @@
   <depend>geometry_msgs</depend>  <!-- 幾何学メッセージ型 -->
   <depend>std_srvs</depend>  <!-- 標準サービス型 -->
   <depend>fluent_lib</depend>  <!-- FluentVision共通ユーティリティ -->
-  <depend>fv_ros_io</depend>  <!-- ROS I/O CPU affinity -->
 
   <!-- ===== インターフェース生成依存関係 ===== -->
   <build_depend>rosidl_default_generators</build_depend>  <!-- インターフェース生成 -->

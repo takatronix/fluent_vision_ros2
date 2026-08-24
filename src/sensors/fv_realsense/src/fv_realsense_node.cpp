@@ -11,7 +11,7 @@
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
 #include "fv_realsense/srv/set_mode.hpp"
-#include "fv_ros_io/thread_affinity.hpp"
+#include "fluent_lib/ros/io_thread.hpp"
 // #include "fv_realsense/srv/generate_point_cloud.hpp"  // Removed: service deleted
 
 #include <pcl_conversions/pcl_conversions.h>
@@ -22,14 +22,12 @@
 #include <rclcpp/qos.hpp>
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <pthread.h>
-#include <sched.h>
 #include <stdexcept>
 #include <thread>
 
@@ -1129,15 +1127,9 @@ void FVDepthCameraNode::startPublisherThread()
                 throw std::runtime_error(
                     std::string("pthread_setname_np failed: ") + std::strerror(name_result));
             }
-            fv::ros_io::bind_current_thread();
-            const int cpu = sched_getcpu();
-            if (cpu < 0) {
-                throw std::runtime_error(
-                    std::string("sched_getcpu failed: ") + std::strerror(errno));
-            }
+            fluent_lib::ros::configure_current_io_thread();
             ready->set_value();
             ready_notified = true;
-            RCLCPP_INFO(this->get_logger(), "ROS I/O publisher thread bound to CPU %d", cpu);
             publisherLoop();
         } catch (...) {
             if (!ready_notified) {
