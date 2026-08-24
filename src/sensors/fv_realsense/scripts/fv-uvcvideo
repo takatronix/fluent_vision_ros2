@@ -1,0 +1,809 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PROGRAM_NAME="fv-uvcvideo"
+readonly TARGET_URB_COUNT=32
+readonly TOOL_VERSION="1"
+readonly NVIDIA_R38_4_SOURCE_URL="https://developer.nvidia.com/downloads/embedded/L4T/r38_Release_v4.0/source/public_sources.tbz2"
+readonly NVIDIA_R38_4_SOURCE_SHA256="6c8504c5e2d90b394ec223511ff892c4854ae615a955c166d3057a8d9abe54b6"
+
+log() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+warn() {
+  printf '%s: warning: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+die() {
+  printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  fv-uvcvideo install [options]
+  fv-uvcvideo status [--kernel-release RELEASE]
+  fv-uvcvideo uninstall [--kernel-release RELEASE] [--reload]
+
+Install options:
+  --allow-unsupported     Attempt an unvalidated environment without prompting
+  --kernel-build PATH     Prepared build tree for the running kernel
+  --kernel-source PATH    Matching kernel source tree or UVC driver directory
+  --kernel-release VALUE  Target kernel release (default: uname -r)
+  --signing-key PATH      PEM private key used to sign the module
+  --signing-cert PATH     X.509 certificate used to sign the module
+  --reload                Reload uvcvideo after installation when it is unused
+
+The optimized module is optional. Without it, the system uvcvideo module remains
+available with its distribution-provided UVC_URBS value.
+
+Jetson Linux R38.4 and Ubuntu packaged kernels resolve matching sources
+automatically. Other environments require confirmation and explicit sources.
+EOF
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "this command must be run with sudo"
+}
+
+read_l4t_release() {
+  local release_file=${1:-/etc/nv_tegra_release}
+  [[ -r $release_file ]] || return 1
+  sed -nE 's/^# R([0-9]+).*REVISION: ([0-9]+\.[0-9]+).*/\1.\2/p' "$release_file" | head -n1
+}
+
+read_os_id() {
+  local os_release_file=${1:-/etc/os-release}
+  [[ -r $os_release_file ]] || return 1
+  sed -nE 's/^ID="?([^"[:space:]]+)"?$/\1/p' "$os_release_file" | head -n1
+}
+
+detect_profile() {
+  local architecture=$1
+  local kernel_release=$2
+  local release_file=${3:-/etc/nv_tegra_release}
+  local os_release_file=${4:-/etc/os-release}
+  local l4t_release=''
+  local os_id=''
+
+  l4t_release=$(read_l4t_release "$release_file" 2>/dev/null || true)
+  if [[ $architecture == aarch64 && $l4t_release == 38.4.0 &&
+        $kernel_release == 6.8.12-tegra* ]]; then
+    printf 'jetson-linux-r38.4\n'
+    return
+  fi
+  if [[ -n $l4t_release ]]; then
+    printf 'unsupported\n'
+    return
+  fi
+
+  os_id=$(read_os_id "$os_release_file" 2>/dev/null || true)
+  if [[ $os_id == ubuntu &&
+        ($architecture == x86_64 || $architecture == aarch64) ]]; then
+    printf 'ubuntu\n'
+    return
+  fi
+
+  printf 'unsupported\n'
+}
+
+confirm_unsupported() {
+  local architecture=$1
+  local kernel_release=$2
+  local reply=''
+
+  warn "this environment has not been validated"
+  printf '  kernel: %s\n  architecture: %s\n' "$kernel_release" "$architecture" >&2
+  printf 'Attempt a strict source, build, and compatibility check? [y/N] ' >&2
+  read -r reply || true
+  [[ $reply == y || $reply == Y ]]
+}
+
+find_uvc_source_dir() {
+  local root=$1
+  local candidate=''
+  local candidates=(
+    "$root"
+    "$root/drivers/media/usb/uvc"
+    "$root/kernel/kernel-noble/drivers/media/usb/uvc"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -f $candidate/uvcvideo.h && -f $candidate/uvc_video.c &&
+          -f $candidate/uvc_driver.c && -f $candidate/Makefile ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+  return 1
+}
+
+validate_kernel_build() {
+  local build_dir=$1
+  local kernel_release=$2
+  local build_release=''
+
+  [[ -d $build_dir ]] || die "kernel build directory not found: $build_dir"
+  [[ -f $build_dir/Makefile ]] || die "kernel Makefile not found: $build_dir/Makefile"
+  [[ -f $build_dir/.config ]] || die "kernel config not found: $build_dir/.config"
+  [[ -f $build_dir/Module.symvers ]] ||
+    die "Module.symvers not found; a prepared or fully built kernel tree is required"
+
+  build_release=$(kernel_build_release "$build_dir")
+  [[ $build_release == "$kernel_release" ]] ||
+    die "kernel build release mismatch: running=$kernel_release build=$build_release"
+}
+
+kernel_build_release() {
+  local build_dir=$1
+  if [[ -s $build_dir/include/config/kernel.release ]]; then
+    cat "$build_dir/include/config/kernel.release"
+    return
+  fi
+  make -s -C "$build_dir" kernelrelease
+}
+
+resolve_kernel_build() {
+  local requested=$1
+  local kernel_release=$2
+  local profile=$3
+  local candidate=''
+  local candidates=()
+
+  if [[ -n $requested ]]; then
+    validate_kernel_build "$requested" "$kernel_release"
+    printf '%s\n' "$requested"
+    return
+  fi
+
+  candidates+=("/lib/modules/$kernel_release/build")
+  while IFS= read -r candidate; do
+    candidates+=("$candidate")
+  done < <(find /usr/src -maxdepth 4 -type f -name Module.symvers -printf '%h\n' 2>/dev/null)
+
+  for candidate in "${candidates[@]}"; do
+    [[ -d $candidate && -f $candidate/Makefile && -f $candidate/.config &&
+       -f $candidate/Module.symvers ]] || continue
+    if [[ $(kernel_build_release "$candidate" 2>/dev/null || true) == "$kernel_release" ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+
+  if [[ $profile == ubuntu ]]; then
+    require_command apt-get
+    log "installing kernel headers for $kernel_release"
+    apt-get update >&2
+    DEBIAN_FRONTEND=noninteractive \
+      apt-get install -y "linux-headers-$kernel_release" >&2
+    candidate="/lib/modules/$kernel_release/build"
+    validate_kernel_build "$candidate" "$kernel_release"
+    printf '%s\n' "$candidate"
+    return
+  fi
+
+  die "no prepared build tree matches $kernel_release; use --kernel-build"
+}
+
+ubuntu_kernel_source_spec() {
+  local kernel_release=$1
+  local package=''
+  local source_name=''
+  local source_version=''
+  local kernel_base=''
+  local source_binary=''
+
+  require_command dpkg-query
+  for package in \
+    "linux-modules-$kernel_release" \
+    "linux-headers-$kernel_release" \
+    "linux-image-unsigned-$kernel_release" \
+    "linux-image-$kernel_release"; do
+    if dpkg-query -W -f='${source:Package}\t${source:Version}\n' "$package" \
+        >/dev/null 2>&1; then
+      read -r source_name source_version < <(
+        dpkg-query -W -f='${source:Package}\t${source:Version}\n' "$package"
+      )
+      break
+    fi
+  done
+
+  [[ -n $source_name && -n $source_version ]] ||
+    die "cannot resolve the Ubuntu source package for $kernel_release"
+  kernel_base=$(sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' <<<"$kernel_release")
+  [[ -n $kernel_base ]] || die "cannot derive the Ubuntu source version from $kernel_release"
+  source_binary="linux-source-$kernel_base"
+  printf '%s\t%s\t%s\n' "$source_binary" "$source_name" "$source_version"
+}
+
+select_install_profile() {
+  local architecture=$1
+  local kernel_release=$2
+  local release_file=${3:-/etc/nv_tegra_release}
+  local os_release_file=${4:-/etc/os-release}
+  local profile=''
+
+  profile=$(detect_profile "$architecture" "$kernel_release" "$release_file" "$os_release_file")
+  if [[ $profile == ubuntu ]] &&
+     ! (ubuntu_kernel_source_spec "$kernel_release" >/dev/null 2>&1); then
+    profile=unsupported
+  fi
+  printf '%s\n' "$profile"
+}
+
+download_ubuntu_source() {
+  local cache_root=$1
+  local kernel_release=$2
+  local source_root="$cache_root/source"
+  local package_root="$cache_root/package"
+  local source_binary=''
+  local expected_source=''
+  local source_version=''
+  local package_spec=''
+  local package_file=''
+  local actual_source=''
+  local actual_version=''
+  local source_archive=''
+  local uvc_header=''
+  local uvc_dir=''
+  local strip_components=''
+
+  require_command apt-get
+  require_command apt-cache
+  require_command dpkg-deb
+  read -r source_binary expected_source source_version < <(
+    ubuntu_kernel_source_spec "$kernel_release"
+  )
+  package_spec="$source_binary=$source_version"
+
+  if ! apt-cache show "$package_spec" >/dev/null 2>&1; then
+    log "refreshing APT metadata for $package_spec"
+    apt-get update >&2
+  fi
+  apt-cache show "$package_spec" >/dev/null 2>&1 ||
+    die "Ubuntu kernel source package is unavailable: $package_spec"
+
+  mkdir -p "$cache_root"
+  package_file=$(find "$cache_root" -maxdepth 1 -type f -name "${source_binary}_*.deb" \
+    -print -quit)
+  if [[ -z $package_file ]]; then
+    log "downloading Ubuntu kernel source package $package_spec"
+    (
+      cd "$cache_root"
+      apt-get -o APT::Sandbox::User=root download "$package_spec" >&2
+    )
+    package_file=$(find "$cache_root" -maxdepth 1 -type f -name "${source_binary}_*.deb" \
+      -print -quit)
+  fi
+  [[ -n $package_file ]] || die "Ubuntu kernel source package was not downloaded: $package_spec"
+
+  actual_source=$(dpkg-deb -f "$package_file" Source)
+  actual_version=$(dpkg-deb -f "$package_file" Version)
+  [[ ${actual_source%% *} == "$expected_source" ]] ||
+    die "Ubuntu kernel source mismatch: expected=$expected_source actual=$actual_source"
+  [[ $actual_version == "$source_version" ]] ||
+    die "Ubuntu kernel source version mismatch: expected=$source_version actual=$actual_version"
+
+  if ! find_uvc_source_dir "$source_root" >/dev/null 2>&1; then
+    rm -rf "$package_root" "$source_root"
+    mkdir -p "$package_root" "$source_root"
+    dpkg-deb -x "$package_file" "$package_root"
+    source_archive=$(find -L "$package_root/usr/src" -maxdepth 2 -type f \
+      -name 'linux-source-*.tar.*' -print -quit)
+    [[ -n $source_archive ]] ||
+      die "Ubuntu kernel source archive was not found in $package_file"
+    uvc_header=$(tar -tf "$source_archive" | \
+      grep -m1 '/drivers/media/usb/uvc/uvcvideo.h$' || true)
+    [[ -n $uvc_header ]] || die "UVC source was not found in $source_archive"
+    uvc_dir=${uvc_header%/uvcvideo.h}
+    strip_components=$(awk -F/ '{print NF}' <<<"$uvc_dir")
+    tar -xf "$source_archive" -C "$source_root" \
+      --strip-components="$strip_components" "$uvc_dir"
+    rm -rf "$package_root"
+  fi
+
+  find_uvc_source_dir "$source_root" ||
+    die "UVC source directory was not extracted from the Ubuntu source package"
+}
+
+download_r38_4_source() {
+  local cache_root=$1
+  local archive_override=${FV_UVCVIDEO_PUBLIC_SOURCES_ARCHIVE:-}
+  local archive="$cache_root/public_sources.tbz2"
+  local kernel_archive="$cache_root/kernel_src.tbz2"
+  local source_root="$cache_root/source"
+  local actual_sha=''
+
+  mkdir -p "$cache_root"
+  if [[ -n $archive_override ]]; then
+    [[ -f $archive_override ]] || die "source archive not found: $archive_override"
+    archive=$archive_override
+  elif [[ ! -f $archive ]]; then
+    require_command curl
+    log "downloading NVIDIA Jetson Linux R38.4 kernel sources"
+    curl --fail --location --retry 3 --output "$archive.part" "$NVIDIA_R38_4_SOURCE_URL"
+    mv "$archive.part" "$archive"
+  fi
+
+  actual_sha=$(sha256sum "$archive" | awk '{print $1}')
+  [[ $actual_sha == "$NVIDIA_R38_4_SOURCE_SHA256" ]] ||
+    die "NVIDIA source archive checksum mismatch: $actual_sha"
+
+  if [[ ! -f $kernel_archive ]]; then
+    tar -xOf "$archive" Linux_for_Tegra/source/kernel_src.tbz2 >"$kernel_archive.part"
+    mv "$kernel_archive.part" "$kernel_archive"
+  fi
+
+  if ! find_uvc_source_dir "$source_root" >/dev/null 2>&1; then
+    rm -rf "$source_root"
+    mkdir -p "$source_root"
+    tar -xjf "$kernel_archive" -C "$source_root" --strip-components=6 \
+      kernel/kernel-noble/drivers/media/usb/uvc
+  fi
+
+  find_uvc_source_dir "$source_root" ||
+    die "UVC source directory was not found in the NVIDIA source archive"
+}
+
+resolve_kernel_source() {
+  local requested=$1
+  local build_dir=$2
+  local profile=$3
+  local cache_root=$4
+  local source_dir=''
+
+  if [[ -n $requested ]]; then
+    source_dir=$(find_uvc_source_dir "$requested" || true)
+    [[ -n $source_dir ]] || die "UVC driver sources not found below: $requested"
+    printf '%s\n' "$source_dir"
+    return
+  fi
+
+  source_dir=$(find_uvc_source_dir "$build_dir/source" 2>/dev/null || true)
+  if [[ -z $source_dir ]]; then
+    source_dir=$(find_uvc_source_dir "$build_dir" 2>/dev/null || true)
+  fi
+  if [[ -n $source_dir ]]; then
+    printf '%s\n' "$source_dir"
+    return
+  fi
+
+  if [[ $profile == jetson-linux-r38.4 ]]; then
+    download_r38_4_source "$cache_root"
+    return
+  fi
+
+  if [[ $profile == ubuntu ]]; then
+    download_ubuntu_source "$cache_root" "$(kernel_build_release "$build_dir")"
+    return
+  fi
+
+  die "matching UVC driver sources were not found; use --kernel-source"
+}
+
+patch_uvc_source() {
+  local source_dir=$1
+  local header="$source_dir/uvcvideo.h"
+  local driver="$source_dir/uvc_driver.c"
+  local makefile="$source_dir/Makefile"
+  local definition_count=''
+  local current_value=''
+
+  definition_count=$(grep -Ec '^[[:space:]]*#define[[:space:]]+UVC_URBS[[:space:]]+[0-9]+' "$header" || true)
+  [[ $definition_count == 1 ]] ||
+    die "expected one numeric UVC_URBS definition, found $definition_count"
+  current_value=$(sed -nE 's/^[[:space:]]*#define[[:space:]]+UVC_URBS[[:space:]]+([0-9]+).*/\1/p' "$header")
+  log "patching UVC_URBS: $current_value -> $TARGET_URB_COUNT"
+  sed -Ei \
+    "s/^([[:space:]]*#define[[:space:]]+UVC_URBS[[:space:]]+)[0-9]+(.*)$/\\1${TARGET_URB_COUNT}\\2/" \
+    "$header"
+
+  if ! grep -q 'MODULE_INFO(fv_uvc_urbs' "$driver"; then
+    printf '\nMODULE_INFO(fv_uvc_urbs, "%s");\n' "$TARGET_URB_COUNT" >>"$driver"
+  fi
+
+  if grep -q '^obj-$(CONFIG_USB_VIDEO_CLASS) += uvcvideo.o$' "$makefile"; then
+    sed -i 's/^obj-$(CONFIG_USB_VIDEO_CLASS) += uvcvideo.o$/obj-m += uvcvideo.o/' "$makefile"
+  elif ! grep -q '^obj-m += uvcvideo.o$' "$makefile"; then
+    die "unsupported UVC Makefile: module target not found"
+  fi
+}
+
+reference_module_path() {
+  local kernel_release=$1
+  local candidate=''
+  while IFS= read -r candidate; do
+    printf '%s\n' "$candidate"
+    return
+  done < <(find "/lib/modules/$kernel_release/kernel" -type f \
+    \( -name 'uvcvideo.ko' -o -name 'uvcvideo.ko.xz' -o -name 'uvcvideo.ko.zst' \) \
+    2>/dev/null | sort)
+}
+
+verify_module() {
+  local module_path=$1
+  local kernel_release=$2
+  local expected_vermagic=''
+  local actual_vermagic=''
+  local reference=''
+  local metadata=''
+
+  require_command modinfo
+  actual_vermagic=$(modinfo -F vermagic "$module_path")
+  [[ ${actual_vermagic%% *} == "$kernel_release" ]] ||
+    die "module vermagic does not target $kernel_release: $actual_vermagic"
+
+  reference=$(reference_module_path "$kernel_release" || true)
+  if [[ -n $reference ]]; then
+    expected_vermagic=$(modinfo -F vermagic "$reference")
+    [[ $actual_vermagic == "$expected_vermagic" ]] ||
+      die "module vermagic mismatch: expected='$expected_vermagic' actual='$actual_vermagic'"
+  fi
+
+  metadata=$(modinfo -F fv_uvc_urbs "$module_path")
+  [[ $metadata == "$TARGET_URB_COUNT" ]] ||
+    die "module does not declare fv_uvc_urbs=$TARGET_URB_COUNT"
+
+}
+
+module_signatures_enforced() {
+  local kernel_release=$1
+  local config_file="/boot/config-$kernel_release"
+  local force_value=''
+
+  if [[ -r /proc/config.gz ]]; then
+    force_value=$(zgrep -E '^CONFIG_MODULE_SIG_FORCE=y$' /proc/config.gz || true)
+  elif [[ -r $config_file ]]; then
+    force_value=$(grep -E '^CONFIG_MODULE_SIG_FORCE=y$' "$config_file" || true)
+  fi
+  [[ -n $force_value ]] && return 0
+  grep -Eq '(^| )module\.sig_enforce=1( |$)' /proc/cmdline 2>/dev/null && return 0
+
+  if command -v mokutil >/dev/null 2>&1 &&
+     mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; then
+    return 0
+  fi
+  return 1
+}
+
+find_enrolled_mok() {
+  local pair=''
+  local key=''
+  local cert=''
+  local pairs=(
+    '/var/lib/shim-signed/mok/MOK.priv:/var/lib/shim-signed/mok/MOK.der'
+    '/var/lib/dkms/mok.key:/var/lib/dkms/mok.pub'
+  )
+
+  command -v mokutil >/dev/null 2>&1 || return 1
+  for pair in "${pairs[@]}"; do
+    key=${pair%%:*}
+    cert=${pair#*:}
+    [[ -r $key && -r $cert ]] || continue
+    if mokutil --test-key "$cert" >/dev/null 2>&1; then
+      printf '%s:%s\n' "$key" "$cert"
+      return
+    fi
+  done
+  return 1
+}
+
+sign_module_if_required() {
+  local module_path=$1
+  local build_dir=$2
+  local kernel_release=$3
+  local signing_key=$4
+  local signing_cert=$5
+  local mok_pair=''
+  local sign_file="$build_dir/scripts/sign-file"
+
+  if [[ -z $signing_key && -z $signing_cert ]] && module_signatures_enforced "$kernel_release"; then
+    mok_pair=$(find_enrolled_mok || true)
+    if [[ -n $mok_pair ]]; then
+      signing_key=${mok_pair%%:*}
+      signing_cert=${mok_pair#*:}
+      log "using the enrolled Ubuntu Machine Owner Key"
+    else
+      die "trusted module signatures are enforced and no enrolled signing key is available"
+    fi
+  fi
+
+  if [[ -z $signing_key && -z $signing_cert ]]; then
+    return
+  fi
+  [[ -n $signing_key && -n $signing_cert ]] ||
+    die "--signing-key and --signing-cert must be specified together"
+  [[ -r $signing_key ]] || die "signing key is not readable: $signing_key"
+  [[ -r $signing_cert ]] || die "signing certificate is not readable: $signing_cert"
+  [[ -x $sign_file ]] || die "kernel sign-file tool not found: $sign_file"
+
+  "$sign_file" sha512 "$signing_key" "$signing_cert" "$module_path"
+  [[ -n $(modinfo -F signer "$module_path") ]] || die "module signing did not produce a signer"
+}
+
+module_install_path() {
+  local kernel_release=$1
+  printf '/lib/modules/%s/updates/fluent-vision/uvcvideo.ko\n' "$kernel_release"
+}
+
+state_dir() {
+  local kernel_release=$1
+  printf '/var/lib/fv-uvcvideo/%s\n' "$kernel_release"
+}
+
+verify_managed_install() {
+  local destination=$1
+  local state=$2
+  local expected_sha=''
+  local actual_sha=''
+
+  [[ -f $state/installed.env ]] ||
+    die "no Fluent Vision installation record exists for $(basename "$state")"
+  [[ -f $destination ]] ||
+    die "the managed module is missing: $destination"
+  expected_sha=$(sed -n 's/^module_sha256=//p' "$state/installed.env")
+  [[ -n $expected_sha ]] || die "the installation record has no module checksum"
+  actual_sha=$(sha256sum "$destination" | awk '{print $1}')
+  [[ $actual_sha == "$expected_sha" ]] ||
+    die "the installed module changed after installation; refusing to remove it"
+}
+
+reload_module() {
+  local action=$1
+  local busy=''
+
+  if compgen -G '/dev/video*' >/dev/null && command -v fuser >/dev/null 2>&1; then
+    busy=$(fuser /dev/video* 2>/dev/null || true)
+  fi
+  if [[ -n $busy ]]; then
+    warn "uvcvideo was $action, but camera devices are busy; reboot or reload it later"
+    return
+  fi
+
+  if [[ -d /sys/module/uvcvideo ]]; then
+    modprobe -r uvcvideo || die "failed to unload uvcvideo"
+  fi
+  modprobe uvcvideo || die "failed to load uvcvideo"
+  log "uvcvideo reloaded"
+}
+
+install_module() {
+  local kernel_release=$1
+  local module_path=$2
+  local profile=$3
+  local source_value=$4
+  local build_value=$5
+  local reload=$6
+  local destination=''
+  local state=''
+  local backup=''
+
+  require_root
+  destination=$(module_install_path "$kernel_release")
+  state=$(state_dir "$kernel_release")
+  backup="$state/replaced-uvcvideo.ko"
+  mkdir -p "$(dirname "$destination")" "$state"
+
+  if [[ -f $destination && ! -f $state/installed.env ]]; then
+    cp -a "$destination" "$backup"
+    log "preserved the existing override at $backup"
+  fi
+
+  install -m 0644 "$module_path" "$destination.new"
+  mv "$destination.new" "$destination"
+  depmod -a "$kernel_release"
+
+  {
+    printf 'tool_version=%s\n' "$TOOL_VERSION"
+    printf 'kernel_release=%s\n' "$kernel_release"
+    printf 'profile=%s\n' "$profile"
+    printf 'urb_count=%s\n' "$TARGET_URB_COUNT"
+    printf 'source=%s\n' "$source_value"
+    printf 'build=%s\n' "$build_value"
+    printf 'module_sha256=%s\n' "$(sha256sum "$destination" | awk '{print $1}')"
+  } >"$state/installed.env"
+
+  log "installed $destination"
+  if [[ $reload == true ]]; then
+    reload_module installed
+  elif [[ -d /sys/module/uvcvideo ]]; then
+    warn "uvcvideo is already loaded; reboot or run install again with --reload"
+  fi
+}
+
+status_command() {
+  local kernel_release=$1
+  local destination=''
+  local selected=''
+  local metadata=''
+  local signer=''
+  local loaded='no'
+
+  destination=$(module_install_path "$kernel_release")
+  selected=$(modinfo -k "$kernel_release" -n uvcvideo 2>/dev/null || true)
+  if [[ $kernel_release != "$(uname -r)" ]]; then
+    loaded='not running'
+  elif [[ -d /sys/module/uvcvideo ]]; then
+    loaded='yes'
+  fi
+  if [[ -f $destination ]]; then
+    metadata=$(modinfo -F fv_uvc_urbs "$destination" 2>/dev/null || true)
+    signer=$(modinfo -F signer "$destination" 2>/dev/null || true)
+  fi
+
+  printf 'kernel: %s\n' "$kernel_release"
+  printf 'selected module: %s\n' "${selected:-not found}"
+  printf 'loaded: %s\n' "$loaded"
+  if [[ $metadata == "$TARGET_URB_COUNT" ]]; then
+    printf 'Fluent Vision override: installed\n'
+    printf 'UVC URBs: %s\n' "$metadata"
+    printf 'signer: %s\n' "${signer:-unsigned}"
+  elif [[ $selected == /lib/modules/"$kernel_release"/kernel/* ]]; then
+    printf 'Fluent Vision override: not installed\n'
+    printf 'UVC URBs: distribution default\n'
+  elif [[ -n $selected ]]; then
+    printf 'Fluent Vision override: not installed\n'
+    printf 'external override: detected\n'
+    printf 'UVC URBs: unknown\n'
+  else
+    printf 'Fluent Vision override: not installed\n'
+    printf 'UVC URBs: unavailable\n'
+  fi
+}
+
+uninstall_command() {
+  local kernel_release=$1
+  local reload=$2
+  local destination=''
+  local state=''
+  local backup=''
+
+  require_root
+  destination=$(module_install_path "$kernel_release")
+  state=$(state_dir "$kernel_release")
+  backup="$state/replaced-uvcvideo.ko"
+  verify_managed_install "$destination" "$state"
+
+  if [[ -f $backup ]]; then
+    mkdir -p "$(dirname "$destination")"
+    mv "$backup" "$destination"
+    log "restored the module that existed before installation"
+  else
+    rm -f "$destination"
+    log "removed the Fluent Vision override"
+  fi
+  rm -f "$state/installed.env"
+  rmdir "$state" 2>/dev/null || true
+  depmod -a "$kernel_release"
+
+  if [[ $reload == true ]]; then
+    reload_module uninstalled
+  elif [[ -d /sys/module/uvcvideo ]]; then
+    warn "uvcvideo is already loaded; reboot or run uninstall again with --reload"
+  fi
+}
+
+install_command() {
+  local allow_unsupported=false
+  local kernel_build=''
+  local kernel_source=''
+  local kernel_release
+  local signing_key=''
+  local signing_cert=''
+  local reload=false
+  local architecture=''
+  local profile=''
+  local resolved_build=''
+  local resolved_source=''
+  local cache_root=''
+  local work_dir=''
+  local built_module=''
+
+  kernel_release=$(uname -r)
+  while (($#)); do
+    case $1 in
+      --allow-unsupported) allow_unsupported=true ;;
+      --kernel-build) shift; [[ $# -gt 0 ]] || die "--kernel-build requires a path"; kernel_build=$1 ;;
+      --kernel-source) shift; [[ $# -gt 0 ]] || die "--kernel-source requires a path"; kernel_source=$1 ;;
+      --kernel-release) shift; [[ $# -gt 0 ]] || die "--kernel-release requires a value"; kernel_release=$1 ;;
+      --signing-key) shift; [[ $# -gt 0 ]] || die "--signing-key requires a path"; signing_key=$1 ;;
+      --signing-cert) shift; [[ $# -gt 0 ]] || die "--signing-cert requires a path"; signing_cert=$1 ;;
+      --reload) reload=true ;;
+      -h|--help) usage; return ;;
+      *) die "unknown install option: $1" ;;
+    esac
+    shift
+  done
+
+  require_root
+  require_command make
+  require_command sha256sum
+  require_command tar
+  require_command modinfo
+  require_command modprobe
+  require_command depmod
+
+  architecture=$(uname -m)
+  profile=$(select_install_profile "$architecture" "$kernel_release")
+  if [[ $profile == unsupported && $allow_unsupported != true ]]; then
+    confirm_unsupported "$architecture" "$kernel_release" || die "installation cancelled"
+  fi
+
+  cache_root="/var/cache/fv-uvcvideo/$profile/$kernel_release"
+  resolved_build=$(resolve_kernel_build "$kernel_build" "$kernel_release" "$profile")
+  resolved_source=$(resolve_kernel_source "$kernel_source" "$resolved_build" "$profile" "$cache_root")
+
+  work_dir=$(mktemp -d "/tmp/fv-uvcvideo.${kernel_release}.XXXXXX")
+  trap 'rm -rf "${work_dir:-}"' RETURN
+  mkdir -p "$work_dir/source"
+  cp -a "$resolved_source/." "$work_dir/source/"
+  patch_uvc_source "$work_dir/source"
+
+  log "building uvcvideo for $kernel_release"
+  make -C "$resolved_build" M="$work_dir/source" modules -j"$(nproc)"
+  built_module="$work_dir/source/uvcvideo.ko"
+  [[ -f $built_module ]] || die "uvcvideo build completed without producing uvcvideo.ko"
+  verify_module "$built_module" "$kernel_release"
+  sign_module_if_required \
+    "$built_module" "$resolved_build" "$kernel_release" "$signing_key" "$signing_cert"
+  verify_module "$built_module" "$kernel_release"
+  install_module \
+    "$kernel_release" "$built_module" "$profile" "$resolved_source" "$resolved_build" "$reload"
+  rm -rf "$work_dir"
+  trap - RETURN
+}
+
+main() {
+  local command=${1:-}
+  local kernel_release
+  local reload=false
+
+  [[ -n $command ]] || { usage; exit 1; }
+  shift
+  case $command in
+    install)
+      install_command "$@"
+      ;;
+    status)
+      kernel_release=$(uname -r)
+      while (($#)); do
+        case $1 in
+          --kernel-release) shift; [[ $# -gt 0 ]] || die "--kernel-release requires a value"; kernel_release=$1 ;;
+          -h|--help) usage; return ;;
+          *) die "unknown status option: $1" ;;
+        esac
+        shift
+      done
+      status_command "$kernel_release"
+      ;;
+    uninstall)
+      kernel_release=$(uname -r)
+      while (($#)); do
+        case $1 in
+          --kernel-release) shift; [[ $# -gt 0 ]] || die "--kernel-release requires a value"; kernel_release=$1 ;;
+          --reload) reload=true ;;
+          -h|--help) usage; return ;;
+          *) die "unknown uninstall option: $1" ;;
+        esac
+        shift
+      done
+      uninstall_command "$kernel_release" "$reload"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
