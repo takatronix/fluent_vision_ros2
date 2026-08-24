@@ -27,6 +27,7 @@ find_package(rclcpp REQUIRED)                         # ROS2 C++クライアン�
 find_package(sensor_msgs REQUIRED)                    # センサーメッセージ型
 find_package(cv_bridge REQUIRED)                      # OpenCV-ROS2橋渡し
 find_package(tf2_ros REQUIRED)                        # TF2 ROS2統合
+find_package(fv_ros_io REQUIRED)                      # ROS I/O CPU affinity
 find_package(PkgConfig REQUIRED)                      # pkg-config
 
 # RealSense SDKの検索（複数の方法を試す）
@@ -187,6 +188,7 @@ ament_target_dependencies(fv_realsense_node
   geometry_msgs             # 幾何学メッセージ型
   std_srvs                  # 標準サービス型
   fluent_lib                # Fluent Lib
+  fv_ros_io                 # ROS I/O CPU affinity
 )
 
 target_link_libraries(fv_realsense_node
@@ -246,6 +248,7 @@ ament_export_dependencies(
   rclcpp
   sensor_msgs
   geometry_msgs
+  fv_ros_io
   rosidl_default_runtime
 )
 ament_export_include_directories(include)

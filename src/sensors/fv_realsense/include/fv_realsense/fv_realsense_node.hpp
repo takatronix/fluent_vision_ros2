@@ -25,6 +25,8 @@
 #include <condition_variable>
 #include <deque>
 #include <chrono>
+#include <future>
+#include <thread>
 
 // Include service headers
 #include "fv_realsense/srv/get_distance.hpp"
@@ -210,6 +212,7 @@ private:
 
     // Threading
     std::thread processing_thread_;
+    std::thread publisher_thread_;
     std::atomic<bool> running_;
     std::mutex frame_mutex_;
     // Guard any calls into rs2::pipeline (not thread-safe across callbacks/services)
@@ -229,6 +232,31 @@ private:
     std::atomic<int64_t> last_paired_publish_ns_{0};
     std::atomic<uint64_t> dropped_color_frames_{0};
     std::atomic<uint64_t> dropped_depth_frames_{0};
+
+    struct PublishBundle {
+        std::unique_ptr<sensor_msgs::msg::Image> color;
+        std::unique_ptr<sensor_msgs::msg::CompressedImage> color_compressed;
+        std::unique_ptr<sensor_msgs::msg::Image> depth;
+        std::unique_ptr<sensor_msgs::msg::Image> depth_roi;
+        std::unique_ptr<sensor_msgs::msg::Image> depth_colormap;
+        std::unique_ptr<sensor_msgs::msg::PointCloud2> registered_points;
+        std::unique_ptr<sensor_msgs::msg::PointCloud2> pointcloud;
+        std::unique_ptr<sensor_msgs::msg::CameraInfo> color_info;
+        std::unique_ptr<sensor_msgs::msg::CameraInfo> depth_info;
+        std::unique_ptr<sensor_msgs::msg::CameraInfo> depth_roi_info;
+
+        bool empty() const
+        {
+            return !color && !color_compressed && !depth && !depth_roi &&
+                !depth_colormap && !registered_points && !pointcloud &&
+                !color_info && !depth_info && !depth_roi_info;
+        }
+    };
+    static constexpr std::size_t kPublishQueueCapacity = 1;
+    std::mutex publish_mutex_;
+    std::condition_variable publish_cv_;
+    std::deque<PublishBundle> publish_queue_;
+    std::atomic<uint64_t> dropped_publish_bundles_{0};
 
     // Cache of latest frames for service-safe access (avoid per-frame cv::Mat clones)
     std::mutex latest_frame_mutex_;
@@ -299,10 +327,18 @@ private:
     void initializePublishers();
     void initializeServices();
     void initializeTF();
+    void startPublisherThread();
+    void publisherLoop();
+    void enqueuePublishBundle(PublishBundle&& bundle);
     void processingLoop();
     rclcpp::Time stampFromDeviceTime(const rs2::frame& frame, double device_ts_ms);
-    void publishFrames(const rs2::frame& color_frame, const rs2::frame& depth_frame, const rclcpp::Time& stamp);
-    void publishPointCloud(const rs2::frame& color_frame, const rs2::frame& depth_frame);
+    void queueFramesForPublish(
+        const rs2::frame& color_frame,
+        const rs2::frame& depth_frame,
+        const rclcpp::Time& stamp);
+    std::unique_ptr<sensor_msgs::msg::PointCloud2> buildPointCloud(
+        const rs2::frame& color_frame,
+        const rs2::frame& depth_frame);
     // depth_roi_config_ と depth 内部パラメータから切り出し矩形を決める。
     // 画像内へクランプ済みなので、返り値はそのまま cv::Mat の部分行列に使える。
     cv::Rect resolveDepthRoi() const;

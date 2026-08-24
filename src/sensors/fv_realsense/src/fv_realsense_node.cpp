@@ -11,6 +11,7 @@
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
 #include "fv_realsense/srv/set_mode.hpp"
+#include "fv_ros_io/thread_affinity.hpp"
 // #include "fv_realsense/srv/generate_point_cloud.hpp"  // Removed: service deleted
 
 #include <pcl_conversions/pcl_conversions.h>
@@ -21,10 +22,15 @@
 #include <rclcpp/qos.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <pthread.h>
+#include <sched.h>
+#include <stdexcept>
 #include <thread>
 
 /**
@@ -73,9 +79,13 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
         RCLCPP_INFO(this->get_logger(), "🔄 Step 5: Initializing TF...");
         initializeTF();
         
-        // ===== Step 6: 処理スレッドの開始 =====
-        RCLCPP_INFO(this->get_logger(), "🔄 Step 6: Starting processing thread...");
+        // ===== Step 6: ROS I/O publishスレッドの開始 =====
         running_ = true;
+        RCLCPP_INFO(this->get_logger(), "🔄 Step 6: Starting ROS I/O publisher thread...");
+        startPublisherThread();
+
+        // ===== Step 7: 処理スレッドの開始 =====
+        RCLCPP_INFO(this->get_logger(), "🔄 Step 7: Starting processing thread...");
         processing_thread_ = std::thread(&FVDepthCameraNode::processingLoop, this);
         
         RCLCPP_INFO(this->get_logger(), "✅ FV Depth Camera started successfully");
@@ -109,18 +119,33 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
                     const long depth_stall_ms = (last_depth_ns > 0) ? long((now_ns - last_depth_ns) / 1000000) : -1;
 
                     RCLCPP_INFO(this->get_logger(),
-                                "📈 Stats(%dms): cb(color=%lu depth=%lu) pub(color=%lu depth=%lu) dropped(color=%lu depth=%lu) stall_ms(color=%ld depth=%ld)",
+                                "📈 Stats(%dms): cb(color=%lu depth=%lu) pub(color=%lu depth=%lu) dropped(color=%lu depth=%lu publish_bundle=%lu) stall_ms(color=%ld depth=%ld)",
                                 period_ms,
                                 (unsigned long)dc_cb, (unsigned long)dd_cb,
                                 (unsigned long)dc_pub, (unsigned long)dd_pub,
                                 (unsigned long)dropped_color_frames_.load(std::memory_order_relaxed),
                                 (unsigned long)dropped_depth_frames_.load(std::memory_order_relaxed),
+                                (unsigned long)dropped_publish_bundles_.load(std::memory_order_relaxed),
                                 color_stall_ms, depth_stall_ms);
                 });
         }
         
     } catch (const std::exception& e) {
         RCLCPP_ERROR(this->get_logger(), "❌ Exception during initialization: %s", e.what());
+        running_ = false;
+        sync_cv_.notify_all();
+        publish_cv_.notify_all();
+        try {
+            stopSensors();
+        } catch (...) {
+        }
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
+        }
+        if (publisher_thread_.joinable()) {
+            publisher_thread_.join();
+        }
+        throw;
     }
 }
 
@@ -139,6 +164,8 @@ FVDepthCameraNode::~FVDepthCameraNode()
     
     // ===== 処理スレッドの停止 =====
     running_ = false;
+    sync_cv_.notify_all();
+    publish_cv_.notify_all();
     // Stop sensors to release USB resources quickly
     try {
         stopSensors();
@@ -146,6 +173,10 @@ FVDepthCameraNode::~FVDepthCameraNode()
     }
     if (processing_thread_.joinable()) {
         processing_thread_.join();
+    }
+    publish_cv_.notify_all();
+    if (publisher_thread_.joinable()) {
+        publisher_thread_.join();
     }
 }
 
@@ -1086,6 +1117,141 @@ void FVDepthCameraNode::initializeSubscribers()
     RCLCPP_INFO(this->get_logger(), "🖱️ Click event subscriber initialized");
 }
 
+void FVDepthCameraNode::startPublisherThread()
+{
+    auto ready = std::make_shared<std::promise<void>>();
+    std::future<void> ready_future = ready->get_future();
+    publisher_thread_ = std::thread([this, ready]() {
+        bool ready_notified = false;
+        try {
+            const int name_result = pthread_setname_np(pthread_self(), "fv_rs_pub");
+            if (name_result != 0) {
+                throw std::runtime_error(
+                    std::string("pthread_setname_np failed: ") + std::strerror(name_result));
+            }
+            fv::ros_io::bind_current_thread();
+            const int cpu = sched_getcpu();
+            if (cpu < 0) {
+                throw std::runtime_error(
+                    std::string("sched_getcpu failed: ") + std::strerror(errno));
+            }
+            ready->set_value();
+            ready_notified = true;
+            RCLCPP_INFO(this->get_logger(), "ROS I/O publisher thread bound to CPU %d", cpu);
+            publisherLoop();
+        } catch (...) {
+            if (!ready_notified) {
+                ready->set_exception(std::current_exception());
+                return;
+            }
+
+            try {
+                throw;
+            } catch (const std::exception& error) {
+                exitForSupervisedRestart(
+                    std::string("ROS I/O publisher thread failed: ") + error.what());
+            }
+        }
+    });
+    ready_future.get();
+}
+
+void FVDepthCameraNode::publisherLoop()
+{
+    RCLCPP_INFO(this->get_logger(), "ROS I/O publisher thread is ready");
+    uint64_t debug_count = 0;
+
+    while (true) {
+        PublishBundle bundle;
+        {
+            std::unique_lock<std::mutex> lock(publish_mutex_);
+            publish_cv_.wait(lock, [this]() {
+                return !running_.load(std::memory_order_relaxed) || !publish_queue_.empty();
+            });
+            if (publish_queue_.empty()) {
+                if (!running_.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                continue;
+            }
+            bundle = std::move(publish_queue_.front());
+            publish_queue_.pop_front();
+        }
+
+        bool published = false;
+        if (bundle.color) {
+            color_pub_->publish(std::move(bundle.color));
+            color_pub_count_.fetch_add(1, std::memory_order_relaxed);
+            published = true;
+        }
+        if (bundle.color_compressed) {
+            color_compressed_pub_->publish(std::move(bundle.color_compressed));
+            published = true;
+        }
+        if (bundle.depth) {
+            depth_pub_->publish(std::move(bundle.depth));
+            depth_pub_count_.fetch_add(1, std::memory_order_relaxed);
+            published = true;
+        }
+        if (bundle.depth_roi) {
+            depth_roi_pub_->publish(std::move(bundle.depth_roi));
+            published = true;
+        }
+        if (bundle.depth_colormap) {
+            depth_colormap_pub_->publish(std::move(bundle.depth_colormap));
+            published = true;
+        }
+        if (bundle.registered_points) {
+            registered_points_pub_->publish(std::move(bundle.registered_points));
+            published = true;
+        }
+        if (bundle.pointcloud) {
+            pointcloud_pub_->publish(std::move(bundle.pointcloud));
+            published = true;
+        }
+        if (bundle.color_info) {
+            color_info_pub_->publish(std::move(bundle.color_info));
+            published = true;
+        }
+        if (bundle.depth_info) {
+            depth_info_pub_->publish(std::move(bundle.depth_info));
+            published = true;
+        }
+        if (bundle.depth_roi_info) {
+            depth_roi_info_pub_->publish(std::move(bundle.depth_roi_info));
+            published = true;
+        }
+
+        if (published) {
+            last_paired_publish_ns_.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
+            if (++debug_count % 30 == 0) {
+                RCLCPP_DEBUG(this->get_logger(), "ROS I/O publisher sent %lu bundles",
+                    static_cast<unsigned long>(debug_count));
+            }
+        }
+    }
+}
+
+void FVDepthCameraNode::enqueuePublishBundle(PublishBundle&& bundle)
+{
+    if (bundle.empty()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(publish_mutex_);
+        if (publish_queue_.size() == kPublishQueueCapacity) {
+            publish_queue_.pop_front();
+            dropped_publish_bundles_.fetch_add(1, std::memory_order_relaxed);
+        }
+        publish_queue_.push_back(std::move(bundle));
+    }
+    publish_cv_.notify_one();
+}
+
 void FVDepthCameraNode::processingLoop()
 {
     RCLCPP_INFO(this->get_logger(), "🔄 Starting processing loop...");
@@ -1153,12 +1319,8 @@ void FVDepthCameraNode::processingLoop()
 
                     frame_count++;
                     const rclcpp::Time stamp = stampFromDeviceTime(color_item.frame, color_item.ts_ms);
-                    publishFrames(color_item.frame, rs2::frame(), stamp);
+                    queueFramesForPublish(color_item.frame, rs2::frame(), stamp);
                     color_pub_count++;
-                    last_paired_publish_ns_.store(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()).count(),
-                        std::memory_order_relaxed);
 
                     auto now = std::chrono::steady_clock::now();
                     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
@@ -1259,23 +1421,18 @@ void FVDepthCameraNode::processingLoop()
                     frame_count++;
                     if (got_color && got_depth && stream_config_.color_enabled && stream_config_.depth_enabled) {
                         const rclcpp::Time stamp = stampFromDeviceTime(color_item.frame, color_item.ts_ms);
-                        publishFrames(color_item.frame, depth_item.frame, stamp);
+                        queueFramesForPublish(color_item.frame, depth_item.frame, stamp);
                         color_pub_count++;
                         depth_pub_count++;
                     } else if (got_color && stream_config_.color_enabled) {
                         const rclcpp::Time cstamp = stampFromDeviceTime(color_item.frame, color_item.ts_ms);
-                        publishFrames(color_item.frame, rs2::frame(), cstamp);
+                        queueFramesForPublish(color_item.frame, rs2::frame(), cstamp);
                         color_pub_count++;
                     } else if (got_depth && stream_config_.depth_enabled) {
                         const rclcpp::Time dstamp = stampFromDeviceTime(depth_item.frame, depth_item.ts_ms);
-                        publishFrames(rs2::frame(), depth_item.frame, dstamp);
+                        queueFramesForPublish(rs2::frame(), depth_item.frame, dstamp);
                         depth_pub_count++;
                     }
-                    last_paired_publish_ns_.store(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()).count(),
-                        std::memory_order_relaxed);
-
                     auto now = std::chrono::steady_clock::now();
                     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
                         const auto dropped_c = dropped_color_frames_.load(std::memory_order_relaxed);
@@ -1391,11 +1548,13 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
     return stamp;
 }
 
-void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::frame& depth_frame, const rclcpp::Time& stamp)
+void FVDepthCameraNode::queueFramesForPublish(
+    const rs2::frame& color_frame,
+    const rs2::frame& depth_frame,
+    const rclcpp::Time& stamp)
 {
     const rclcpp::Time now = stamp;
-    static int publish_count = 0;
-    static auto last_publish_log = std::chrono::steady_clock::now();
+    PublishBundle bundle;
     
     int current_mode = current_mode_.load();
     
@@ -1431,16 +1590,6 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
         auto color_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", bgr_image).toImageMsg();
         color_msg->header.stamp = now;
         color_msg->header.frame_id = tf_config_.color_optical_frame;
-        color_pub_->publish(*color_msg);
-        color_pub_count_.fetch_add(1, std::memory_order_relaxed);
-        publish_count++;
-        
-        // Debug: Check if actually published
-        static int debug_count = 0;
-        if (++debug_count % 30 == 0) {  // Log every 30 frames (1 second)
-            RCLCPP_DEBUG(this->get_logger(), "🔍 Published color image to topic: %s", 
-                topic_config_.color.c_str());
-        }
         
         // Publish compressed color
         if (camera_info_config_.enable_compressed_topics && color_compressed_pub_) {
@@ -1456,8 +1605,10 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
             
             cv::imencode(".jpg", bgr_image, compressed_msg->data, compression_params);
             
-            color_compressed_pub_->publish(std::move(compressed_msg));
+            bundle.color_compressed = std::move(compressed_msg);
         }
+
+        bundle.color = std::make_unique<sensor_msgs::msg::Image>(std::move(*color_msg));
 
         if (cache_latest_frames_enabled_) {
             try {
@@ -1484,8 +1635,7 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
             auto depth_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "16UC1", depth_image).toImageMsg();
             depth_msg->header.stamp = now;
             depth_msg->header.frame_id = tf_config_.depth_optical_frame;
-            depth_pub_->publish(*depth_msg);
-            depth_pub_count_.fetch_add(1, std::memory_order_relaxed);
+            bundle.depth = std::make_unique<sensor_msgs::msg::Image>(std::move(*depth_msg));
         }
 
         // ROI (小窓) — フル解像度を要らない購読者のための別トピック。
@@ -1496,7 +1646,7 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
                                               depth_image(roi).clone()).toImageMsg();
             roi_msg->header.stamp = now;
             roi_msg->header.frame_id = tf_config_.depth_optical_frame;
-            depth_roi_pub_->publish(*roi_msg);
+            bundle.depth_roi = std::make_unique<sensor_msgs::msg::Image>(std::move(*roi_msg));
         }
 
         if (cache_latest_frames_enabled_) {
@@ -1517,7 +1667,7 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
         auto colormap_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", colormap).toImageMsg();
         colormap_msg->header.stamp = now;
         colormap_msg->header.frame_id = tf_config_.depth_optical_frame;
-        depth_colormap_pub_->publish(*colormap_msg);
+        bundle.depth_colormap = std::make_unique<sensor_msgs::msg::Image>(std::move(*colormap_msg));
     }
 
     // Publish organized registered_points (optional)
@@ -1589,7 +1739,8 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
                     dst += point_step;
                 }
             }
-            registered_points_pub_->publish(cloud_msg);
+            bundle.registered_points =
+                std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(cloud_msg));
             } catch (const std::exception& e) {
                 RCLCPP_WARN(this->get_logger(), "organized cloud publish failed: %s", e.what());
             }
@@ -1626,7 +1777,8 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
                 color_info.d[i] = color_intrinsics_.coeffs[i];
             }
             
-            color_info_pub_->publish(color_info);
+            bundle.color_info =
+                std::make_unique<sensor_msgs::msg::CameraInfo>(std::move(color_info));
         }
         
         if (depth_info_pub_ && depth_frame) {
@@ -1657,7 +1809,8 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
                 depth_info.d[i] = depth_intrinsics_.coeffs[i];
             }
             
-            depth_info_pub_->publish(depth_info);
+            bundle.depth_info =
+                std::make_unique<sensor_msgs::msg::CameraInfo>(std::move(depth_info));
         }
 
         // ROI 用 CameraInfo — 小画像そのものの内部パラメータ。
@@ -1693,22 +1846,17 @@ void FVDepthCameraNode::publishFrames(const rs2::frame& color_frame, const rs2::
                 roi_info.d[i] = depth_intrinsics_.coeffs[i];
             }
 
-            depth_roi_info_pub_->publish(roi_info);
+            bundle.depth_roi_info =
+                std::make_unique<sensor_msgs::msg::CameraInfo>(std::move(roi_info));
         }
     }
 
     // Optional point cloud (requires both frames)
     if (current_mode == 2 && stream_config_.pointcloud_enabled && color_frame && depth_frame) {
-        publishPointCloud(color_frame, depth_frame);
+        bundle.pointcloud = buildPointCloud(color_frame, depth_frame);
     }
-    
-    // Log publishing status
-    auto current_time = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::seconds>(current_time - last_publish_log).count() >= 1) {
-        RCLCPP_DEBUG(this->get_logger(), "📤 Published %d frames in last second", publish_count);
-        publish_count = 0;
-        last_publish_log = current_time;
-    }
+
+    enqueuePublishBundle(std::move(bundle));
 }
 void FVDepthCameraNode::drawHUD(cv::Mat& frame) const
 {
@@ -1740,21 +1888,23 @@ cv::Rect FVDepthCameraNode::resolveDepthRoi() const
     return cv::Rect(x, y, w, h);
 }
 
-void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const rs2::frame& depth_frame)
+std::unique_ptr<sensor_msgs::msg::PointCloud2> FVDepthCameraNode::buildPointCloud(
+    const rs2::frame& color_frame,
+    const rs2::frame& depth_frame)
 {
-    RCLCPP_DEBUG(this->get_logger(), "🔍 publishPointCloud called");
+    RCLCPP_DEBUG(this->get_logger(), "🔍 buildPointCloud called");
     
     // Point cloud requires both color and depth frames
     if (!color_frame || !depth_frame) {
         RCLCPP_WARN(this->get_logger(), "⚠️ Missing frames - color: %s, depth: %s", 
             color_frame ? "✅" : "❌", depth_frame ? "✅" : "❌");
-        return;
+        return nullptr;
     }
     
     // Check if publisher is valid
     if (!pointcloud_pub_) {
         RCLCPP_ERROR(this->get_logger(), "❌ Point cloud publisher is null!");
-        return;
+        return nullptr;
     }
     
     // Check publisher status
@@ -1812,15 +1962,11 @@ void FVDepthCameraNode::publishPointCloud(const rs2::frame& color_frame, const r
     cloud.height = 1;
     cloud.is_dense = false;
     
-    // Publish
-    sensor_msgs::msg::PointCloud2 cloud_msg;
-    pcl::toROSMsg(cloud, cloud_msg);
-    cloud_msg.header.stamp = rclcpp::Clock(RCL_SYSTEM_TIME).now();
-    cloud_msg.header.frame_id = tf_config_.color_optical_frame;
-    
-    RCLCPP_DEBUG(this->get_logger(), "📤 Publishing point cloud with %zu points", cloud.points.size());
-    pointcloud_pub_->publish(cloud_msg);
-    RCLCPP_DEBUG(this->get_logger(), "✅ Point cloud published successfully");
+    auto cloud_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(cloud, *cloud_msg);
+    cloud_msg->header.stamp = rclcpp::Clock(RCL_SYSTEM_TIME).now();
+    cloud_msg->header.frame_id = tf_config_.color_optical_frame;
+    return cloud_msg;
 }
 
 cv::Mat FVDepthCameraNode::createDepthColormap(const rs2::frame& depth_frame)
