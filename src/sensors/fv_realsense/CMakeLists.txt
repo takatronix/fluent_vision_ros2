@@ -230,6 +230,11 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}  # インストール先：share/fv_realsense/
 )
 
+install(PROGRAMS
+  scripts/fv-uvcvideo
+  DESTINATION bin
+)
+
 # ヘッダーファイルのインストール
 install(DIRECTORY include/
   DESTINATION include/       # インストール先：include/
@@ -239,6 +244,11 @@ install(DIRECTORY include/
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)                    # 自動リントツール
   ament_lint_auto_find_test_dependencies()                  # テスト依存関係検索
+
+  add_test(
+    NAME test_fv_uvcvideo
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_fv_uvcvideo.sh
+  )
 endif()
 
 # ===== パッケージエクスポート設定 =====
