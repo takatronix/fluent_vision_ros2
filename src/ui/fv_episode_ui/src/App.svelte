@@ -1801,9 +1801,9 @@
                 <td class="px-2 py-2.5 text-right whitespace-nowrap">
                   <button
                     onclick={(e) => openDist(row.batchId, e)}
-                    class="opacity-0 group-hover:opacity-100 text-(--color-text-mute) hover:text-(--color-accent) transition p-1 rounded hover:bg-cyan-500/10 mr-1"
-                    title="分布ビュー — 経路の多様性を重ね描き">
-                    🗺
+                    class="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-cyan-500/40 text-cyan-300 text-[11px] hover:bg-cyan-500/10 transition mr-2 align-middle"
+                    title="バッチ内全エピソードの TCP 経路を 3D で重ね描き (多様性の確認)">
+                    🗺 分布
                   </button>
                   <button
                     onclick={(e) => togglePinBatch(row.batchId, row.eps, e)}
