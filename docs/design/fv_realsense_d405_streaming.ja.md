@@ -42,8 +42,28 @@ flowchart TD
 - **互換性検証**：生成モジュールのreleaseおよび完全な`vermagic`を、対象カーネルと標準モジュールに照合する。
 - **既存override**：導入先に別モジュールがある場合は退避し、uninstall時に復元する。
 - **署名**：署名強制時は登録済みUbuntu MOKまたは明示された鍵と証明書を使用する。
+- **導入記録の先行書込**：`/var/lib/fv-uvcvideo/<release>/installed.env`をモジュール設置より先に書く。設置・`depmod`・選択確認のいずれかが失敗した場合は、退避したoverrideの復元、記録の削除、`depmod`の再実行で導入前の状態へ戻す。強制終了で記録だけが残った場合も`uninstall`で回収できる。
+- **選択確認**：`depmod`後に`modinfo -k <release> -n uvcvideo`が設置先を指すことを確認する。`updates/dkms/`などの別overrideが探索順で優先される場合は成功と報告せず、巻き戻して終了する。
+- **`--kernel-release`の検証**：値は`/lib/modules/<release>/`と`/var/lib/fv-uvcvideo/<release>/`へ埋め込むため、英数字で始まり`[A-Za-z0-9._+-]`のみからなる単一path componentに限定する（`..`や`/`を含む値は拒否）。
+- **metadataの根拠**：`UVC_URBS`の置換後にヘッダを再読取りし、値が32であることを確認してから`MODULE_INFO(fv_uvc_urbs, "32")`を追記する。`modinfo -F fv_uvc_urbs`はビルド入力の証明になる。
 
 通常Ubuntuでは、実行中カーネルのパッケージに対応する正確なsource versionを選び、別バージョンの`linux-source`を流用しない。
+
+### 環境ごとのprofile
+
+`detect_profile`が返すprofileと、その環境での動作は次のとおり。
+
+| 環境 | profile | 動作 |
+|---|---|---|
+| Jetson Linux R38.4（`6.8.12-tegra*`, aarch64） | `jetson-linux-r38.4` | NVIDIA公式`public_sources.tbz2`をSHA256検証して取得し、自動でビルドする（実機検証済み） |
+| Ubuntu 24.04 / 26.04の配布カーネル（`linux-generic`等、x86_64 / aarch64） | `ubuntu` | `linux-headers-<release>`と同一versionの`linux-source`をAPTで解決する |
+| Ubuntuの派生カーネル（`-aws` / `-oem` / HWE等、`linux-source`のversionが一致しない） | `ubuntu` → 取得失敗 | `linux-source`のversion不一致を検出して停止する。`--kernel-source`で一致するsource treeを指定する |
+| Jetson Linux R38.4以外のL4T（R38.2 / R39.x等） | `unsupported` | `[y/N]`確認（非対話では`--allow-unsupported`）の上、`--kernel-build`と`--kernel-source`で実行中kernelと一致するtreeを指定する。NVIDIA公式ソースの自動取得は行わない |
+| その他（Debian等） | `unsupported` | 同上 |
+
+`unsupported`環境でもvermagic、`Module.symvers`、kernel releaseの検証は同じ厳密さで行うため、一致するsourceを用意すれば導入できる。
+
+ノード本体（`fv_realsense`）とDDS socket buffer設定はカーネルモジュールに依存せず、`fv-uvcvideo`を導入しない環境でも配布`uvcvideo`のまま動作する。
 
 ## ノード内部の処理
 

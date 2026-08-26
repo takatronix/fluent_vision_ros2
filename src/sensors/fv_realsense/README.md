@@ -85,6 +85,16 @@ D405の欠番改善を実機で確認した環境はJetson Linux R38.4です。
 
 非対話環境から未検証の構成を試す場合は、`--allow-unsupported`を明示します。
 
+Jetson Linux R38.4以外のL4T（R38.2、R39.xなど）や、`linux-source`のversionが一致しない派生カーネル（`-aws`、`-oem`など）では、実行中カーネルと一致するbuild treeとUVCソースを明示します。
+
+```bash
+sudo fv-uvcvideo install --allow-unsupported \
+    --kernel-build /usr/src/linux-headers-$(uname -r) \
+    --kernel-source /path/to/kernel-source --reload
+```
+
+導入は失敗時に自動で巻き戻ります（退避したoverrideの復元、導入記録の削除、`depmod`）。導入後は`depmod`が本モジュールを選択したことを`modinfo -n`で確認し、別のoverrideが優先される場合はエラーになります。
+
 元のモジュールへ戻す場合は、次を実行します。
 
 ```bash
