@@ -79,12 +79,13 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
         
         // ===== Step 6: ROS I/O publishスレッドの開始 =====
         running_ = true;
-        RCLCPP_INFO(this->get_logger(), "🔄 Step 6: Starting ROS I/O publisher thread...");
-        startPublisherThread();
+        RCLCPP_INFO(this->get_logger(), "🔄 Step 6: Starting ROS I/O publisher threads...");
+        startPublisherThreads();
 
         // ===== Step 7: 処理スレッドの開始 =====
-        RCLCPP_INFO(this->get_logger(), "🔄 Step 7: Starting processing thread...");
-        processing_thread_ = std::thread(&FVDepthCameraNode::processingLoop, this);
+        RCLCPP_INFO(this->get_logger(), "🔄 Step 7: Starting color/depth processing threads...");
+        color_processing_thread_ = std::thread(&FVDepthCameraNode::colorProcessingLoop, this);
+        depth_processing_thread_ = std::thread(&FVDepthCameraNode::depthProcessingLoop, this);
         
         RCLCPP_INFO(this->get_logger(), "✅ FV Depth Camera started successfully");
 
@@ -117,13 +118,15 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
                     const long depth_stall_ms = (last_depth_ns > 0) ? long((now_ns - last_depth_ns) / 1000000) : -1;
 
                     RCLCPP_INFO(this->get_logger(),
-                                "📈 Stats(%dms): cb(color=%lu depth=%lu) pub(color=%lu depth=%lu) dropped(color=%lu depth=%lu publish_bundle=%lu) stall_ms(color=%ld depth=%ld)",
+                                "📈 Stats(%dms): cb(color=%lu depth=%lu) pub(color=%lu depth=%lu) dropped(color=%lu depth=%lu publish_color=%lu publish_compressed=%lu publish_depth=%lu) stall_ms(color=%ld depth=%ld)",
                                 period_ms,
                                 (unsigned long)dc_cb, (unsigned long)dd_cb,
                                 (unsigned long)dc_pub, (unsigned long)dd_pub,
                                 (unsigned long)dropped_color_frames_.load(std::memory_order_relaxed),
                                 (unsigned long)dropped_depth_frames_.load(std::memory_order_relaxed),
-                                (unsigned long)dropped_publish_bundles_.load(std::memory_order_relaxed),
+                                (unsigned long)dropped_color_publish_bundles_.load(std::memory_order_relaxed),
+                                (unsigned long)dropped_compressed_color_publish_bundles_.load(std::memory_order_relaxed),
+                                (unsigned long)dropped_depth_publish_bundles_.load(std::memory_order_relaxed),
                                 color_stall_ms, depth_stall_ms);
                 });
         }
@@ -131,20 +134,33 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
     } catch (const std::exception& e) {
         RCLCPP_ERROR(this->get_logger(), "❌ Exception during initialization: %s", e.what());
         {
-            std::lock_guard<std::mutex> lock(publish_mutex_);
+            std::scoped_lock lock(
+                color_publish_mutex_, compressed_color_publish_mutex_, depth_publish_mutex_);
             running_.store(false, std::memory_order_relaxed);
         }
-        sync_cv_.notify_all();
-        publish_cv_.notify_all();
+        color_queue_cv_.notify_all();
+        depth_queue_cv_.notify_all();
+        color_publish_cv_.notify_all();
+        compressed_color_publish_cv_.notify_all();
+        depth_publish_cv_.notify_all();
         try {
             stopSensors();
         } catch (...) {
         }
-        if (processing_thread_.joinable()) {
-            processing_thread_.join();
+        if (color_processing_thread_.joinable()) {
+            color_processing_thread_.join();
         }
-        if (publisher_thread_.joinable()) {
-            publisher_thread_.join();
+        if (depth_processing_thread_.joinable()) {
+            depth_processing_thread_.join();
+        }
+        if (color_publisher_thread_.joinable()) {
+            color_publisher_thread_.join();
+        }
+        if (compressed_color_publisher_thread_.joinable()) {
+            compressed_color_publisher_thread_.join();
+        }
+        if (depth_publisher_thread_.joinable()) {
+            depth_publisher_thread_.join();
         }
         throw;
     }
@@ -165,21 +181,34 @@ FVDepthCameraNode::~FVDepthCameraNode()
     
     // ===== 処理スレッドの停止 =====
     {
-        std::lock_guard<std::mutex> lock(publish_mutex_);
+        std::scoped_lock lock(
+            color_publish_mutex_, compressed_color_publish_mutex_, depth_publish_mutex_);
         running_.store(false, std::memory_order_relaxed);
     }
-    sync_cv_.notify_all();
-    publish_cv_.notify_all();
+    color_queue_cv_.notify_all();
+    depth_queue_cv_.notify_all();
+    color_publish_cv_.notify_all();
+    compressed_color_publish_cv_.notify_all();
+    depth_publish_cv_.notify_all();
     // Stop sensors to release USB resources quickly
     try {
         stopSensors();
     } catch (...) {
     }
-    if (processing_thread_.joinable()) {
-        processing_thread_.join();
+    if (color_processing_thread_.joinable()) {
+        color_processing_thread_.join();
     }
-    if (publisher_thread_.joinable()) {
-        publisher_thread_.join();
+    if (depth_processing_thread_.joinable()) {
+        depth_processing_thread_.join();
+    }
+    if (color_publisher_thread_.joinable()) {
+        color_publisher_thread_.join();
+    }
+    if (compressed_color_publisher_thread_.joinable()) {
+        compressed_color_publisher_thread_.join();
+    }
+    if (depth_publisher_thread_.joinable()) {
+        depth_publisher_thread_.join();
     }
 }
 
@@ -604,7 +633,7 @@ bool FVDepthCameraNode::startSensors() {
 
     // Reset queues
     {
-        std::lock_guard<std::mutex> lk(sync_mutex_);
+        std::scoped_lock lk(color_queue_mutex_, depth_queue_mutex_);
         color_queue_.clear();
         depth_queue_.clear();
     }
@@ -823,14 +852,14 @@ void FVDepthCameraNode::onColorFrame(const rs2::frame& frame) {
     item.recv_tp = std::chrono::steady_clock::now();
 
     {
-        std::lock_guard<std::mutex> lk(sync_mutex_);
+        std::lock_guard<std::mutex> lk(color_queue_mutex_);
         color_queue_.push_back(std::move(item));
         while (color_queue_.size() > sync_queue_size_) {
             color_queue_.pop_front();
             dropped_color_frames_.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    sync_cv_.notify_one();
+    color_queue_cv_.notify_one();
 }
 
 void FVDepthCameraNode::onDepthFrame(const rs2::frame& frame) {
@@ -854,14 +883,14 @@ void FVDepthCameraNode::onDepthFrame(const rs2::frame& frame) {
     item.recv_tp = std::chrono::steady_clock::now();
 
     {
-        std::lock_guard<std::mutex> lk(sync_mutex_);
+        std::lock_guard<std::mutex> lk(depth_queue_mutex_);
         depth_queue_.push_back(std::move(item));
         while (depth_queue_.size() > sync_queue_size_) {
             depth_queue_.pop_front();
             dropped_depth_frames_.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    sync_cv_.notify_one();
+    depth_queue_cv_.notify_one();
 }
 
 bool FVDepthCameraNode::selectCamera()
@@ -1120,352 +1149,358 @@ void FVDepthCameraNode::initializeSubscribers()
     RCLCPP_INFO(this->get_logger(), "🖱️ Click event subscriber initialized");
 }
 
-void FVDepthCameraNode::startPublisherThread()
+void FVDepthCameraNode::startPublisherThreads()
 {
-    auto ready = std::make_shared<std::promise<void>>();
-    std::future<void> ready_future = ready->get_future();
-    publisher_thread_ = std::thread([this, ready]() {
-        bool ready_notified = false;
-        try {
-            const int name_result = pthread_setname_np(pthread_self(), "fv_rs_pub");
-            if (name_result != 0) {
-                throw std::runtime_error(
-                    std::string("pthread_setname_np failed: ") + std::strerror(name_result));
-            }
-            fluent_lib::ros::configure_current_io_thread();
-            ready->set_value();
-            ready_notified = true;
-            publisherLoop();
-        } catch (...) {
-            if (!ready_notified) {
-                ready->set_exception(std::current_exception());
-                return;
-            }
-
+    auto start_thread = [this](std::thread& thread, const char* name, PublishPath path) {
+        auto ready = std::make_shared<std::promise<void>>();
+        std::future<void> ready_future = ready->get_future();
+        thread = std::thread([this, ready, name, path]() {
+            bool ready_notified = false;
             try {
-                throw;
-            } catch (const std::exception& error) {
-                exitForSupervisedRestart(
-                    std::string("ROS I/O publisher thread failed: ") + error.what());
+                const int name_result = pthread_setname_np(pthread_self(), name);
+                if (name_result != 0) {
+                    throw std::runtime_error(
+                        std::string("pthread_setname_np failed: ") + std::strerror(name_result));
+                }
+                fluent_lib::ros::configure_current_io_thread();
+                ready->set_value();
+                ready_notified = true;
+                publisherLoop(path);
+            } catch (...) {
+                if (!ready_notified) {
+                    ready->set_exception(std::current_exception());
+                    return;
+                }
+
+                try {
+                    throw;
+                } catch (const std::exception& error) {
+                    exitForSupervisedRestart(
+                        std::string("ROS I/O publisher thread failed: ") + error.what());
+                }
             }
-        }
-    });
-    ready_future.get();
+        });
+        ready_future.get();
+    };
+
+    start_thread(color_publisher_thread_, "fv_rs_colorpub", PublishPath::Color);
+    start_thread(
+        compressed_color_publisher_thread_, "fv_rs_jpegpub", PublishPath::CompressedColor);
+    start_thread(depth_publisher_thread_, "fv_rs_depthpub", PublishPath::Depth);
 }
 
-void FVDepthCameraNode::publisherLoop()
+void FVDepthCameraNode::publisherLoop(PublishPath path)
 {
-    RCLCPP_INFO(this->get_logger(), "ROS I/O publisher thread is ready");
+    const char* path_name = nullptr;
+    std::mutex* mutex = nullptr;
+    std::condition_variable* cv = nullptr;
+    std::deque<PublishBundle>* queue = nullptr;
+    switch (path) {
+        case PublishPath::Color:
+            path_name = "color";
+            mutex = &color_publish_mutex_;
+            cv = &color_publish_cv_;
+            queue = &color_publish_queue_;
+            break;
+        case PublishPath::CompressedColor:
+            path_name = "compressed color";
+            mutex = &compressed_color_publish_mutex_;
+            cv = &compressed_color_publish_cv_;
+            queue = &compressed_color_publish_queue_;
+            break;
+        case PublishPath::Depth:
+            path_name = "depth";
+            mutex = &depth_publish_mutex_;
+            cv = &depth_publish_cv_;
+            queue = &depth_publish_queue_;
+            break;
+    }
+
+    RCLCPP_INFO(
+        this->get_logger(), "ROS I/O %s publisher thread is ready",
+        path_name);
     uint64_t debug_count = 0;
 
     while (true) {
         PublishBundle bundle;
         {
-            std::unique_lock<std::mutex> lock(publish_mutex_);
-            publish_cv_.wait(lock, [this]() {
-                return !running_.load(std::memory_order_relaxed) || !publish_queue_.empty();
+            std::unique_lock<std::mutex> lock(*mutex);
+            cv->wait(lock, [this, queue]() {
+                return !running_.load(std::memory_order_relaxed) || !queue->empty();
             });
-            if (publish_queue_.empty()) {
+            if (queue->empty()) {
                 if (!running_.load(std::memory_order_relaxed)) {
                     return;
                 }
                 continue;
             }
-            bundle = std::move(publish_queue_.front());
-            publish_queue_.pop_front();
+            bundle = std::move(queue->front());
+            queue->pop_front();
         }
 
-        bool published = false;
-        if (bundle.color) {
-            color_pub_->publish(std::move(bundle.color));
-            color_pub_count_.fetch_add(1, std::memory_order_relaxed);
-            published = true;
-        }
-        if (bundle.color_compressed) {
-            color_compressed_pub_->publish(std::move(bundle.color_compressed));
-            published = true;
-        }
-        if (bundle.depth) {
-            depth_pub_->publish(std::move(bundle.depth));
-            depth_pub_count_.fetch_add(1, std::memory_order_relaxed);
-            published = true;
-        }
-        if (bundle.depth_roi) {
-            depth_roi_pub_->publish(std::move(bundle.depth_roi));
-            published = true;
-        }
-        if (bundle.depth_colormap) {
-            depth_colormap_pub_->publish(std::move(bundle.depth_colormap));
-            published = true;
-        }
-        if (bundle.registered_points) {
-            registered_points_pub_->publish(std::move(bundle.registered_points));
-            published = true;
-        }
-        if (bundle.pointcloud) {
-            pointcloud_pub_->publish(std::move(bundle.pointcloud));
-            published = true;
-        }
-        if (bundle.color_info) {
-            color_info_pub_->publish(std::move(bundle.color_info));
-            published = true;
-        }
-        if (bundle.depth_info) {
-            depth_info_pub_->publish(std::move(bundle.depth_info));
-            published = true;
-        }
-        if (bundle.depth_roi_info) {
-            depth_roi_info_pub_->publish(std::move(bundle.depth_roi_info));
-            published = true;
-        }
-
-        if (published) {
-            last_paired_publish_ns_.store(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count(),
-                std::memory_order_relaxed);
-            if (++debug_count % 30 == 0) {
-                RCLCPP_DEBUG(this->get_logger(), "ROS I/O publisher sent %lu bundles",
-                    static_cast<unsigned long>(debug_count));
-            }
+        publishBundle(std::move(bundle));
+        if (++debug_count % 30 == 0) {
+            RCLCPP_DEBUG(
+                this->get_logger(), "ROS I/O %s publisher sent %lu bundles",
+                path_name,
+                static_cast<unsigned long>(debug_count));
         }
     }
 }
 
-void FVDepthCameraNode::enqueuePublishBundle(PublishBundle&& bundle)
+void FVDepthCameraNode::publishBundle(PublishBundle&& bundle)
+{
+    bool published = false;
+    if (bundle.color) {
+        color_pub_->publish(std::move(bundle.color));
+        color_pub_count_.fetch_add(1, std::memory_order_relaxed);
+        published = true;
+    }
+    if (bundle.color_compressed) {
+        color_compressed_pub_->publish(std::move(bundle.color_compressed));
+        published = true;
+    }
+    if (bundle.depth) {
+        depth_pub_->publish(std::move(bundle.depth));
+        depth_pub_count_.fetch_add(1, std::memory_order_relaxed);
+        published = true;
+    }
+    if (bundle.depth_roi) {
+        depth_roi_pub_->publish(std::move(bundle.depth_roi));
+        published = true;
+    }
+    if (bundle.depth_colormap) {
+        depth_colormap_pub_->publish(std::move(bundle.depth_colormap));
+        published = true;
+    }
+    if (bundle.registered_points) {
+        registered_points_pub_->publish(std::move(bundle.registered_points));
+        published = true;
+    }
+    if (bundle.pointcloud) {
+        pointcloud_pub_->publish(std::move(bundle.pointcloud));
+        published = true;
+    }
+    if (bundle.color_info) {
+        color_info_pub_->publish(std::move(bundle.color_info));
+        published = true;
+    }
+    if (bundle.depth_info) {
+        depth_info_pub_->publish(std::move(bundle.depth_info));
+        published = true;
+    }
+    if (bundle.depth_roi_info) {
+        depth_roi_info_pub_->publish(std::move(bundle.depth_roi_info));
+        published = true;
+    }
+
+    if (published) {
+        last_paired_publish_ns_.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+    }
+}
+
+void FVDepthCameraNode::enqueueLatestPublishBundle(PublishBundle&& bundle, PublishPath path)
 {
     if (bundle.empty()) {
         return;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(publish_mutex_);
-        if (publish_queue_.size() == kPublishQueueCapacity) {
-            publish_queue_.pop_front();
-            dropped_publish_bundles_.fetch_add(1, std::memory_order_relaxed);
-        }
-        publish_queue_.push_back(std::move(bundle));
+    std::mutex* mutex = nullptr;
+    std::condition_variable* cv = nullptr;
+    std::deque<PublishBundle>* queue = nullptr;
+    std::atomic<uint64_t>* dropped = nullptr;
+    switch (path) {
+        case PublishPath::Color:
+            mutex = &color_publish_mutex_;
+            cv = &color_publish_cv_;
+            queue = &color_publish_queue_;
+            dropped = &dropped_color_publish_bundles_;
+            break;
+        case PublishPath::CompressedColor:
+            mutex = &compressed_color_publish_mutex_;
+            cv = &compressed_color_publish_cv_;
+            queue = &compressed_color_publish_queue_;
+            dropped = &dropped_compressed_color_publish_bundles_;
+            break;
+        case PublishPath::Depth:
+            mutex = &depth_publish_mutex_;
+            cv = &depth_publish_cv_;
+            queue = &depth_publish_queue_;
+            dropped = &dropped_depth_publish_bundles_;
+            break;
     }
-    publish_cv_.notify_one();
+
+    {
+        std::lock_guard<std::mutex> lock(*mutex);
+        if (queue->size() == kPublishQueueCapacity) {
+            queue->pop_front();
+            dropped->fetch_add(1, std::memory_order_relaxed);
+        }
+        queue->push_back(std::move(bundle));
+    }
+    cv->notify_one();
 }
 
-void FVDepthCameraNode::processingLoop()
+void FVDepthCameraNode::enqueuePublishBundle(PublishBundle&& bundle)
 {
-    RCLCPP_INFO(this->get_logger(), "🔄 Starting processing loop...");
-    
-    int frame_count = 0;
-    int color_pub_count = 0;
-    int depth_pub_count = 0;
-    auto last_log_time = std::chrono::steady_clock::now();
+    PublishBundle color_bundle;
+    color_bundle.color = std::move(bundle.color);
+    color_bundle.color_info = std::move(bundle.color_info);
+
+    PublishBundle compressed_color_bundle;
+    compressed_color_bundle.color_compressed = std::move(bundle.color_compressed);
+
+    PublishBundle depth_bundle;
+    depth_bundle.depth = std::move(bundle.depth);
+    depth_bundle.depth_roi = std::move(bundle.depth_roi);
+    depth_bundle.depth_colormap = std::move(bundle.depth_colormap);
+    depth_bundle.registered_points = std::move(bundle.registered_points);
+    depth_bundle.pointcloud = std::move(bundle.pointcloud);
+    depth_bundle.depth_info = std::move(bundle.depth_info);
+    depth_bundle.depth_roi_info = std::move(bundle.depth_roi_info);
+
+    enqueueLatestPublishBundle(std::move(color_bundle), PublishPath::Color);
+    enqueueLatestPublishBundle(
+        std::move(compressed_color_bundle), PublishPath::CompressedColor);
+    enqueueLatestPublishBundle(std::move(depth_bundle), PublishPath::Depth);
+}
+
+void FVDepthCameraNode::colorProcessingLoop()
+{
+    RCLCPP_INFO(this->get_logger(), "🔄 Starting color processing loop...");
     bool warned = false;
-    bool warned_depth = false;
-    // Baseline for the depth watchdog when no depth frame has arrived at
-    // all (e.g. the sensor opened color-only after a respawn).
+
+    while (running_ && rclcpp::ok()) {
+        try {
+            if (current_mode_.load(std::memory_order_relaxed) == 0 ||
+                !stream_config_.color_enabled) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+
+            FrameItem color_item;
+            bool got_color = false;
+            {
+                std::unique_lock<std::mutex> lock(color_queue_mutex_);
+                color_queue_cv_.wait_for(lock, std::chrono::milliseconds(frame_wait_timeout_ms_), [this]() {
+                    return !running_.load(std::memory_order_relaxed) || !color_queue_.empty();
+                });
+                if (!running_.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                if (!color_queue_.empty()) {
+                    color_item = std::move(color_queue_.front());
+                    color_queue_.pop_front();
+                    got_color = true;
+                }
+            }
+
+            if (!got_color) {
+                const int64_t last_ns = last_color_recv_ns_.load(std::memory_order_relaxed);
+                if (last_ns > 0) {
+                    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now().time_since_epoch())
+                                               .count();
+                    const int64_t stall_ms = (now_ns - last_ns) / 1000000;
+                    if (stall_warn_ms_ > 0 && stall_ms >= stall_warn_ms_ && !warned) {
+                        RCLCPP_WARN(this->get_logger(), "⚠️ No color frames for %ldms", (long)stall_ms);
+                        warned = true;
+                    }
+                    if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
+                        exitForSupervisedRestart(
+                            std::to_string((long)stall_ms) + "ms color stall");
+                    }
+                }
+                continue;
+            }
+
+            warned = false;
+            const rclcpp::Time stamp = stampFromDeviceTime(
+                color_item.frame, color_item.ts_ms, CameraStream::Color);
+            queueFramesForPublish(
+                color_item.frame, rs2::frame(), stamp, true, false);
+        } catch (const rs2::error& e) {
+            RCLCPP_WARN(this->get_logger(), "⚠️ Color frame processing error: %s", e.what());
+        }
+    }
+
+    RCLCPP_INFO(this->get_logger(), "🛑 Color processing loop stopped");
+}
+
+void FVDepthCameraNode::depthProcessingLoop()
+{
+    RCLCPP_INFO(this->get_logger(), "🔄 Starting depth processing loop...");
+    bool warned = false;
     const int64_t loop_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now().time_since_epoch())
                                       .count();
-    
+
     while (running_ && rclcpp::ok()) {
         try {
-            // モードに応じた処理
-            int current_mode = current_mode_.load();
-            
-            switch (current_mode) {
-                case 0: {  // 停止モード
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (current_mode_.load(std::memory_order_relaxed) != 2 ||
+                !stream_config_.depth_enabled) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+
+            FrameItem depth_item;
+            bool got_depth = false;
+            {
+                std::unique_lock<std::mutex> lock(depth_queue_mutex_);
+                depth_queue_cv_.wait_for(lock, std::chrono::milliseconds(frame_wait_timeout_ms_), [this]() {
+                    return !running_.load(std::memory_order_relaxed) || !depth_queue_.empty();
+                });
+                if (!running_.load(std::memory_order_relaxed)) {
                     break;
                 }
-                    
-                case 1: {  // 基本動作モード
-                    // カラーのみ: 最新colorフレームを待って配信
-                    FrameItem color_item;
-                    bool got_color = false;
-                    {
-                        std::unique_lock<std::mutex> lk(sync_mutex_);
-                        sync_cv_.wait_for(lk, std::chrono::milliseconds(frame_wait_timeout_ms_), [&]() {
-                            return !running_.load() || !color_queue_.empty();
-                        });
-                        if (!running_.load()) break;
-                        if (!color_queue_.empty()) {
-                            color_item = std::move(color_queue_.back());
-                            color_queue_.clear();
-                            got_color = true;
-                        }
-                    }
-
-                    if (!got_color) {
-                        // Stall detection based on last receive timestamp (from callbacks)
-                        const int64_t last_ns = last_color_recv_ns_.load(std::memory_order_relaxed);
-                        if (last_ns > 0) {
-                            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                       std::chrono::steady_clock::now().time_since_epoch())
-                                                       .count();
-                            const int64_t stall_ms = (now_ns - last_ns) / 1000000;
-                            if (stall_warn_ms_ > 0 && stall_ms >= stall_warn_ms_ && !warned) {
-                                RCLCPP_WARN(this->get_logger(), "⚠️ No color frames for %ldms (mode=1)", (long)stall_ms);
-                                warned = true;
-                            }
-                            if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
-                                exitForSupervisedRestart(
-                                    std::to_string((long)stall_ms) + "ms color stall (mode=1)");
-                            }
-                        }
-                        break;
-                    }
-                    warned = false;
-
-                    frame_count++;
-                    const rclcpp::Time stamp = stampFromDeviceTime(color_item.frame, color_item.ts_ms);
-                    queueFramesForPublish(color_item.frame, rs2::frame(), stamp);
-                    color_pub_count++;
-
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
-                        const auto dropped_c = dropped_color_frames_.load(std::memory_order_relaxed);
-                        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                   std::chrono::steady_clock::now().time_since_epoch())
-                                                   .count();
-                        const int64_t last_color_ns = last_color_recv_ns_.load(std::memory_order_relaxed);
-                        const int64_t last_pub_ns = last_paired_publish_ns_.load(std::memory_order_relaxed);
-                        const long color_stall_ms = (last_color_ns > 0) ? long((now_ns - last_color_ns) / 1000000) : -1;
-                        const long pub_stall_ms = (last_pub_ns > 0) ? long((now_ns - last_pub_ns) / 1000000) : -1;
-                        RCLCPP_DEBUG(this->get_logger(), "📊 Mode 1: loop=%d color=%d dropped_color=%lu stall(color=%ldms pub=%ldms)",
-                                     frame_count, color_pub_count, (unsigned long)dropped_c,
-                                     color_stall_ms, pub_stall_ms);
-                        frame_count = 0;
-                        color_pub_count = 0;
-                        last_log_time = now;
-                    }
-                    break;
-                }
-                    
-                case 2: {  // フル機能モード
-                    // color/depth を独立に配信（ペア待ちでブロックしない）
-                    FrameItem color_item;
-                    FrameItem depth_item;
-                    bool got_color = false;
-                    bool got_depth = false;
-                    {
-                        std::unique_lock<std::mutex> lk(sync_mutex_);
-                        sync_cv_.wait_for(lk, std::chrono::milliseconds(frame_wait_timeout_ms_), [&]() {
-                            return !running_.load() || !color_queue_.empty() || !depth_queue_.empty();
-                        });
-                        if (!running_.load()) break;
-                        if (!color_queue_.empty()) {
-                            color_item = std::move(color_queue_.back());
-                            color_queue_.clear();
-                            got_color = true;
-                        }
-                        if (!depth_queue_.empty()) {
-                            depth_item = std::move(depth_queue_.back());
-                            depth_queue_.clear();
-                            got_depth = true;
-                        }
-                    }
-
-                    // Depth-only stall watchdog. The color-keyed check below
-                    // never runs while color frames keep arriving, so a depth
-                    // stream dying alone (observed in production as a partial
-                    // USB failure: color stayed at 30Hz, depth silent for
-                    // 45min) previously went undetected forever. Same
-                    // exit+respawn recovery, same thresholds.
-                    if (got_depth) {
-                        warned_depth = false;
-                    } else if (got_color && stream_config_.depth_enabled && stall_restart_ms_ > 0) {
-                        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                   std::chrono::steady_clock::now().time_since_epoch())
-                                                   .count();
-                        const int64_t last_d_ns = last_depth_recv_ns_.load(std::memory_order_relaxed);
-                        const int64_t base_ns = (last_d_ns > 0) ? last_d_ns : loop_start_ns;
-                        const int64_t d_stall_ms = (now_ns - base_ns) / 1000000;
-                        if (stall_warn_ms_ > 0 && d_stall_ms >= stall_warn_ms_ && !warned_depth) {
-                            RCLCPP_WARN(this->get_logger(),
-                                        "⚠️ No depth frames for %ldms while color continues (mode=2)",
-                                        (long)d_stall_ms);
-                            warned_depth = true;
-                        }
-                        if (d_stall_ms >= stall_restart_ms_) {
-                            exitForSupervisedRestart(
-                                std::to_string((long)d_stall_ms) + "ms depth stall (mode=2, color still alive)");
-                        }
-                    }
-
-                    if (!got_color && !got_depth) {
-                        const int64_t last_ns = last_color_recv_ns_.load(std::memory_order_relaxed);
-                        if (last_ns > 0) {
-                            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                       std::chrono::steady_clock::now().time_since_epoch())
-                                                       .count();
-                            const int64_t stall_ms = (now_ns - last_ns) / 1000000;
-                            if (stall_warn_ms_ > 0 && stall_ms >= stall_warn_ms_ && !warned) {
-                                const int64_t last_depth_ns = last_depth_recv_ns_.load(std::memory_order_relaxed);
-                                int64_t depth_stall_ms = -1;
-                                if (last_depth_ns > 0) depth_stall_ms = (now_ns - last_depth_ns) / 1000000;
-                                RCLCPP_WARN(this->get_logger(),
-                                            "⚠️ No frames for %ldms (mode=2) (color_stall=%ldms depth_stall=%ldms)",
-                                            (long)stall_ms, (long)stall_ms, (long)depth_stall_ms);
-                                warned = true;
-                            }
-                            if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
-                                exitForSupervisedRestart(
-                                    std::to_string((long)stall_ms) + "ms color stall (mode=2)");
-                            }
-                        }
-                        break;
-                    }
-                    warned = false;
-
-                    frame_count++;
-                    if (got_color && got_depth && stream_config_.color_enabled && stream_config_.depth_enabled) {
-                        const rclcpp::Time stamp = stampFromDeviceTime(color_item.frame, color_item.ts_ms);
-                        queueFramesForPublish(color_item.frame, depth_item.frame, stamp);
-                        color_pub_count++;
-                        depth_pub_count++;
-                    } else if (got_color && stream_config_.color_enabled) {
-                        const rclcpp::Time cstamp = stampFromDeviceTime(color_item.frame, color_item.ts_ms);
-                        queueFramesForPublish(color_item.frame, rs2::frame(), cstamp);
-                        color_pub_count++;
-                    } else if (got_depth && stream_config_.depth_enabled) {
-                        const rclcpp::Time dstamp = stampFromDeviceTime(depth_item.frame, depth_item.ts_ms);
-                        queueFramesForPublish(rs2::frame(), depth_item.frame, dstamp);
-                        depth_pub_count++;
-                    }
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
-                        const auto dropped_c = dropped_color_frames_.load(std::memory_order_relaxed);
-                        const auto dropped_d = dropped_depth_frames_.load(std::memory_order_relaxed);
-                        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                   std::chrono::steady_clock::now().time_since_epoch())
-                                                   .count();
-                        const int64_t last_color_ns = last_color_recv_ns_.load(std::memory_order_relaxed);
-                        const int64_t last_depth_ns = last_depth_recv_ns_.load(std::memory_order_relaxed);
-                        const int64_t last_pub_ns = last_paired_publish_ns_.load(std::memory_order_relaxed);
-                        const long color_stall_ms = (last_color_ns > 0) ? long((now_ns - last_color_ns) / 1000000) : -1;
-                        const long depth_stall_ms = (last_depth_ns > 0) ? long((now_ns - last_depth_ns) / 1000000) : -1;
-                        const long pub_stall_ms = (last_pub_ns > 0) ? long((now_ns - last_pub_ns) / 1000000) : -1;
-                        RCLCPP_DEBUG(this->get_logger(),
-                                     "📊 Mode 2: loop=%d color=%d depth=%d dropped_color=%lu dropped_depth=%lu stall(color=%ldms depth=%ldms pub=%ldms)",
-                                     frame_count, color_pub_count, depth_pub_count,
-                                     (unsigned long)dropped_c, (unsigned long)dropped_d,
-                                     color_stall_ms, depth_stall_ms, pub_stall_ms);
-                        frame_count = 0;
-                        color_pub_count = 0;
-                        depth_pub_count = 0;
-                        last_log_time = now;
-                    }
-                    break;
+                if (!depth_queue_.empty()) {
+                    depth_item = std::move(depth_queue_.front());
+                    depth_queue_.pop_front();
+                    got_depth = true;
                 }
             }
-            
+
+            if (!got_depth) {
+                const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now().time_since_epoch())
+                                           .count();
+                const int64_t last_ns = last_depth_recv_ns_.load(std::memory_order_relaxed);
+                const int64_t base_ns = last_ns > 0 ? last_ns : loop_start_ns;
+                const int64_t stall_ms = (now_ns - base_ns) / 1000000;
+                if (stall_warn_ms_ > 0 && stall_ms >= stall_warn_ms_ && !warned) {
+                    RCLCPP_WARN(this->get_logger(), "⚠️ No depth frames for %ldms", (long)stall_ms);
+                    warned = true;
+                }
+                if (stall_restart_ms_ > 0 && stall_ms >= stall_restart_ms_) {
+                    exitForSupervisedRestart(
+                        std::to_string((long)stall_ms) + "ms depth stall");
+                }
+                continue;
+            }
+
+            warned = false;
+            rs2::frame latest_color;
+            {
+                std::lock_guard<std::mutex> lock(latest_frame_mutex_);
+                latest_color = latest_color_frame_;
+            }
+            const rclcpp::Time stamp = stampFromDeviceTime(
+                depth_item.frame, depth_item.ts_ms, CameraStream::Depth);
+            queueFramesForPublish(
+                latest_color, depth_item.frame, stamp, false, true);
         } catch (const rs2::error& e) {
-            RCLCPP_WARN(this->get_logger(), "⚠️ Frame processing error: %s", e.what());
+            RCLCPP_WARN(this->get_logger(), "⚠️ Depth frame processing error: %s", e.what());
         }
     }
-    
-    RCLCPP_INFO(this->get_logger(), "🛑 Processing loop stopped");
+
+    RCLCPP_INFO(this->get_logger(), "🛑 Depth processing loop stopped");
 }
 
-rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, double device_ts_ms)
+rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(
+    const rs2::frame& frame, double device_ts_ms, CameraStream stream)
 {
     if (!use_device_timestamp_) {
         return this->now();
@@ -1475,22 +1510,30 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
     const rclcpp::Time now = this->now();
 
     std::lock_guard<std::mutex> lk(device_time_mutex_);
+    StreamTimeState& state = stream == CameraStream::Color
+        ? color_time_state_
+        : depth_time_state_;
     if (!device_time_initialized_ || domain != device_time_domain_) {
         device_time_initialized_ = true;
         device_time_domain_ = domain;
         base_device_ts_ms_ = device_ts_ms;
         base_ros_stamp_ = now;
-        last_device_ts_ms_ = device_ts_ms;
-        last_ros_stamp_ = now;
+        color_time_state_ = StreamTimeState{};
+        depth_time_state_ = StreamTimeState{};
+        state.last_device_ts_ms = device_ts_ms;
+        state.last_ros_stamp = now;
         return now;
     }
 
     // Reset mapping if device timestamp jumps backwards significantly (device reset).
-    if ((device_ts_ms + device_ts_reset_threshold_ms_) < last_device_ts_ms_) {
+    if (state.last_device_ts_ms > 0.0 &&
+        (device_ts_ms + device_ts_reset_threshold_ms_) < state.last_device_ts_ms) {
         base_device_ts_ms_ = device_ts_ms;
         base_ros_stamp_ = now;
-        last_device_ts_ms_ = device_ts_ms;
-        last_ros_stamp_ = now;
+        color_time_state_ = StreamTimeState{};
+        depth_time_state_ = StreamTimeState{};
+        state.last_device_ts_ms = device_ts_ms;
+        state.last_ros_stamp = now;
         return now;
     }
 
@@ -1521,8 +1564,10 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
             base_device_ts_ms_ = device_ts_ms;
             base_ros_stamp_ = now;
             stamp = now;
-            last_device_ts_ms_ = device_ts_ms;
-            last_ros_stamp_ = now;
+            color_time_state_ = StreamTimeState{};
+            depth_time_state_ = StreamTimeState{};
+            state.last_device_ts_ms = device_ts_ms;
+            state.last_ros_stamp = now;
             // Surface the event at most once per 10 s to avoid log spam.
             static int64_t s_last_log_ns = 0;
             if ((now.nanoseconds() - s_last_log_ns) > static_cast<int64_t>(1e10)) {
@@ -1537,18 +1582,20 @@ rclcpp::Time FVDepthCameraNode::stampFromDeviceTime(const rs2::frame& frame, dou
         }
     }
 
-    if (stamp < last_ros_stamp_) {
-        stamp = last_ros_stamp_;
+    if (state.last_device_ts_ms > 0.0 && stamp < state.last_ros_stamp) {
+        stamp = state.last_ros_stamp;
     }
-    last_device_ts_ms_ = device_ts_ms;
-    last_ros_stamp_ = stamp;
+    state.last_device_ts_ms = device_ts_ms;
+    state.last_ros_stamp = stamp;
     return stamp;
 }
 
 void FVDepthCameraNode::queueFramesForPublish(
     const rs2::frame& color_frame,
     const rs2::frame& depth_frame,
-    const rclcpp::Time& stamp)
+    const rclcpp::Time& stamp,
+    bool include_color_messages,
+    bool include_depth_messages)
 {
     const rclcpp::Time now = stamp;
     PublishBundle bundle;
@@ -1561,7 +1608,7 @@ void FVDepthCameraNode::queueFramesForPublish(
     }
     
     // Publish color frame (モード1と2で配信)
-    if (stream_config_.color_enabled && color_frame && color_pub_) {
+    if (include_color_messages && stream_config_.color_enabled && color_frame && color_pub_) {
         cv::Mat color_image(cv::Size(color_intrinsics_.width, color_intrinsics_.height),
                            CV_8UC3, (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
         cv::Mat bgr_image;
@@ -1620,7 +1667,8 @@ void FVDepthCameraNode::queueFramesForPublish(
     }
     
     // Publish depth frame (モード2のみ配信)
-    if (current_mode == 2 && stream_config_.depth_enabled && depth_frame) {
+    if (include_depth_messages && current_mode == 2 &&
+        stream_config_.depth_enabled && depth_frame) {
         cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), 
                            CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
         
@@ -1659,7 +1707,8 @@ void FVDepthCameraNode::queueFramesForPublish(
     }
     
     // Publish depth colormap (モード2のみ配信)
-    if (current_mode == 2 && stream_config_.depth_colormap_enabled && depth_frame && depth_colormap_pub_) {
+    if (include_depth_messages && current_mode == 2 &&
+        stream_config_.depth_colormap_enabled && depth_frame && depth_colormap_pub_) {
         cv::Mat colormap = createDepthColormap(depth_frame);
         auto colormap_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", colormap).toImageMsg();
         colormap_msg->header.stamp = now;
@@ -1668,7 +1717,8 @@ void FVDepthCameraNode::queueFramesForPublish(
     }
 
     // Publish organized registered_points (optional)
-    if (current_mode == 2 && organized_pointcloud_enabled_ && registered_points_pub_ && depth_frame) {
+    if (include_depth_messages && current_mode == 2 &&
+        organized_pointcloud_enabled_ && registered_points_pub_ && depth_frame) {
         // Publish only if there are subscribers to reduce CPU
         if (registered_points_pub_->get_subscription_count() != 0) {
             try {
@@ -1746,7 +1796,7 @@ void FVDepthCameraNode::queueFramesForPublish(
     
     // Publish camera info
     if (camera_info_config_.enable_camera_info) {
-        if (color_info_pub_ && color_frame) {
+        if (include_color_messages && color_info_pub_ && color_frame) {
             sensor_msgs::msg::CameraInfo color_info;
             color_info.header.stamp = now;
             color_info.header.frame_id = tf_config_.color_optical_frame;
@@ -1778,7 +1828,7 @@ void FVDepthCameraNode::queueFramesForPublish(
                 std::make_unique<sensor_msgs::msg::CameraInfo>(std::move(color_info));
         }
         
-        if (depth_info_pub_ && depth_frame) {
+        if (include_depth_messages && depth_info_pub_ && depth_frame) {
             sensor_msgs::msg::CameraInfo depth_info;
             depth_info.header.stamp = now;
             depth_info.header.frame_id = tf_config_.depth_optical_frame;
@@ -1813,7 +1863,7 @@ void FVDepthCameraNode::queueFramesForPublish(
         // ROI 用 CameraInfo — 小画像そのものの内部パラメータ。
         // width/height は ROI 寸法、cx/cy は ROI 原点ぶん引いてある。roi フィールドは
         // 0 のまま (= この画像の全体) で、二重にオフセットされる事故を避ける。
-        if (depth_roi_info_pub_ && depth_frame &&
+        if (include_depth_messages && depth_roi_info_pub_ && depth_frame &&
             depth_roi_info_pub_->get_subscription_count() != 0) {
             const cv::Rect roi = resolveDepthRoi();
             sensor_msgs::msg::CameraInfo roi_info;
@@ -1849,7 +1899,8 @@ void FVDepthCameraNode::queueFramesForPublish(
     }
 
     // Optional point cloud (requires both frames)
-    if (current_mode == 2 && stream_config_.pointcloud_enabled && color_frame && depth_frame) {
+    if (include_depth_messages && current_mode == 2 &&
+        stream_config_.pointcloud_enabled && color_frame && depth_frame) {
         bundle.pointcloud = buildPointCloud(color_frame, depth_frame);
     }
 

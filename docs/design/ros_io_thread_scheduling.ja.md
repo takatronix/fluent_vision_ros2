@@ -1,8 +1,8 @@
-# ROS I/O thread schedulingとDDS受信バッファ
+# ROS I/O thread schedulingとDDS socket buffer
 
 ## 1. 対象
 
-本文書は、ROS 2の大容量messageを安定した周期でpublishするためのthread構成、Linux scheduler設定、DDS受信バッファ設定を定義する。
+本文書は、ROS 2の大容量messageを安定した周期でpublishするためのthread構成、Linux scheduler設定、DDS socket buffer設定を定義する。
 
 共通のthread scheduling APIは `fluent_lib` が提供する。
 
@@ -10,26 +10,34 @@
 
 ## 2. publish処理の構成
 
-画像変換とROS message構築を行うprocessing threadから `publish()` を分離する。
+画像変換とROS message構築を行うprocessing threadから`publish()`を分離する。
 
-processing threadは完成したmessage群を容量1 tickのbounded queueへ渡す。
+`fv_realsense`はcolor処理とdepth処理を別threadで実行する。
 
-publish専用threadはqueueの取得と `publish()` を担当する。
+color raw、compressed color、depthは、それぞれ独立した容量1 tickのbounded queueを持つ。
+
+各publish専用threadは、対応するqueueの取得と`publish()`を担当する。
 
 ```mermaid
 flowchart LR
-    Camera[Camera callback] --> Processing[Processing thread]
-    Processing --> Build[画像変換とmessage構築]
-    Build --> Queue[1 tick bounded queue]
-    Queue --> Publisher[Publish thread]
-    Publisher --> DDS[rclcpp / DDS]
+    Camera[Camera callback] --> ColorProcessing[Color processing thread]
+    Camera --> DepthProcessing[Depth processing thread]
+    ColorProcessing --> RawQueue[Color raw queue]
+    ColorProcessing --> CompressedQueue[Compressed color queue]
+    DepthProcessing --> DepthQueue[Depth queue]
+    RawQueue --> RawPublisher[Color raw publish thread]
+    CompressedQueue --> CompressedPublisher[Compressed color publish thread]
+    DepthQueue --> DepthPublisher[Depth publish thread]
+    RawPublisher --> DDS[rclcpp / DDS]
+    CompressedPublisher --> DDS
+    DepthPublisher --> DDS
 ```
 
-queueに未送信のbundleが残っている状態で次のtickが到着した場合は、古いbundleを新しいbundleへ置き換える。
+各queueに未送信のbundleが残っている状態で次のtickが到着した場合は、古いbundleを新しいbundleへ置き換える。
 
 この動作により、publishの遅れを古いframeとして蓄積せず、最新のcamera tickをDDSへ渡す。
 
-置き換えた件数は `dropped_publish_bundles` として診断ログへ出力する。
+置き換えた件数はcolor raw、compressed color、depthごとのcounterとして診断ログへ出力する。
 
 ## 3. thread scheduling
 
@@ -98,7 +106,9 @@ systemd serviceでは `LimitRTPRIO=20` 以上を設定する。
 
 priority 20は実行時に `sched_get_priority_min()` と `sched_get_priority_max()` で取得した範囲内であることを検証する。
 
-## 7. DDS受信バッファ
+## 7. DDS socket buffer
+
+### 7.1 受信バッファ
 
 `net.core.rmem_max` が212,992 bytesの環境では、CycloneDDSが大容量画像messageに必要なsocket receive bufferを確保できなかった。
 
@@ -126,6 +136,45 @@ effective_bytes = max(current_bytes, 16777216)
 既に起動しているDDS processのsocketには新しい上限が反映されないため、設定後にDDS processを再起動する。
 
 同じkeyを複数のsysctl設定ファイルで管理する場合は、辞書順で後に読み込まれる値が有効になるため、すべての定義をスクリプトが表示した適用値へ統一する。
+
+### 7.2 送信バッファ
+
+`net.core.wmem_max`が212,992 bytesの環境では、CycloneDDSの送信socketがraw画像一枚を保持できない。
+
+640x480 BGR8のraw画像は921,600 bytesである。
+
+8個のreaderへunicastする実構成では、CycloneDDSが一枚を約69個のUDP fragmentへ分割し、約552回の`sendmsg()`をpublish thread上で実行した。
+
+送信socketが満杯になるとblocking `sendmsg()`が待機し、`publish()`が次の33.3 ms周期を超える。
+
+`fluent_lib`は送信バッファ上限専用の設定スクリプトをinstallする。
+
+```bash
+source <workspace>/install/setup.bash
+sudo "$(command -v setup_dds_send_buffer.sh)"
+```
+
+スクリプトは`net.core.wmem_max`の下限を16 MiBとして、`/etc/sysctl.d/90-fluent-vision-dds-send.conf`へ保存し、現在のnetwork namespaceにも反映する。
+
+`net.core.wmem_default`は変更しない。
+
+送信socketを大きくするprocessだけが、middleware設定から16 MiBを要求する。
+
+CycloneDDSでは次の設定を使用する。
+
+```xml
+<CycloneDDS>
+  <Domain>
+    <Internal>
+      <SocketSendBufferSize min="16 MiB" max="16 MiB"/>
+    </Internal>
+  </Domain>
+</CycloneDDS>
+```
+
+`wmem_max`は要求可能な上限であり、この設定を変更しただけでは既存socketやsystem defaultの容量は増えない。
+
+設定スクリプトを実行した後にDDS processを再起動し、CycloneDDSが16 MiBを要求する必要がある。
 
 ## 8. 実測結果
 
@@ -184,6 +233,50 @@ DDS受信バッファの実測結果は次のとおりである。
 | color DDS受信レート | 28.170 FPS | 29.440 FPS |
 | 15秒間の受信socket UDP drop数 | 771件 | 0件 |
 
+DDS送信バッファの実測結果は次のとおりである。
+
+8個のraw image readerと`SCHED_FIFO:20`を維持し、各条件を60秒計測した。
+
+| 計測項目 | `wmem_default/max = 212,992 B` | `wmem_default/max = 16 MiB` |
+|---|---:|---:|
+| color raw `publish()` 20 ms超 | 132件 | 0件 |
+| color raw `publish()` 33.3 ms超 | 22件 | 0件 |
+| color raw `publish()`最大 | 49.297 ms | 20 ms未満 |
+| color raw publish queue drop | 0件 | 0件 |
+
+別の212,992 bytes計測区間では、`publish()`最大89.736 ms、66.7 ms超16件、publish queue drop 20件を記録した。
+
+その区間の遅い`publish()`では、thread CPU時間が平均4.049 ms、scheduler待機が平均0.121 ms、socketまたはkernel内の待機が平均29.671 msだった。
+
+したがって、残っていたcolor raw dropはCPU実行時間やscheduler待機ではなく、送信socketのblocking waitによって発生していた。
+
+製品構成では`wmem_default`を212,992 bytesに維持し、`wmem_max = 16 MiB`とCycloneDDSの16 MiB要求を組み合わせた。
+
+### 8.1 FV recorderによる60秒収録
+
+`wmem_max = 16 MiB`とCycloneDDSの16 MiB要求を適用し、`piper_single_teleop`でtop camera、D405 arm color、rosbagを同時に60秒収録した。
+
+D405 arm colorの結果は次のとおりである。
+
+| 計測項目 | Run 1 | Run 2 | Run 3 |
+|---|---:|---:|---:|
+| sidecar行数 | 1,801 | 1,800 | 1,800 |
+| ROS timestamp区間 | 60.013865 s | 59.981660 s | 59.981685 s |
+| ROS timestamp実効FPS | 29.993069 FPS | 29.992501 FPS | 29.992489 FPS |
+| ROS timestamp間隔p99 | 33.381599 ms | 33.351074 ms | 33.376464 ms |
+| ROS timestamp間隔最大 | 33.390381 ms | 33.351563 ms | 33.379883 ms |
+| 40 ms超のtimestamp間隔 | 0件 | 0件 | 0件 |
+| MP4実frame数 | 1,801 | 1,800 | 1,800 |
+| recorder camera drop | 0件 | 0件 | 0件 |
+| color raw publish queue drop | 0件 | 0件 | 0件 |
+| compressed color publish queue drop | 0件 | 0件 | 0件 |
+
+3回ともsidecar行数とMP4実frame数が一致し、D405 arm colorを約30 FPSで欠損なく記録した。
+
+同時収録したtop cameraは14.506から14.606 FPSだった。
+
+`fv_camera`node自身の出力が同じrateであり、recorderのsidecar行数とMP4実frame数は一致したため、top cameraのrate低下はrecorder内のdropではない。
+
 ## 9. 検証項目
 
 単体テストは次の契約を確認する。
@@ -192,5 +285,6 @@ DDS受信バッファの実測結果は次のとおりである。
 - `SCHED_FIFO`の適用と読戻し
 - 権限不足時の`SCHED_OTHER`適用と読戻し
 - DDS受信バッファ設定の保存、即時反映、再実行時の冪等性
+- DDS送信バッファ設定の保存、即時反映、再実行時の冪等性
 
 実機検証はpublish latency、scheduler待機時間、実効FPS、drop件数、起動ログを確認する。
