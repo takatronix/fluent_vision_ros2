@@ -52,6 +52,14 @@ require_root() {
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "this command must be run with sudo"
 }
 
+# The release is spliced into /lib/modules/<release>/... and /var/lib paths,
+# so it must be a single path component (no separators, no "." / "..").
+validate_kernel_release() {
+  local kernel_release=$1
+  [[ $kernel_release =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] ||
+    die "invalid kernel release: '$kernel_release'"
+}
+
 read_l4t_release() {
   local release_file=${1:-/etc/nv_tegra_release}
   [[ -r $release_file ]] || return 1
@@ -267,7 +275,9 @@ download_ubuntu_source() {
     apt-get update >&2
   fi
   apt-cache show "$package_spec" >/dev/null 2>&1 ||
-    die "Ubuntu kernel source package is unavailable: $package_spec"
+    die "Ubuntu kernel source package is unavailable: $package_spec" \
+      "(kernel $kernel_release comes from source package '$expected_source';" \
+      "cloud/OEM/HWE kernels may need --kernel-source with a matching tree)"
 
   mkdir -p "$cache_root"
   package_file=$(find "$cache_root" -maxdepth 1 -type f -name "${source_binary}_*.deb" \
@@ -394,6 +404,7 @@ patch_uvc_source() {
   local makefile="$source_dir/Makefile"
   local definition_count=''
   local current_value=''
+  local patched_value=''
 
   definition_count=$(grep -Ec '^[[:space:]]*#define[[:space:]]+UVC_URBS[[:space:]]+[0-9]+' "$header" || true)
   [[ $definition_count == 1 ]] ||
@@ -403,7 +414,12 @@ patch_uvc_source() {
   sed -Ei \
     "s/^([[:space:]]*#define[[:space:]]+UVC_URBS[[:space:]]+)[0-9]+(.*)$/\\1${TARGET_URB_COUNT}\\2/" \
     "$header"
+  patched_value=$(sed -nE 's/^[[:space:]]*#define[[:space:]]+UVC_URBS[[:space:]]+([0-9]+).*/\1/p' "$header")
+  [[ $patched_value == "$TARGET_URB_COUNT" ]] ||
+    die "UVC_URBS patch verification failed: header defines '$patched_value'"
 
+  # Only declare the metadata once the header is proven to carry the value,
+  # so `modinfo -F fv_uvc_urbs` is evidence of the build input, not of intent.
   if ! grep -q 'MODULE_INFO(fv_uvc_urbs' "$driver"; then
     printf '\nMODULE_INFO(fv_uvc_urbs, "%s");\n' "$TARGET_URB_COUNT" >>"$driver"
   fi
@@ -545,13 +561,49 @@ verify_managed_install() {
 
   [[ -f $state/installed.env ]] ||
     die "no Fluent Vision installation record exists for $(basename "$state")"
-  [[ -f $destination ]] ||
-    die "the managed module is missing: $destination"
+  if [[ ! -f $destination ]]; then
+    # An interrupted install can leave the record without the module; let
+    # uninstall clean up the record and restore any preserved override.
+    warn "the managed module is missing: $destination"
+    return
+  fi
   expected_sha=$(sed -n 's/^module_sha256=//p' "$state/installed.env")
   [[ -n $expected_sha ]] || die "the installation record has no module checksum"
   actual_sha=$(sha256sum "$destination" | awk '{print $1}')
   [[ $actual_sha == "$expected_sha" ]] ||
     die "the installed module changed after installation; refusing to remove it"
+}
+
+# depmod prefers `updates/` over `kernel/`, but another override (dkms, a
+# hand-copied module) can still win the search order; confirm ours is the one
+# modprobe will load.
+verify_module_selected() {
+  local kernel_release=$1
+  local destination=$2
+  local selected=''
+
+  selected=$(modinfo -k "$kernel_release" -n uvcvideo 2>/dev/null || true)
+  [[ -n $selected ]] || die "depmod did not register uvcvideo for $kernel_release"
+  [[ $(realpath -e "$selected" 2>/dev/null || true) == "$(realpath -e "$destination")" ]] ||
+    die "another uvcvideo override takes precedence over $destination: $selected"
+}
+
+rollback_install() {
+  local kernel_release=$1
+  local destination=$2
+  local state=$3
+  local backup=$4
+
+  rm -f "$destination.new"
+  if [[ -f $backup ]]; then
+    mv -f "$backup" "$destination"
+    warn "restored the previous override at $destination"
+  else
+    rm -f "$destination"
+  fi
+  rm -f "$state/installed.env"
+  rmdir "$state" 2>/dev/null || true
+  depmod -a "$kernel_release" || warn "depmod failed during rollback; run depmod -a manually"
 }
 
 reload_module() {
@@ -560,6 +612,12 @@ reload_module() {
 
   if compgen -G '/dev/video*' >/dev/null && command -v fuser >/dev/null 2>&1; then
     busy=$(fuser /dev/video* 2>/dev/null || true)
+  fi
+  # refcnt covers hosts without fuser and users that hold the device via
+  # other paths (v4l2 subdevs, media controller).
+  if [[ -z $busy && -r /sys/module/uvcvideo/refcnt ]] &&
+     (( $(tr -d '[:space:]' </sys/module/uvcvideo/refcnt) > 0 )); then
+    busy='refcnt'
   fi
   if [[ -n $busy ]]; then
     warn "uvcvideo was $action, but camera devices are busy; reboot or reload it later"
@@ -595,10 +653,8 @@ install_module() {
     log "preserved the existing override at $backup"
   fi
 
-  install -m 0644 "$module_path" "$destination.new"
-  mv "$destination.new" "$destination"
-  depmod -a "$kernel_release"
-
+  # Record first: every later failure is rolled back below, and even a hard
+  # kill leaves a record that `uninstall` can act on.
   {
     printf 'tool_version=%s\n' "$TOOL_VERSION"
     printf 'kernel_release=%s\n' "$kernel_release"
@@ -606,8 +662,18 @@ install_module() {
     printf 'urb_count=%s\n' "$TARGET_URB_COUNT"
     printf 'source=%s\n' "$source_value"
     printf 'build=%s\n' "$build_value"
-    printf 'module_sha256=%s\n' "$(sha256sum "$destination" | awk '{print $1}')"
+    printf 'module_sha256=%s\n' "$(sha256sum "$module_path" | awk '{print $1}')"
   } >"$state/installed.env"
+
+  if ! (
+    install -m 0644 "$module_path" "$destination.new" &&
+    mv "$destination.new" "$destination" &&
+    depmod -a "$kernel_release" &&
+    verify_module_selected "$kernel_release" "$destination"
+  ); then
+    rollback_install "$kernel_release" "$destination" "$state" "$backup"
+    die "installation failed; the previous uvcvideo selection was restored"
+  fi
 
   log "installed $destination"
   if [[ $reload == true ]]; then
@@ -711,7 +777,9 @@ install_command() {
       --allow-unsupported) allow_unsupported=true ;;
       --kernel-build) shift; [[ $# -gt 0 ]] || die "--kernel-build requires a path"; kernel_build=$1 ;;
       --kernel-source) shift; [[ $# -gt 0 ]] || die "--kernel-source requires a path"; kernel_source=$1 ;;
-      --kernel-release) shift; [[ $# -gt 0 ]] || die "--kernel-release requires a value"; kernel_release=$1 ;;
+      --kernel-release)
+            shift; [[ $# -gt 0 ]] || die "--kernel-release requires a value"
+            kernel_release=$1; validate_kernel_release "$kernel_release" ;;
       --signing-key) shift; [[ $# -gt 0 ]] || die "--signing-key requires a path"; signing_key=$1 ;;
       --signing-cert) shift; [[ $# -gt 0 ]] || die "--signing-cert requires a path"; signing_cert=$1 ;;
       --reload) reload=true ;;
@@ -740,7 +808,8 @@ install_command() {
   resolved_source=$(resolve_kernel_source "$kernel_source" "$resolved_build" "$profile" "$cache_root")
 
   work_dir=$(mktemp -d "/tmp/fv-uvcvideo.${kernel_release}.XXXXXX")
-  trap 'rm -rf "${work_dir:-}"' RETURN
+  # EXIT (not RETURN) so `die` paths also clean the copied kernel sources
+  trap 'rm -rf "${work_dir:-}"' EXIT
   mkdir -p "$work_dir/source"
   cp -a "$resolved_source/." "$work_dir/source/"
   patch_uvc_source "$work_dir/source"
@@ -756,7 +825,7 @@ install_command() {
   install_module \
     "$kernel_release" "$built_module" "$profile" "$resolved_source" "$resolved_build" "$reload"
   rm -rf "$work_dir"
-  trap - RETURN
+  trap - EXIT
 }
 
 main() {
@@ -774,7 +843,9 @@ main() {
       kernel_release=$(uname -r)
       while (($#)); do
         case $1 in
-          --kernel-release) shift; [[ $# -gt 0 ]] || die "--kernel-release requires a value"; kernel_release=$1 ;;
+          --kernel-release)
+            shift; [[ $# -gt 0 ]] || die "--kernel-release requires a value"
+            kernel_release=$1; validate_kernel_release "$kernel_release" ;;
           -h|--help) usage; return ;;
           *) die "unknown status option: $1" ;;
         esac
@@ -786,7 +857,9 @@ main() {
       kernel_release=$(uname -r)
       while (($#)); do
         case $1 in
-          --kernel-release) shift; [[ $# -gt 0 ]] || die "--kernel-release requires a value"; kernel_release=$1 ;;
+          --kernel-release)
+            shift; [[ $# -gt 0 ]] || die "--kernel-release requires a value"
+            kernel_release=$1; validate_kernel_release "$kernel_release" ;;
           --reload) reload=true ;;
           -h|--help) usage; return ;;
           *) die "unknown uninstall option: $1" ;;

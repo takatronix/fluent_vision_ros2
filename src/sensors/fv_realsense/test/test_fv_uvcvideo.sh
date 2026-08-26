@@ -110,5 +110,67 @@ printf changed-module >"$temporary/uvcvideo.ko"
 if (verify_managed_install "$temporary/uvcvideo.ko" "$temporary/state") >/dev/null 2>&1; then
   fail 'a changed installed module was accepted for removal'
 fi
+rm -f "$temporary/uvcvideo.ko"
+(verify_managed_install "$temporary/uvcvideo.ko" "$temporary/state") >/dev/null 2>&1 ||
+  fail 'a record without a module must remain removable'
+
+# --kernel-release is spliced into filesystem paths
+for release in 6.8.0-138-generic 6.8.12-tegra-usbmon 7.0.0-1009-aws 6.8.12+; do
+  (validate_kernel_release "$release") >/dev/null 2>&1 ||
+    fail "valid kernel release rejected: $release"
+done
+for release in '' . .. ../../.. 'a/b' '-6.8' '6.8 generic' '$(id)'; do
+  if (validate_kernel_release "$release") >/dev/null 2>&1; then
+    fail "invalid kernel release accepted: '$release'"
+  fi
+done
+
+# UVC_URBS patch must be verified in the header before metadata is declared
+mkdir -p "$temporary/unpatchable"
+printf '#define UVC_URBS 5 /* keep */\n' >"$temporary/unpatchable/uvcvideo.h"
+printf '' >"$temporary/unpatchable/uvc_driver.c"
+touch "$temporary/unpatchable/uvc_video.c"
+printf 'obj-m += uvcvideo.o\n' >"$temporary/unpatchable/Makefile"
+sed() { if [[ $1 == -Ei ]]; then return 0; fi; command sed "$@"; }
+if (patch_uvc_source "$temporary/unpatchable") >/dev/null 2>&1; then
+  fail 'an unpatched UVC_URBS header was accepted'
+fi
+unset -f sed
+grep -q 'MODULE_INFO(fv_uvc_urbs' "$temporary/unpatchable/uvc_driver.c" &&
+  fail 'module metadata was declared without a verified UVC_URBS patch'
+
+# the installed module must be the one depmod selects
+mkdir -p "$temporary/modules/updates/fluent-vision" "$temporary/modules/updates/dkms"
+printf ours >"$temporary/modules/updates/fluent-vision/uvcvideo.ko"
+printf theirs >"$temporary/modules/updates/dkms/uvcvideo.ko"
+modinfo() { printf '%s\n' "$FAKE_SELECTED_MODULE"; }
+ours="$temporary/modules/updates/fluent-vision/uvcvideo.ko"
+FAKE_SELECTED_MODULE=$ours
+verify_module_selected 6.8.0-138-generic "$ours" ||
+  fail 'the installed module was not recognised as selected'
+FAKE_SELECTED_MODULE="$temporary/modules/updates/dkms/uvcvideo.ko"
+if (verify_module_selected 6.8.0-138-generic "$ours") >/dev/null 2>&1; then
+  fail 'a foreign override winning depmod was reported as success'
+fi
+FAKE_SELECTED_MODULE=''
+if (verify_module_selected 6.8.0-138-generic "$ours") >/dev/null 2>&1; then
+  fail 'a missing depmod entry was reported as success'
+fi
+unset -f modinfo FAKE_SELECTED_MODULE
+
+# a failed install must restore the preserved override and drop the record
+mkdir -p "$temporary/rollback/state"
+printf preserved >"$temporary/rollback/state/replaced-uvcvideo.ko"
+printf record >"$temporary/rollback/state/installed.env"
+printf ours >"$temporary/rollback/uvcvideo.ko"
+printf partial >"$temporary/rollback/uvcvideo.ko.new"
+depmod() { :; }
+rollback_install 6.8.0-138-generic \
+  "$temporary/rollback/uvcvideo.ko" "$temporary/rollback/state" \
+  "$temporary/rollback/state/replaced-uvcvideo.ko" 2>/dev/null
+unset -f depmod
+assert_equal 'preserved' "$(cat "$temporary/rollback/uvcvideo.ko")"
+[[ ! -e $temporary/rollback/uvcvideo.ko.new ]] || fail 'partial module was left behind'
+[[ ! -e $temporary/rollback/state ]] || fail 'installation record survived rollback'
 
 printf 'test_fv_uvcvideo: passed\n'
