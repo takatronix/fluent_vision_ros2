@@ -113,7 +113,9 @@ install(TARGETS ${PROJECT_NAME}
   RUNTIME DESTINATION bin
 )
 install(
-  PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup_dds_receive_buffer.sh
+  PROGRAMS
+    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup_dds_receive_buffer.sh
+    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup_dds_send_buffer.sh
   DESTINATION bin
 )
 
@@ -152,6 +154,10 @@ if(BUILD_TESTING)
   add_test(
     NAME test_setup_dds_receive_buffer
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_setup_dds_receive_buffer.sh
+  )
+  add_test(
+    NAME test_setup_dds_send_buffer
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_setup_dds_send_buffer.sh
   )
 endif()
 

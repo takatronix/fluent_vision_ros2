@@ -180,8 +180,16 @@ private:
     rs2_timestamp_domain device_time_domain_{RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK};
     double base_device_ts_ms_ = 0.0;
     rclcpp::Time base_ros_stamp_{0, 0, RCL_SYSTEM_TIME};
-    double last_device_ts_ms_ = 0.0;
-    rclcpp::Time last_ros_stamp_{0, 0, RCL_SYSTEM_TIME};
+    enum class CameraStream {
+        Color,
+        Depth,
+    };
+    struct StreamTimeState {
+        double last_device_ts_ms = 0.0;
+        rclcpp::Time last_ros_stamp{0, 0, RCL_SYSTEM_TIME};
+    };
+    StreamTimeState color_time_state_;
+    StreamTimeState depth_time_state_;
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr color_pub_;
@@ -211,8 +219,11 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
     // Threading
-    std::thread processing_thread_;
-    std::thread publisher_thread_;
+    std::thread color_processing_thread_;
+    std::thread depth_processing_thread_;
+    std::thread color_publisher_thread_;
+    std::thread compressed_color_publisher_thread_;
+    std::thread depth_publisher_thread_;
     std::atomic<bool> running_;
     std::mutex frame_mutex_;
     // Guard any calls into rs2::pipeline (not thread-safe across callbacks/services)
@@ -223,8 +234,10 @@ private:
         double ts_ms = 0.0;  // device timestamp (ms)
         std::chrono::steady_clock::time_point recv_tp{};
     };
-    std::mutex sync_mutex_;
-    std::condition_variable sync_cv_;
+    std::mutex color_queue_mutex_;
+    std::condition_variable color_queue_cv_;
+    std::mutex depth_queue_mutex_;
+    std::condition_variable depth_queue_cv_;
     std::deque<FrameItem> color_queue_;
     std::deque<FrameItem> depth_queue_;
     std::atomic<int64_t> last_color_recv_ns_{0};
@@ -232,7 +245,6 @@ private:
     std::atomic<int64_t> last_paired_publish_ns_{0};
     std::atomic<uint64_t> dropped_color_frames_{0};
     std::atomic<uint64_t> dropped_depth_frames_{0};
-
     struct PublishBundle {
         std::unique_ptr<sensor_msgs::msg::Image> color;
         std::unique_ptr<sensor_msgs::msg::CompressedImage> color_compressed;
@@ -252,11 +264,24 @@ private:
                 !color_info && !depth_info && !depth_roi_info;
         }
     };
+    enum class PublishPath {
+        Color,
+        CompressedColor,
+        Depth,
+    };
     static constexpr std::size_t kPublishQueueCapacity = 1;
-    std::mutex publish_mutex_;
-    std::condition_variable publish_cv_;
-    std::deque<PublishBundle> publish_queue_;
-    std::atomic<uint64_t> dropped_publish_bundles_{0};
+    std::mutex color_publish_mutex_;
+    std::condition_variable color_publish_cv_;
+    std::deque<PublishBundle> color_publish_queue_;
+    std::mutex compressed_color_publish_mutex_;
+    std::condition_variable compressed_color_publish_cv_;
+    std::deque<PublishBundle> compressed_color_publish_queue_;
+    std::mutex depth_publish_mutex_;
+    std::condition_variable depth_publish_cv_;
+    std::deque<PublishBundle> depth_publish_queue_;
+    std::atomic<uint64_t> dropped_color_publish_bundles_{0};
+    std::atomic<uint64_t> dropped_compressed_color_publish_bundles_{0};
+    std::atomic<uint64_t> dropped_depth_publish_bundles_{0};
 
     // Cache of latest frames for service-safe access (avoid per-frame cv::Mat clones)
     std::mutex latest_frame_mutex_;
@@ -327,15 +352,21 @@ private:
     void initializePublishers();
     void initializeServices();
     void initializeTF();
-    void startPublisherThread();
-    void publisherLoop();
+    void startPublisherThreads();
+    void publisherLoop(PublishPath path);
+    void publishBundle(PublishBundle&& bundle);
+    void enqueueLatestPublishBundle(PublishBundle&& bundle, PublishPath path);
     void enqueuePublishBundle(PublishBundle&& bundle);
-    void processingLoop();
-    rclcpp::Time stampFromDeviceTime(const rs2::frame& frame, double device_ts_ms);
+    void colorProcessingLoop();
+    void depthProcessingLoop();
+    rclcpp::Time stampFromDeviceTime(
+        const rs2::frame& frame, double device_ts_ms, CameraStream stream);
     void queueFramesForPublish(
         const rs2::frame& color_frame,
         const rs2::frame& depth_frame,
-        const rclcpp::Time& stamp);
+        const rclcpp::Time& stamp,
+        bool include_color_messages,
+        bool include_depth_messages);
     std::unique_ptr<sensor_msgs::msg::PointCloud2> buildPointCloud(
         const rs2::frame& color_frame,
         const rs2::frame& depth_frame);
