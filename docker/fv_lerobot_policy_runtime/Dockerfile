@@ -47,6 +47,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     "numpy<2" \
     "opencv-python-headless>=4.9" \
     "pillow>=10" \
+    "pydantic>=2.10.0,<3.0.0" \
     "pyyaml>=6" \
     "safetensors>=0.4" \
     "sentencepiece>=0.2" \
