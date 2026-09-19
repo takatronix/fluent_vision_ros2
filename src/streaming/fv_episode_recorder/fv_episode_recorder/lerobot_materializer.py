@@ -614,7 +614,21 @@ def materialize(
     state_topic: str,
     action_topic: str,
     task_override: Optional[str],
+    image_writer_threads: int = 0,
+    video_file_size_mb: Optional[int] = None,
 ) -> dict:
+    """image_writer_threads / video_file_size_mb は変換時間のチューニング
+    (既定は従来どおり = 同期書き出し・動画 1 ファイル):
+
+    - image_writer_threads > 0: add_frame のフレーム画像書き出しを別スレッドへ
+      逃がし、tick 整列ループと重ねる (save_episode が合流を待つので結果は同じ)
+    - video_file_size_mb: 出力動画をこのサイズで新ファイルへ切り替える。
+      LeRobot は「新エピソードの動画を直前のファイルへ連結」するたびに直前
+      ファイルの全フレームを検証デコードするため、1 ファイルに詰め続けると
+      変換時間がエピソード数の 2 乗で伸びる (45 エピソードで変換時間の約 4 割)。
+      v3.0 形式は複数ファイルが正規の形 (meta/episodes が chunk/file index と
+      from/to_timestamp を持つ)
+    """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     # --- 事前検証: meta.json のみ・動画はデコードしない ---
@@ -673,7 +687,11 @@ def materialize(
                 root=str(out_root),
                 robot_type="piper",
                 use_videos=True,
+                image_writer_threads=max(0, int(image_writer_threads)),
             )
+            if video_file_size_mb is not None:
+                dataset.meta.update_chunk_settings(
+                    video_files_size_in_mb=int(video_file_size_mb))
 
         task = task_override or ep.task or "recording"
         span_start, span_end = ep.aligned_span()
@@ -769,6 +787,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--state-topic", default=DEFAULT_STATE_TOPIC)
     parser.add_argument("--action-topic", default=DEFAULT_ACTION_TOPIC)
     parser.add_argument("--task", default=None, help="override task string for all episodes")
+    parser.add_argument(
+        "--image-writer-threads", type=int, default=0,
+        help="threads for asynchronous frame-image writes (default 0 = synchronous)")
+    parser.add_argument(
+        "--video-file-size-mb", type=int, default=None,
+        help="rotate output video files at this size; default keeps the LeRobot "
+             "default (one growing file, conversion time grows quadratically)")
     args = parser.parse_args(argv)
 
     camera_map = parse_camera_map(args.camera_map)
@@ -783,6 +808,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         state_topic=args.state_topic,
         action_topic=args.action_topic,
         task_override=args.task,
+        image_writer_threads=args.image_writer_threads,
+        video_file_size_mb=args.video_file_size_mb,
     )
 
     info_path = out_root / "meta" / "info.json"
