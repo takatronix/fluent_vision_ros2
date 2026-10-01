@@ -57,3 +57,17 @@ fv_lingbot_depth:
     worker_endpoint: "http://127.0.0.1:5540/infer"
     fallback_passthrough: true
 ```
+
+### Selector-aware input demand and one-shot capture
+
+A downstream reader starts continuous camera input only while this node is the
+selected depth source. Selecting raw depth releases the image subscriptions even
+if a reader remains on the refined output. An explicit `~/capture` still wakes
+input and processes one frame when no output is subscribed, including when the
+selector is already set to refined. Capture waits for the demand timer to update
+subscriptions in the image callback group, avoiding cross-thread ROS entity
+changes. Subscriber callbacks and synchronizer queues are discarded on pause.
+
+`test/test_input_demand.py` checks pause/resume, selector changes, capture, and
+timeout cleanup with tiny synthetic frames, a stubbed model, and ROS domain 136.
+It does not contact the robot or load a neural model.

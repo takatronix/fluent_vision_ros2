@@ -30,6 +30,8 @@ if(BUILD_TESTING)
   # 需要駆動ゲートの単体テスト。ROS には触らないので実機でも安全に回せる
   # (ROSノードを構築するテストは 2026-08-23 に 52GB 食ってスタックを落とした)。
   ament_add_pytest_test(test_demand_gate test/test_demand_gate.py)
+  # Domain 136, tiny synthetic frames and a stubbed model: no robot or model load.
+  ament_add_pytest_test(test_input_demand test/test_input_demand.py TIMEOUT 45)
 endif()
 
 ament_package()

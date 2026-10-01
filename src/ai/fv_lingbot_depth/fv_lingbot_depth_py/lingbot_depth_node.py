@@ -312,6 +312,7 @@ class FvLingbotDepthNode(Node):
             inner = getattr(sub, "sub", None)
             if inner is not None:
                 self.destroy_subscription(inner)
+            sub.callbacks.clear()
 
     def _input_demanded(self) -> bool:
         """入力を受け取る理由があるか。
@@ -320,7 +321,7 @@ class FvLingbotDepthNode(Node):
         無い状態から1枚だけ処理する口なので、ここに含めないと永遠に
         タイムアウトする。
         """
-        if self._demanded():
+        if self._source_selected and self._demanded():
             return True
         with self._capture_lock:
             return self._capture_pending > 0
@@ -407,7 +408,7 @@ class FvLingbotDepthNode(Node):
         that. No passthrough: if the worker/model fails, the call times out
         rather than returning raw depth dressed up as refined.
         """
-        if self._source_selected:
+        if self._source_selected and self._demanded():
             response.success = True
             response.message = json.dumps(
                 {"note": "continuous mode active; refined stream already live"})
@@ -416,9 +417,9 @@ class FvLingbotDepthNode(Node):
             if self._capture_pending <= 0:
                 self._capture_event.clear()
                 self._capture_pending = 1
-        # 購読が落ちている状態からの capture。タイマ (既定1秒) を待たずに
-        # ここで上げる — 待つと capture_timeout_sec を無駄に食う。
-        self._reconcile_input()
+        # The default callback group's timer owns ROS subscription changes.
+        # This service has a separate callback group and only changes demand;
+        # reconciling here races image callbacks and the regular demand timer.
         if self._capture_event.wait(self.capture_timeout_sec):
             response.success = True
             response.message = json.dumps(self._capture_result)
@@ -467,12 +468,10 @@ class FvLingbotDepthNode(Node):
 
     def _on_synced(self, color_msg: Image, depth_msg: Image,
                    info_msg: Optional[CameraInfo]) -> None:
-        capture = False
-        if not self._source_selected:
-            with self._capture_lock:
-                if self._capture_pending <= 0:
-                    return
-                capture = True
+        with self._capture_lock:
+            capture = self._capture_pending > 0
+        if not self._source_selected and not capture:
+            return
         # A pending /capture request is an explicit one-shot demand, so it
         # bypasses the subscriber check (the caller wants a single frame
         # even with nothing subscribed).

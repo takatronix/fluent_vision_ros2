@@ -168,13 +168,15 @@ def test_capture_counts_as_demand():
     assert '_demanded()' in body
 
 
-def test_capture_reconciles_immediately():
-    """タイマ (既定1秒) を待つと capture_timeout_sec を無駄に食う。"""
+def test_capture_leaves_subscription_changes_to_the_executor_timer():
+    """別callback groupのcaptureから画像購読を作成・破棄しない。"""
     src = _node_src()
     body = src[src.index('def _on_capture'):]
     body = body[:body.index('def _on_synced_static_intr')]
-    assert '_reconcile_input()' in body
-    assert body.index('_reconcile_input()') < body.index('_capture_event.wait')
+    assert '_reconcile_input()' not in body
+    assert 'self._capture_pending = 1' in body
+    assert 'self._demand_poll_sec, self._reconcile_input)' in src
+    assert body.index('self._capture_pending = 1') < body.index('_capture_event.wait')
 
 
 def test_teardown_drops_the_synchronizer_first():
