@@ -25,4 +25,10 @@ install(DIRECTORY resource/
   DESTINATION share/${PROJECT_NAME}
 )
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_input_demand test/test_input_demand.py TIMEOUT 30
+    ENV ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)
+endif()
+
 ament_package()

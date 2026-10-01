@@ -213,30 +213,13 @@ class FvLingbotDepthNode(Node):
                 f"inference gated by {self.depth_source_topic} "
                 "(paused until it selects the refined stream)")
 
-        qos = self._sensor_qos_profile()
-        self.color_sub = Subscriber(self, Image, self.color_topic, qos_profile=qos)
-        self.depth_sub = Subscriber(self, Image, self.depth_topic, qos_profile=qos)
-        if self._static_intr is not None:
-            # No camera_info stream: sync color+depth only, intrinsics come
-            # from the static_intrinsics parameter.
-            self.info_sub = None
-            self.sync = ApproximateTimeSynchronizer(
-                [self.color_sub, self.depth_sub],
-                queue_size=self.sync_queue_size,
-                slop=self.sync_slop_sec,
-                allow_headerless=False,
-            )
-            self.sync.registerCallback(self._on_synced_static_intr)
-        else:
-            self.info_sub = Subscriber(
-                self, CameraInfo, self.camera_info_topic, qos_profile=qos)
-            self.sync = ApproximateTimeSynchronizer(
-                [self.color_sub, self.depth_sub, self.info_sub],
-                queue_size=self.sync_queue_size,
-                slop=self.sync_slop_sec,
-                allow_headerless=False,
-            )
-            self.sync.registerCallback(self._on_synced)
+        # Do not receive/deserialise camera images while no output is used.
+        # Recreate the synchronizer on every resume so it cannot match an old
+        # buffered frame with a newly arrived frame after an idle interval.
+        self.color_sub = None
+        self.depth_sub = None
+        self.info_sub = None
+        self.sync = None
 
         # On-demand capture: its own callback group so the (blocking) service
         # handler can wait while the sync callback runs on the default group
@@ -248,6 +231,9 @@ class FvLingbotDepthNode(Node):
         self._capture_srv = self.create_service(
             Trigger, "~/capture", self._on_capture,
             callback_group=MutuallyExclusiveCallbackGroup())
+
+        self._input_demand_timer = self.create_timer(0.25, self._reconcile_input_demand)
+        self._reconcile_input_demand()
 
         self._frame_counter = 0
         self._proc_ms_acc = 0.0
@@ -263,6 +249,39 @@ class FvLingbotDepthNode(Node):
             f"info={self.camera_info_topic} out_depth={self.refined_depth_topic} "
             f"out_points={self.pointcloud_topic} backend={self.backend} model={model_source}"
         )
+
+    def _reconcile_input_demand(self) -> None:
+        # Runs in the same mutually-exclusive callback group as image and
+        # selector callbacks. The capture service only changes its request
+        # flag, under the lock, and lets this timer own subscription changes.
+        with self._capture_lock:
+            capture_pending = self._capture_pending > 0
+        wanted = capture_pending or (self._source_selected and self._demanded())
+        if wanted == (self.sync is not None):
+            return
+        if not wanted:
+            for subscriber in (self.color_sub, self.depth_sub, self.info_sub):
+                if subscriber is not None:
+                    self.destroy_subscription(subscriber.sub)
+                    subscriber.callbacks.clear()
+            self.color_sub = self.depth_sub = self.info_sub = self.sync = None
+            self.get_logger().debug("camera subscriptions paused: no refined output demand")
+            return
+
+        qos = self._sensor_qos_profile()
+        self.color_sub = Subscriber(self, Image, self.color_topic, qos_profile=qos)
+        self.depth_sub = Subscriber(self, Image, self.depth_topic, qos_profile=qos)
+        inputs = [self.color_sub, self.depth_sub]
+        if self._static_intr is None:
+            self.info_sub = Subscriber(self, CameraInfo, self.camera_info_topic, qos_profile=qos)
+            inputs.append(self.info_sub)
+        self.sync = ApproximateTimeSynchronizer(
+            inputs, queue_size=self.sync_queue_size, slop=self.sync_slop_sec,
+            allow_headerless=False,
+        )
+        self.sync.registerCallback(
+            self._on_synced_static_intr if self._static_intr is not None else self._on_synced)
+        self.get_logger().debug("camera subscriptions resumed: refined output/capture demand")
 
     def _on_param_update(self, params) -> SetParametersResult:
         for p in params:
@@ -343,7 +362,7 @@ class FvLingbotDepthNode(Node):
         that. No passthrough: if the worker/model fails, the call times out
         rather than returning raw depth dressed up as refined.
         """
-        if self._source_selected:
+        if self._source_selected and self._demanded():
             response.success = True
             response.message = json.dumps(
                 {"note": "continuous mode active; refined stream already live"})
@@ -392,12 +411,10 @@ class FvLingbotDepthNode(Node):
 
     def _on_synced(self, color_msg: Image, depth_msg: Image,
                    info_msg: Optional[CameraInfo]) -> None:
-        capture = False
-        if not self._source_selected:
-            with self._capture_lock:
-                if self._capture_pending <= 0:
-                    return
-                capture = True
+        with self._capture_lock:
+            capture = self._capture_pending > 0
+        if not self._source_selected and not capture:
+            return
         # A pending /capture request is an explicit one-shot demand, so it
         # bypasses the subscriber check (the caller wants a single frame
         # even with nothing subscribed).

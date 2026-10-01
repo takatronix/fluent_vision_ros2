@@ -11,6 +11,23 @@ ROS2 node integrating [LingBot-Depth](https://github.com/Robbyant/lingbot-depth)
   - point cloud (`PointCloud2`, XYZ)
 - Optional passthrough fallback when model is unavailable
 
+RGB/depth/camera-info subscriptions are created only while a refined output
+has a subscriber and the optional depth-source selector permits inference.
+The 250 ms demand check removes subscriptions and clears synchronized frames
+when demand disappears, so pausing also stops unused camera DDS traffic and
+deserialization. Active downstream perception consumers retain the same inputs
+and inference quality. The resident model stays loaded.
+
+`~/capture` creates temporary input demand even without output subscribers,
+including when the selector gate is disabled. Inputs are released after capture
+or timeout; a timeout never reports raw depth as a successful refined capture.
+
+The synthetic ROS lifecycle test runs in isolated domain 136:
+
+```bash
+ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST python3 -m pytest -q test/test_input_demand.py
+```
+
 ## Dependencies
 
 ROS:
