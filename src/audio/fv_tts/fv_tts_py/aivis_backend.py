@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""VOICEVOX ENGINE を叩く TTS バックエンド。
+"""AivisSpeech Engine を叩く TTS バックエンド (fv_tts の engine="aivis" 用)。
 
-fv_tts のエンジン差替え機構 (engine="voicevox") 用。ローカルで動く
-VOICEVOX ENGINE (既定 http://127.0.0.1:50021) の 2 段 API を呼ぶ:
+ロボット内で動く AivisSpeech Engine (既定 http://127.0.0.1:10101) の 2 段 API を呼ぶ:
 
   1. POST /audio_query?text=<text>&speaker=<id>   → 合成用クエリ(JSON)
-  2. POST /synthesis?speaker=<id>  (body=上記JSON) → 24kHz mono 16bit WAV
+  2. POST /synthesis?speaker=<id>  (body=上記JSON) → mono 16bit WAV (44.1kHz)
 
-返ってきた WAV からヘッダを剥がして PCM(int16) と実サンプルレートを取り出す。
+返ってきた WAV からヘッダを剥がして PCM(int16) と実サンプルレートを取り出す
+(出力レートへのリサンプルは呼び出し側)。スタイル ID は 135718976 (女) /
+1310138977 (男) のように大きいが int のまま渡せばよい。
+接続不可・HTTP エラー・想定外フォーマットは握りつぶさず例外送出する
+(Open JTalk への切替は呼び出し側の声キャッシュ層が行う)。
 
-AivisSpeech Engine (既定 :10101) も同じ API なのでそのまま使える。スタイル ID が
-135718976 のように大きいが int のまま渡せばよい。出力は 44.1kHz (呼び出し側でリサンプル)。
-接続不可・HTTP エラー・想定外フォーマットは握りつぶさず例外送出する (fallback 禁止)。
-
-依存は標準ライブラリのみ (urllib / wave)。エンジン本体は外部プロセスなので
-rosdep 依存には含めず、起動確認は `curl http://127.0.0.1:50021/version`。
+依存は標準ライブラリのみ (urllib / wave)。エンジン本体は外部プロセス
+(systemd --user の aivisspeech.service) なので rosdep 依存には含めず、
+起動確認は `curl http://127.0.0.1:10101/version`。
 """
 import io
 import json
@@ -23,28 +23,30 @@ import urllib.parse
 import urllib.request
 import wave
 
-
-class VoicevoxError(RuntimeError):
-    """VOICEVOX ENGINE との通信・合成に失敗したときの明示例外。"""
+DEFAULT_URL = "http://127.0.0.1:10101"
 
 
-class VoicevoxUnreachable(VoicevoxError):
+class AivisError(RuntimeError):
+    """AivisSpeech Engine との通信・合成に失敗したときの明示例外。"""
+
+
+class AivisUnreachable(AivisError):
     """接続できない / タイムアウト (HTTP 応答が無い)。エンジン側の問題。"""
 
 
-def _wrap(msg: str, exc: Exception) -> VoicevoxError:
+def _wrap(msg: str, exc: Exception) -> AivisError:
     if isinstance(exc, urllib.error.HTTPError):
-        return VoicevoxError(f"{msg}: {exc}")
-    return VoicevoxUnreachable(f"{msg}: {exc}")
+        return AivisError(f"{msg}: {exc}")
+    return AivisUnreachable(f"{msg}: {exc}")
 
 
-class VoicevoxBackend:
-    """VOICEVOX ENGINE の HTTP クライアント。
+class AivisBackend:
+    """AivisSpeech Engine の HTTP クライアント。
 
     synthesize(text, speaker) -> (pcm_int16_bytes, sample_rate, channels, bit_depth)
     """
 
-    def __init__(self, url: str = "http://127.0.0.1:50021", timeout: float = 15.0) -> None:
+    def __init__(self, url: str = DEFAULT_URL, timeout: float = 15.0) -> None:
         self.url = url.rstrip("/")
         self.timeout = float(timeout)
 
@@ -55,20 +57,20 @@ class VoicevoxBackend:
         query_overrides: audio_query の結果へ上書きする項目 (例 {"speedScale": 1.1})。
         """
         if not text:
-            raise VoicevoxError("text is empty")
+            raise AivisError("text is empty")
         query = self._audio_query(text, int(speaker))
         if query_overrides:
             try:
                 obj = json.loads(query)
             except ValueError as exc:
-                raise VoicevoxError(f"audio_query の JSON が壊れている: {exc}") from exc
+                raise AivisError(f"audio_query の JSON が壊れている: {exc}") from exc
             obj.update(query_overrides)
             query = json.dumps(obj).encode("utf-8")
         wav_bytes = self._synthesis(query, int(speaker))
         return self._decode_wav(wav_bytes)
 
     def version(self) -> str:
-        """ENGINE のバージョン文字列 (疎通確認用)。"""
+        """エンジンのバージョン文字列 (疎通確認用)。"""
         try:
             with urllib.request.urlopen(f"{self.url}/version", timeout=self.timeout) as resp:
                 return resp.read().decode("utf-8", errors="ignore").strip()
@@ -108,9 +110,9 @@ class VoicevoxBackend:
                 sample_rate = w.getframerate()
                 pcm = w.readframes(w.getnframes())
         except wave.Error as exc:
-            raise VoicevoxError(f"WAV decode失敗: {exc}") from exc
+            raise AivisError(f"WAV decode失敗: {exc}") from exc
         if bit_depth != 16:
-            raise VoicevoxError(f"想定外のbit_depth={bit_depth} (16bit想定)")
+            raise AivisError(f"想定外のbit_depth={bit_depth} (16bit想定)")
         if not pcm:
-            raise VoicevoxError("合成結果が空 (PCM 0 bytes)")
+            raise AivisError("合成結果が空 (PCM 0 bytes)")
         return pcm, int(sample_rate), int(channels), int(bit_depth)

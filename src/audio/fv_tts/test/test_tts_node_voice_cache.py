@@ -12,7 +12,7 @@ import pytest
 
 tts_node = pytest.importorskip("fv_tts_py.tts_node")
 vc = pytest.importorskip("fv_tts_py.voice_cache")
-VoicevoxUnreachable = tts_node.VoicevoxUnreachable
+AivisUnreachable = tts_node.AivisUnreachable
 
 
 class Log:
@@ -40,7 +40,7 @@ def node(tmp_path, monkeypatch):
     n.engine = "pyopenjtalk"
     n.default_volume_db = 8.0
     n.output_sample_rate = 48000
-    n.vc_kind, n.vc_speaker, n.vc_query, n.vc_max_chars = "voicevox", 135718976, {}, 120
+    n.vc_kind, n.vc_speaker, n.vc_query, n.vc_max_chars = "aivis", 135718976, {}, 120
     n.voice_store = vc.VoiceCacheStore(tmp_path, 10 ** 8)
     n.vc_active = True
     n.vc_live_budget = 0.0  # その場合成は個別テストで ON
@@ -53,7 +53,6 @@ def node(tmp_path, monkeypatch):
     n._vc_skip_until = 0.0
     n._warmup_path = None
     n._warmup_due = False
-    n.voicevox_speaker = 30
     n.submitted = []
 
     class W:
@@ -194,7 +193,7 @@ def test_live_too_slow_falls_back_and_saves_later(live):
 
 
 def test_engine_down_speaks_open_jtalk_and_stops_trying_for_a_while(live):
-    live.vc_backend = _Backend(exc=VoicevoxUnreachable("connection refused"))
+    live.vc_backend = _Backend(exc=AivisUnreachable("connection refused"))
     live.get_audio("一つ目。", "", 8.0, "k1")
     live.get_audio("二つ目。", "", 8.0, "k2")
     assert live.ojt_calls == ["一つ目。", "二つ目。"]  # 無音にしない
@@ -215,7 +214,7 @@ def test_male_and_female_are_cached_separately(node):
 
 def test_settings_toggle_engine_and_voice(node):
     msg = type("M", (), {})()
-    msg.data = json.dumps({"tts_engine": "pyopenjtalk", "voicevox_speaker": 30})
+    msg.data = json.dumps({"tts_engine": "pyopenjtalk"})
     node.on_settings(msg)
     assert node.vc_active is False
     node.get_audio("テストです。", "", 8.0, "k")
@@ -244,9 +243,44 @@ def test_voice_change_rewarms_after_startup(node, tmp_path):
 def test_render_maps_unreachable_to_engine_down(node):
     class Backend:
         def synthesize(self, *a):
-            raise VoicevoxUnreachable("connection refused")
+            raise AivisUnreachable("connection refused")
 
     node.vc_backend = Backend()
     with pytest.raises(vc.EngineDown):
         node._render_voice("k", "テスト", 0.2)
 
+
+
+def test_legacy_voicevox_setting_turns_aivis_on(node):
+    node._apply_voice_settings({"tts_engine": "pyopenjtalk"})
+    assert node.vc_active is False
+    node._apply_voice_settings({"tts_engine": "voicevox"})  # 旧 viewer の保存値
+    assert node.vc_active is True
+
+
+@pytest.mark.parametrize("engine,url,expected,warns", [
+    ("pyopenjtalk", "", "pyopenjtalk", False),
+    ("", "", "pyopenjtalk", False),
+    ("AIVIS", "", "aivis", False),
+    ("voicevox", "http://127.0.0.1:10101", "aivis", True),   # 旧設定: URL があれば aivis
+    ("voicevox", "", "pyopenjtalk", True),                     # 無ければ Open JTalk
+])
+def test_resolve_engine(engine, url, expected, warns):
+    got, warning = tts_node.resolve_engine(engine, url)
+    assert got == expected and bool(warning) == warns
+
+
+def test_resolve_engine_rejects_unknown():
+    with pytest.raises(RuntimeError):
+        tts_node.resolve_engine("espeak", "")
+
+
+def test_open_jtalk_cache_key_is_stable(node):
+    import hashlib
+    digest = hashlib.sha1()
+    for part in (b"pyopenjtalk", "テスト".encode(), b"", b"8.0"):
+        digest.update(part)
+    # 既存の Open JTalk ディスクキャッシュ (~/.fluent_voice_cache) をそのまま使える
+    assert node.make_cache_key("テスト", "", 8.0) == digest.hexdigest()
+    node.engine = "aivis"
+    assert node.make_cache_key("テスト", "", 8.0) == digest.hexdigest()

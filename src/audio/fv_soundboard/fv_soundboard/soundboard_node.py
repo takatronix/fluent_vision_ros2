@@ -350,7 +350,7 @@ class SoundboardNode(Node):
                 raise ValueError("object required")
             enabled = bool(obj.get("robot_enabled", True))
             # enable_tts は任意キー: 無指定なら現状維持 (起動パラメータ値)。
-            # 「通知音は鳴らすが読み上げ(VOICEVOX)だけ止める」用 (_speak が参照)。
+            # 「通知音は鳴らすが読み上げだけ止める」用 (_speak が参照)。
             tts_flag = obj.get("enable_tts")
             disabled = {
                 str(name) for name in obj.get("disabled_events", [])

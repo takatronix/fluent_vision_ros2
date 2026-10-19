@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """声キャッシュ: 「その場は軽量エンジン、裏で高品質エンジン、次回から高品質」。
 
-fv_tts の engine=pyopenjtalk に重ねて使う。初回は Open JTalk で即答し、同じ文を
-VOICEVOX 互換エンジン (AivisSpeech 等) で裏で合成して WAV に保存する。次に同じ文が
+fv_tts の Open JTalk に重ねて使う。初回は Open JTalk で即答し、同じ文を
+AivisSpeech で裏で合成して WAV に保存する。次に同じ文が
 来たら保存済み WAV を流す。高品質エンジンが落ちていても遅くても Open JTalk で
 喋り続ける (無音にしない)。
 
