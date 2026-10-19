@@ -644,7 +644,9 @@ def main(args=None) -> None:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # SIGINT 時は rclpy が既に shutdown 済み (二重呼びで exit code 1 になっていた)
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
