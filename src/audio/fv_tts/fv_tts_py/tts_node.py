@@ -21,7 +21,8 @@ from std_msgs.msg import Bool, Empty, String
 from fv_audio.msg import AudioFrame
 from fv_tts.srv import Speak
 
-from fv_tts_py.voicevox_backend import VoicevoxBackend, VoicevoxError
+from fv_tts_py.voicevox_backend import VoicevoxBackend, VoicevoxError, VoicevoxUnreachable
+from fv_tts_py import voice_cache as vc
 
 # Disable tqdm progress bar for pyopenjtalk downloads
 os.environ["TQDM_DISABLE"] = "1"
@@ -29,6 +30,8 @@ os.environ["TQDM_DISABLE"] = "1"
 pyopenjtalk = None
 _IMPORT_ERROR = None
 _PYOPENJTALK_LOADED = False
+# pyopenjtalk は内部状態を持つので、声キャッシュの裏スレッドと同時に呼ばない
+_PYOPENJTALK_LOCK = threading.Lock()
 
 
 def load_pyopenjtalk():
@@ -114,6 +117,21 @@ class FvTtsNode(Node):
         self.speaking_topic = self.get_parameter("speaking_topic").get_parameter_value().string_value
         self.settings_topic = self.get_parameter("settings_topic").value
 
+        # 声キャッシュ (engine=pyopenjtalk のときだけ有効): その場は Open JTalk、
+        # 裏で voice_cache_engine の声を作り、次に同じ文が来たらそれを流す。
+        self.declare_parameter("voice_cache_engine", "")  # "" (無効) | "voicevox" (AivisSpeech 含む)
+        self.declare_parameter("voice_cache_url", "http://127.0.0.1:10101")
+        self.declare_parameter("voice_cache_speaker", -1)
+        self.declare_parameter("voice_cache_query", "{}")  # audio_query 上書き JSON
+        self.declare_parameter("voice_cache_dir", "~/.aspa/tts_cache/voice")
+        self.declare_parameter("voice_cache_max_mb", 300)
+        self.declare_parameter("voice_cache_max_chars", 120)
+        self.declare_parameter("voice_cache_timeout_s", 60.0)
+        self.declare_parameter("voice_cache_warmup_file", "")
+        self.declare_parameter("voice_cache_warmup_delay_s", 90.0)
+        self.declare_parameter("voice_cache_max_load", 0.0)  # 1分 loadavg がこれ以上ならウォームアップ待ち (0=無効)
+        self.declare_parameter("voice_cache_nice", 10)
+
         self.get_logger().info(f"Starting FV TTS node (engine={self.engine})")
 
         # エンジンごとに必要リソースを確認 (fallback せず、駄目なら止める)
@@ -178,6 +196,142 @@ class FvTtsNode(Node):
 
         self.cache: Dict[str, CachedAudio] = {}
 
+        self.voice_store: Optional[vc.VoiceCacheStore] = None
+        self.voice_worker: Optional[vc.RenderWorker] = None
+        self._warmup_timer: Optional[threading.Timer] = None
+        try:
+            self._setup_voice_cache()
+        except Exception as exc:  # pylint: disable=broad-except
+            # 声キャッシュは付加機能。壊れていても Open JTalk はそのまま喋る。
+            self.get_logger().error(f"voice cache disabled: {exc}")
+            self.voice_store = None
+            self.voice_worker = None
+
+    # ── 声キャッシュ ───────────────────────────────────
+    def _setup_voice_cache(self) -> None:
+        kind = str(self.get_parameter("voice_cache_engine").value or "").strip().lower()
+        if not kind:
+            return
+        if kind != "voicevox":
+            raise RuntimeError(f"未知の voice_cache_engine='{kind}' (voicevox のみ)")
+        if self.engine != "pyopenjtalk":
+            self.get_logger().info(f"voice cache は engine=pyopenjtalk 専用 (今は {self.engine}) — 無効")
+            return
+        self.vc_speaker = int(self.get_parameter("voice_cache_speaker").value)
+        if self.vc_speaker < 0:
+            raise RuntimeError("voice_cache_speaker が未設定")
+        self.vc_query = json.loads(str(self.get_parameter("voice_cache_query").value or "{}"))
+        if not isinstance(self.vc_query, dict):
+            raise RuntimeError("voice_cache_query は JSON object")
+        self.vc_kind = kind
+        self.vc_max_chars = int(self.get_parameter("voice_cache_max_chars").value)
+        url = str(self.get_parameter("voice_cache_url").value)
+        self.vc_backend = VoicevoxBackend(
+            url, timeout=float(self.get_parameter("voice_cache_timeout_s").value))
+        max_mb = int(self.get_parameter("voice_cache_max_mb").value)
+        cache_dir = str(self.get_parameter("voice_cache_dir").value)
+        self.voice_store = vc.VoiceCacheStore(cache_dir, max_mb * 1024 * 1024)
+        max_load = float(self.get_parameter("voice_cache_max_load").value)
+        busy = (lambda: os.getloadavg()[0] >= max_load) if max_load > 0 else None
+        self.voice_worker = vc.RenderWorker(
+            self.voice_store, self._render_voice,
+            meta={"engine": kind, "speaker": self.vc_speaker},
+            log=lambda m: self.get_logger().info(m),
+            busy=busy, nice=int(self.get_parameter("voice_cache_nice").value))
+        self.voice_worker.start()
+        self.get_logger().info(
+            f"voice cache ON: {kind} @ {url} speaker={self.vc_speaker} dir={self.voice_store.dir} "
+            f"({len(self.voice_store.index)} 件, {self.voice_store.total_bytes() / 1e6:.1f}MB / {max_mb}MB)")
+
+        warmup = str(self.get_parameter("voice_cache_warmup_file").value or "").strip()
+        if warmup:
+            path = Path(warmup).expanduser()
+            if not path.is_absolute():
+                try:
+                    from ament_index_python.packages import get_package_share_directory
+                    path = Path(get_package_share_directory("fv_tts")) / "config" / warmup
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            delay = float(self.get_parameter("voice_cache_warmup_delay_s").value)
+            self._warmup_timer = threading.Timer(delay, self._enqueue_warmup, args=(path,))
+            self._warmup_timer.daemon = True
+            self._warmup_timer.start()
+
+    def _voice_key(self, text: str, volume_db: float) -> str:
+        return vc.make_key(self.vc_kind, self.vc_speaker, self.vc_query, volume_db, text)
+
+    def _enqueue_warmup(self, path: Path) -> None:
+        try:
+            texts = vc.load_warmup(path)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().warn(f"voice cache warmup 読込失敗 {path}: {exc}")
+            return
+        n = 0
+        for text in texts:
+            if self.voice_worker and len(text) <= self.vc_max_chars:
+                n += self.voice_worker.submit(
+                    self._voice_key(text, self.default_volume_db), text, None, priority=False)
+        self.get_logger().info(f"voice cache warmup: {len(texts)} 文中 {n} 文を裏で作成予定 ({path.name})")
+
+    def _render_voice(self, _key: str, text: str, ref_rms: Optional[float]):
+        """裏スレッド: 高品質エンジンで合成→出力レートへ→Open JTalk 版と同じ音量へ。"""
+        try:
+            pcm, sr, channels, bit_depth = self.vc_backend.synthesize(text, self.vc_speaker, self.vc_query)
+        except VoicevoxUnreachable as exc:
+            raise vc.EngineDown(str(exc)) from exc
+        if channels != 1 or bit_depth != 16:
+            raise RuntimeError(f"想定外フォーマット channels={channels} bit_depth={bit_depth}")
+        if ref_rms is None:
+            ref = self._synthesize_pyopenjtalk(text, "", self.default_volume_db)
+            ref_rms = vc.active_rms(vc.pcm16_to_float(ref.audio_bytes), ref.sample_rate)
+        out_sr = int(self.output_sample_rate) if self.output_sample_rate > 0 else sr
+        wave_f = vc.resample(vc.pcm16_to_float(pcm), sr, out_sr)
+        wave_f, gain_db = vc.match_loudness(wave_f, out_sr, ref_rms)
+        self.get_logger().debug(f"voice cache gain {gain_db:+.1f}dB")
+        return vc.float_to_pcm16(wave_f), out_sr
+
+    def _voice_cache_lookup(self, text: str, voice_id: str, volume_db: float):
+        """(CachedAudio or None, key or None)。None なら呼び出し側は今まで通り Open JTalk。"""
+        if self.voice_store is None or voice_id or len(vc.normalize_text(text)) > self.vc_max_chars:
+            return None, None
+        key = self._voice_key(text, volume_db)
+        try:
+            hit = self.voice_store.get(key)
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().warn(f"voice cache read failed: {exc}")
+            return None, key
+        if hit is None:
+            return None, key
+        pcm, sr = hit
+        samples = vc.pcm16_to_float(pcm)
+        rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+        peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+        self.get_logger().info(f"voice cache hit ({self.vc_kind}:{self.vc_speaker})")
+        return CachedAudio(pcm, sr, 1, 16, rms, peak), key
+
+    def _voice_cache_submit(self, key: Optional[str], text: str, cached: CachedAudio) -> None:
+        if key is None or self.voice_worker is None:
+            return
+        ref = vc.active_rms(vc.pcm16_to_float(cached.audio_bytes), cached.sample_rate)
+        if self.voice_worker.submit(key, text, ref, priority=True):
+            self.get_logger().info(f"voice cache: 裏で作成を予約 (待ち {self.voice_worker.queued()})")
+
+    def get_audio(self, text: str, voice_id: str, volume_db: float, cache_key: str) -> CachedAudio:
+        """声キャッシュにあればそれ、無ければ今まで通り合成し、裏で作成を予約。"""
+        voiced, vkey = self._voice_cache_lookup(text, voice_id, volume_db)
+        if voiced is not None:
+            return voiced
+        cached = self.get_cached(text, voice_id, volume_db, cache_key)
+        self._voice_cache_submit(vkey, text, cached)
+        return cached
+
+    def destroy_node(self):
+        if self._warmup_timer is not None:
+            self._warmup_timer.cancel()
+        if self.voice_worker is not None:
+            self.voice_worker.stop()
+        return super().destroy_node()
+
     def on_settings(self, msg: String) -> None:
         try:
             obj = json.loads(msg.data or "{}")
@@ -219,7 +373,7 @@ class FvTtsNode(Node):
         cache_key = request.cache_key or self.make_cache_key(text, voice_id, volume_db)
 
         try:
-            cached = self.get_cached(text, voice_id, volume_db, cache_key)
+            cached = self.get_audio(text, voice_id, volume_db, cache_key)
         except Exception as exc:  # pylint: disable=broad-except
             self.get_logger().error(f"TTS failed: {exc}")
             response.success = False
@@ -252,7 +406,7 @@ class FvTtsNode(Node):
         volume_db = self.default_volume_db
         cache_key = self.make_cache_key(text, voice_id, volume_db)
         try:
-            cached = self.get_cached(text, voice_id, volume_db, cache_key)
+            cached = self.get_audio(text, voice_id, volume_db, cache_key)
         except Exception as exc:  # pylint: disable=broad-except
             self.get_logger().error(f"say TTS failed: {exc}")
             return
@@ -362,7 +516,8 @@ class FvTtsNode(Node):
         if voice_id:
             self.get_logger().warn(
                 f"pyopenjtalk: voice_id='{voice_id}' is ignored (single voice engine)")
-        wav, sample_rate = pyopenjtalk.tts(text, **options)
+        with _PYOPENJTALK_LOCK:
+            wav, sample_rate = pyopenjtalk.tts(text, **options)
         waveform = np.asarray(wav, dtype=np.float32)
 
         # pyopenjtalk が返す波形は float64 だが、環境によっては
