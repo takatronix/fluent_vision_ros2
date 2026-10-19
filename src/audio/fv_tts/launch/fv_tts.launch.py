@@ -1,11 +1,40 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
+# 声キャッシュ (engine=pyopenjtalk 時のみ): 起動スクリプトを変えずに機体ごとに
+# 有効化できるよう、既定値を環境変数 (~/.aspa/env など) から取る。
+_VOICE_CACHE_ARGS = [
+    # (launch arg / ROS param, env var, default, type, description)
+    ('voice_cache_engine', 'ASPA_TTS_VOICE_CACHE_ENGINE', '', str,
+     '"" = off, "voicevox" = render cached voice with a VOICEVOX-compatible engine (AivisSpeech)'),
+    ('voice_cache_url', 'ASPA_TTS_VOICE_CACHE_URL', 'http://127.0.0.1:10101', str,
+     'Engine URL for the cached voice'),
+    ('voice_cache_speaker', 'ASPA_TTS_VOICE_CACHE_SPEAKER', '-1', int,
+     'Style/speaker id for the cached voice'),
+    ('voice_cache_dir', 'ASPA_TTS_VOICE_CACHE_DIR', '~/.aspa/tts_cache/voice', str,
+     'Directory of cached WAVs + index.json'),
+    ('voice_cache_max_mb', 'ASPA_TTS_VOICE_CACHE_MAX_MB', '300', int,
+     'Cache size cap (LRU eviction)'),
+    ('voice_cache_warmup_file', 'ASPA_TTS_VOICE_CACHE_WARMUP', '', str,
+     'YAML of texts rendered in the background at startup (relative = share/fv_tts/config)'),
+    ('voice_cache_max_load', 'ASPA_TTS_VOICE_CACHE_MAX_LOAD', '0.0', float,
+     'Warm-up waits while 1-min loadavg >= this (0 = no guard)'),
+]
+
 
 def generate_launch_description():
+    cache_args = [
+        DeclareLaunchArgument(name, default_value=EnvironmentVariable(env, default_value=default),
+                              description=desc)
+        for name, env, default, _t, desc in _VOICE_CACHE_ARGS
+    ]
+    cache_params = {
+        name: ParameterValue(LaunchConfiguration(name), value_type=typ)
+        for name, _env, _d, typ, _desc in _VOICE_CACHE_ARGS
+    }
     return LaunchDescription([
         DeclareLaunchArgument(
             'engine', default_value='pyopenjtalk',
@@ -13,6 +42,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'default_volume_db', default_value='8.0',
             description='Engine-specific synthesis gain in dB'),
+        *cache_args,
         Node(
             package='fv_tts',
             executable='fv_tts_node',
@@ -35,6 +65,7 @@ def generate_launch_description():
                 'speaking_topic': '/aspa/audio/speaking',
                 'settings_topic': '/aspa/tts/settings',
                 'cache_dir': '~/.fluent_voice_cache',
+                **cache_params,
             }],
         )
     ])
