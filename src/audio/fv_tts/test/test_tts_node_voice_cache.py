@@ -2,6 +2,11 @@
 
 ノードは起動せず、__init__ を飛ばした素のインスタンスに部品を差し込む。
 """
+import concurrent.futures
+import json
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -37,11 +42,25 @@ def node(tmp_path, monkeypatch):
     n.output_sample_rate = 48000
     n.vc_kind, n.vc_speaker, n.vc_query, n.vc_max_chars = "voicevox", 135718976, {}, 120
     n.voice_store = vc.VoiceCacheStore(tmp_path, 10 ** 8)
+    n.vc_active = True
+    n.vc_live_budget = 0.0  # その場合成は個別テストで ON
+    n.vc_volume_db = 0.0
+    n.vc_match_loudness = False
+    n.vc_down_skip = 30.0
+    n._vc_pool = None
+    n._vc_inflight = set()
+    n._vc_lock = threading.Lock()
+    n._vc_skip_until = 0.0
+    n._warmup_path = None
+    n._warmup_due = False
+    n.voicevox_speaker = 30
     n.submitted = []
 
     class W:
-        def submit(self, key, text, ref, priority=True):
-            n.submitted.append((key, text, ref, priority))
+        backoff = 0.0
+
+        def submit(self, key, text, ref, priority=True, job=None):
+            n.submitted.append((key, text, ref, priority, job))
             return True
 
         def queued(self):
@@ -62,8 +81,9 @@ def test_miss_speaks_open_jtalk_and_enqueues(node):
     audio = node.get_audio("テストです。", "", 8.0, "k")
     assert node.ojt_calls == ["テストです。"]
     assert audio.sample_rate == 48000
-    key, text, ref, prio = node.submitted[0]
+    key, text, ref, prio, job = node.submitted[0]
     assert text == "テストです。" and prio and ref == pytest.approx(0.3 / np.sqrt(2), rel=0.02)
+    assert job == {"speaker": 135718976}
 
 
 def test_hit_plays_cached_voice_without_open_jtalk(node):
@@ -105,9 +125,120 @@ def test_render_matches_open_jtalk_loudness_and_rate(node):
             return vc.float_to_pcm16(0.05 * np.sin(2 * np.pi * 200 * t)), 44100, 1, 16
 
     node.vc_backend = Backend()
+    node.vc_match_loudness = True
     pcm, sr = node._render_voice("k", "テスト", 0.2)
     assert sr == 48000
     assert vc.active_rms(vc.pcm16_to_float(pcm), sr) == pytest.approx(0.2, rel=0.03)
+
+
+def test_render_default_keeps_engine_level_and_uses_job_speaker(node):
+    seen = []
+
+    class Backend:
+        def synthesize(self, text, speaker, query):
+            seen.append(speaker)
+            t = np.arange(44100) / 44100
+            return vc.float_to_pcm16(0.25 * np.sin(2 * np.pi * 200 * t)), 44100, 1, 16
+
+    node.vc_backend = Backend()
+    pcm, sr = node._render_voice("k", "テスト", None, {"speaker": 1310138977})
+    assert seen == [1310138977] and sr == 48000
+    # 0 dB: AivisSpeech の素の音量のまま (Open JTalk を呼ばない)
+    assert np.max(np.abs(vc.pcm16_to_float(pcm))) == pytest.approx(0.25, rel=0.03)
+    assert node.ojt_calls == []
+
+
+class _Backend:
+    def __init__(self, delay=0.0, exc=None):
+        self.delay, self.exc, self.calls = delay, exc, []
+
+    def synthesize(self, text, speaker, query):
+        self.calls.append((text, speaker))
+        time.sleep(self.delay)
+        if self.exc is not None:
+            raise self.exc
+        return vc.float_to_pcm16(np.full(4410, 0.1, np.float32)), 44100, 1, 16
+
+
+@pytest.fixture
+def live(node):
+    node.vc_live_budget = 0.5
+    node._vc_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    yield node
+    node._vc_pool.shutdown(wait=True)
+
+
+def test_live_aivis_within_budget_plays_and_caches(live):
+    live.vc_backend = _Backend()
+    audio = live.get_audio("テストです。", "", 8.0, "k")
+    assert live.ojt_calls == [] and live.submitted == []
+    assert audio.sample_rate == 48000
+    assert live._voice_key("テストです。", 8.0) in live.voice_store
+    live.get_audio("テストです。", "", 8.0, "k")  # 2 回目はキャッシュ (エンジンを呼ばない)
+    assert len(live.vc_backend.calls) == 1
+
+
+def test_live_too_slow_falls_back_and_saves_later(live):
+    live.vc_live_budget = 0.05
+    live.vc_backend = _Backend(delay=0.3)
+    t0 = time.monotonic()
+    live.get_audio("テストです。", "", 8.0, "k")
+    assert time.monotonic() - t0 < 0.25
+    assert live.ojt_calls == ["テストです。"]
+    assert live.submitted == []  # 続きはその場合成のスレッドが保存する (二重に作らない)
+    for _ in range(50):
+        if live._voice_key("テストです。", 8.0) in live.voice_store:
+            break
+        time.sleep(0.02)
+    assert live._voice_key("テストです。", 8.0) in live.voice_store
+
+
+def test_engine_down_speaks_open_jtalk_and_stops_trying_for_a_while(live):
+    live.vc_backend = _Backend(exc=VoicevoxUnreachable("connection refused"))
+    live.get_audio("一つ目。", "", 8.0, "k1")
+    live.get_audio("二つ目。", "", 8.0, "k2")
+    assert live.ojt_calls == ["一つ目。", "二つ目。"]  # 無音にしない
+    assert len(live.vc_backend.calls) == 1             # 2 回目は待たずに Open JTalk
+    assert [s[1] for s in live.submitted] == ["一つ目。", "二つ目。"]  # 裏の作業者が後で作る
+
+
+def test_male_and_female_are_cached_separately(node):
+    female = node._voice_key("収穫を始めます。", 8.0, 135718976)
+    male = node._voice_key("収穫を始めます。", 8.0, 1310138977)
+    assert female != male
+    node.voice_store.put(female, vc.float_to_pcm16(np.full(480, 0.1, np.float32)), 48000, {})
+    node._apply_voice_settings({"tts_engine": "aivis", "aivis_speaker": 1310138977})
+    node.get_audio("収穫を始めます。", "", 8.0, "k")
+    assert node.ojt_calls == ["収穫を始めます。"]  # 男はまだ無い
+    assert node.submitted[0][0] == male and node.submitted[0][4] == {"speaker": 1310138977}
+
+
+def test_settings_toggle_engine_and_voice(node):
+    msg = type("M", (), {})()
+    msg.data = json.dumps({"tts_engine": "pyopenjtalk", "voicevox_speaker": 30})
+    node.on_settings(msg)
+    assert node.vc_active is False
+    node.get_audio("テストです。", "", 8.0, "k")
+    assert node.submitted == []  # Open JTalk のみ
+    msg.data = json.dumps({"tts_engine": "aivis", "voice": "male", "aivis_speaker": 1310138977})
+    node.on_settings(msg)
+    assert node.vc_active is True and node.vc_speaker == 1310138977
+    msg.data = json.dumps({"aivis_speaker": -1})
+    node.on_settings(msg)  # 壊れた値は無視
+    assert node.vc_speaker == 1310138977
+
+
+def test_voice_change_rewarms_after_startup(node, tmp_path):
+    w = tmp_path / "w.yaml"
+    w.write_text("texts:\n  - 準備ができました\n  - 停止します\n", encoding="utf-8")
+    node._warmup_path = w
+    node._apply_voice_settings({"tts_engine": "aivis", "aivis_speaker": 1310138977})
+    assert node.submitted == []  # 起動直後の待ち時間中は作らない
+    node._warmup_fire()
+    assert [s[4] for s in node.submitted] == [{"speaker": 1310138977}] * 2
+    node._apply_voice_settings({"aivis_speaker": 135718976})
+    assert [s[4]["speaker"] for s in node.submitted[2:]] == [135718976] * 2
+    assert all(not s[3] for s in node.submitted)  # ウォームアップは低優先
 
 
 def test_render_maps_unreachable_to_engine_down(node):

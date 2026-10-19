@@ -28,15 +28,17 @@ curl http://127.0.0.1:50021/version   # 疎通確認
   `audio/output/frame`へ流します。**この値は`fv_audio_output`の`audio.sample_rate`と一致させること**
   (不一致だと format mismatch で無音になります)。
 
-## 声キャッシュ (その場は Open JTalk、裏で作って次からキャッシュの声)
+## 声キャッシュ (高品質の声 + Open JTalk の保険)
 
 VOICEVOX 互換エンジン (AivisSpeech 等) は高品質だが、混んだ CPU では 6 秒の文に 10 秒以上
-かかりライブでは間に合わない。そこで `engine:=pyopenjtalk` のまま次の動きを足せる:
+かかることがある。そこで `engine:=pyopenjtalk` のまま次の動きを足せる:
 
-1. キャッシュに無い文 → 今まで通り Open JTalk で**即**喋る (遅延ゼロ)。同じ文を裏で予約
-2. 裏スレッド (1本・nice 10・重複排除・ライブ優先・タイムアウト付き・エンジン不通時は
+1. キャッシュにある文 → 保存した高品質の WAV を流す
+2. キャッシュに無い文 → エンジンが元気なら `voice_cache_live_budget_s` (2 秒) まで
+   その場の高品質合成を待って流し、保存する。間に合わない・不通 → Open JTalk で即喋り、
+   高品質版は裏で作る (不通を検知したら `voice_cache_down_skip_s` (30 秒) は待たずに Open JTalk)
+3. 裏スレッド (1本・nice 10・重複排除・ライブ優先・タイムアウト付き・エンジン不通時は
    指数バックオフ 5→300s・文ごと 3 回失敗で諦め) が高品質の声で合成し WAV に保存
-3. 次に同じ文 → 保存した WAV を流す
 4. `voice_cache_warmup_file` の文を起動 `voice_cache_warmup_delay_s` 秒後から裏で作っておく
    (`voice_cache_max_load` 以上の loadavg の間は待つ)
 
@@ -52,6 +54,8 @@ VOICEVOX 互換エンジン (AivisSpeech 等) は高品質だが、混んだ CPU
 | `voice_cache_max_mb` | `ASPA_TTS_VOICE_CACHE_MAX_MB` | `300` (超えたら最終使用が古い順に削除) |
 | `voice_cache_warmup_file` | `ASPA_TTS_VOICE_CACHE_WARMUP` | `""` (相対名は `share/fv_tts/config/`) |
 | `voice_cache_max_load` | `ASPA_TTS_VOICE_CACHE_MAX_LOAD` | `0` (ガード無し) |
+| `voice_cache_live_budget_s` | `ASPA_TTS_VOICE_CACHE_LIVE_BUDGET` | `2.0` (0 = その場合成しない) |
+| `voice_cache_volume_db` | `ASPA_TTS_VOICE_CACHE_VOLUME_DB` | `0.0` (AivisSpeech 素の音量 ≒ Open JTalk +8dB) |
 
 ほか ROS パラメータのみ: `voice_cache_query` (audio_query 上書き JSON 例 `{"speedScale":1.1}`)、
 `voice_cache_timeout_s` (60)、`voice_cache_warmup_delay_s` (90)、`voice_cache_nice` (10)、
@@ -66,11 +70,14 @@ export ASPA_TTS_VOICE_CACHE_SPEAKER=135718976      # 楽町音穏_T3モデル �
 export ASPA_TTS_VOICE_CACHE_WARMUP=voice_cache_warmup_aspa.yaml
 ```
 
+- **viewer の設定 (`/aspa/tts/settings`) で切替 (再起動不要)**: `tts_engine` が `aivis` なら高品質の声 ON、
+  それ以外 (`pyopenjtalk` など) なら OFF (Open JTalk のみ)。`aivis_speaker` で話者を切替 (男/女)。
+  切替後は新しい話者でウォームアップ文を裏で作り直す
 - **キー**: sha1(エンジン種別, 話者ID, `voice_cache_query`, 音量dB, NFKC 正規化テキスト)。URL は含めない
 - **保存**: `<key>.wav` (48kHz mono 16bit、`output_sample_rate`) + `index.json` (文・作成/最終使用時刻・
   回数)。tmp→rename の原子的書き込み。壊れた WAV は捨てて Open JTalk へ
-- **音量**: 同じ文の Open JTalk 版 (`default_volume_db` 込み) と「発話区間の RMS」を揃え、
-  ピークはソフトリミッタで 1.0 未満に。声が切り替わっても音量が跳ねない
+- **音量**: 既定は固定ゲイン `voice_cache_volume_db` (0 dB)。`voice_cache_match_loudness:=true` なら
+  文ごとに Open JTalk 版 (`default_volume_db` 込み) と「発話区間の RMS」を揃える (ソフトリミッタ付き)
 - **中身を見る**: `python3 -m json.tool ~/.aspa/tts_cache/voice/index.json`。消すならディレクトリごと削除
 - `engine:=voicevox` のときは無効 (もともと全部高品質)
 - テスト: `python3 -m pytest src/audio/fv_tts/test -q` (ノード部分は ROS 環境で実行、無ければ skip)
