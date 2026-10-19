@@ -19,9 +19,9 @@ _spec.loader.exec_module(vc)
 
 # ── key ────────────────────────────────────────────────
 def test_key_normalizes_text():
-    a = vc.make_key("voicevox", 135718976, {}, 8.0, "テストです。")
-    b = vc.make_key("voicevox", 135718976, {}, 8.0, "  テストです。\n")
-    c = vc.make_key("voicevox", 135718976, {}, 8.0, "ﾃｽﾄです。")  # 半角カナ → NFKC
+    a = vc.make_key("aivis", 135718976, {}, 8.0, "テストです。")
+    b = vc.make_key("aivis", 135718976, {}, 8.0, "  テストです。\n")
+    c = vc.make_key("aivis", 135718976, {}, 8.0, "ﾃｽﾄです。")  # 半角カナ → NFKC
     assert a == b == c
 
 
@@ -30,7 +30,7 @@ def test_key_normalizes_text():
     dict(volume_db=0.0), dict(text="テストでした。"),
 ])
 def test_key_changes_with_audio_affecting_inputs(change):
-    base = dict(kind="voicevox", speaker=135718976, params={}, volume_db=8.0, text="テストです。")
+    base = dict(kind="aivis", speaker=135718976, params={}, volume_db=8.0, text="テストです。")
     assert vc.make_key(**base) != vc.make_key(**{**base, **change})
 
 
