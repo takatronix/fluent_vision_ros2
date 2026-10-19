@@ -22,7 +22,7 @@ from std_msgs.msg import Bool, Empty, String
 from fv_audio.msg import AudioFrame
 from fv_tts.srv import Speak
 
-from fv_tts_py.voicevox_backend import VoicevoxBackend, VoicevoxError, VoicevoxUnreachable
+from fv_tts_py.aivis_backend import DEFAULT_URL as AIVIS_DEFAULT_URL, AivisBackend, AivisUnreachable
 from fv_tts_py import voice_cache as vc
 
 # Disable tqdm progress bar for pyopenjtalk downloads
@@ -34,13 +34,32 @@ _PYOPENJTALK_LOADED = False
 # pyopenjtalk は内部状態を持つので、声キャッシュの裏スレッドと同時に呼ばない
 _PYOPENJTALK_LOCK = threading.Lock()
 
+ENGINES = ("pyopenjtalk", "aivis")
+AIVIS_FEMALE = 135718976   # 楽町音穏_T3モデル ノーマル (女)
+AIVIS_MALE = 1310138977    # 阿井田 茂 Calm (男)
+
+
+def resolve_engine(engine: str, aivis_url: str):
+    """engine パラメータを pyopenjtalk | aivis に正規化する。(engine, 警告文 or None)。
+
+    旧設定の engine=voicevox (VOICEVOX 対応は削除済み) では止めずに、AivisSpeech の
+    URL が設定されていれば aivis、無ければ pyopenjtalk として動かす。
+    """
+    name = (engine or "").strip().lower() or "pyopenjtalk"
+    if name in ENGINES:
+        return name, None
+    if name == "voicevox":
+        new = "aivis" if (aivis_url or "").strip() else "pyopenjtalk"
+        return new, (f"engine=voicevox は廃止 (VOICEVOX 対応は削除) → engine={new} として動かします。"
+                     f"設定を engine:={new} に直してください")
+    raise RuntimeError(f"未知の engine='{engine}' (pyopenjtalk | aivis のいずれか)")
+
 
 def load_pyopenjtalk():
-    """Load Open JTalk only when selected.
+    """Load Open JTalk lazily (first use).
 
-    VOICEVOX mode must not pay for loading a second synthesis engine.  The
-    bundled ARM64 wheel also contains the dictionary and voice, so importing
-    it eagerly would use otherwise avoidable memory.
+    The bundled ARM64 wheel also contains the dictionary and voice, so
+    importing it eagerly would use otherwise avoidable memory.
     """
     global pyopenjtalk, _IMPORT_ERROR, _PYOPENJTALK_LOADED
     if _PYOPENJTALK_LOADED:
@@ -89,14 +108,17 @@ class FvTtsNode(Node):
         self.declare_parameter("use_playback_topic", True)
         self.declare_parameter("stop_topic", "audio/output/stop")
         self.declare_parameter("cache_dir", "")
-        # Open JTalk is quieter than VOICEVOX, hence the lightweight default's
-        # +8 dB.  The launch script passes 0 dB when VOICEVOX is selected.
+        # Open JTalk gain (it is quiet): +8 dB.  The AivisSpeech voice has its
+        # own gain (voice_cache_volume_db, 0 dB).
         self.declare_parameter("default_volume_db", 8.0)
-        # エンジン差替え: "pyopenjtalk"(軽量・既定) | "voicevox"
+        # エンジン: "pyopenjtalk"(軽量・既定) | "aivis" (AivisSpeech。Open JTalk が保険)
         self.declare_parameter("engine", "pyopenjtalk")
-        self.declare_parameter("voicevox_url", "http://127.0.0.1:50021")
-        self.declare_parameter("voicevox_speaker", 30)  # No.7 (アナウンス)
-        # 出力パイプライン (fv_audio_output) のサンプルレート。voicevox は 24kHz を
+        # AivisSpeech Engine の URL。"" = 未設定 (engine=aivis なら既定 :10101)。
+        # engine=pyopenjtalk でも設定されていれば、viewer の設定 (tts_engine=aivis)
+        # で再起動なしに AivisSpeech へ切り替えられるよう準備しておく。
+        self.declare_parameter("aivis_url", "")
+        self.declare_parameter("aivis_speaker", AIVIS_FEMALE)  # 女。男は 1310138977
+        # 出力パイプライン (fv_audio_output) のサンプルレート。AivisSpeech は 44.1kHz を
         # 返すので、このレート(既定 48kHz)へリサンプルしてから publish する。
         self.declare_parameter("output_sample_rate", 48000)
         # Event Bus 契約: 任意テキストを喋らせる topic I/F と再生中フラグ
@@ -110,20 +132,19 @@ class FvTtsNode(Node):
         self.publish_playback = self.get_parameter("use_playback_topic").get_parameter_value().bool_value
         self.stop_topic = self.get_parameter("stop_topic").get_parameter_value().string_value
         self.default_volume_db = self.get_parameter("default_volume_db").get_parameter_value().double_value
-        self.engine = self.get_parameter("engine").get_parameter_value().string_value.strip().lower()
-        self.voicevox_url = self.get_parameter("voicevox_url").get_parameter_value().string_value
-        self.voicevox_speaker = self.get_parameter("voicevox_speaker").get_parameter_value().integer_value
+        self.aivis_url = str(self.get_parameter("aivis_url").value or "").strip()
+        self.engine, warning = resolve_engine(
+            self.get_parameter("engine").get_parameter_value().string_value, self.aivis_url)
+        if warning:
+            self.get_logger().warn(warning)
         self.output_sample_rate = self.get_parameter("output_sample_rate").get_parameter_value().integer_value
         self.say_topic = self.get_parameter("say_topic").get_parameter_value().string_value
         self.speaking_topic = self.get_parameter("speaking_topic").get_parameter_value().string_value
         self.settings_topic = self.get_parameter("settings_topic").value
 
-        # 声キャッシュ (engine=pyopenjtalk のときだけ有効): その場は Open JTalk、
-        # 裏で voice_cache_engine の声を作り、次に同じ文が来たらそれを流す。
-        self.declare_parameter("voice_cache_engine", "")  # "" (無効) | "voicevox" (AivisSpeech 含む)
-        self.declare_parameter("voice_cache_url", "http://127.0.0.1:10101")
-        self.declare_parameter("voice_cache_speaker", -1)
-        self.declare_parameter("voice_cache_query", "{}")  # audio_query 上書き JSON
+        # AivisSpeech の声 + 声キャッシュ: 保存済みの文はその WAV、無ければその場で
+        # AivisSpeech (budget 内)、間に合わない・不通なら Open JTalk で即答し裏で作る。
+        self.declare_parameter("aivis_query", "{}")  # audio_query 上書き JSON
         self.declare_parameter("voice_cache_dir", "~/.aspa/tts_cache/voice")
         self.declare_parameter("voice_cache_max_mb", 300)
         self.declare_parameter("voice_cache_max_chars", 120)
@@ -144,27 +165,11 @@ class FvTtsNode(Node):
 
         self.get_logger().info(f"Starting FV TTS node (engine={self.engine})")
 
-        # エンジンごとに必要リソースを確認 (fallback せず、駄目なら止める)
-        self.voicevox: Optional[VoicevoxBackend] = None
-        if self.engine == "pyopenjtalk":
-            if load_pyopenjtalk() is None:
-                raise RuntimeError(
-                    f"engine=pyopenjtalk だが pyopenjtalk が使えません: {_IMPORT_ERROR}"
-                ) from _IMPORT_ERROR
-        elif self.engine == "voicevox":
-            self.voicevox = VoicevoxBackend(self.voicevox_url)
-            try:
-                ver = self.voicevox.version()
-                self.get_logger().info(
-                    f"VOICEVOX ENGINE {ver} @ {self.voicevox_url}, speaker={self.voicevox_speaker}")
-            except VoicevoxError as exc:
-                # 起動時点で不通なら分かりやすく警告 (実合成時に RuntimeError で止まる)
-                self.get_logger().warn(
-                    f"VOICEVOX ENGINE 未応答 ({self.voicevox_url}): {exc}. "
-                    f"`curl {self.voicevox_url}/version` で起動確認してください")
-        else:
+        # Open JTalk はどちらのエンジンでも要る (aivis の保険)。無ければ止める。
+        if load_pyopenjtalk() is None:
             raise RuntimeError(
-                f"未知の engine='{self.engine}' (voicevox | pyopenjtalk のいずれか)")
+                f"pyopenjtalk が使えません: {_IMPORT_ERROR}"
+            ) from _IMPORT_ERROR
 
         cache_dir_param = self.get_parameter("cache_dir").get_parameter_value().string_value
         self.cache_dir = Path(cache_dir_param).expanduser() if cache_dir_param else None
@@ -211,7 +216,8 @@ class FvTtsNode(Node):
         self._warmup_timer: Optional[threading.Timer] = None
         self._warmup_path: Optional[Path] = None
         self._warmup_due = False
-        # 高品質の声を使うか。viewer の設定 (tts_engine=aivis) で ON/OFF を切り替える。
+        # AivisSpeech の声を使うか。起動時は engine=aivis なら ON、viewer の設定
+        # (tts_engine=aivis | pyopenjtalk) で再起動なしに ON/OFF を切り替える。
         self.vc_active = False
         self._vc_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._vc_inflight: set = set()
@@ -220,31 +226,27 @@ class FvTtsNode(Node):
         try:
             self._setup_voice_cache()
         except Exception as exc:  # pylint: disable=broad-except
-            # 声キャッシュは付加機能。壊れていても Open JTalk はそのまま喋る。
-            self.get_logger().error(f"voice cache disabled: {exc}")
+            # AivisSpeech は付加機能。壊れていても Open JTalk はそのまま喋る。
+            self.get_logger().error(f"AivisSpeech voice disabled: {exc}")
             self.voice_store = None
             self.voice_worker = None
 
     # ── 声キャッシュ ───────────────────────────────────
     def _setup_voice_cache(self) -> None:
-        kind = str(self.get_parameter("voice_cache_engine").value or "").strip().lower()
-        if not kind:
-            return
-        if kind != "voicevox":
-            raise RuntimeError(f"未知の voice_cache_engine='{kind}' (voicevox のみ)")
-        if self.engine != "pyopenjtalk":
-            self.get_logger().info(f"voice cache は engine=pyopenjtalk 専用 (今は {self.engine}) — 無効")
-            return
-        self.vc_speaker = int(self.get_parameter("voice_cache_speaker").value)
+        if self.engine != "aivis" and not self.aivis_url:
+            return  # Open JTalk だけ (AivisSpeech は使わない)
+        self.vc_speaker = int(self.get_parameter("aivis_speaker").value)
         if self.vc_speaker < 0:
-            raise RuntimeError("voice_cache_speaker が未設定")
-        self.vc_query = json.loads(str(self.get_parameter("voice_cache_query").value or "{}"))
+            raise RuntimeError("aivis_speaker が負")
+        self.vc_query = json.loads(str(self.get_parameter("aivis_query").value or "{}"))
         if not isinstance(self.vc_query, dict):
-            raise RuntimeError("voice_cache_query は JSON object")
+            raise RuntimeError("aivis_query は JSON object")
+        # キャッシュキーに入るエンジン名。旧 VOICEVOX 経路の保存音とは混ざらない。
+        kind = "aivis"
         self.vc_kind = kind
         self.vc_max_chars = int(self.get_parameter("voice_cache_max_chars").value)
-        url = str(self.get_parameter("voice_cache_url").value)
-        self.vc_backend = VoicevoxBackend(
+        url = self.aivis_url or AIVIS_DEFAULT_URL
+        self.vc_backend = AivisBackend(
             url, timeout=float(self.get_parameter("voice_cache_timeout_s").value))
         max_mb = int(self.get_parameter("voice_cache_max_mb").value)
         cache_dir = str(self.get_parameter("voice_cache_dir").value)
@@ -263,9 +265,9 @@ class FvTtsNode(Node):
         self.voice_worker.start()
         self._vc_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="voice_live")
-        self.vc_active = True
+        self.vc_active = self.engine == "aivis"
         self.get_logger().info(
-            f"voice cache ON: {kind} @ {url} live<={self.vc_live_budget:.1f}s speaker={self.vc_speaker} dir={self.voice_store.dir} "
+            f"AivisSpeech {'ON' if self.vc_active else '準備のみ (viewer の tts_engine=aivis で ON)'}: {url} live<={self.vc_live_budget:.1f}s speaker={self.vc_speaker} dir={self.voice_store.dir} "
             f"({len(self.voice_store.index)} 件, {self.voice_store.total_bytes() / 1e6:.1f}MB / {max_mb}MB)")
 
         warmup = str(self.get_parameter("voice_cache_warmup_file").value or "").strip()
@@ -315,7 +317,7 @@ class FvTtsNode(Node):
         speaker = int((job or {}).get("speaker", self.vc_speaker))
         try:
             pcm, sr, channels, bit_depth = self.vc_backend.synthesize(text, speaker, self.vc_query)
-        except VoicevoxUnreachable as exc:
+        except AivisUnreachable as exc:
             raise vc.EngineDown(str(exc)) from exc
         if channels != 1 or bit_depth != 16:
             raise RuntimeError(f"想定外フォーマット channels={channels} bit_depth={bit_depth}")
@@ -468,28 +470,16 @@ class FvTtsNode(Node):
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             self.get_logger().warn(f"TTS settings parse failed: {exc}")
             return
-        if "voicevox_speaker" in obj:
-            try:
-                speaker = int(obj["voicevox_speaker"])
-                if speaker < 0:
-                    raise ValueError("speaker must be >= 0")
-            except (TypeError, ValueError) as exc:
-                self.get_logger().warn(f"TTS settings parse failed: {exc}")
-            else:
-                previous = self.voicevox_speaker
-                self.voicevox_speaker = speaker
-                if previous != speaker:
-                    self.get_logger().info(
-                        f"VOICEVOX speaker changed: {previous} -> {speaker}")
         self._apply_voice_settings(obj)
 
     def _apply_voice_settings(self, obj: Dict) -> None:
-        """viewer の設定: tts_engine=aivis で高品質の声 ON、aivis_speaker で男/女。"""
+        """viewer の設定: tts_engine=aivis で AivisSpeech ON、aivis_speaker で男/女。"""
         if self.voice_store is None:
             return
         engine = str(obj.get("tts_engine", "") or "").strip().lower()
         if engine:
-            active = engine == "aivis"
+            # 旧 viewer の保存値 voicevox は aivis 扱い (VOICEVOX 対応は削除済み)
+            active = engine in ("aivis", "voicevox")
             if active != self.vc_active:
                 self.vc_active = active
                 self.get_logger().info(
@@ -627,51 +617,8 @@ class FvTtsNode(Node):
             self.speaking_pub.publish(Bool(data=False))
 
     def synthesize(self, text: str, voice_id: str, volume_db: float) -> CachedAudio:
-        """エンジンで分岐して合成。CachedAudio(16bit mono)を返す。"""
-        if self.engine == "voicevox":
-            return self._synthesize_voicevox(text, voice_id, volume_db)
+        """Open JTalk で合成。CachedAudio(16bit mono)を返す (AivisSpeech は get_audio 側)。"""
         return self._synthesize_pyopenjtalk(text, voice_id, volume_db)
-
-    def _synthesize_voicevox(self, text: str, voice_id: str, volume_db: float) -> CachedAudio:
-        if self.voicevox is None:
-            raise RuntimeError("voicevox backend が初期化されていません")
-        # voice_id が数値文字列なら speaker override、それ以外は既定 speaker
-        speaker = self.voicevox_speaker
-        if voice_id:
-            try:
-                speaker = int(voice_id)
-            except ValueError:
-                self.get_logger().warn(
-                    f"voicevox: voice_id='{voice_id}' は数値でないため既定 speaker={speaker} を使用")
-        try:
-            pcm_bytes, native_sr, channels, bit_depth = self.voicevox.synthesize(text, speaker)
-        except VoicevoxError as exc:
-            raise RuntimeError(f"VOICEVOX 合成失敗: {exc}") from exc
-        if channels != 1 or bit_depth != 16:
-            raise RuntimeError(
-                f"VOICEVOX 想定外フォーマット channels={channels} bit_depth={bit_depth} (mono/16bit 想定)")
-
-        waveform = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.float32) / 32768.0
-        if volume_db != 0.0:
-            waveform = waveform * float(10.0 ** (volume_db / 20.0))
-        # 出力パイプライン (fv_audio_output) は固定レート。合致しなければリサンプルする
-        # (でないと format mismatch で黙って drop される)。
-        out_sr = int(self.output_sample_rate) if self.output_sample_rate > 0 else native_sr
-        if native_sr != out_sr and waveform.size:
-            n_out = int(round(waveform.size * out_sr / native_sr))
-            src_idx = np.linspace(0.0, waveform.size - 1.0, n_out)
-            waveform = np.interp(src_idx, np.arange(waveform.size), waveform).astype(np.float32)
-            self.get_logger().debug(
-                f"voicevox resample {native_sr}->{out_sr}Hz ({waveform.size} samples)")
-        else:
-            out_sr = native_sr
-        waveform = np.clip(waveform, -1.0, 1.0)
-        pcm = (waveform * 32767.0).astype(np.int16)
-        audio_bytes = pcm.tobytes()
-        float_samples = pcm.astype(np.float32) / 32768.0
-        rms = float(np.sqrt(np.mean(np.square(float_samples)))) if float_samples.size else 0.0
-        peak = float(np.max(np.abs(float_samples))) if float_samples.size else 0.0
-        return CachedAudio(audio_bytes, int(out_sr), 1, 16, rms, peak)
 
     def _synthesize_pyopenjtalk(self, text: str, voice_id: str, volume_db: float) -> CachedAudio:
         if load_pyopenjtalk() is None:
@@ -719,22 +666,12 @@ class FvTtsNode(Node):
         frame.epoch = int(epoch) if epoch is not None else 0
         return frame
 
-    def cache_voice_id(self, voice_id: str) -> str:
-        """Resolve the actual voice so changing the default cannot reuse old audio."""
-        if self.engine != "voicevox":
-            return voice_id
-        if voice_id:
-            try:
-                return str(int(voice_id))
-            except ValueError:
-                pass
-        return str(self.voicevox_speaker)
-
     def make_cache_key(self, text: str, voice_id: str, volume_db: float) -> str:
         digest = hashlib.sha1()  # nosec B303
-        digest.update(self.engine.encode("utf-8"))
+        # Open JTalk 版のキャッシュ (AivisSpeech の声は voice_cache 側、別キー)
+        digest.update(b"pyopenjtalk")
         digest.update(text.encode("utf-8"))
-        digest.update(self.cache_voice_id(voice_id).encode("utf-8"))
+        digest.update(voice_id.encode("utf-8"))
         digest.update(str(volume_db).encode("utf-8"))
         return digest.hexdigest()
 
