@@ -1197,16 +1197,51 @@
     } finally { retentionBusy = false; }
   }
 
+  // 全削除 walks every page of the current filter on the server. `episodes`
+  // only holds the pages scrolled into view (PAGE_SIZE each, and the poll in
+  // load() resets it to the first page), so filtering it deleted just the
+  // visible 50 and left the rest listed after the reload.
+  async function fetchAllEpisodes(): Promise<Episode[]> {
+    const all: Episode[] = [];
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; ; page++) {
+      if (page >= 200) throw new Error('episodes list did not terminate (cursor loop)');
+      const params = new URLSearchParams({ limit: '500' });
+      if (activeProfile) params.set('profile', activeProfile);
+      if (cursor) params.set('cursor', cursor);
+      const r = await fetch(`${API}/episodes?${params}`);
+      if (!r.ok) throw new Error(`episodes list failed: HTTP ${r.status}`);
+      const j = await r.json();
+      for (const e of (j.episodes || []) as Episode[]) {
+        if (seen.has(e.episode_id)) continue;
+        seen.add(e.episode_id);
+        all.push(e);
+      }
+      cursor = j.next_cursor || null;
+      if (!cursor) return all;
+    }
+  }
+
   async function deleteAllEpisodes() {
-    const targets = episodes.filter(e => !e.pinned && e.state !== 'recording');
+    let listed: Episode[];
+    try {
+      listed = await fetchAllEpisodes();
+    } catch (e: any) {
+      alert(`一覧の取得に失敗したため全削除を中止しました: ${e.message || String(e)}`);
+      return;
+    }
+    const targets = listed.filter(e => !e.pinned && e.state !== 'recording');
+    const protectedCount = listed.length - targets.length;
     if (targets.length === 0) {
       alert('削除対象なし (録画中・pinned を除く)');
       return;
     }
     const totalBytes = targets.reduce((s, e) => s + (e.size_bytes || 0), 0);
+    const scope = activeProfile ? `プロファイル ${activeProfile} の全エピソード` : '全プロファイルの全エピソード';
     // Two-step confirm so a stray click doesn't nuke everything.
-    if (!confirm(`【全削除】 ${targets.length} 件のエピソード (${fmtBytes(totalBytes)}) を削除します。\n\npinned エピソードは保護されます。録画中エピソードも対象外。\nこの操作は取り消せません。`)) return;
-    if (!confirm(`本当にすべて削除しますか？\n(${targets.length} 件 / ${fmtBytes(totalBytes)})`)) return;
+    if (!confirm(`【全削除】 ${scope}${targets.length}件 (${fmtBytes(totalBytes)}) を削除します。\n画面に表示中の分だけでなく、サーバー上の全ページが対象です。\n\npinned エピソードは保護されます。録画中エピソードも対象外${protectedCount ? ` (${protectedCount}件を除外)` : ''}。\nこの操作は取り消せません。`)) return;
+    if (!confirm(`本当にすべて削除しますか？\n(${targets.length}件 / ${fmtBytes(totalBytes)})`)) return;
     bulkDeleteProgress = { total: targets.length, done: 0, failed: 0 };
     for (const ep of targets) {
       try {
