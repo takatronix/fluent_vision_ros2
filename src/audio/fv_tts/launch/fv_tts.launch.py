@@ -22,6 +22,10 @@ _VOICE_CACHE_ARGS = [
      'YAML of texts rendered in the background at startup (relative = share/fv_tts/config)'),
     ('voice_cache_max_load', 'ASPA_TTS_VOICE_CACHE_MAX_LOAD', '0.0', float,
      'Warm-up waits while 1-min loadavg >= this (0 = no guard)'),
+    ('voice_cache_live_budget_s', 'ASPA_TTS_VOICE_CACHE_LIVE_BUDGET', '2.0', float,
+     'Not cached: wait up to this for the high-quality engine, else Open JTalk (0 = never wait)'),
+    ('voice_cache_volume_db', 'ASPA_TTS_VOICE_CACHE_VOLUME_DB', '0.0', float,
+     'Gain for the high-quality voice (AivisSpeech 0 dB ~ Open JTalk +8 dB)'),
 ]
 
 
@@ -42,6 +46,13 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'default_volume_db', default_value='8.0',
             description='Engine-specific synthesis gain in dB'),
+        # VOICEVOX 互換 API の URL (engine=voicevox 用)。機体の ~/.aspa/env で
+        # ASPA_VOICEVOX_URL を指定すれば AivisSpeech Engine (:10101) などへ向けられる。
+        DeclareLaunchArgument(
+            'voicevox_url',
+            default_value=EnvironmentVariable(
+                'ASPA_VOICEVOX_URL', default_value='http://127.0.0.1:50021'),
+            description='VOICEVOX-compatible engine URL (VOICEVOX :50021 / AivisSpeech :10101)'),
         *cache_args,
         Node(
             package='fv_tts',
@@ -54,7 +65,7 @@ def generate_launch_description():
                     LaunchConfiguration('engine'), value_type=str),
                 'default_volume_db': ParameterValue(
                     LaunchConfiguration('default_volume_db'), value_type=float),
-                'voicevox_url': 'http://127.0.0.1:50021',
+                'voicevox_url': LaunchConfiguration('voicevox_url'),
                 'voicevox_speaker': 30,
                 'output_sample_rate': 48000,
                 'default_voice': '',

@@ -113,8 +113,9 @@ class FakeRender:
         self.calls = []
         self.outcomes = list(outcomes or [])
 
-    def __call__(self, key, text, ref):
+    def __call__(self, key, text, ref, job):
         self.calls.append((text, ref))
+        self.jobs = getattr(self, 'jobs', []) + [job]
         if self.outcomes:
             o = self.outcomes.pop(0)
             if isinstance(o, Exception):

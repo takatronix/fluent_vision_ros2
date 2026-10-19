@@ -257,13 +257,14 @@ class EngineDown(RuntimeError):
 class RenderWorker:
     """裏で 1 件ずつ合成して store に入れるスレッド。
 
-    render(key, text, ref) -> (pcm16 bytes, sample_rate) を呼ぶ。EngineDown を投げたら
+    render(key, text, ref, job) -> (pcm16 bytes, sample_rate) を呼ぶ。job は submit 時に
+    渡した dict (話者 ID など、文ごとに違う値)。保存時の index にも書き込む。EngineDown を投げたら
     指数バックオフ (backoff_min→backoff_max)、それ以外の例外は文ごとに失敗回数を数え
     max_attempts で諦める。ライブ要求 (priority=True) はウォームアップより先に処理。
     """
 
     def __init__(self, store: VoiceCacheStore,
-                 render: Callable[[str, str, Optional[float]], Tuple[bytes, int]],
+                 render: Callable[[str, str, Optional[float], Dict], Tuple[bytes, int]],
                  meta: Optional[Dict] = None,
                  log: Optional[Callable[[str], None]] = None,
                  max_queue: int = 200, max_attempts: int = 3,
@@ -286,7 +287,7 @@ class RenderWorker:
         self._sleep = sleep
         self._live: "collections.deque" = collections.deque()
         self._warm: "collections.deque" = collections.deque()
-        self._pending: Dict[str, Tuple[str, Optional[float]]] = {}
+        self._pending: Dict[str, Tuple[str, Optional[float], Dict]] = {}
         self._failures: Dict[str, int] = {}
         self._cv = threading.Condition()
         self._stop = False
@@ -296,7 +297,7 @@ class RenderWorker:
 
     # 呼び出し側 (ROS コールバック) からは即戻る
     def submit(self, key: str, text: str, ref_rms: Optional[float] = None,
-               priority: bool = True) -> bool:
+               priority: bool = True, job: Optional[Dict] = None) -> bool:
         with self._cv:
             if key in self.store or self._failures.get(key, 0) >= self.max_attempts:
                 return False
@@ -308,7 +309,7 @@ class RenderWorker:
                 return False
             if len(self._pending) >= self.max_queue:
                 return False
-            self._pending[key] = (text, ref_rms)
+            self._pending[key] = (text, ref_rms, dict(job or {}))
             (self._live if priority else self._warm).append(key)
             self._cv.notify()
             return True
@@ -361,10 +362,10 @@ class RenderWorker:
             self._sleep(10.0)
             return
         with self._cv:
-            text, ref = self._pending[key]
+            text, ref, job = self._pending[key]
         t0 = time.monotonic()
         try:
-            pcm, sr = self.render(key, text, ref)
+            pcm, sr = self.render(key, text, ref, job)
         except EngineDown as exc:
             self.backoff = min(self.backoff_max, max(self.backoff_min, self.backoff * 2))
             self.log(f"voice cache: エンジン不通 ({exc}); {self.backoff:.0f}s 後に再試行")
@@ -384,6 +385,7 @@ class RenderWorker:
             return
         self.backoff = 0.0
         meta = dict(self.meta)
+        meta.update(job)
         meta["text"] = normalize_text(text)
         meta["render_s"] = round(time.monotonic() - t0, 2)
         try:
