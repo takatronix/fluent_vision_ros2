@@ -25,7 +25,7 @@ from aiohttp import web
 from .active_lock import ActiveLock
 from .batch_runner import BatchConfig, BatchRunner
 from .replay_runner import ReplayRunner
-from .bag_recorder import BagRecorder
+from .bag_recorder import BagRecorder, detect_bag_storage
 from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeMeta, EpisodeStore, new_episode_id, utc_now_iso
 from .marker_manager import MarkerManager
@@ -479,7 +479,11 @@ async def _start_episode(request: web.Request) -> web.Response:
             LOG.warning("ros2 not available, skipping bag record")
         else:
             try:
-                bag_recorder.start(ep_dir / "bag", bag_topics)
+                from .topic_discovery import discover_bag_options
+                bag_opts = discover_bag_options(profile_dict or {})
+                bag_recorder.start(ep_dir / "bag", bag_topics,
+                                   storage=bag_opts["storage"],
+                                   storage_preset=bag_opts["storage_preset"])
                 bag_started = True
             except Exception as exc:
                 LOG.error("bag recorder start failed: %s", exc)
@@ -918,7 +922,10 @@ async def _episode_joints(request: web.Request) -> web.Response:
         from rclpy.serialization import deserialize_message
         from rosidl_runtime_py.utilities import get_message
 
-        storage_options = rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id="sqlite3")
+        # sqlite3 (default) or mcap (profile bag_storage) — read the id
+        # from metadata.yaml instead of assuming sqlite3.
+        storage_options = rosbag2_py.StorageOptions(
+            uri=str(bag_dir), storage_id=detect_bag_storage(bag_dir))
         converter_options = rosbag2_py.ConverterOptions(
             input_serialization_format="cdr", output_serialization_format="cdr"
         )
@@ -1122,7 +1129,10 @@ async def _depth_preview(request: web.Request) -> web.Response:
             import rosbag2_py
             from rclpy.serialization import deserialize_message
             from rosidl_runtime_py.utilities import get_message
-            storage_options = rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id="sqlite3")
+            # sqlite3 (default) or mcap (profile bag_storage) — read the id
+            # from metadata.yaml instead of assuming sqlite3.
+            storage_options = rosbag2_py.StorageOptions(
+                uri=str(bag_dir), storage_id=detect_bag_storage(bag_dir))
             converter_options = rosbag2_py.ConverterOptions(
                 input_serialization_format="cdr", output_serialization_format="cdr"
             )

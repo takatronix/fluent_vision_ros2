@@ -11,7 +11,8 @@ CLI::
     python3 -m fv_episode_recorder.lerobot_materializer <episode_dir>... \
         --out <dataset_root> --repo-id <id> [--fps 30] \
         [--camera-map fv=lerobot,...] [--state-topic ...] [--action-topic ...] \
-        [--task <override>]
+        [--task <override>] [--windows windows.json] [--include-depth] \
+        [--outcome success|abort|discard]... [--tag X]...
 
 Design notes
 ------------
@@ -34,7 +35,20 @@ Design notes
   cameras keep rolling — the last command would be zero-order-held under moving
   video for ~2-3s per episode, which is exactly the kind of frame/action
   misalignment the teleop recorder never writes.
-* Depth cameras are skipped entirely in v1.
+* Depth cameras never go through LeRobot's 8-bit video encoder. By default
+  they are skipped (as in v1). With ``include_depth=True`` / ``--include-depth``
+  the ``depth_hevc10`` recordings are copied byte-for-byte (no re-encode, no
+  re-quantisation) into ``depth/<key>/<source_episode_id>/`` and registered in
+  ``meta/info.json["fv_depth"]`` with the exact frame range and timestamp
+  offset per LeRobot episode; ``load_depth_frames()`` decodes them.
+* ``windows`` (``--windows windows.json``) cut source episodes into time
+  windows; each window becomes ONE LeRobot episode (e.g. one harvest attempt).
+  Without windows: one LeRobot episode per episode dir (unchanged).
+* ``meta/fv_episodes.jsonl`` carries one line per LeRobot ``episode_index``
+  with the source episode metadata (outcome, tags, window, window ``extra``
+  such as attempt_id/result/reason) and calibration (camera_info, /tf_static).
+* lerobot / cv2 are imported lazily so the pure helpers (window selection,
+  sidecar building, info.json patching, depth copy) are testable without them.
 * Episodes are materialized one at a time (decode -> write -> release) so the
   peak RSS stays at ~one episode regardless of the episode count.
 """
@@ -45,9 +59,11 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -59,7 +75,6 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("LEROBOT_VIDEO_VCODEC", "h264")
 os.environ.setdefault("LEROBOT_VIDEO_PIX_FMT", "yuv420p")
 
-import cv2  # noqa: E402
 import pandas as pd  # noqa: E402
 
 RAD_TO_DEG = 180.0 / math.pi
@@ -86,8 +101,13 @@ STATE_ACTION_NAMES: List[str] = [
     "follower_arm_gripper",
 ]
 
-# Camera "kind" values that we skip in v1 (depth streams).
+# Camera "kind" values that never become LeRobot image/video features
+# (depth streams). depth_hevc10 can be exported as a sidecar (include_depth).
 DEPTH_KINDS = {"depth_bag", "depth_hevc10", "depth_png_seq"}
+DEPTH_EXPORT_KINDS = {"depth_hevc10"}
+DEPTH_KEY_PREFIX = "observation.depth."
+FV_EPISODES_FILE = "fv_episodes.jsonl"
+OUTCOMES = ("success", "abort", "discard")
 
 DEFAULT_CAMERA_MAP = {
     "top_camera": "top_camera",
@@ -324,6 +344,8 @@ def load_camera_frames(
     Row ``i`` of ``frames.parquet`` corresponds to element ``i`` of the returned
     list. Returns ``(ros_stamp_ns array, images)``.
     """
+    import cv2  # lazy: the pure helpers / tests must not need OpenCV
+
     df = pd.read_parquet(sidecar)
     df = df.sort_values("frame_index").reset_index(drop=True)
     stamps = df["ros_stamp_ns"].to_numpy(dtype=np.int64)
@@ -567,6 +589,524 @@ class Episode:
 
 
 # ===========================================================================
+# Episode selection / time windows / sidecars (pure — no lerobot, no cv2)
+# ===========================================================================
+def parse_started_at(value: Any) -> Optional[float]:
+    """meta.json ``started_at`` (ISO-8601, ``...Z``) -> unix seconds, or None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"  # python 3.10 fromisoformat has no 'Z'
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _opt_float(value: Any, what: str) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"window {what} must be a number, got {value!r}") from None
+
+
+def normalize_windows(raw: Any, base_dir: Optional[Path] = None) -> List[dict]:
+    """Validate a windows list (the parsed windows.json).
+
+    Accepts a list or ``{"windows": [...]}``. Each entry::
+
+        {"episode_dir": "<path>",              # required
+         "start_s": 12.0, "end_s": 48.5,       # seconds from meta.started_at
+         # or "start_unix": ..., "end_unix": ...  (absolute unix seconds)
+         "task": "harvest asparagus",          # optional, overrides the task
+         "extra": {"attempt_id": ..., ...}}    # optional, copied to fv_episodes.jsonl
+
+    Either bound may be omitted (= open towards that end). ``*_unix`` wins over
+    ``*_s`` when both are given. Relative ``episode_dir`` resolves against
+    ``base_dir`` (the windows.json directory) when that path exists, else cwd.
+    Returns normalized dicts with an added ``index`` (position in the input).
+    """
+    if isinstance(raw, dict) and "windows" in raw:
+        raw = raw["windows"]
+    if not isinstance(raw, list):
+        raise ValueError("windows must be a JSON list (or {\"windows\": [...]})")
+    out: List[dict] = []
+    for i, w in enumerate(raw):
+        if not isinstance(w, dict) or not w.get("episode_dir"):
+            raise ValueError(f"window #{i}: 'episode_dir' is required")
+        ep = Path(str(w["episode_dir"])).expanduser()
+        if not ep.is_absolute():
+            if base_dir is not None and (base_dir / ep).exists():
+                ep = base_dir / ep
+            ep = ep.resolve()
+        extra = w.get("extra") or {}
+        if not isinstance(extra, dict):
+            raise ValueError(f"window #{i}: 'extra' must be an object")
+        norm = {
+            "index": i,
+            "episode_dir": ep,
+            "start_s": _opt_float(w.get("start_s"), "start_s"),
+            "end_s": _opt_float(w.get("end_s"), "end_s"),
+            "start_unix": _opt_float(w.get("start_unix"), "start_unix"),
+            "end_unix": _opt_float(w.get("end_unix"), "end_unix"),
+            "task": (str(w["task"]).strip() or None) if w.get("task") else None,
+            "extra": dict(extra),
+        }
+        out.append(norm)
+    return out
+
+
+def load_windows(path: Path) -> List[dict]:
+    path = Path(path)
+    return normalize_windows(json.loads(path.read_text()), base_dir=path.resolve().parent)
+
+
+def window_bounds_ns(window: dict, meta: dict) -> Tuple[Optional[int], Optional[int]]:
+    """Absolute [start, end] of a window in ns (None = unbounded).
+
+    Relative bounds (start_s/end_s) are offsets from meta ``started_at`` —
+    the same origin as the recorder's trim_start_s/trim_end_s. Camera/joint
+    stamps are header stamps on the same wall clock."""
+    origin: Optional[float] = None
+
+    def _bound(unix_key: str, rel_key: str) -> Optional[int]:
+        nonlocal origin
+        if window.get(unix_key) is not None:
+            return int(round(float(window[unix_key]) * 1e9))
+        if window.get(rel_key) is not None:
+            if origin is None:
+                origin = parse_started_at(meta.get("started_at"))
+                if origin is None:
+                    raise ValueError(
+                        f"window #{window.get('index')}: relative {rel_key} needs "
+                        f"meta.started_at (episode {meta.get('episode_id')})")
+            return int(round((origin + float(window[rel_key])) * 1e9))
+        return None
+
+    start = _bound("start_unix", "start_s")
+    end = _bound("end_unix", "end_s")
+    if start is not None and end is not None and end <= start:
+        raise ValueError(f"window #{window.get('index')}: end must be after start")
+    return start, end
+
+
+def episode_matches(meta: dict, outcomes: Optional[Sequence[str]],
+                    tags: Optional[Sequence[str]]) -> bool:
+    """--outcome: any-of (meta.outcome in outcomes). --tag: all-of
+    (every requested tag present in meta.tags). Empty filter = pass."""
+    if outcomes:
+        if str(meta.get("outcome") or "") not in set(outcomes):
+            return False
+    if tags:
+        have = {str(t) for t in (meta.get("tags") or [])}
+        if not set(str(t) for t in tags) <= have:
+            return False
+    return True
+
+
+def plan_units(
+    episode_dirs: Sequence[Path],
+    windows: Optional[Sequence[dict]] = None,
+    outcomes: Optional[Sequence[str]] = None,
+    tags: Optional[Sequence[str]] = None,
+) -> List[dict]:
+    """Decide which LeRobot episodes to write.
+
+    Returns a list of ``{"episode_dir": Path, "meta": dict, "window": dict|None}``
+    — one element per future LeRobot episode, in episode_index order.
+    Without windows: one unit per episode dir (input order). With windows: one
+    unit per window, grouped by episode dir in first-appearance order (so a
+    source episode is decoded once even if its windows are interleaved),
+    windows of the same dir keep their input order. Outcome/tag filters apply
+    to the source episode's meta.json in both modes.
+    """
+    meta_cache: Dict[Path, dict] = {}
+
+    def _meta(d: Path) -> dict:
+        if d not in meta_cache:
+            meta_cache[d] = json.loads((d / "meta.json").read_text())
+        return meta_cache[d]
+
+    units: List[dict] = []
+    if windows is None:
+        for d in episode_dirs:
+            d = Path(d)
+            meta = _meta(d)
+            if not episode_matches(meta, outcomes, tags):
+                print(f"[filter] skip {d.name} (outcome={meta.get('outcome')} tags={meta.get('tags')})")
+                continue
+            units.append({"episode_dir": d, "meta": meta, "window": None})
+        return units
+
+    order: List[Path] = []
+    grouped: Dict[Path, List[dict]] = {}
+    for w in windows:
+        d = Path(w["episode_dir"])
+        if d not in grouped:
+            grouped[d] = []
+            order.append(d)
+        grouped[d].append(w)
+    for d in order:
+        meta = _meta(d)
+        if not episode_matches(meta, outcomes, tags):
+            print(f"[filter] skip {d.name}: {len(grouped[d])} window(s) "
+                  f"(outcome={meta.get('outcome')} tags={meta.get('tags')})")
+            continue
+        for w in grouped[d]:
+            units.append({"episode_dir": d, "meta": meta, "window": w})
+    return units
+
+
+def select_ticks(
+    all_ticks: Sequence[int],
+    span_start: int,
+    span_end: int,
+    window_ns: Optional[Tuple[Optional[int], Optional[int]]] = None,
+) -> List[int]:
+    """Ticks inside the aligned camera/state/action span AND the window."""
+    lo, hi = span_start, span_end
+    if window_ns is not None:
+        if window_ns[0] is not None:
+            lo = max(lo, int(window_ns[0]))
+        if window_ns[1] is not None:
+            hi = min(hi, int(window_ns[1]))
+    return [t for t in all_ticks if lo <= t <= hi]
+
+
+def collect_calibration(ep_dir: Path, meta: dict, camera_map: Dict[str, str]) -> Optional[dict]:
+    """camera_info from meta.json cameras[] + /tf_static from the bag.
+
+    ``{"cameras": {fv_name: {"key", "kind", "camera_info"}}, "tf_static": [...]|None}``
+    or None when neither is available. Never raises."""
+    from .calibration import read_tf_static
+
+    cams: Dict[str, dict] = {}
+    for cam in meta.get("cameras", []) or []:
+        info = cam.get("camera_info")
+        if not info:
+            continue
+        name = str(cam.get("name"))
+        kind = cam.get("kind") or "color"
+        prefix = DEPTH_KEY_PREFIX if kind in DEPTH_KINDS else "observation.images."
+        cams[name] = {
+            "key": prefix + camera_map.get(name, name),
+            "kind": kind,
+            "camera_info": info,
+        }
+    try:
+        bag_dir = ep_dir / str(meta.get("bag_path", "bag/")).rstrip("/")
+        tf_static = read_tf_static(bag_dir)
+    except Exception:
+        tf_static = None
+    if not cams and tf_static is None:
+        return None
+    return {"cameras": cams, "tf_static": tf_static}
+
+
+def build_fv_episode_record(
+    episode_index: int,
+    ep_dir: Path,
+    meta: dict,
+    window: Optional[dict],
+    *,
+    task: str,
+    n_frames: int,
+    fps: int,
+    t0_stamp_ns: int,
+    t_end_stamp_ns: int,
+    calibration: Optional[dict] = None,
+    depth_keys: Optional[List[str]] = None,
+) -> dict:
+    """One meta/fv_episodes.jsonl line (see README for the key list)."""
+    win = None
+    if window is not None:
+        win = {
+            "index": window.get("index"),
+            "start_s": window.get("start_s"),
+            "end_s": window.get("end_s"),
+            "start_unix": window.get("start_unix"),
+            "end_unix": window.get("end_unix"),
+        }
+    started_unix = parse_started_at(meta.get("started_at"))
+    return {
+        "episode_index": int(episode_index),
+        "source_episode_id": meta.get("episode_id"),
+        "episode_dir": ep_dir.name,
+        "episode_path": str(ep_dir),
+        "profile": meta.get("profile"),
+        "robot_id": meta.get("robot_id"),
+        "operator": meta.get("operator"),
+        "parent_session_id": meta.get("parent_session_id"),
+        "task": task,
+        "task_description": meta.get("task_description"),
+        "started_at": meta.get("started_at"),
+        "outcome": meta.get("outcome"),
+        "tags": list(meta.get("tags") or []),
+        "pinned": bool(meta.get("pinned", False)),
+        "detected_variants": list(meta.get("detected_variants") or []),
+        "window": win,
+        "extra": dict((window or {}).get("extra") or {}),
+        "n_frames": int(n_frames),
+        "fps": int(fps),
+        # LeRobot timestamp t of this episode <-> header stamp t0 + t (ns)
+        "t0_stamp_ns": int(t0_stamp_ns),
+        "t_end_stamp_ns": int(t_end_stamp_ns),
+        "t0_offset_s": (round(t0_stamp_ns / 1e9 - started_unix, 6)
+                        if started_unix is not None else None),
+        "calibration": calibration,
+        "depth_keys": list(depth_keys or []),
+    }
+
+
+def write_fv_episodes(out_root: Path, records: Sequence[dict]) -> Path:
+    path = Path(out_root) / "meta" / FV_EPISODES_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        for rec in sorted(records, key=lambda r: r["episode_index"]):
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Depth sidecar (depth_hevc10 copied as-is, never re-encoded)
+# ---------------------------------------------------------------------------
+def depth_sources(ep_dir: Path, meta: dict, camera_map: Dict[str, str]) -> List[dict]:
+    """depth_hevc10 cameras with frames + video + depth_meta.json on disk."""
+    out: List[dict] = []
+    for cam in meta.get("cameras", []) or []:
+        if cam.get("kind") not in DEPTH_EXPORT_KINDS:
+            continue
+        name = str(cam.get("name"))
+        video_dir = cam.get("video_dir")
+        if not video_dir or int(cam.get("frame_count") or 0) <= 0:
+            print(f"  skip depth: {name} (no frames)")
+            continue
+        cam_dir = ep_dir / "videos" / str(video_dir)
+        segs = cam.get("segments") or [{"file": "0000.mp4"}]
+        video = cam_dir / str(segs[0].get("file") or "0000.mp4")
+        meta_file = cam_dir / "depth_meta.json"
+        sidecar = ep_dir / "videos" / str(cam.get("sidecar_file") or f"{name}/frames.parquet")
+        missing = [p.name for p in (video, meta_file, sidecar) if not p.exists()]
+        if missing:
+            print(f"  skip depth: {name} (missing {missing})")
+            continue
+        out.append({
+            "fv_name": name,
+            "key": DEPTH_KEY_PREFIX + camera_map.get(name, name),
+            "video": video,
+            "meta_file": meta_file,
+            "sidecar": sidecar,
+        })
+    return out
+
+
+def _read_depth_sidecar(sidecar: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """(ros_stamp_ns, segment_local_frame) in decode order."""
+    df = pd.read_parquet(sidecar, columns=["frame_index", "segment_local_frame", "ros_stamp_ns"])
+    df = df.sort_values("frame_index").reset_index(drop=True)
+    return (df["ros_stamp_ns"].to_numpy(dtype=np.int64),
+            df["segment_local_frame"].to_numpy(dtype=np.int64))
+
+
+def depth_frame_range(stamps_ns: np.ndarray, t0_ns: int, t_end_ns: int) -> Tuple[int, int]:
+    """[first, last] row (inclusive) covering a LeRobot episode [t0, t_end].
+
+    Floor selection on both ends — the same at-or-before rule secondary
+    colour cameras use — so depth frame ``first`` is what was current at
+    LeRobot timestamp 0. Clamped to the recording (head before the first
+    depth frame → 0)."""
+    n = len(stamps_ns)
+    if n == 0:
+        return 0, -1
+    first = max(int(np.searchsorted(stamps_ns, t0_ns, side="right")) - 1, 0)
+    last = max(int(np.searchsorted(stamps_ns, t_end_ns, side="right")) - 1, first)
+    return first, min(last, n - 1)
+
+
+def plan_depth_entry(src: dict, episode_index: int, source_id: str,
+                     t0_ns: int, t_end_ns: int) -> dict:
+    """Per-episode depth index entry (+ private ``_copy`` list for the copy step)."""
+    from . import depth10
+
+    stamps, local = _read_depth_sidecar(src["sidecar"])
+    first, last = depth_frame_range(stamps, t0_ns, t_end_ns)
+    dmeta = json.loads(src["meta_file"].read_text())
+    rel_dir = f"depth/{src['key']}/{source_id}"
+    actual_pf = depth10.probe_pix_fmt(src["video"])
+    bit_ok = depth10.is_10bit_pix_fmt(actual_pf) if actual_pf else None
+    if actual_pf and not bit_ok:
+        print(
+            f"  [WARN] depth {src['fv_name']} ({src['video']}): stream pix_fmt is "
+            f"{actual_pf} (8-bit) but depth_meta says {dmeta.get('pix_fmt')} — the "
+            f"10-bit inverse-depth codes were truncated to ~255 levels by the "
+            f"encoder; decoded depth is coarse. Exported as-is, flagged bit_depth_ok=false.",
+            file=sys.stderr,
+        )
+    entry = {
+        "episode_index": int(episode_index),
+        "source_episode_id": source_id,
+        "file": f"{rel_dir}/{src['video'].name}",
+        "meta_file": f"{rel_dir}/{src['meta_file'].name}",
+        "frames_file": f"{rel_dir}/frames.parquet",
+        # decode-order frame numbers (= segment_local_frame) inclusive
+        "frame_from": int(local[first]) if last >= first else 0,
+        "frame_to": int(local[last]) if last >= first else -1,
+        "n_frames": int(last - first + 1) if last >= first else 0,
+        "t0_stamp_ns": int(t0_ns),
+        "from_stamp_ns": int(stamps[first]) if last >= first else None,
+        "to_stamp_ns": int(stamps[last]) if last >= first else None,
+        # LeRobot timestamp of depth frame_from (negative = slightly before t0)
+        "first_frame_timestamp_s": (round((int(stamps[first]) - t0_ns) / 1e9, 6)
+                                    if last >= first else None),
+        "d_min_counts": dmeta.get("d_min_counts"),
+        "d_max_counts": dmeta.get("d_max_counts"),
+        "depth_scale_mm_per_count": dmeta.get("depth_scale_mm_per_count"),
+        "actual_pix_fmt": actual_pf,
+        "bit_depth_ok": bit_ok,
+        "_key": src["key"],
+        "_fv_name": src["fv_name"],
+        "_meta": dmeta,
+        "_copy": [
+            (src["video"], f"{rel_dir}/{src['video'].name}"),
+            (src["meta_file"], f"{rel_dir}/{src['meta_file'].name}"),
+            (src["sidecar"], f"{rel_dir}/frames.parquet"),
+        ],
+    }
+    return entry
+
+
+def copy_depth_files(out_root: Path, entries: Sequence[dict]) -> int:
+    """Copy each source depth file once (byte-identical to ``ffmpeg -c copy``
+    of the whole file, and needs no ffmpeg). Returns bytes copied."""
+    done: set = set()
+    total = 0
+    for e in entries:
+        for src, rel in e.get("_copy", []):
+            if rel in done:
+                continue
+            dst = Path(out_root) / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            total += dst.stat().st_size
+            done.add(rel)
+    return total
+
+
+def build_fv_depth_block(entries: Sequence[dict]) -> dict:
+    """``meta/info.json["fv_depth"]`` from planned depth entries."""
+    keys: Dict[str, dict] = {}
+    for e in sorted(entries, key=lambda x: (x["_key"], x["episode_index"])):
+        key = e["_key"]
+        m = e["_meta"]
+        if key not in keys:
+            keys[key] = {
+                "source_camera": e["_fv_name"],
+                "path_template": f"depth/{key}/{{source_episode_id}}/0000.mp4",
+                "meta_template": f"depth/{key}/{{source_episode_id}}/depth_meta.json",
+                "frames_template": f"depth/{key}/{{source_episode_id}}/frames.parquet",
+                "format": m.get("format"),
+                "codec": "hevc",
+                "encoder": m.get("codec"),
+                "pix_fmt": m.get("pix_fmt", "yuv420p10le"),
+                "quantisation": "inverse_depth_10bit",
+                "d_min_counts": m.get("d_min_counts"),
+                "d_max_counts": m.get("d_max_counts"),
+                "depth_scale_mm_per_count": m.get("depth_scale_mm_per_count"),
+                "luma_levels": m.get("luma_levels"),
+                "invalid_luma": m.get("invalid_luma"),
+                "far_handling": m.get("far_handling"),
+                "width": m.get("width"),
+                "height": m.get("height"),
+                "fps": m.get("fps"),
+                "decode": "fv_episode_recorder.depth10.decode_video",
+                "loader": "fv_episode_recorder.lerobot_materializer.load_depth_frames",
+                "actual_pix_fmt": e.get("actual_pix_fmt"),
+                "bit_depth_ok": e.get("bit_depth_ok"),
+                "episodes": {},
+            }
+        k = keys[key]
+        # ranges may differ between source episodes (profile change): the
+        # per-episode entry + its depth_meta.json are authoritative.
+        for fld in ("d_min_counts", "d_max_counts", "depth_scale_mm_per_count"):
+            if k[fld] != m.get(fld):
+                k[fld] = "per_episode"
+        if e.get("actual_pix_fmt") and k.get("actual_pix_fmt") != e.get("actual_pix_fmt"):
+            k["actual_pix_fmt"] = "mixed"
+        if e.get("bit_depth_ok") is False:
+            k["bit_depth_ok"] = False
+        elif e.get("bit_depth_ok") is True and k["bit_depth_ok"] is None:
+            k["bit_depth_ok"] = True
+        k["episodes"][str(e["episode_index"])] = {
+            kk: vv for kk, vv in e.items() if not kk.startswith("_")
+        }
+    return {"version": 1, "keys": keys}
+
+
+def patch_info_json(out_root: Path, fv_depth: dict) -> Path:
+    """Add the top-level ``fv_depth`` block to meta/info.json (after finalize —
+    LeRobot rewrites info.json on save_episode/finalize). Unknown top-level
+    keys are ignored by LeRobot's loader."""
+    path = Path(out_root) / "meta" / "info.json"
+    info = json.loads(path.read_text()) if path.exists() else {}
+    info["fv_depth"] = fv_depth
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(info, indent=4, ensure_ascii=False))
+    return path
+
+
+def load_depth_frames(
+    dataset_root: Path, episode_index: int, key: str, unit: str = "mm"
+) -> Iterator[Tuple[float, np.ndarray]]:
+    """Yield ``(timestamp_s, depth)`` for one LeRobot episode's depth key.
+
+    ``timestamp_s`` is on the LeRobot episode clock (0 = the episode's first
+    frame; may be slightly negative for the first depth frame, which is the
+    one current at t=0). ``unit``: "mm" → uint16 millimetres (rounded; 0 =
+    invalid), "counts" → uint16 raw sensor counts (D405: 0.1 mm/count, keeps
+    sub-mm resolution), "mm_f32" → float32 millimetres. Needs ffmpeg.
+    """
+    from . import depth10
+
+    root = Path(dataset_root)
+    info = json.loads((root / "meta" / "info.json").read_text())
+    try:
+        ent = info["fv_depth"]["keys"][key]["episodes"][str(int(episode_index))]
+    except KeyError:
+        raise KeyError(f"no depth '{key}' for episode {episode_index} in {root}") from None
+    dmeta = json.loads((root / ent["meta_file"]).read_text())
+    scale = float(dmeta.get("depth_scale_mm_per_count") or 1.0)
+    stamps, local = _read_depth_sidecar(root / ent["frames_file"])
+    stamp_by_local = dict(zip(local.tolist(), stamps.tolist()))
+    t0 = int(ent["t0_stamp_ns"])
+    lo, hi = int(ent["frame_from"]), int(ent["frame_to"])
+    for i, counts in enumerate(depth10.decode_video(root / ent["file"], dmeta)):
+        if i < lo:
+            continue
+        if i > hi:
+            break
+        ts = (int(stamp_by_local.get(i, t0)) - t0) / 1e9
+        if unit == "counts":
+            yield ts, counts
+        elif unit == "mm_f32":
+            yield ts, counts.astype(np.float32) * np.float32(scale)
+        elif unit == "mm":
+            if scale == 1.0:
+                yield ts, counts
+            else:
+                yield ts, np.rint(counts.astype(np.float32) * scale).astype(np.uint16)
+        else:
+            raise ValueError(f"unit must be mm|counts|mm_f32, got {unit!r}")
+
+
+# ===========================================================================
 # Materialization
 # ===========================================================================
 def build_features(cameras: List[CameraSource], use_videos: bool) -> dict:
@@ -616,6 +1156,11 @@ def materialize(
     task_override: Optional[str],
     image_writer_threads: int = 0,
     video_file_size_mb: Optional[int] = None,
+    *,
+    windows: Optional[Sequence[dict]] = None,
+    include_depth: bool = False,
+    outcomes: Optional[Sequence[str]] = None,
+    tags: Optional[Sequence[str]] = None,
 ) -> dict:
     """image_writer_threads / video_file_size_mb は変換時間のチューニング
     (既定は従来どおり = 同期書き出し・動画 1 ファイル):
@@ -628,8 +1173,24 @@ def materialize(
       変換時間がエピソード数の 2 乗で伸びる (45 エピソードで変換時間の約 4 割)。
       v3.0 形式は複数ファイルが正規の形 (meta/episodes が chunk/file index と
       from/to_timestamp を持つ)
+
+    追加オプション (いずれも既定は従来動作):
+
+    - windows: normalize_windows() 形式の時間窓リスト。窓 1 つ = LeRobot
+      エピソード 1 つ (収穫の試み単位など)。None なら従来どおり 1 ディレクトリ
+      = 1 エピソードで、episode_dirs を使う (windows 指定時 episode_dirs は無視)
+    - include_depth: depth_hevc10 カメラを再エンコードせずに depth/ へコピーし
+      meta/info.json の fv_depth に登録する (load_depth_frames で読める)
+    - outcomes / tags: 入力エピソードの絞り込み (outcome は any-of、tag は all-of)
+
+    meta/fv_episodes.jsonl (episode_index ごとの由来・窓・extra・calibration)
+    は常に書く。
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    units = plan_units(episode_dirs, windows=windows, outcomes=outcomes, tags=tags)
+    if not units:
+        raise RuntimeError("no episodes to materialize (all filtered out?)")
 
     # --- 事前検証: meta.json のみ・動画はデコードしない ---
     # かつては全エピソードをここで一括ロード (全フレームデコード) してから
@@ -637,9 +1198,13 @@ def materialize(
     # 伸びる (実測: 60EP/~40k フレームで 65GB → OOM kill)。カメラ集合の検証は
     # meta.json だけで済むので、書き込み開始前にデコード無しで先に済ませる。
     canonical_keys: Optional[List[str]] = None
-    for ep_dir in episode_dirs:
-        meta = json.loads((ep_dir / "meta.json").read_text())
-        selected, _ = _select_cameras(ep_dir, meta, camera_map)
+    seen_dirs: set = set()
+    for unit in units:
+        ep_dir = unit["episode_dir"]
+        if ep_dir in seen_dirs:
+            continue
+        seen_dirs.add(ep_dir)
+        selected, _ = _select_cameras(ep_dir, unit["meta"], camera_map)
         keys = [lerobot_key for _, lerobot_key, _, _ in selected]
         if not keys:
             raise RuntimeError(f"episode {ep_dir} has no usable (color) cameras")
@@ -649,6 +1214,11 @@ def materialize(
             raise RuntimeError(
                 f"camera set mismatch: {ep_dir} has {keys}, expected {canonical_keys}"
             )
+        if windows is not None:
+            # 相対窓の started_at 欠落などは書き込み開始前に落とす
+            for u in units:
+                if u["episode_dir"] == ep_dir:
+                    window_bounds_ns(u["window"], u["meta"])
 
     if out_root.exists() and any(out_root.iterdir()):
         raise RuntimeError(f"output root {out_root} already exists and is not empty")
@@ -659,6 +1229,8 @@ def materialize(
     # [load] / [episode] の行フォーマットは datagen / sim_eval の
     # parse_materializer_progress が読むので変えないこと。ストリーミング化で
     # 両者の出現順が交互になるが、あちらは行頭前綴りを数えるだけなので無害。
+    # 窓モードでは同じソースの窓が連続する (plan_units がまとめる) ので、
+    # ソース 1 本につきデコードは 1 回、解放は最後の窓の後。
     dataset = None
     total_frames = 0
     episode_count = 0
@@ -666,16 +1238,31 @@ def materialize(
     total_head_trim_s = 0.0
     total_tail_trim_s = 0.0
     per_camera_reuse: Dict[str, Dict[str, int]] = {}
-    for ep_dir in episode_dirs:
-        print(f"[load] {ep_dir}")
-        ep = Episode(ep_dir)
-        ep.load(camera_map, state_topic, action_topic)
-        for s in ep.skipped_cameras:
-            print(f"  skip camera: {s}")
-        print(
-            f"  cameras: {[(c.fv_name, c.lerobot_key, c.width, c.height) for c in ep.cameras]}"
-            f"  state_msgs={len(ep.state_series)} action_msgs={len(ep.action_series)}"
-        )
+    fv_records: List[dict] = []
+    depth_entries: List[dict] = []
+    skipped_windows: List[dict] = []
+    ep: Optional[Episode] = None
+    calibration: Optional[dict] = None
+    depth_srcs: List[dict] = []
+    for i_unit, unit in enumerate(units):
+        ep_dir = unit["episode_dir"]
+        window = unit["window"]
+        if ep is None or ep.dir != ep_dir:
+            print(f"[load] {ep_dir}")
+            ep = Episode(ep_dir)
+            ep.load(camera_map, state_topic, action_topic)
+            for s in ep.skipped_cameras:
+                print(f"  skip camera: {s}")
+            print(
+                f"  cameras: {[(c.fv_name, c.lerobot_key, c.width, c.height) for c in ep.cameras]}"
+                f"  state_msgs={len(ep.state_series)} action_msgs={len(ep.action_series)}"
+            )
+            for cam in ep.cameras:
+                acc = per_camera_reuse.setdefault(
+                    cam.lerobot_key, {"used": 0, "reused": 0, "src_frames": 0})
+                acc["src_frames"] += len(cam.stamps)
+            calibration = collect_calibration(ep_dir, ep.meta, camera_map)
+            depth_srcs = depth_sources(ep_dir, ep.meta, camera_map) if include_depth else []
 
         if dataset is None:
             features = build_features(ep.cameras, use_videos=True)
@@ -693,12 +1280,15 @@ def materialize(
                 dataset.meta.update_chunk_settings(
                     video_files_size_in_mb=int(video_file_size_mb))
 
-        task = task_override or ep.task or "recording"
+        # 優先度: 窓の task > --task > meta.task_description
+        task = ((window or {}).get("task") or task_override or ep.task or "recording")
         span_start, span_end = ep.aligned_span()
         all_ticks = ep.timeline(fps)
-        ticks = [t for t in all_ticks if span_start <= t <= span_end]
+        window_ns = window_bounds_ns(window, ep.meta) if window is not None else None
+        ticks = select_ticks(all_ticks, span_start, span_end, window_ns)
         head_trim_s = (span_start - all_ticks[0]) / 1e9 if all_ticks else 0.0
         tail_trim_s = (all_ticks[-1] - span_end) / 1e9 if all_ticks else 0.0
+        used_before = {c.lerobot_key: (c.used, c.reused) for c in ep.cameras}
 
         # Alignment mirrors session_recorder: the primary camera's frame stamp
         # is the pairing stamp for the whole tuple, and a tick with no primary
@@ -706,6 +1296,8 @@ def materialize(
         stale_ns = int(max(0.2, 2.0 / fps) * 1e9)
         written = 0
         skipped_stale = 0
+        first_pair_ns: Optional[int] = None
+        last_pair_ns: Optional[int] = None
         for tick_ns in ticks:
             p_idx = _nearest_index(ep.primary, tick_ns)
             pair_ns = int(ep.primary.stamps[p_idx])
@@ -728,36 +1320,88 @@ def materialize(
                 frame[f"observation.images.{cam.lerobot_key}"] = np.ascontiguousarray(img)
             dataset.add_frame(frame)
             written += 1
+            if first_pair_ns is None:
+                first_pair_ns = pair_ns
+            last_pair_ns = pair_ns
+        is_last_of_source = (i_unit + 1 == len(units)
+                             or units[i_unit + 1]["episode_dir"] != ep_dir)
         if written == 0:
-            raise RuntimeError(
-                f"episode {ep.dir}: no frames survived alignment "
-                f"(ticks={len(ticks)}, stale_skipped={skipped_stale})"
-            )
+            if window is None:
+                raise RuntimeError(
+                    f"episode {ep.dir}: no frames survived alignment "
+                    f"(ticks={len(ticks)}, stale_skipped={skipped_stale})"
+                )
+            # 窓が録画/関節の重なり区間の外 (または短すぎ) — その窓だけ捨てる。
+            # エピソード番号は詰めたまま (save_episode していない)。
+            print(f"  [warn] window #{window.get('index')} on {ep.dir.name}: no frames "
+                  f"in span (ticks={len(ticks)}, stale_skipped={skipped_stale}) — skipped",
+                  file=sys.stderr)
+            skipped_windows.append({"index": window.get("index"),
+                                    "episode_dir": str(ep_dir),
+                                    "extra": window.get("extra")})
+            if is_last_of_source:
+                ep.release()
+            continue
         dataset.save_episode()
+        episode_index = episode_count
         total_frames += written
         total_skipped_stale += skipped_stale
         total_head_trim_s += max(head_trim_s, 0.0)
         total_tail_trim_s += max(tail_trim_s, 0.0)
         episode_count += 1
         for cam in ep.cameras:
-            acc = per_camera_reuse.setdefault(cam.lerobot_key, {"used": 0, "reused": 0, "src_frames": 0})
-            acc["used"] += cam.used
-            acc["reused"] += cam.reused
-            acc["src_frames"] += len(cam.stamps)
+            acc = per_camera_reuse[cam.lerobot_key]
+            u0, r0 = used_before.get(cam.lerobot_key, (0, 0))
+            acc["used"] += cam.used - u0
+            acc["reused"] += cam.reused - r0
+
+        source_id = str(ep.meta.get("episode_id") or ep_dir.name)
+        ep_depth_keys: List[str] = []
+        for src in depth_srcs:
+            entry = plan_depth_entry(src, episode_index, source_id,
+                                     int(first_pair_ns), int(last_pair_ns))
+            depth_entries.append(entry)
+            ep_depth_keys.append(src["key"])
+        fv_records.append(build_fv_episode_record(
+            episode_index, ep_dir, ep.meta, window,
+            task=task, n_frames=written, fps=fps,
+            t0_stamp_ns=int(first_pair_ns), t_end_stamp_ns=int(last_pair_ns),
+            calibration=calibration, depth_keys=ep_depth_keys,
+        ))
+        win_label = f" window=#{window.get('index')}" if window is not None else ""
         print(
             f"[episode] {ep.dir.name}: {written} frames "
             f"(trim head {head_trim_s:.2f}s / tail {tail_trim_s:.2f}s, "
-            f"stale_skipped={skipped_stale}), task='{task}'"
+            f"stale_skipped={skipped_stale}), task='{task}'{win_label}"
         )
         # save_episode 済みの画像はもう使わない。次のデコードが始まる前に解放
-        ep.release()
+        if is_last_of_source:
+            ep.release()
 
     if dataset is None:
         # CLI 経由は argparse nargs="+" で 1 件以上が保証されるが、
         # materialize() をライブラリとして空リストで呼ぶ経路を塞ぐ
         # (assert は python -O で消える)。
         raise RuntimeError("no episodes to materialize")
+    if episode_count == 0:
+        raise RuntimeError("no episodes to materialize (every window was empty)")
     dataset.finalize()
+
+    # --- finalize 後: LeRobot が info.json を書き終えてから sidecar を足す ---
+    fv_episodes_path = write_fv_episodes(out_root, fv_records)
+    depth_summary: Dict[str, Any] = {}
+    if include_depth and depth_entries:
+        copied = copy_depth_files(out_root, depth_entries)
+        block = build_fv_depth_block(depth_entries)
+        patch_info_json(out_root, block)
+        depth_summary = {
+            "keys": sorted(block["keys"]),
+            "entries": len(depth_entries),
+            "bytes_copied": copied,
+            "bit_depth_ok": {k: v.get("bit_depth_ok") for k, v in block["keys"].items()},
+        }
+    elif include_depth:
+        print("  [warn] --include-depth: no depth_hevc10 recordings found", file=sys.stderr)
 
     return {
         "episodes": episode_count,
@@ -767,6 +1411,9 @@ def materialize(
         "tail_trim_s": round(total_tail_trim_s, 3),
         "per_camera": per_camera_reuse,
         "root": str(out_root),
+        "skipped_windows": skipped_windows,
+        "fv_episodes": str(fv_episodes_path),
+        "depth": depth_summary,
     }
 
 
@@ -779,7 +1426,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         prog="python3 -m fv_episode_recorder.lerobot_materializer",
         description="Materialize fv_episode_recorder episodes into a LeRobot v3.0 dataset.",
     )
-    parser.add_argument("episode_dirs", nargs="+", type=Path, help="episode directories")
+    parser.add_argument("episode_dirs", nargs="*", type=Path,
+                        help="episode directories (omit when --windows is given)")
     parser.add_argument("--out", required=True, type=Path, help="output dataset root")
     parser.add_argument("--repo-id", required=True, help="lerobot repo id, e.g. user/name")
     parser.add_argument("--fps", type=int, default=30, help="dataset fps (default 30)")
@@ -794,7 +1442,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--video-file-size-mb", type=int, default=None,
         help="rotate output video files at this size; default keeps the LeRobot "
              "default (one growing file, conversion time grows quadratically)")
+    parser.add_argument(
+        "--windows", type=Path, default=None,
+        help="windows.json: list of {episode_dir, start_s/end_s | start_unix/end_unix, "
+             "task?, extra?}; each window becomes one LeRobot episode")
+    parser.add_argument(
+        "--include-depth", action="store_true",
+        help="copy depth_hevc10 recordings (no re-encode) into depth/ and register "
+             "them in meta/info.json fv_depth")
+    parser.add_argument(
+        "--outcome", action="append", choices=OUTCOMES, default=None,
+        help="only include episode dirs with this outcome (repeatable, any-of)")
+    parser.add_argument(
+        "--tag", action="append", default=None,
+        help="only include episode dirs carrying this tag (repeatable, all-of)")
     args = parser.parse_args(argv)
+
+    if args.windows is None and not args.episode_dirs:
+        parser.error("give episode directories or --windows")
+    if args.windows is not None and args.episode_dirs:
+        parser.error("--windows names its episode dirs itself; drop the positional dirs")
+    windows = load_windows(args.windows) if args.windows is not None else None
 
     camera_map = parse_camera_map(args.camera_map)
     out_root = args.out.resolve()
@@ -810,6 +1478,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         task_override=args.task,
         image_writer_threads=args.image_writer_threads,
         video_file_size_mb=args.video_file_size_mb,
+        windows=windows,
+        include_depth=args.include_depth,
+        outcomes=args.outcome,
+        tags=args.tag,
     )
 
     info_path = out_root / "meta" / "info.json"
@@ -831,6 +1503,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"output root      : {summary['root']}")
     print(f"output size      : {size_bytes / 1e6:.2f} MB")
     print(f"info.json        : {info_path}  (exists={info_path.exists()})")
+    print(f"fv_episodes      : {summary['fv_episodes']}")
+    if summary["skipped_windows"]:
+        print(f"skipped windows  : {[w['index'] for w in summary['skipped_windows']]}")
+    if summary["depth"]:
+        print(f"depth            : {summary['depth']}")
     print("================================================")
     return 0
 

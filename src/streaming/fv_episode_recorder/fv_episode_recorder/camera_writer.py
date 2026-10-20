@@ -34,6 +34,7 @@ from sensor_msgs.msg import CompressedImage, Image
 
 from .frames_sidecar import FramesSidecar
 from . import depth10
+from .calibration import camera_info_to_dict
 
 LOG = logging.getLogger("fv_episode_recorder.camera")
 
@@ -111,39 +112,21 @@ def _spawn_ffmpeg_hevc10_encoder(out_path: Path, width: int, height: int,
     if not shutil.which("ffmpeg"):
         LOG.error("ffmpeg not found in PATH")
         return None
-    encoder_tries = [
-        ("hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", str(cq),
-                        "-pix_fmt", "p010le", "-profile:v", "main10"]),
-        # CPU fallback must never stall the pipe: a blocked stdin.write blocks
-        # the subscriber callback (E2E: D555 depth dropped to 4 frames/77s
-        # while slower encodes hogged the executor). ultrafast + no lookahead.
-        ("libx265", ["-preset", "ultrafast", "-crf", str(cq + 2),
-                     "-pix_fmt", "yuv420p10le", "-profile:v", "main10",
-                     "-x265-params", "log-level=none:bframes=0:rc-lookahead=0"]),
-    ]
+    encoder_tries = depth10.hevc10_encoder_tries(cq)
     for codec, extra in encoder_tries:
-        try:
-            test = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.04:r=25,format=yuv420p10le",
-                 "-c:v", codec, *extra, "-f", "null", "-"],
-                stderr=subprocess.PIPE, timeout=10,
-            )
-            if test.returncode != 0:
-                LOG.warning("[encoder probe] %s unavailable: %s", codec,
-                            test.stderr.decode("utf-8", errors="replace")[:200])
-                continue
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-            LOG.warning("[encoder probe] %s probe failed: %s", codec, exc)
+        # Probe by encoding a short 10-bit clip and ffprobe-ing the result:
+        # an encoder that "succeeds" but writes 8-bit (nv12 — observed with
+        # hevc_nvenc on the ASPA Jetson) would silently cut the 1..1023 luma
+        # codes to ~255 levels while depth_meta.json still claims Main10.
+        ok, pix_fmt = depth10.probe_encoder_10bit(codec, extra)
+        if not ok:
+            if pix_fmt:
+                LOG.error("[encoder probe] %s writes %s (8-bit), not 10-bit — skipped",
+                          codec, pix_fmt)
+            else:
+                LOG.warning("[encoder probe] %s unavailable", codec)
             continue
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "yuv420p10le",
-            "-s", f"{width}x{height}", "-r", str(fps),
-            "-i", "pipe:0",
-            "-c:v", codec, *extra,
-            str(out_path),
-        ]
+        cmd = depth10.hevc10_encode_cmd(codec, extra, out_path, width, height, fps)
         try:
             # stderr must NOT be an unread PIPE: ffmpeg blocks once the pipe
             # buffer fills, which freezes stdin.write in the subscriber
@@ -163,7 +146,31 @@ def _spawn_ffmpeg_hevc10_encoder(out_path: Path, width: int, height: int,
     return None
 
 
-class CameraWriter:
+class _CameraInfoMixin:
+    """Optional intrinsics captured once per camera.
+
+    CameraWriterPool feeds the first sensor_msgs/CameraInfo from the
+    profile's ``camera_info_topic`` via set_camera_info(); summary() then
+    carries it as ``camera_info`` (meta.json cameras[]). Without a
+    configured topic nothing is added — meta.json stays byte-compatible."""
+
+    camera_info: Optional[dict] = None
+    camera_info_topic: Optional[str] = None
+
+    def set_camera_info(self, info: Optional[dict]) -> None:
+        # first message wins: intrinsics are static per episode
+        if info and self.camera_info is None:
+            self.camera_info = dict(info)
+
+    def _with_camera_info(self, summary: dict) -> dict:
+        if self.camera_info_topic:
+            summary["camera_info_topic"] = self.camera_info_topic
+        if self.camera_info is not None:
+            summary["camera_info"] = self.camera_info
+        return summary
+
+
+class CameraWriter(_CameraInfoMixin):
     """One worker per camera: subscribes, encodes, writes mp4 + sidecar."""
 
     def __init__(
@@ -356,7 +363,7 @@ class CameraWriter:
 
     def summary(self) -> dict:
         size_bytes = self._segment_file.stat().st_size if self._segment_file.exists() else 0
-        return {
+        return self._with_camera_info({
             "name": self.name,
             "topic": self.topic,
             "dropped_frames": self.dropped_frames,
@@ -374,10 +381,10 @@ class CameraWriter:
                     "size_bytes": size_bytes,
                 }
             ],
-        }
+        })
 
 
-class DepthCameraWriter:
+class DepthCameraWriter(_CameraInfoMixin):
     """16-bit depth (sensor_msgs/Image, encoding 16UC1) → PNG sequence sidecar.
 
     mp4 can't carry 16-bit single-channel losslessly without exotic codecs,
@@ -488,7 +495,7 @@ class DepthCameraWriter:
                 total_bytes += p.stat().st_size
         except OSError:
             pass
-        return {
+        return self._with_camera_info({
             "name": self.name,
             "topic": self.topic,
             "kind": "depth_png_seq",
@@ -502,10 +509,10 @@ class DepthCameraWriter:
             "sidecar_file": f"{self.output_dir.name}/frames.parquet",
             "segments": [],  # PNG sequence — listed via /files/ if needed
             "total_png_bytes": total_bytes,
-        }
+        })
 
 
-class DepthVideoWriter:
+class DepthVideoWriter(_CameraInfoMixin):
     """16-bit depth → 10-bit-luma HEVC Main10 video (lossy, ~30-60× smaller
     than the compressedDepth PNG bag path).
 
@@ -692,7 +699,7 @@ class DepthVideoWriter:
 
     def summary(self) -> dict:
         size_bytes = self._segment_file.stat().st_size if self._segment_file.exists() else 0
-        return {
+        return self._with_camera_info({
             "name": self.name,
             "topic": self.topic,
             "dropped_frames": self.dropped_frames,
@@ -717,7 +724,7 @@ class DepthVideoWriter:
                     "size_bytes": size_bytes,
                 }
             ],
-        }
+        })
 
 
 class CameraWriterPool:
@@ -730,6 +737,39 @@ class CameraWriterPool:
         # play modal still needs them in cameras[]. Stored here so stop_all
         # can re-emit the placeholders alongside the real writers' summaries.
         self._depth_placeholders: list[dict] = []
+        # camera_info_topic subscriptions (one per camera that declares it);
+        # torn down in stop_all.
+        self._info_subs: list = []
+
+    def _subscribe_camera_info(self, writer: _CameraInfoMixin, topic: str) -> None:
+        """Hand the first CameraInfo on ``topic`` to ``writer``. Best effort:
+        any failure is logged and the recording continues without it."""
+        try:
+            from sensor_msgs.msg import CameraInfo
+
+            def _cb(msg, _w=writer) -> None:
+                if _w.camera_info is None:
+                    try:
+                        _w.set_camera_info(camera_info_to_dict(msg))
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning("camera_info convert failed (%s): %s", topic, exc)
+
+            # sensor_data (best effort) also matches reliable publishers and
+            # the usual latched-less camera_info cadence (= image rate).
+            sub = self._node.create_subscription(
+                CameraInfo, topic, _cb, qos_profile_sensor_data)
+            self._info_subs.append(sub)
+            writer.camera_info_topic = topic
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("camera_info subscribe failed (%s): %s", topic, exc)
+
+    def _destroy_info_subs(self) -> None:
+        for sub in self._info_subs:
+            try:
+                self._node.destroy_subscription(sub)
+            except Exception:  # noqa: BLE001
+                pass
+        self._info_subs = []
 
     def start_all(self, episode_dir: Path, cameras: list[dict], fps: int = 30) -> list[dict]:
         """cameras: [{name, topic, kind?, codec?}, ...]. Color cameras get a
@@ -763,6 +803,8 @@ class CameraWriterPool:
                 )
                 writer.start()
                 self._writers[name] = writer
+                if cam.get("camera_info_topic"):
+                    self._subscribe_camera_info(writer, str(cam["camera_info_topic"]))
                 continue
             if kind == "depth":
                 # No on-disk writer — depth lives in the bag. Synthesize a
@@ -788,6 +830,8 @@ class CameraWriterPool:
             )
             writer.start()
             self._writers[name] = writer
+            if cam.get("camera_info_topic"):
+                self._subscribe_camera_info(writer, str(cam["camera_info_topic"]))
         return [w.summary() for w in self._writers.values()] + self._depth_placeholders
 
     def apply_depth_frame_counts(self, counts: dict[str, int]) -> None:
@@ -802,6 +846,7 @@ class CameraWriterPool:
                 ph["frame_count"] = int(counts[name])
 
     def stop_all(self) -> list[dict]:
+        self._destroy_info_subs()
         summaries = []
         for name, writer in list(self._writers.items()):
             summaries.append(writer.stop())

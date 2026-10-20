@@ -124,6 +124,100 @@ def decode_video(video: Path, meta: dict):
         proc.wait()
 
 
+# ---------------------------------------------------------------------------
+# Encoder argv + bit-depth verification
+# ---------------------------------------------------------------------------
+# 10-bit pix_fmts a depth10 stream may legitimately come back as. Anything
+# else (nv12 / yuv420p) means the encoder silently produced 8-bit: the
+# 1..1023 luma codes were truncated to ~255 levels before encoding.
+TEN_BIT_PIX_FMTS = ("yuv420p10le", "yuv420p10be", "p010le", "p010be",
+                    "yuv444p10le", "gray10le")
+
+
+def is_10bit_pix_fmt(pix_fmt: str | None) -> bool:
+    return bool(pix_fmt) and str(pix_fmt).strip().lower() in TEN_BIT_PIX_FMTS
+
+
+def hevc10_encoder_tries(cq: int) -> list[tuple[str, list[str]]]:
+    """(codec, output options) in priority order: hevc_nvenc → libx265.
+
+    The pix_fmt / profile options are OUTPUT options (they follow
+    ``-i pipe:0`` in hevc10_encode_cmd) and must request a 10-bit format."""
+    return [
+        ("hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", str(cq),
+                        "-pix_fmt", "p010le", "-profile:v", "main10"]),
+        # CPU fallback must never stall the pipe: a blocked stdin.write blocks
+        # the subscriber callback (E2E: D555 depth dropped to 4 frames/77s
+        # while slower encodes hogged the executor). ultrafast + no lookahead.
+        ("libx265", ["-preset", "ultrafast", "-crf", str(cq + 2),
+                     "-pix_fmt", "yuv420p10le", "-profile:v", "main10",
+                     "-x265-params", "log-level=none:bframes=0:rc-lookahead=0"]),
+    ]
+
+
+def hevc10_encode_cmd(codec: str, extra: list[str], out_path: Path,
+                      width: int, height: int, fps: float) -> list[str]:
+    """ffmpeg argv: yuv420p10le rawvideo on stdin → HEVC Main10 file."""
+    return [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "yuv420p10le",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", codec, *extra,
+        str(out_path),
+    ]
+
+
+def probe_pix_fmt(video: Path) -> str | None:
+    """Actual pix_fmt of the first video stream (ffprobe), None if unknown."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt", "-of", "default=nw=1:nk=1",
+             str(video)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    pf = out.stdout.decode("utf-8", "replace").strip().splitlines()
+    return pf[0].strip() if pf and pf[0].strip() else None
+
+
+def probe_encoder_10bit(codec: str, extra: list[str]) -> tuple[bool, str | None]:
+    """Encode a few 10-bit test frames with (codec, extra) and ffprobe the
+    result. Returns (encoder works AND output is 10-bit, actual pix_fmt).
+
+    Some builds (seen on the ASPA Jetson: hevc_nvenc → nv12) accept
+    ``-pix_fmt p010le -profile:v main10`` without error yet write 8-bit,
+    so a return-code-only probe is not enough."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="depth10probe-") as td:
+        out = Path(td) / "probe.mp4"
+        try:
+            res = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                 "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.2:r=25,format=yuv420p10le",
+                 "-c:v", codec, *extra, str(out)],
+                stderr=subprocess.PIPE, timeout=20,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False, None
+        if res.returncode != 0 or not out.exists():
+            return False, None
+        pf = probe_pix_fmt(out)
+        if pf is None:
+            # no ffprobe: cannot verify, keep the historical behaviour
+            return True, None
+        return is_10bit_pix_fmt(pf), pf
+
+
 def _cli() -> None:
     import argparse
 
