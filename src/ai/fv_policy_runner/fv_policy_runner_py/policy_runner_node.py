@@ -473,6 +473,18 @@ class FvPolicyRunnerNode(Node):
         self._running = self.auto_start
         self._last_trigger = False
         self._queue: deque[np.ndarray] = deque()
+        # RTC 用: policy 単位のままの生アクション (ROS 単位へ変換する前)。
+        # gateway へ「まだ再生していない前チャンクの残り」として渡すため、
+        # _queue と常に同じ長さで前後させる。
+        self._queue_raw: deque[list[float]] = deque()
+        # RTC: 推論 submit 時点のキュー残数。到着時との差 = 推論中に消費した
+        # ステップ数で、新チャンクの先頭の同数ステップは「もう過ぎた時刻」の
+        # 分なので捨てる (これが無いと毎リフィルで ~delay 本を巻き戻し再生する)。
+        self._infer_submit_queue_len = 0
+        # shim から受け取る RTC 情報 (0 = 未較正/RTC無効 = 従来の枯渇時推論)
+        self._rtc_refill_threshold: int = 0
+        self._rtc_mode: str = ""
+        self._rtc_phase: str = ""
         self._infer_future: Optional[Future] = None
         self._next_trajectory_refresh_time = 0.0
         self._last_error = ""
@@ -607,6 +619,7 @@ class FvPolicyRunnerNode(Node):
         self._state_velocity = None
         with self._lock:
             self._queue.clear()
+            self._queue_raw.clear()
 
     def _on_load_vla_profile(self, request, response):
         try:
@@ -791,6 +804,7 @@ class FvPolicyRunnerNode(Node):
             was_running = self._running
             self._running = True
             self._queue.clear()
+            self._queue_raw.clear()
         self._create_obs_subs()
         if not was_running:
             self._publish_status("trigger")
@@ -801,6 +815,7 @@ class FvPolicyRunnerNode(Node):
         with self._lock:
             self._running = False
             self._queue.clear()
+            self._queue_raw.clear()
         self._drop_obs_subs()
         self._publish_status("stop")
 
@@ -811,6 +826,7 @@ class FvPolicyRunnerNode(Node):
         with self._lock:
             self._policy_id = policy_id
             self._queue.clear()
+            self._queue_raw.clear()
         self._publish_status("policy_select")
 
     def _on_prompt(self, msg: String) -> None:
@@ -832,6 +848,11 @@ class FvPolicyRunnerNode(Node):
     def _snapshot_observation(self) -> Optional[dict]:
         now = time.time()
         with self._lock:
+            # RTC: まだ再生していない前チャンクの残り (policy 単位)。shim 経由で
+            # gateway へ渡すと、その区間を保ったまま新チャンクが合成される
+            # =チャンク境界で動きが途切れない。
+            previous_original_actions = [list(a) for a in self._queue_raw]
+            self._infer_submit_queue_len = len(self._queue)
             if self._state_vector is None:
                 self._last_error = "state not received yet"
                 return None
@@ -880,6 +901,10 @@ class FvPolicyRunnerNode(Node):
                 "state": state_vector.tolist(),
                 "images": images,
                 "joint_names": self._state_names,
+                # RTC: まだ再生していない前チャンクの残り (policy 単位)。
+                # backend (shim) が RTC 有効なら gateway がこの区間を保ったまま
+                # 新チャンクを合成する。無効な backend は未知キーを無視するだけ。
+                "previous_original_actions": previous_original_actions,
             }
             # Live observation extras for state-based RL policies. Velocities are
             # best-effort (the backend warns + zero-fills if absent). object_pose is
@@ -948,7 +973,7 @@ class FvPolicyRunnerNode(Node):
             return
         self._infer_future = self._executor.submit(self._infer_request, snapshot)
 
-    def _post_infer(self, snapshot: dict) -> tuple[list[np.ndarray], float]:
+    def _post_infer(self, snapshot: dict) -> tuple[list[np.ndarray], list[list[float]], float]:
         raw = json.dumps(snapshot).encode("utf-8")
         request = urllib.request.Request(
             self.backend_endpoint,
@@ -961,12 +986,29 @@ class FvPolicyRunnerNode(Node):
         if not payload.get("ok", False):
             raise RuntimeError(payload.get("error", "inference failed"))
         actions = [np.asarray(x, dtype=np.float32) for x in payload.get("actions", [])]
+        # ポリシー空間の生値 (shim: gateway action.original_values)。RTC の
+        # previous_original_actions は**この空間でなければならない** — 後処理済みの
+        # actions (度/グリッパ%) を返すと正規化空間に実単位が混入して行動が壊れる。
+        original_actions = [
+            [float(v) for v in row] for row in payload.get("original_actions", [])
+        ]
         infer_ms = float(payload.get("timing", {}).get("infer_ms", 0.0))
-        return actions, infer_ms
+        # RTC (shim が返す): refill_threshold_steps>0 なら「残りがこれ以下になったら
+        # 先行推論する」。gateway が前チャンクと合成するのでチャンク境界で止まらない。
+        rtc = payload.get("rtc") or {}
+        if isinstance(rtc, dict) and rtc.get("refill_threshold_steps") is not None:
+            try:
+                self._rtc_refill_threshold = max(0, int(rtc["refill_threshold_steps"]))
+                self._rtc_mode = str(rtc.get("mode") or "")
+                self._rtc_phase = str(rtc.get("phase") or "")
+            except (TypeError, ValueError):
+                pass
+        return actions, original_actions, infer_ms
 
     def _infer_request(
         self, snapshot: dict
-    ) -> tuple[list[np.ndarray], float, float, float, dict[str, list[np.ndarray]], dict[str, float]]:
+    ) -> tuple[list[np.ndarray], list[list[float]], float, float, float,
+               dict[str, list[np.ndarray]], dict[str, float]]:
         wall_start = time.perf_counter()
         primary_policy_id = str(snapshot.get("policy_id", "")).strip()
         requests: dict[str, dict] = {}
@@ -981,7 +1023,7 @@ class FvPolicyRunnerNode(Node):
             requests[policy_id] = compare_snapshot
 
         if not requests:
-            return [], 0.0, 0.0, 0.0, {}, {}
+            return [], [], 0.0, 0.0, 0.0, {}, {}
 
         max_workers = min(len(requests), max(1, 1 + len(self.compare_policy_ids)))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -991,9 +1033,10 @@ class FvPolicyRunnerNode(Node):
             }
             results = {policy_id: future.result() for policy_id, future in futures.items()}
 
-        trajectories = {policy_id: actions for policy_id, (actions, _) in results.items()}
-        policy_infer_ms = {policy_id: infer_ms for policy_id, (_, infer_ms) in results.items()}
+        trajectories = {policy_id: actions for policy_id, (actions, _, _) in results.items()}
+        policy_infer_ms = {policy_id: infer_ms for policy_id, (_, _, infer_ms) in results.items()}
         actions = trajectories.get(primary_policy_id, [])
+        original_actions = results.get(primary_policy_id, ([], [], 0.0))[1]
         infer_ms = policy_infer_ms.get(primary_policy_id, 0.0)
         compare_ms = sum(
             infer_ms_value
@@ -1002,7 +1045,7 @@ class FvPolicyRunnerNode(Node):
         )
         wall_ms = (time.perf_counter() - wall_start) * 1000.0
 
-        return actions, infer_ms, compare_ms, wall_ms, trajectories, policy_infer_ms
+        return actions, original_actions, infer_ms, compare_ms, wall_ms, trajectories, policy_infer_ms
 
     def _consume_future(self) -> None:
         if self._infer_future is None or not self._infer_future.done():
@@ -1010,17 +1053,60 @@ class FvPolicyRunnerNode(Node):
         future = self._infer_future
         self._infer_future = None
         try:
-            actions, infer_ms, compare_ms, wall_ms, trajectories, policy_infer_ms = future.result()
+            (actions, original_actions, infer_ms, compare_ms, wall_ms,
+             trajectories, policy_infer_ms) = future.result()
+            # RTC の previous_original_actions は**ポリシー空間の生値** (shim の
+            # original_actions = gateway action.original_values) のみ使用可。
+            # 以前は shim の actions (gateway 後処理済み = 度/グリッパ%) を控えて
+            # いて、正規化空間に実単位が混入し行動が桁違いに壊れた (gripper 5000% /
+            # 全関節セグメント拒否で立ち往生, 2026-08-07)。original が無い
+            # (旧 shim / 旧 gateway) 場合は raw を空にする = RTC ブレンド無しの
+            # 素の再推論 (安全側)。actions と本数が合わない場合も同様。
+            if len(original_actions) != len(actions):
+                if original_actions:
+                    self.get_logger().warning(
+                        "original_actions/actions length mismatch "
+                        f"({len(original_actions)}/{len(actions)}); "
+                        "disabling RTC blend for this chunk")
+                raw_actions: list[list[float]] = []
+            else:
+                raw_actions = original_actions
             actions = [self._policy_action_to_ros_action(action) for action in actions]
             trajectories = {
                 policy_id: [self._policy_action_to_ros_action(action) for action in policy_actions]
                 for policy_id, policy_actions in trajectories.items()
             }
             with self._lock:
+                # RTC のみ: チャンクの時間軸は観測時点起点なので、推論中に既に
+                # 再生した本数 (submit時キュー長 − 現在キュー長) を新チャンクの
+                # 先頭から捨てる。捨てないと毎リフィルで ~inference_delay 本
+                # (≈0.43s) を巻き戻して再生し、関節ジャンプ/戻り動作になる
+                # (実証済み実装 vlabor_inference/runtime.py は tick 比較で同じ
+                # ことをしている)。非RTC (refill_threshold=0) は従来挙動のまま。
+                if self._rtc_refill_threshold > 0 and self.replace_action_queue_on_infer:
+                    consumed = max(0, self._infer_submit_queue_len - len(self._queue))
+                    if consumed >= len(actions):
+                        self.get_logger().warning(
+                            f"chunk fully stale ({consumed} consumed >= "
+                            f"{len(actions)} actions); dropping chunk")
+                        actions = []
+                        raw_actions = []
+                    elif consumed:
+                        actions = actions[consumed:]
+                        if raw_actions:
+                            raw_actions = raw_actions[consumed:]
                 if self.replace_action_queue_on_infer:
                     self._queue.clear()
+                self._queue_raw.clear()
                 for action in actions:
                     self._queue.append(action)
+                # 不変条件: _queue_raw は「空」か「_queue と完全に同長・同順」のみ。
+                # 途中までの同期は許さない (pop の lockstep が崩れて RTC に
+                # ズレた前チャンクを渡してしまう)。append モード (replace=False) で
+                # 旧チャンクが残っている場合は空のまま = RTC ブレンド無し。
+                if raw_actions and len(self._queue) == len(raw_actions):
+                    for raw in raw_actions:
+                        self._queue_raw.append(raw)
                 self._last_error = ""
                 self._last_infer_ms = infer_ms
                 self._last_compare_ms = compare_ms
@@ -1368,13 +1454,25 @@ class FvPolicyRunnerNode(Node):
 
         with self._lock:
             action = self._queue.popleft() if self._queue else None
+            if self._queue_raw:
+                self._queue_raw.popleft()
             queue_len = len(self._queue)
             inflight = self._infer_future is not None
 
         if action is not None:
             self._publish_action(action)
 
-        if queue_len <= self.replenish_threshold_steps and not inflight:
+        # RTC 有効時は shim が返した refill しきい値 (推論遅延 + 実行ホライズン) を
+        # 使い、**再生中に**次を投げる。無効/未較正 (=0) のときだけ従来の
+        # replenish_threshold_steps (既定=枯渇間際) にフォールバックする。
+        # replace モード限定: RTC の合成は「新チャンクでキューを置き換える」前提。
+        # append モード (実機ダイヘン既定) でこのしきい値を使うと、旧チャンクの
+        # 後ろに新チャンクが積まれて定常ラグが増えるだけなので、従来の
+        # replenish 挙動を1ビットも変えない。
+        threshold = ((self._rtc_refill_threshold
+                      if self.replace_action_queue_on_infer else 0)
+                     or self.replenish_threshold_steps)
+        if queue_len <= threshold and not inflight:
             self._submit_infer()
 
     def destroy_node(self) -> bool:

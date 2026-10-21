@@ -73,11 +73,33 @@ class ActiveLock:
 
 
 def _pid_alive(pid: int) -> bool:
+    # pid が「録画ノードとして」生きているかを確認する。コンテナ再起動で
+    # PID 空間が変わると、残留ロックの pid が無関係なプロセスに再利用されて
+    # 「生きている」と誤判定し、録画ノードが永久に起動拒否する
+    # (2026-08-08 実害)。存在確認だけでなく cmdline まで見る。
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
-        # process exists but we lack signal permission -> treat as alive
-        return True
+        pass      # 存在はする — 録画ノードかどうかは cmdline で判定
+    return _pid_is_recorder(pid)
+
+
+def _read_cmdline(pid: int) -> bytes:
+    """/proc/<pid>/cmdline を返す (読めなければ OSError)。テストで差し替える
+    最小の縫い目 — pathlib.Path 全体を patch するとプロセス全体を巻き込む。"""
+    return Path(f"/proc/{pid}/cmdline").read_bytes()
+
+
+def _pid_is_recorder(pid: int) -> bool:
+    """pid の cmdline が録画ノードのものか (テストから直接検証できる形)。
+
+    /proc が読めない場合は False = 録画ノードではない扱い (ロックは
+    orphan として上書きされ、次の録画開始で回復する)。
+    """
+    try:
+        cmdline = _read_cmdline(pid).replace(b"\0", b" ")
+        return b"recorder_node" in cmdline
+    except OSError:      # PermissionError 含む
+        return False

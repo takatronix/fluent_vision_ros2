@@ -1,0 +1,75 @@
+# Image-space effects: the camera feed runs through a Gaussian blur and then a
+# color transform (contrast + saturation boost) before being placed. Effects
+# are ordinary graph nodes — bounded kernels, no per-frame shader compiles.
+schema: fluent.scene/v1alpha1
+kind: Scene
+metadata:
+  name: effects_demo
+params:
+  blur_radius:            # ライブに動かせるノブ: renderer->setParam("blur_radius", v)
+    type: f32
+    default: 6.0
+    runtime_mutable: true
+inputs:
+  camera:
+    type: image.rgba8
+    required: true
+    update: per_frame
+  status_text:
+    type: string
+    required: false
+    update: on_change
+resources:
+  ui_font:
+    type: font
+    uri: builtin://fonts/default-cjk
+    glyph_capacity: 2048
+nodes:
+  - id: soften
+    type: effects.blur
+    inputs:
+      image: $inputs.camera
+    params:
+      radius: $params.blur_radius
+  - id: grade
+    type: effects.color_transform
+    inputs:
+      image: $nodes.soften.image
+    params:
+      contrast: 1.35
+      saturation: 1.25
+      brightness: -0.03
+  - id: camera_layer
+    type: visual.image2d
+    inputs:
+      image: $nodes.grade.image
+    params:
+      fit: contain
+  - id: status_layer
+    type: text.dynamic
+    inputs:
+      text: $inputs.status_text
+    params:
+      font: $resources.ui_font
+      position: [24.0, 24.0]
+      shadow: true
+      default_text: "blur → color_transform → 配置"
+    bounds:
+      max_glyphs: 64
+      overflow: truncate_end
+  - id: composite
+    type: composite.layers
+    inputs:
+      layers:
+        - $nodes.camera_layer.layer
+        - $nodes.status_layer.layer
+outputs:
+  frame:
+    type: image.rgba8
+    source: $nodes.composite.image
+budgets:
+  max_width: 1920
+  max_height: 1080
+  max_gpu_bytes: 268435456
+  max_upload_bytes_per_frame: 33554432
+  max_frames_in_flight: 2

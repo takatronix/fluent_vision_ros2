@@ -15,4 +15,4 @@ Run:
 curl http://127.0.0.1:8010/models
 ```
 
-The model registry is `policy_models.yaml`. It maps display names such as `Pi05-Week19-Morikawa-All_20k` to their UUID-backed DPEX model directories without creating filesystem aliases. The default test runtime loads `20k` and `10k` into memory; switch with `policy_id`.
+The model registry is `policy_models.yaml`. It maps display names to their UUID-backed DPEX model directories without creating filesystem aliases. The registry ships empty: nothing is loaded by default. Export a model from DPEX first, then either add an entry here or set `DPEX_POLICY_SPECS` (`key:policy_type:/data/models/<model_id>`, `;`-separated) when starting the container, and select it per request with `policy_id`.

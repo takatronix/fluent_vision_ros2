@@ -168,7 +168,11 @@ void FVPlayerNode::runPlaybackLoop(const std::vector<std::string>& recording_fil
                 
                 // 再生速度に応じて待機（Bagのタイムスタンプはナノ秒、差分を使う）
                 static uint64_t prev_ts = 0;
-                uint64_t ts = serialized_message->time_stamp; // nanoseconds
+#ifdef FV_ROSBAG2_HAS_RECV_TIMESTAMP
+                uint64_t ts = static_cast<uint64_t>(serialized_message->recv_timestamp); // nanoseconds
+#else
+                uint64_t ts = static_cast<uint64_t>(serialized_message->time_stamp); // nanoseconds
+#endif
                 if (prev_ts != 0 && ts > prev_ts) {
                     uint64_t delta = ts - prev_ts;
                     delta = static_cast<uint64_t>(static_cast<double>(delta) / std::max(0.0001, config_.playback_speed));

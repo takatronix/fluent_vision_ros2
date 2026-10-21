@@ -24,6 +24,7 @@ setup(
         'python-ulid',
         'pyarrow',
     ],
+    tests_require=['pytest'],
     zip_safe=True,
     maintainer='FluentVision',
     maintainer_email='dev@fluentvision.io',

@@ -1,5 +1,4 @@
 #include "fv_recorder/fv_recorder_node.hpp"
-#include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 #include <iomanip>
 #include <sstream>

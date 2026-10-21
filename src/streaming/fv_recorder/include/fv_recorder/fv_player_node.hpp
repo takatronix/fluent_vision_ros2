@@ -21,7 +21,15 @@
 #include <mutex>
 #include <atomic>
 #include <opencv2/opencv.hpp>
+#if __has_include(<cv_bridge/cv_bridge.h>)
 #include <cv_bridge/cv_bridge.h>
+#elif __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#elif __has_include(<cv_bridge/cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge/cv_bridge.hpp>
+#else
+#error "cv_bridge header not found"
+#endif
 
 struct PlayerConfig {
     std::string recording_directory;
@@ -74,4 +82,4 @@ private:
     void sleepForDuration(int64_t nanoseconds);
 };
 
-#endif // FV_PLAYER_NODE_HPP 
+#endif // FV_PLAYER_NODE_HPP

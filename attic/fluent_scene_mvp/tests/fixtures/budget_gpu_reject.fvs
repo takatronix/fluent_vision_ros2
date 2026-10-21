@@ -1,0 +1,31 @@
+# Validates cleanly but the planned device footprint (camera import + composite
+# target at 1920x1080 rgba8 ≈ 16.6 MB) exceeds max_gpu_bytes -> compile reject.
+schema: fluent.scene/v1alpha1
+kind: Scene
+metadata:
+  name: budget_gpu_reject_fixture
+inputs:
+  camera:
+    type: image.rgba8
+    required: true
+    update: per_frame
+nodes:
+  - id: camera_layer
+    type: visual.image2d
+    inputs:
+      image: $inputs.camera
+  - id: composite
+    type: composite.layers
+    inputs:
+      layers:
+        - $nodes.camera_layer.layer
+outputs:
+  frame:
+    type: image.rgba8
+    source: $nodes.composite.image
+budgets:
+  max_width: 1920
+  max_height: 1080
+  max_gpu_bytes: 1000000
+  max_upload_bytes_per_frame: 33554432
+  max_frames_in_flight: 2

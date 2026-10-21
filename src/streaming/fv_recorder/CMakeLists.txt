@@ -8,6 +8,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_auto REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -22,6 +23,12 @@ find_package(rosbag2_cpp REQUIRED)
 find_package(rosbag2_storage REQUIRED)
 find_package(rosbag2_transport REQUIRED)
 find_package(nlohmann_json REQUIRED)
+
+# rosbag2 0.26 (Jazzy) renamed SerializedBagMessage::time_stamp to
+# recv_timestamp; Humble (0.15) only has time_stamp.
+if(rosbag2_storage_VERSION VERSION_GREATER_EQUAL "0.26.0")
+  add_compile_definitions(FV_ROSBAG2_HAS_RECV_TIMESTAMP=1)
+endif()
 
 # Generate services and messages
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -93,4 +100,5 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-ament_package() 
+ament_export_dependencies(rosidl_default_runtime)
+ament_package()

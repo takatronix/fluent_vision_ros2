@@ -1,0 +1,69 @@
+name: "Browser Webcam Demo"
+description: "訪問者のブラウザカメラ → COCO検出 / YOLOEオープン語彙（ページ上で即時切替）"
+
+# オンラインデモ用。fv_browser_camera がデモページ(:8096)を配信し、
+# ブラウザのカメラ映像を選択中モデルの入力トピックにだけ流す。
+# 両検出器は常駐（切替時のモデル再ロードなし）。アイドル側は入力が来ないため休む。
+#
+# COCOモデルの重みはリポジトリに含まれない（models/ はアスパラ専用）。
+# デプロイ時に取得すること:
+#   yolov10n → models/onnx/yolov10n.onnx + class_names(COCO 80クラス)
+
+system:
+  default_start_delay: 0.5
+
+nodes:
+  - id: browser_cam
+    enable: true
+    package: fv_browser_camera
+    exec: browser_camera_node
+    node_name: browser_cam
+    namespace: /fv
+    parameters:
+      port: 8096
+      models.coco.input_topic: /fv/browser_cam/coco/image_raw
+      models.coco.overlay_topic: /fv/browser_demo/coco/overlay
+      models.yoloe.input_topic: /fv/browser_cam/yoloe/image_raw
+      models.yoloe.overlay_topic: /fv/browser_demo/yoloe/overlay/compressed
+      yoloe_prompt_topic: /fv/yoloe_1/set_prompt
+      default_model: coco
+      max_fps: 15.0
+
+  - id: object_detector_coco
+    enable: true
+    package: fv_object_detector
+    exec: fv_object_detector_node
+    node_name: object_detector_coco
+    namespace: /fv
+    parameters:
+      input_image_topic: /fv/browser_cam/coco/image_raw
+      output_image_topic: /fv/browser_demo/coco/overlay
+      output_detections_topic: /fv/browser_demo/coco/detections
+      processing_frequency: 10.0
+      enable_tracking: true
+      model:
+        type: yolov10
+        model_path: models/onnx/yolov10n.onnx   # デプロイ時に取得
+        device: cpu
+        confidence_threshold: 0.4
+
+  - id: yoloe_1
+    enable: true
+    package: fv_yoloe
+    exec: fv_yoloe_node
+    node_name: yoloe_1
+    namespace: /fv
+    parameters:
+      input_image_topic: /fv/browser_cam/yoloe/image_raw
+      overlay_topic: /fv/browser_demo/yoloe/overlay
+      overlay_compressed_topic: /fv/browser_demo/yoloe/overlay/compressed
+      detections_topic: /fv/browser_demo/yoloe/detections
+      model_name: yoloe-11s-seg.pt
+      device: cpu
+      text_prompt: "person, cup, phone"
+      processing_frequency: 3.0
+
+layout:
+  browser_cam: { x: 80, y: 200, width: 220 }
+  object_detector_coco: { x: 400, y: 120, width: 230 }
+  yoloe_1: { x: 400, y: 300, width: 230 }
