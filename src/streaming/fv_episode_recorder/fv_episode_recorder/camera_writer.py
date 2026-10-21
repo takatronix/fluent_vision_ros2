@@ -16,11 +16,11 @@ Future steps:
 from __future__ import annotations
 
 import logging
-import queue
 import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -113,7 +113,7 @@ def _spawn_ffmpeg_hevc10_encoder(out_path: Path, width: int, height: int,
         LOG.error("ffmpeg not found in PATH")
         return None
     encoder_tries = depth10.hevc10_encoder_tries(cq)
-    picked = depth10.choose_hevc10_encoder(cq)
+    picked = _choose_hevc10(cq)
     for codec, extra in ([picked[:2]] if picked else []):
         # choose_hevc10_encoder probes with rawvideo on stdin (no lavfi — the
         # Jetson ffmpeg has none) and ffprobes the result: prefer an encoder
@@ -141,6 +141,158 @@ def _spawn_ffmpeg_hevc10_encoder(out_path: Path, width: int, height: int,
             continue
     LOG.error("no HEVC Main10 encoder available (tried %s)", [c for c, _ in encoder_tries])
     return None
+
+
+# ---------------------------------------------------------------------------
+# Encoder warm-up.
+#
+# Opening an NVENC encoder takes ~2 s while aspa3's GPU is busy (CUDA context
+# + encode session), and the encoder probes cost about as much again. Both
+# happened on each camera's first frame while the encode thread sat blocked,
+# so the 8-frame ingest queue overflowed and the head of the episode was
+# dropped (2026-10-22, aspa3: 69-90 frames per camera on the first episode
+# after a recorder restart, 2-24 later; aspa2 1-12). Now:
+#   - warm_encoders() runs the depth encoder choice once when the recorder
+#     starts (CameraWriterPool), so no episode waits for that probe;
+#   - _IngestQueue keeps the frames that arrive until the camera's encoder has
+#     written output (bounded), oldest first, with the time the callback got
+#     them.
+# ---------------------------------------------------------------------------
+_WARMUP_MAX_S = 8.0               # hold at most this long's worth of frames (fps_nominal) …
+_WARMUP_MAX_BYTES = 256 << 20     # … and at most this many message bytes per camera
+_STEADY_QUEUE = 8                 # afterwards: bounded latency, the newest frame is dropped
+
+_hevc10_lock = threading.Lock()
+_hevc10_pick: Optional[tuple] = None
+_hevc10_failed_at = float("-inf")    # time.monotonic() when the last choice found no encoder
+
+
+def _choose_hevc10(cq: int) -> tuple[str, list[str], str | None, bool] | None:
+    """depth10.choose_hevc10_encoder, probed once per process whatever the cq
+    (which encoder works does not depend on it; its options do) and one probe
+    at a time — depth cameras that start during the warm-up wait for it. "No
+    encoder" is shared only with those waiting; later calls probe again."""
+    global _hevc10_pick, _hevc10_failed_at
+    asked = time.monotonic()
+    with _hevc10_lock:
+        if _hevc10_pick is None and _hevc10_failed_at < asked:
+            _hevc10_pick = depth10.choose_hevc10_encoder(cq)
+            if _hevc10_pick is None:
+                _hevc10_failed_at = time.monotonic()
+        picked = _hevc10_pick
+    if picked is None:
+        return None
+    codec, _extra, pix_fmt, ten_bit = picked
+    return codec, dict(depth10.hevc10_encoder_tries(cq))[codec], pix_fmt, ten_bit
+
+
+def warm_encoders(cq: int = 16) -> dict[str, str]:
+    """Pick the depth encoder now. Returns {"hevc10": codec} ("" = none works)."""
+    picked = _choose_hevc10(cq) if shutil.which("ffmpeg") else None
+    out = {"hevc10": picked[0] if picked else ""}
+    LOG.info("encoders warmed up: %s", out)
+    return out
+
+
+class _IngestQueue:
+    """Frames from a camera callback to its encode thread, oldest first, each
+    with the time the callback got it.
+
+    Holds `steady` frames once warmed up (put() returns False when full: the
+    newest frame is dropped). Until end_warmup() — the writer's encoder has
+    written output and the backlog is down to `steady` — it holds up to
+    `warm_frames` frames / `warm_bytes` bytes instead: the head of the episode,
+    arriving while the encoder opens."""
+
+    def __init__(self, steady: int = _STEADY_QUEUE, warm_frames: int = 240,
+                 warm_bytes: int = _WARMUP_MAX_BYTES):
+        self.steady = steady
+        self.warm_frames = max(warm_frames, steady)
+        self.warm_bytes = warm_bytes
+        self.warming = True
+        self.first_frame_t: Optional[float] = None   # time.monotonic() of the first frame
+        self.peak = 0                     # most frames held at once
+        self._items: deque = deque()
+        self._bytes = 0
+        self._closed = False
+        self._cv = threading.Condition()
+
+    def put(self, msg, nbytes: int = 0) -> bool:
+        """False = dropped (full). A frame after close() belongs to no episode:
+        ignored, not counted."""
+        recv_ns = time.time_ns()
+        with self._cv:
+            if self._closed:
+                return True
+            if self.first_frame_t is None:
+                self.first_frame_t = time.monotonic()
+            n = len(self._items)
+            if self.warming:
+                full = n >= self.warm_frames or (n > 0 and self._bytes + nbytes > self.warm_bytes)
+            else:
+                full = n >= self.steady
+            if full:
+                return False
+            self._items.append((msg, recv_ns, nbytes))
+            self._bytes += nbytes
+            self.peak = max(self.peak, n + 1)
+            self._cv.notify()
+            return True
+
+    def close(self) -> None:
+        """get() returns None after the frames already queued."""
+        with self._cv:
+            self._closed = True
+            self._items.append(None)
+            self._cv.notify()
+
+    def drop_pending(self) -> int:
+        """Discard the frames still queued (stop gave up waiting); returns how
+        many. get() returns None next."""
+        with self._cv:
+            n = sum(1 for it in self._items if it is not None)
+            self._items.clear()
+            self._bytes = 0
+            self._closed = True
+            self._items.append(None)
+            self._cv.notify()
+            return n
+
+    def get(self):
+        """Next (msg, recv_ns) — blocks — or None once closed."""
+        with self._cv:
+            while not self._items:
+                self._cv.wait()
+            item = self._items.popleft()
+            if item is None:
+                return None
+            self._bytes -= item[2]
+            return item[0], item[1]
+
+    def end_warmup(self) -> None:
+        with self._cv:
+            self.warming = False
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+def _maybe_end_warmup(name: str, q: _IngestQueue, proc: Optional[subprocess.Popen],
+                      out_path: Path) -> None:
+    """Back to the steady bound once the encoder writes (ffmpeg writes the mp4
+    only after the encoder has opened) and the backlog is drained — or
+    _WARMUP_MAX_S after the first frame, e.g. when no encoder works at all."""
+    waited = time.monotonic() - (q.first_frame_t or time.monotonic())
+    writing = False
+    if proc is not None and len(q) <= q.steady:
+        try:
+            writing = out_path.stat().st_size > 0
+        except OSError:
+            pass
+    if writing or waited > _WARMUP_MAX_S:
+        q.end_warmup()
+        LOG.info("[%s] encoder %s after %.2f s; held up to %d frames meanwhile",
+                 name, "up" if writing else "not writing yet", waited, q.peak)
 
 
 class _CameraInfoMixin:
@@ -211,8 +363,9 @@ class CameraWriter(_CameraInfoMixin):
         self._stopped = False
         # bounded ingest queue + worker thread: the rclpy callback only
         # enqueues; decode/encode runs here so no camera can starve the
-        # executor. Overflow drops the newest frame (bounded latency).
-        self._queue: queue.Queue = queue.Queue(maxsize=8)
+        # executor. Overflow drops the newest frame (bounded latency) —
+        # except while the encoder starts (see _IngestQueue).
+        self._queue = _IngestQueue(warm_frames=int(fps * _WARMUP_MAX_S))
         self._worker = threading.Thread(
             target=self._drain, name=f"camwr-{name}", daemon=True)
         self.dropped_frames = 0
@@ -264,26 +417,25 @@ class CameraWriter(_CameraInfoMixin):
         others to a few frames per minute in E2E."""
         if self._stopped:
             return
-        try:
-            self._queue.put_nowait(msg)
-        except queue.Full:
+        if not self._queue.put(msg, len(msg.data)):
             self.dropped_frames += 1
 
     def _drain(self) -> None:
         while True:
-            msg = self._queue.get()
-            if msg is None:
+            item = self._queue.get()
+            if item is None:
                 return
             try:
-                self._process(msg)
+                self._process(*item)
             except Exception as exc:  # keep the worker alive
                 LOG.warning("[%s] frame processing failed: %s", self.name, exc)
+            if self._queue.warming:
+                _maybe_end_warmup(self.name, self._queue, self._ffmpeg, self._segment_file)
 
-    def _process(self, msg) -> None:
+    def _process(self, msg, recv_ns: int) -> None:
         with self._lock:
             if self._stopped:
                 return
-            recv_ns = time.time_ns()
             img = self._decode_frame(msg)
             if img is None:
                 LOG.warning("[%s] decode failed, skipping frame", self.name)
@@ -334,8 +486,15 @@ class CameraWriter(_CameraInfoMixin):
                 pass
             self._sub = None
         # let queued frames finish, then wake the worker with a sentinel
-        self._queue.put(None)
+        self._queue.close()
         self._worker.join(timeout=20)
+        if self._worker.is_alive():
+            # (a frame the encode thread has already taken but not written is
+            # not counted — this only happens after a 20 s stall)
+            lost = self._queue.drop_pending()
+            self.dropped_frames += lost
+            LOG.warning("[%s] encode thread still busy at stop: %d queued frames not written",
+                        self.name, lost)
         with self._lock:
             self._stopped = True
             if self._ffmpeg is not None:
@@ -552,7 +711,7 @@ class DepthVideoWriter(_CameraInfoMixin):
         self.height = 0
         self.fps_actual = 0.0
         self._encoding_seen = ""
-        self._queue: queue.Queue = queue.Queue(maxsize=8)
+        self._queue = _IngestQueue(warm_frames=int(fps * _WARMUP_MAX_S))
         self._worker = threading.Thread(
             target=self._drain, name=f"depth10-{name}", daemon=True)
         self.dropped_frames = 0
@@ -593,26 +752,25 @@ class DepthVideoWriter(_CameraInfoMixin):
         """rclpy callback: enqueue only (see CameraWriter._on_image)."""
         if self._stopped:
             return
-        try:
-            self._queue.put_nowait(msg)
-        except queue.Full:
+        if not self._queue.put(msg, len(msg.data)):
             self.dropped_frames += 1
 
     def _drain(self) -> None:
         while True:
-            msg = self._queue.get()
-            if msg is None:
+            item = self._queue.get()
+            if item is None:
                 return
             try:
-                self._process(msg)
+                self._process(*item)
             except Exception as exc:
                 LOG.warning("[%s] frame processing failed: %s", self.name, exc)
+            if self._queue.warming:
+                _maybe_end_warmup(self.name, self._queue, self._ffmpeg, self._segment_file)
 
-    def _process(self, msg: Image) -> None:
+    def _process(self, msg: Image, recv_ns: int) -> None:
         with self._lock:
             if self._stopped:
                 return
-            recv_ns = time.time_ns()
             self._encoding_seen = msg.encoding
             depth = self._to_counts(msg)
             if depth is None:
@@ -670,8 +828,15 @@ class DepthVideoWriter(_CameraInfoMixin):
             except Exception:
                 pass
             self._sub = None
-        self._queue.put(None)
+        self._queue.close()
         self._worker.join(timeout=20)
+        if self._worker.is_alive():
+            # (a frame the encode thread has already taken but not written is
+            # not counted — this only happens after a 20 s stall)
+            lost = self._queue.drop_pending()
+            self.dropped_frames += lost
+            LOG.warning("[%s] encode thread still busy at stop: %d queued frames not written",
+                        self.name, lost)
         with self._lock:
             self._stopped = True
             if self._ffmpeg is not None:
@@ -727,9 +892,12 @@ class DepthVideoWriter(_CameraInfoMixin):
 class CameraWriterPool:
     """Manage multiple CameraWriter instances for one episode."""
 
-    def __init__(self, node: Node):
+    def __init__(self, node: Node, warm_up: bool = True):
         self._node = node
         self._writers: dict[str, CameraWriter | DepthCameraWriter | DepthVideoWriter] = {}
+        if warm_up:
+            # pick the depth encoder now, not on the first episode's first frames
+            threading.Thread(target=warm_encoders, name="encoder-warmup", daemon=True).start()
         # Depth cameras don't have a writer (they go into the bag) but the
         # play modal still needs them in cameras[]. Stored here so stop_all
         # can re-emit the placeholders alongside the real writers' summaries.
