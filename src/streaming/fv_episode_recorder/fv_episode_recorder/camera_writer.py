@@ -113,19 +113,16 @@ def _spawn_ffmpeg_hevc10_encoder(out_path: Path, width: int, height: int,
         LOG.error("ffmpeg not found in PATH")
         return None
     encoder_tries = depth10.hevc10_encoder_tries(cq)
-    for codec, extra in encoder_tries:
-        # Probe by encoding a short 10-bit clip and ffprobe-ing the result:
-        # an encoder that "succeeds" but writes 8-bit (nv12 — observed with
-        # hevc_nvenc on the ASPA Jetson) would silently cut the 1..1023 luma
-        # codes to ~255 levels while depth_meta.json still claims Main10.
-        ok, pix_fmt = depth10.probe_encoder_10bit(codec, extra)
-        if not ok:
-            if pix_fmt:
-                LOG.error("[encoder probe] %s writes %s (8-bit), not 10-bit — skipped",
-                          codec, pix_fmt)
-            else:
-                LOG.warning("[encoder probe] %s unavailable", codec)
-            continue
+    picked = depth10.choose_hevc10_encoder(cq)
+    for codec, extra in ([picked[:2]] if picked else []):
+        # choose_hevc10_encoder probes with rawvideo on stdin (no lavfi — the
+        # Jetson ffmpeg has none) and ffprobes the result: prefer an encoder
+        # that really writes 10-bit; else keep the working one (e.g. hevc_nvenc
+        # → nv12 on the ASPA Jetson) so depth is still recorded, and say so.
+        if not picked[3]:
+            LOG.error("[encoder probe] no verified 10-bit HEVC encoder; using %s (writes %s) — "
+                      "depth is coarser than Main10 (materializer flags bit_depth_ok=false)",
+                      codec, picked[2] or "unknown pix_fmt")
         cmd = depth10.hevc10_encode_cmd(codec, extra, out_path, width, height, fps)
         try:
             # stderr must NOT be an unread PIPE: ffmpeg blocks once the pipe

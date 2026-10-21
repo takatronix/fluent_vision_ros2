@@ -931,9 +931,19 @@ def depth_frame_range(stamps_ns: np.ndarray, t0_ns: int, t_end_ns: int) -> Tuple
     return first, min(last, n - 1)
 
 
+def frame_stamps_rel(episode_index: int) -> str:
+    return f"depth/frame_stamps/episode_{int(episode_index):06d}.json"
+
+
 def plan_depth_entry(src: dict, episode_index: int, source_id: str,
-                     t0_ns: int, t_end_ns: int) -> dict:
-    """Per-episode depth index entry (+ private ``_copy`` list for the copy step)."""
+                     t0_ns: int, t_end_ns: int,
+                     frame_stamps_ns: Optional[Sequence[int]] = None) -> dict:
+    """Per-episode depth index entry (+ private ``_copy`` / ``_write`` lists for the copy step).
+
+    frame_stamps_ns: source stamp (ns) of every emitted LeRobot frame, in
+    frame_index order. Stale ticks are skipped, so the LeRobot clock
+    (frame_index / fps) is not the source clock minus t0; load_depth_frames
+    maps depth stamps through this list so depth lines up with RGB/actions."""
     from . import depth10
 
     stamps, local = _read_depth_sidecar(src["sidecar"])
@@ -974,12 +984,17 @@ def plan_depth_entry(src: dict, episode_index: int, source_id: str,
         "_key": src["key"],
         "_fv_name": src["fv_name"],
         "_meta": dmeta,
+        "_write": ([(frame_stamps_rel(episode_index),
+                     json.dumps([int(x) for x in frame_stamps_ns]).encode("utf-8"))]
+                   if frame_stamps_ns else []),
         "_copy": [
             (src["video"], f"{rel_dir}/{src['video'].name}"),
             (src["meta_file"], f"{rel_dir}/{src['meta_file'].name}"),
             (src["sidecar"], f"{rel_dir}/frames.parquet"),
         ],
     }
+    if frame_stamps_ns:
+        entry["frame_stamps_file"] = frame_stamps_rel(episode_index)
     return entry
 
 
@@ -996,6 +1011,14 @@ def copy_depth_files(out_root: Path, entries: Sequence[dict]) -> int:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             total += dst.stat().st_size
+            done.add(rel)
+        for rel, data in e.get("_write", []):
+            if rel in done:
+                continue
+            dst = Path(out_root) / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
+            total += len(data)
             done.add(rel)
     return total
 
@@ -1087,12 +1110,31 @@ def load_depth_frames(
     stamp_by_local = dict(zip(local.tolist(), stamps.tolist()))
     t0 = int(ent["t0_stamp_ns"])
     lo, hi = int(ent["frame_from"]), int(ent["frame_to"])
+    # LeRobot clock = frame_index / fps. With the per-frame source stamps the
+    # depth stamp is placed on that clock (gaps from skipped stale ticks are
+    # compressed the same way as RGB/actions); older exports: source - t0.
+    pair = None
+    if ent.get("frame_stamps_file") and (root / ent["frame_stamps_file"]).exists():
+        pair = np.asarray(json.loads((root / ent["frame_stamps_file"]).read_text()), dtype=np.float64)
+        fps = float(info.get("fps") or 0) or None
+        if pair.size < 2 or fps is None:
+            pair = None
     for i, counts in enumerate(depth10.decode_video(root / ent["file"], dmeta)):
         if i < lo:
             continue
         if i > hi:
             break
-        ts = (int(stamp_by_local.get(i, t0)) - t0) / 1e9
+        st = int(stamp_by_local.get(i, t0))
+        if pair is not None:
+            idx = np.arange(pair.size, dtype=np.float64)
+            if pair[0] <= st <= pair[-1]:
+                ts = float(np.interp(st, pair, idx)) / fps
+            elif st < pair[0]:
+                ts = (st - pair[0]) / 1e9
+            else:
+                ts = (pair.size - 1) / fps + (st - pair[-1]) / 1e9
+        else:
+            ts = (st - t0) / 1e9
         if unit == "counts":
             yield ts, counts
         elif unit == "mm_f32":
@@ -1298,11 +1340,20 @@ def materialize(
         skipped_stale = 0
         first_pair_ns: Optional[int] = None
         last_pair_ns: Optional[int] = None
+        pair_stamps: List[int] = []
+        skipped_window = 0
+        w_lo = window_ns[0] if window_ns is not None else None
+        w_hi = window_ns[1] if window_ns is not None else None
         for tick_ns in ticks:
             p_idx = _nearest_index(ep.primary, tick_ns)
             pair_ns = int(ep.primary.stamps[p_idx])
             if abs(pair_ns - tick_ns) > stale_ns:
                 skipped_stale += 1
+                continue
+            # the tick is inside the window but the nearest primary frame may
+            # not be (it could belong to the neighbouring harvest attempt)
+            if (w_lo is not None and pair_ns < int(w_lo)) or (w_hi is not None and pair_ns > int(w_hi)):
+                skipped_window += 1
                 continue
             state = _sample_zoh(ep.state_series, pair_ns).astype(np.float32)
             action = _sample_zoh(ep.action_series, pair_ns).astype(np.float32)
@@ -1323,6 +1374,7 @@ def materialize(
             if first_pair_ns is None:
                 first_pair_ns = pair_ns
             last_pair_ns = pair_ns
+            pair_stamps.append(pair_ns)
         is_last_of_source = (i_unit + 1 == len(units)
                              or units[i_unit + 1]["episode_dir"] != ep_dir)
         if written == 0:
@@ -1359,7 +1411,8 @@ def materialize(
         ep_depth_keys: List[str] = []
         for src in depth_srcs:
             entry = plan_depth_entry(src, episode_index, source_id,
-                                     int(first_pair_ns), int(last_pair_ns))
+                                     int(first_pair_ns), int(last_pair_ns),
+                                     frame_stamps_ns=pair_stamps)
             depth_entries.append(entry)
             ep_depth_keys.append(src["key"])
         fv_records.append(build_fv_episode_record(
@@ -1372,7 +1425,7 @@ def materialize(
         print(
             f"[episode] {ep.dir.name}: {written} frames "
             f"(trim head {head_trim_s:.2f}s / tail {tail_trim_s:.2f}s, "
-            f"stale_skipped={skipped_stale}), task='{task}'{win_label}"
+            f"stale_skipped={skipped_stale}, window_skipped={skipped_window}), task='{task}'{win_label}"
         )
         # save_episode 済みの画像はもう使わない。次のデコードが始まる前に解放
         if is_last_of_source:

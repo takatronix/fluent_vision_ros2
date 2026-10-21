@@ -211,3 +211,66 @@ def test_probe_encoder_10bit_detects_8bit_output():
     ok, pf = depth10.probe_encoder_10bit("libx265", ["-pix_fmt", "yuv420p",
                                                      "-x265-params", "log-level=none"])
     assert not ok and pf == "yuv420p"
+
+
+@needs_x265
+def test_load_depth_frames_follows_lerobot_clock_across_skipped_frames(tmp_path):
+    """Stale ticks are skipped (frames 6,7 here), so LeRobot time = frame_index / fps
+    compresses that gap. Depth must be placed on the same clock (via the
+    per-frame source stamps), not on source time - t0 (review 2026-10-21)."""
+    lossless = ["-pix_fmt", "yuv420p10le", "-profile:v", "main10",
+                "-x265-params", "log-level=none:lossless=1"]
+    ep = _make_depth_episode(tmp_path, d_min=700, d_max=15000, scale=0.1, extra=lossless)
+    meta = json.loads((ep / "meta.json").read_text())
+    src = lm.depth_sources(ep, meta, {})[0]
+    st = lambda i: BASE_NS + int(i * 1e9 / FPS)  # noqa: E731
+    emitted = [st(i) for i in (3, 4, 5, 8, 9)]
+    e = lm.plan_depth_entry(src, 0, "01EPISODE", emitted[0], emitted[-1], frame_stamps_ns=emitted)
+    out = tmp_path / "ds"
+    (out / "meta").mkdir(parents=True)
+    (out / "meta" / "info.json").write_text(json.dumps({"fps": FPS}))
+    lm.copy_depth_files(out, [e])
+    lm.patch_info_json(out, lm.build_fv_depth_block([e]))
+    assert json.loads((out / e["frame_stamps_file"]).read_text()) == emitted
+    got = [ts for ts, _ in lm.load_depth_frames(out, 0, "observation.depth.depth", unit="counts")]
+    assert len(got) == 7  # depth frames 3..9 (6, 7 fall in the skipped gap)
+    assert got[0] == pytest.approx(0.0, abs=1e-6)
+    assert got[2] == pytest.approx(2 / FPS, abs=1e-6)      # frame 5 → LeRobot index 2
+    assert got[5] == pytest.approx(3 / FPS, abs=1e-6)      # frame 8 → LeRobot index 3 (not 5/FPS)
+    assert got[6] == pytest.approx(4 / FPS, abs=1e-6)
+    assert got[2] < got[3] < got[4] < got[5]               # gap frames stay ordered in between
+
+
+def test_choose_encoder_prefers_verified_10bit_and_never_drops_the_only_one():
+    tries = dict(depth10.hevc10_encoder_tries(16))
+
+    def probe_of(results):
+        return lambda codec, extra: results.get(codec, (False, None))
+    # Jetson: hevc_nvenc writes nv12, no libx265 → keep nvenc (depth still recorded), flagged unverified
+    got = depth10.choose_hevc10_encoder(16, probe=probe_of({"hevc_nvenc": (True, "nv12")}))
+    assert got[0] == "hevc_nvenc" and got[2] == "nv12" and got[3] is False and got[1] == tries["hevc_nvenc"]
+    # a real 10-bit encoder wins over an 8-bit one
+    got = depth10.choose_hevc10_encoder(16, probe=probe_of({"hevc_nvenc": (True, "nv12"),
+                                                            "libx265": (True, "yuv420p10le")}))
+    assert got[0] == "libx265" and got[3] is True
+    # pix_fmt unreadable (no ffprobe) is NOT reported as verified 10-bit
+    got = depth10.choose_hevc10_encoder(16, probe=probe_of({"hevc_nvenc": (True, None)}))
+    assert got[0] == "hevc_nvenc" and got[3] is False
+    assert depth10.choose_hevc10_encoder(16, probe=probe_of({})) is None
+
+
+@needs_x265
+def test_probe_encoder_uses_stdin_not_lavfi(monkeypatch):
+    """The Jetson ffmpeg has no lavfi: the probe must feed frames on stdin."""
+    import subprocess
+    seen = []
+    real = subprocess.run
+
+    def spy(cmd, *a, **k):
+        seen.append(list(cmd))
+        return real(cmd, *a, **k)
+    monkeypatch.setattr(subprocess, "run", spy)
+    ok, pf = depth10.probe_encoder("libx265", dict(depth10.hevc10_encoder_tries(16))["libx265"])
+    assert ok and pf == "yuv420p10le"
+    enc = [c for c in seen if c[0] == "ffmpeg"][0]
+    assert "lavfi" not in enc and enc[enc.index("-i") + 1] == "pipe:0"

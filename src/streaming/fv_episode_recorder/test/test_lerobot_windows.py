@@ -334,3 +334,42 @@ def test_cli_requires_dirs_or_windows(tmp_path):
     with pytest.raises(SystemExit):
         lm.main([str(tmp_path), "--windows", str(wf), "--out", str(tmp_path / "o"),
                  "--repo-id", "a/b"])
+
+
+def _fake_load_offset(self, camera_map, state_topic, action_topic):
+    # primary frames at 10 fps, 80 ms after each 100 ms mark: the tick at
+    # exactly the window start (2.0 s) is nearest to the frame at 1.98 s,
+    # which lies OUTSIDE the window (it belongs to the previous attempt).
+    base = int((T0 + 0.08) * 1e9)
+    stamps = np.array([base + int(i * 1e8) for i in range(100)], dtype=np.int64)
+    imgs = [np.zeros((2, 2, 3), dtype=np.uint8)] * len(stamps)
+    self.cameras = [lm.CameraSource("main", "top_camera", stamps, imgs)]
+    self.primary = self.cameras[0]
+    self.skipped_cameras = []
+    vec = np.zeros(7)
+    self.state_series = [(int(stamps[0]) - 1, vec), (int(stamps[-1]) + 1, vec)]
+    self.action_series = list(self.state_series)
+
+
+def test_window_bounds_apply_to_selected_frames(tmp_path, monkeypatch):
+    """Review 2026-10-21: a tick inside the window must not pull in a primary
+    frame from outside it."""
+    cams = [{"name": "main", "video_dir": "main/", "sidecar_file": "main/frames.parquet",
+             "frame_count": 100}]
+    a = _make_episode(tmp_path / "src", "a", cameras=cams)
+    (a / "videos" / "main").mkdir(parents=True)
+    (a / "videos" / "main" / "frames.parquet").write_bytes(b"")
+    fake_mod = types.ModuleType("lerobot.datasets.lerobot_dataset")
+    fake_mod.LeRobotDataset = _FakeDataset
+    for name in ("lerobot", "lerobot.datasets"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "lerobot.datasets.lerobot_dataset", fake_mod)
+    monkeypatch.setattr(lm.Episode, "load", _fake_load_offset)
+    _FakeDataset.instances = []
+    windows = lm.normalize_windows([{"episode_dir": str(a), "start_s": 2.0, "end_s": 3.0,
+                                     "extra": {"attempt_id": 1}}])
+    out = tmp_path / "ds"
+    lm.materialize([], out, "t/x", 30, {}, "/s", "/a", None, windows=windows)
+    line = json.loads((out / "meta" / "fv_episodes.jsonl").read_text().splitlines()[0])
+    assert line["t0_offset_s"] >= 2.0 - 1e-6
+    assert line["t0_offset_s"] + line["n_frames"] * 0 <= 3.0
