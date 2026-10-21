@@ -1518,11 +1518,12 @@ async def _replay_stop(request: web.Request) -> web.Response:
 
 
 async def _retention_get_policy(request: web.Request) -> web.Response:
-    """Current effective policy (operator override > profile default > disabled)."""
+    """Current effective policy (operator override > profile default > disabled),
+    plus the tag holds from .retention_hold.json (RetentionRunner.policy_view)."""
     runner = request.app.get("retention_runner")
     if runner is None:
         return web.json_response({"enabled": False, "error": "retention_runner_not_wired"}, status=503)
-    return web.json_response(runner.current_policy().to_dict())
+    return web.json_response(runner.policy_view())
 
 
 async def _retention_put_policy(request: web.Request) -> web.Response:
@@ -1540,7 +1541,7 @@ async def _retention_put_policy(request: web.Request) -> web.Response:
         runner.clear_override()
     else:
         runner.set_policy(RetentionPolicy.from_dict(body))
-    return web.json_response(runner.current_policy().to_dict())
+    return web.json_response(runner.policy_view())
 
 
 async def _patch_episode(request: web.Request) -> web.Response:

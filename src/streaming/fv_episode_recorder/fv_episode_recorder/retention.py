@@ -1,9 +1,10 @@
 """Automatic episode retention (Phase 2).
 
 Evaluates three independent rules — `max_age_days`, `max_episodes`,
-`free_min_pct` — and unions the candidate set. `pinned` episodes are
-always protected. Each rule fires deterministically (oldest-first) so
-the operator can reason about what will be deleted.
+`free_min_pct` — and unions the candidate set. `pinned` episodes and
+episodes carrying a held tag (`.retention_hold.json`, see
+`load_hold_tags`) are always protected. Each rule fires deterministically
+(oldest-first) so the operator can reason about what will be deleted.
 
 The runner walks the filesystem each tick; a sqlite index would make
 this cheaper at 10k+ episodes but for the current scale (hundreds)
@@ -23,6 +24,44 @@ from typing import Optional
 from .episode_store import EpisodeMeta, EpisodeStore
 
 LOG = logging.getLogger("fv_episode_recorder.retention")
+
+# Tag-based holds written by an external producer (the DPEx backend's
+# synthetic data generation): `{"tags": ["job_...", ...]}`. Any episode
+# whose `tags` intersect this set is protected exactly like `pinned`, and
+# — also like pinned — does not count toward `max_episodes`. The producer
+# owns the file (adds a tag when a batch starts recording, drops it once
+# the batch is converted/discarded); the recorder only reads it.
+# Without this a 1500-EP generation run under `max_episodes: 500` lost
+# 1168 unconverted episodes overnight to the count rule.
+HOLD_FILE = ".retention_hold.json"
+
+
+class HoldFileError(ValueError):
+    """`.retention_hold.json` exists but can't be read / parsed."""
+
+
+def load_hold_tags(output_dir: Path) -> set[str]:
+    """Held tags from `<output_dir>/.retention_hold.json`.
+
+    Missing file → empty set. A file that exists but is unreadable or
+    malformed raises HoldFileError: the caller must then delete nothing,
+    since it can't tell which episodes are meant to be protected."""
+    path = Path(output_dir) / HOLD_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        raise HoldFileError(f"{path}: {exc}") from exc
+    import json
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise HoldFileError(f"{path}: {exc}") from exc
+    tags = data.get("tags") if isinstance(data, dict) else None
+    if not isinstance(tags, list):
+        raise HoldFileError(f"{path}: expected {{\"tags\": [...]}}")
+    return {str(t) for t in tags if str(t)}
 
 
 @dataclass
@@ -85,6 +124,9 @@ class RetentionPlanner:
 
     def __init__(self, store: EpisodeStore):
         self.store = store
+        # Episodes protected by a held tag on the last plan() (for the
+        # tick summary / dashboard). None = hold file unreadable.
+        self.last_held: Optional[int] = 0
 
     def _list_all(self) -> list[tuple[EpisodeMeta, Path, int]]:
         """All episodes (unbounded), with their dir paths + sizes."""
@@ -114,15 +156,28 @@ class RetentionPlanner:
         return out
 
     def plan(self, policy: RetentionPolicy) -> list[Candidate]:
-        """Return the list of episodes to delete. Pinned + currently-active
-        recording are always excluded."""
+        """Return the list of episodes to delete. Pinned, held-tag and
+        currently-active recording are always excluded. An unreadable hold
+        file plans nothing (fail closed)."""
         if not policy.enabled:
             return []
+        try:
+            held_tags = load_hold_tags(self.store.output_dir)
+        except HoldFileError as exc:
+            LOG.warning("retention: hold file unreadable — deleting nothing "
+                        "this tick: %s", exc)
+            self.last_held = None
+            return []
         all_eps = self._list_all()
-        # Drop pinned + active.
+        # Drop pinned + held + active.
         active_id = self.store.active.episode_id if self.store.active else None
+        held = [m for m, _d, _s in all_eps
+                if held_tags and not held_tags.isdisjoint(m.tags or [])]
+        held_ids = {m.episode_id for m in held}
+        self.last_held = len(held)
         unpinned = [(m, d, s) for m, d, s in all_eps
-                    if not m.pinned and m.episode_id != active_id]
+                    if not m.pinned and m.episode_id != active_id
+                    and m.episode_id not in held_ids]
 
         marks: dict[str, list[str]] = {}   # episode_id -> reasons
 
@@ -205,6 +260,21 @@ class RetentionRunner:
                 return RetentionPolicy()
         return RetentionPolicy()
 
+    def policy_view(self) -> dict:
+        """GET/PUT /retention/policy response: the effective policy plus the
+        hold state. `supports_hold_tags` lets a producer (DPEx datagen) tell
+        a recorder that honors `.retention_hold.json` from an older one —
+        against an older recorder it has to refuse runs that would overflow
+        `max_episodes` instead. Not persisted (to_dict() is the file)."""
+        out = self.current_policy().to_dict()
+        out["supports_hold_tags"] = True
+        try:
+            out["hold_tags"] = sorted(load_hold_tags(self.store.output_dir))
+        except HoldFileError as exc:
+            out["hold_tags"] = None
+            out["hold_error"] = str(exc)
+        return out
+
     def set_policy(self, policy: RetentionPolicy) -> None:
         self._policy_override = policy
         self._save_policy()
@@ -272,6 +342,7 @@ class RetentionRunner:
             return {"enabled": False, "scheduled": 0, "deleted": 0, "candidates": [], "policy": policy.to_dict()}
 
         candidates = self._planner.plan(policy)
+        held = self._planner.last_held
         cand_ids = {c.meta.episode_id for c in candidates}
         now = time.time()
 
@@ -341,5 +412,8 @@ class RetentionRunner:
             ],
             "newly_scheduled": newly_scheduled,
             "deleted": deleted,
+            # episodes protected by .retention_hold.json (None = unreadable
+            # hold file → nothing was planned this tick)
+            "held": held,
             "dry_run": dry_run,
         }
