@@ -16,11 +16,11 @@ Future steps:
 from __future__ import annotations
 
 import logging
-import queue
 import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -38,24 +38,259 @@ from . import depth10
 LOG = logging.getLogger("fv_episode_recorder.camera")
 
 
-def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> tuple[subprocess.Popen, str] | None:
-    """Try ffmpeg with H.264 encoders in priority order. Returns (proc, codec_used)
-    or None if all encoders failed. Output is faststart mp4 for HTML5 video.
+# ---------------------------------------------------------------------------
+# ffmpeg encoder selection.
+#
+# Raw frames are piped to ffmpeg already in the encoder's native input format
+# (yuv420p for H.264, p010le for hevc_nvenc) so NO libavfilter conversion is
+# needed. The Jetson ffmpeg package (7:8.0.1-nvidia1, JetPack 7) ships NVENC
+# but only ~30 filters: no `lavfi` (the old probe's test source) and no
+# `scale` (which ffmpeg inserts to convert bgr24 → yuv420p). On that build the
+# lavfi probe reported every encoder as unavailable and the pipe would have
+# died at the first frame anyway ("'scale' filter not present"), so every
+# episode had 0 video frames (aspa2 / aspa3, 2026-10-20). Probing with two
+# black rawvideo frames on stdin works on every ffmpeg build.
+# ---------------------------------------------------------------------------
+_PROBE_SIDE = 256   # NVENC rejects tiny frames: a 64x64 probe made h264_nvenc look unavailable
+_PROBE_BYTES_PER_PIXEL = {"yuv420p": 1.5, "bgr24": 3, "bgra": 4, "yuv420p10le": 3, "p010le": 3}
+_probe_ok: set[tuple[str, str]] = set()   # (codec, stdin pix_fmt) that encoded the test frames in this process
+_probe_failed: dict[tuple[str, str], tuple[float, str]] = {}   # key -> (monotonic end, reason)
+_probe_locks: dict[tuple[str, str], threading.Lock] = {}
+_probe_locks_guard = threading.Lock()
 
-    Priority: h264_nvenc (Tegra HW encode) → libx264 (CPU). Both produce
-    browser-native H.264 mp4 (Chrome / Safari / Firefox HW decode)."""
+
+def _run_probe(codec: str, extra: list[str], pix_fmt: str) -> Optional[str]:
+    """Encode two black rawvideo frames from stdin. None = usable, else the reason (for the log)."""
+    key = (codec, pix_fmt)
+    if key in _probe_ok:
+        return None
+    n = int(_PROBE_SIDE * _PROBE_SIDE * _PROBE_BYTES_PER_PIXEL[pix_fmt]) * 2
+    try:
+        test = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{_PROBE_SIDE}x{_PROBE_SIDE}", "-r", "25",
+             "-i", "pipe:0", "-c:v", codec, *extra, "-frames:v", "2", "-f", "null", "-"],
+            input=bytes(n), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return f"probe failed: {exc}"
+    err = test.stderr.decode("utf-8", errors="replace").strip()
+    # "Nothing was written" comes with exit 0 when the encoder could not be opened
+    # (e.g. a pixel format conversion that needs the missing `scale` filter).
+    if test.returncode != 0 or "Nothing was written" in err:
+        return (err or f"exit {test.returncode}")[:200]
+    _probe_ok.add(key)
+    return None
+
+
+def _probe_encoder(codec: str, extra: list[str], pix_fmt: str) -> Optional[str]:
+    """_run_probe, one at a time per encoder: cameras whose episode starts while
+    the warm-up probe runs wait for its answer instead of opening NVENC again
+    (a failure is shared only with those waiting; later calls probe again)."""
+    key = (codec, pix_fmt)
+    if key in _probe_ok:
+        return None
+    asked = time.monotonic()
+    with _probe_locks_guard:
+        lock = _probe_locks.setdefault(key, threading.Lock())
+    with lock:
+        failed = _probe_failed.get(key)
+        if failed is not None and failed[0] >= asked:
+            return failed[1]
+        why = _run_probe(codec, extra, pix_fmt)
+        if why is not None:
+            _probe_failed[key] = (time.monotonic(), why)
+        return why
+
+
+def _spawn_pipe(cmd: list[str], out_path: Path) -> subprocess.Popen:
+    # stderr must NOT be an unread PIPE: ffmpeg blocks once the pipe buffer
+    # fills, which freezes stdin.write in the worker thread and stalls the
+    # whole recording. Log file instead.
+    with open(out_path.parent / "ffmpeg.log", "ab") as errlog:
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errlog)
+
+
+def _h264_tries() -> list[tuple[str, list[str], str]]:
+    return [
+        # (codec, extra args, stdin pix_fmt)
+        ("h264_nvenc", ["-preset", "p1", "-tune", "ll"], "yuv420p"),               # Tegra HW, fastest
+        ("libx264",    ["-preset", "ultrafast", "-tune", "zerolatency"], "yuv420p"),
+    ]
+
+
+def _hevc10_tries(cq: int) -> list[tuple[str, list[str], str]]:
+    return [
+        ("hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", str(cq),
+                        "-pix_fmt", "p010le", "-profile:v", "main10"], "p010le"),
+        # CPU fallback must never stall the pipe: a blocked stdin.write blocks
+        # the subscriber callback (E2E: D555 depth dropped to 4 frames/77s
+        # while slower encodes hogged the executor). ultrafast + no lookahead.
+        ("libx265", ["-preset", "ultrafast", "-crf", str(cq + 2),
+                     "-pix_fmt", "yuv420p10le", "-profile:v", "main10",
+                     "-x265-params", "log-level=none:bframes=0:rc-lookahead=0"], "yuv420p10le"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Encoder warm-up.
+#
+# Opening an NVENC encoder takes ~2 s while aspa3's GPU is busy (CUDA context
+# + encode session). That happened on each camera's first frame — for the
+# first episode after a recorder restart the probe came on top — while the
+# encode thread sat blocked in ffmpeg's stdin, so the 8-frame ingest queue
+# overflowed and the head of the episode was dropped (2026-10-22, aspa3:
+# 69-90 frames per camera on the first episode after a restart, 2-24 later;
+# aspa2 1-12). Now:
+#   - warm_encoders() probes once when the recorder starts (CameraWriterPool),
+#     so no episode waits for a probe;
+#   - _IngestQueue keeps the frames that arrive until the camera's encoder has
+#     written output (bounded), oldest first, with the time the callback got
+#     them.
+# ---------------------------------------------------------------------------
+_WARMUP_MAX_S = 8.0               # hold at most this long's worth of frames (fps_nominal) …
+_WARMUP_MAX_BYTES = 256 << 20     # … and at most this many message bytes per camera
+_STEADY_QUEUE = 8                 # afterwards: bounded latency, the newest frame is dropped
+
+
+def warm_encoders(cq: int = 16) -> dict[str, str]:
+    """Probe the H.264 and HEVC Main10 encoders once, in the order the writers
+    try them. Returns {"h264": codec, "hevc10": codec} ("" = none works)."""
+    out = {"h264": "", "hevc10": ""}
+    if not shutil.which("ffmpeg"):
+        return out
+    for label, tries in (("h264", _h264_tries()), ("hevc10", _hevc10_tries(cq))):
+        for codec, extra, pix_fmt in tries:
+            why = _probe_encoder(codec, extra, pix_fmt)
+            if why is None:
+                out[label] = codec
+                break
+            LOG.warning("[encoder warm-up] %s (%s in) unavailable: %s", codec, pix_fmt, why)
+    LOG.info("encoders warmed up: %s", out)
+    return out
+
+
+class _IngestQueue:
+    """Frames from a camera callback to its encode thread, oldest first, each
+    with the time the callback got it.
+
+    Holds `steady` frames once warmed up (put() returns False when full: the
+    newest frame is dropped). Until end_warmup() — the writer's encoder has
+    written output and the backlog is down to `steady` — it holds up to
+    `warm_frames` frames / `warm_bytes` bytes instead: the head of the episode,
+    arriving while the encoder opens."""
+
+    def __init__(self, steady: int = _STEADY_QUEUE, warm_frames: int = 240,
+                 warm_bytes: int = _WARMUP_MAX_BYTES):
+        self.steady = steady
+        self.warm_frames = max(warm_frames, steady)
+        self.warm_bytes = warm_bytes
+        self.warming = True
+        self.first_frame_t: Optional[float] = None   # time.monotonic() of the first frame
+        self.peak = 0                     # most frames held at once
+        self._items: deque = deque()
+        self._bytes = 0
+        self._closed = False
+        self._cv = threading.Condition()
+
+    def put(self, msg, nbytes: int = 0) -> bool:
+        """False = dropped (full). A frame after close() belongs to no episode:
+        ignored, not counted."""
+        recv_ns = time.time_ns()
+        with self._cv:
+            if self._closed:
+                return True
+            if self.first_frame_t is None:
+                self.first_frame_t = time.monotonic()
+            n = len(self._items)
+            if self.warming:
+                full = n >= self.warm_frames or (n > 0 and self._bytes + nbytes > self.warm_bytes)
+            else:
+                full = n >= self.steady
+            if full:
+                return False
+            self._items.append((msg, recv_ns, nbytes))
+            self._bytes += nbytes
+            self.peak = max(self.peak, n + 1)
+            self._cv.notify()
+            return True
+
+    def close(self) -> None:
+        """get() returns None after the frames already queued."""
+        with self._cv:
+            self._closed = True
+            self._items.append(None)
+            self._cv.notify()
+
+    def drop_pending(self) -> int:
+        """Discard the frames still queued (stop gave up waiting); returns how
+        many. get() returns None next."""
+        with self._cv:
+            n = sum(1 for it in self._items if it is not None)
+            self._items.clear()
+            self._bytes = 0
+            self._closed = True
+            self._items.append(None)
+            self._cv.notify()
+            return n
+
+    def get(self):
+        """Next (msg, recv_ns) — blocks — or None once closed."""
+        with self._cv:
+            while not self._items:
+                self._cv.wait()
+            item = self._items.popleft()
+            if item is None:
+                return None
+            self._bytes -= item[2]
+            return item[0], item[1]
+
+    def end_warmup(self) -> None:
+        with self._cv:
+            self.warming = False
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+def _maybe_end_warmup(name: str, q: _IngestQueue, proc: Optional[subprocess.Popen],
+                      out_path: Path) -> None:
+    """Back to the steady bound once the encoder writes (ffmpeg writes the mp4
+    only after the encoder has opened) and the backlog is drained — or
+    _WARMUP_MAX_S after the first frame, e.g. when no encoder works at all."""
+    waited = time.monotonic() - (q.first_frame_t or time.monotonic())
+    writing = False
+    if proc is not None and len(q) <= q.steady:
+        try:
+            writing = out_path.stat().st_size > 0
+        except OSError:
+            pass
+    if writing or waited > _WARMUP_MAX_S:
+        q.end_warmup()
+        LOG.info("[%s] encoder %s after %.2f s; held up to %d frames meanwhile",
+                 name, "up" if writing else "not writing yet", waited, q.peak)
+
+
+def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int
+                          ) -> tuple[subprocess.Popen, str, str] | None:
+    """Try H.264 encoders in priority order. Returns (proc, codec, stdin pix_fmt)
+    or None if all encoders failed. Frames must be written in that pix_fmt
+    (yuv420p = planar I420, see CameraWriter._to_pipe_bytes). Output is
+    faststart mp4 (browser-native H.264 4:2:0).
+
+    Priority: h264_nvenc (Tegra HW encode) → libx264 (CPU)."""
     if not shutil.which("ffmpeg"):
         LOG.error("ffmpeg not found in PATH")
         return None
-    encoder_tries = [
-        # (codec, extra args)
-        ("h264_nvenc", ["-preset", "p1", "-tune", "ll"]),    # Tegra HW, fastest
-        ("libx264",    ["-preset", "ultrafast", "-tune", "zerolatency"]),
-    ]
-    for codec, extra in encoder_tries:
+    encoder_tries = _h264_tries()
+    for codec, extra, pix_fmt in encoder_tries:
+        why = _probe_encoder(codec, extra, pix_fmt)
+        if why is not None:
+            LOG.warning("[encoder probe] %s (%s in) unavailable: %s", codec, pix_fmt, why)
+            continue
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-f", "rawvideo", "-pix_fmt", pix_fmt,
             "-s", f"{width}x{height}", "-r", str(fps),
             "-i", "pipe:0",
             "-c:v", codec,
@@ -65,101 +300,49 @@ def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> 
             str(out_path),
         ]
         try:
-            # Probe encoder availability first (some builds list h264_nvenc but
-            # fail at runtime if no GPU). Spawn a tiny test pipe.
-            test = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                # 256x256: NVENC rejects tiny probe frames (min-size error) —
-                # a 64x64 probe made h264_nvenc look unavailable and silently
-                # forced libx264 on every camera.
-                 "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.04:r=25",
-                 "-c:v", codec, *extra, "-f", "null", "-"],
-                stderr=subprocess.PIPE, timeout=10,
-            )
-            if test.returncode != 0:
-                LOG.warning("[encoder probe] %s unavailable: %s", codec,
-                            test.stderr.decode("utf-8", errors="replace")[:200])
-                continue
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-            LOG.warning("[encoder probe] %s probe failed: %s", codec, exc)
-            continue
-        # Launch the real encoder pipe.
-        try:
-            # stderr must NOT be an unread PIPE: ffmpeg blocks once the pipe
-            # buffer fills, which freezes stdin.write in the subscriber
-            # callback and stalls the whole recording. Log file instead.
-            errlog = open(out_path.parent / "ffmpeg.log", "ab")
-            proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errlog,
-            )
-            errlog.close()
-            LOG.info("ffmpeg encoder ready: %s → %s (%dx%d @ %dfps)",
-                     codec, out_path.name, width, height, fps)
-            return proc, codec
+            proc = _spawn_pipe(cmd, out_path)
         except Exception as exc:
             LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
             continue
-    LOG.error("no H.264 encoder available (tried %s)", [c for c, _ in encoder_tries])
+        LOG.info("ffmpeg encoder ready: %s (%s in) → %s (%dx%d @ %dfps)",
+                 codec, pix_fmt, out_path.name, width, height, fps)
+        return proc, codec, pix_fmt
+    LOG.error("no H.264 encoder available (tried %s)", [c for c, _, _ in encoder_tries])
     return None
 
 
 def _spawn_ffmpeg_hevc10_encoder(out_path: Path, width: int, height: int,
-                                 fps: int, cq: int) -> tuple[subprocess.Popen, str] | None:
-    """HEVC Main10 encoder pipe for 10-bit-luma depth video (yuv420p10le stdin).
-    Priority: hevc_nvenc (Tegra HW) → libx265 (CPU). Not browser-playable —
-    this stream is training data, decoded via fv_episode_recorder.depth10."""
+                                 fps: int, cq: int) -> tuple[subprocess.Popen, str, str] | None:
+    """HEVC Main10 encoder pipe for 10-bit-luma depth video. Returns (proc,
+    codec, stdin pix_fmt): p010le for hevc_nvenc (its native 10-bit layout,
+    no filter needed), yuv420p10le for libx265. Not browser-playable — this
+    stream is training data, decoded via fv_episode_recorder.depth10."""
     if not shutil.which("ffmpeg"):
         LOG.error("ffmpeg not found in PATH")
         return None
-    encoder_tries = [
-        ("hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", str(cq),
-                        "-pix_fmt", "p010le", "-profile:v", "main10"]),
-        # CPU fallback must never stall the pipe: a blocked stdin.write blocks
-        # the subscriber callback (E2E: D555 depth dropped to 4 frames/77s
-        # while slower encodes hogged the executor). ultrafast + no lookahead.
-        ("libx265", ["-preset", "ultrafast", "-crf", str(cq + 2),
-                     "-pix_fmt", "yuv420p10le", "-profile:v", "main10",
-                     "-x265-params", "log-level=none:bframes=0:rc-lookahead=0"]),
-    ]
-    for codec, extra in encoder_tries:
-        try:
-            test = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.04:r=25,format=yuv420p10le",
-                 "-c:v", codec, *extra, "-f", "null", "-"],
-                stderr=subprocess.PIPE, timeout=10,
-            )
-            if test.returncode != 0:
-                LOG.warning("[encoder probe] %s unavailable: %s", codec,
-                            test.stderr.decode("utf-8", errors="replace")[:200])
-                continue
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-            LOG.warning("[encoder probe] %s probe failed: %s", codec, exc)
+    encoder_tries = _hevc10_tries(cq)
+    for codec, extra, pix_fmt in encoder_tries:
+        why = _probe_encoder(codec, extra, pix_fmt)
+        if why is not None:
+            LOG.warning("[encoder probe] %s (%s in) unavailable: %s", codec, pix_fmt, why)
             continue
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "yuv420p10le",
+            "-f", "rawvideo", "-pix_fmt", pix_fmt,
             "-s", f"{width}x{height}", "-r", str(fps),
             "-i", "pipe:0",
             "-c:v", codec, *extra,
             str(out_path),
         ]
         try:
-            # stderr must NOT be an unread PIPE: ffmpeg blocks once the pipe
-            # buffer fills, which freezes stdin.write in the subscriber
-            # callback and stalls the whole recording. Log file instead.
-            errlog = open(out_path.parent / "ffmpeg.log", "ab")
-            proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errlog,
-            )
-            errlog.close()
-            LOG.info("hevc10 encoder ready: %s → %s (%dx%d @ %dfps cq%d)",
-                     codec, out_path.name, width, height, fps, cq)
-            return proc, codec
+            proc = _spawn_pipe(cmd, out_path)
         except Exception as exc:
             LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
             continue
-    LOG.error("no HEVC Main10 encoder available (tried %s)", [c for c, _ in encoder_tries])
+        LOG.info("hevc10 encoder ready: %s (%s in) → %s (%dx%d @ %dfps cq%d)",
+                 codec, pix_fmt, out_path.name, width, height, fps, cq)
+        return proc, codec, pix_fmt
+    LOG.error("no HEVC Main10 encoder available (tried %s)", [c for c, _, _ in encoder_tries])
     return None
 
 
@@ -183,7 +366,7 @@ class CameraWriter:
         self._node = node
         # raw_image: topic carries sensor_msgs/Image (bgr8/rgb8) instead of
         # CompressedImage — e.g. the X3 equirect stream, which has no
-        # /compressed sibling. Frames feed the same ffmpeg bgr24 pipe.
+        # /compressed sibling. Frames feed the same ffmpeg pipe.
         self.raw_image = raw_image
 
         self._segment_file = self.output_dir / "0000.mp4"
@@ -193,6 +376,7 @@ class CameraWriter:
         # only had MPEG-4 part 2 — that codec is not browser-playable.
         self._ffmpeg: Optional[subprocess.Popen] = None
         self._codec_in_use: str = ""
+        self._pix_fmt_in: str = ""       # what ffmpeg expects on stdin (see _to_pipe_bytes)
         self._frame_index = 0
         self._segment_local = 0
         self._last_recv_ns = 0
@@ -207,8 +391,9 @@ class CameraWriter:
         self._stopped = False
         # bounded ingest queue + worker thread: the rclpy callback only
         # enqueues; decode/encode runs here so no camera can starve the
-        # executor. Overflow drops the newest frame (bounded latency).
-        self._queue: queue.Queue = queue.Queue(maxsize=8)
+        # executor. Overflow drops the newest frame (bounded latency) —
+        # except while the encoder starts (see _IngestQueue).
+        self._queue = _IngestQueue(warm_frames=int(fps * _WARMUP_MAX_S))
         self._worker = threading.Thread(
             target=self._drain, name=f"camwr-{name}", daemon=True)
         self.dropped_frames = 0
@@ -253,6 +438,16 @@ class CameraWriter:
         LOG.warning("[%s] unsupported raw encoding %s", self.name, msg.encoding)
         return None
 
+    def _to_pipe_bytes(self, img: np.ndarray) -> bytes:
+        """BGR frame → the bytes ffmpeg expects on stdin. yuv420p (planar I420)
+        is converted here with cv2 so ffmpeg needs no libavfilter `scale`
+        (absent on the Jetson ffmpeg package); the encoders take it as is."""
+        if self._pix_fmt_in == "yuv420p":
+            return cv2.cvtColor(img, cv2.COLOR_BGR2YUV_I420).tobytes()
+        if self._pix_fmt_in == "bgra":
+            return cv2.cvtColor(img, cv2.COLOR_BGR2BGRA).tobytes()
+        return np.ascontiguousarray(img).tobytes()        # bgr24
+
     def _on_image(self, msg) -> None:
         """rclpy callback: enqueue only. Encoding happens on the worker
         thread — a blocking callback starves every other subscription
@@ -260,44 +455,46 @@ class CameraWriter:
         others to a few frames per minute in E2E."""
         if self._stopped:
             return
-        try:
-            self._queue.put_nowait(msg)
-        except queue.Full:
+        if not self._queue.put(msg, len(msg.data)):
             self.dropped_frames += 1
 
     def _drain(self) -> None:
         while True:
-            msg = self._queue.get()
-            if msg is None:
+            item = self._queue.get()
+            if item is None:
                 return
             try:
-                self._process(msg)
+                self._process(*item)
             except Exception as exc:  # keep the worker alive
                 LOG.warning("[%s] frame processing failed: %s", self.name, exc)
+            if self._queue.warming:
+                _maybe_end_warmup(self.name, self._queue, self._ffmpeg, self._segment_file)
 
-    def _process(self, msg) -> None:
+    def _process(self, msg, recv_ns: int) -> None:
         with self._lock:
             if self._stopped:
                 return
-            recv_ns = time.time_ns()
             img = self._decode_frame(msg)
             if img is None:
                 LOG.warning("[%s] decode failed, skipping frame", self.name)
                 return
             h, w = img.shape[:2]
+            if (h & 1) or (w & 1):
+                img = img[: h & ~1, : w & ~1]          # 4:2:0 needs even dimensions
+                h, w = img.shape[:2]
             if self._ffmpeg is None:
                 spawned = _spawn_ffmpeg_encoder(self._segment_file, w, h, self.fps_nominal)
                 if spawned is None:
                     LOG.error("[%s] no H.264 encoder available — frame dropped", self.name)
                     return
-                self._ffmpeg, self._codec_in_use = spawned
+                self._ffmpeg, self._codec_in_use, self._pix_fmt_in = spawned
                 self.width = w
                 self.height = h
-                LOG.info("[%s] first frame %dx%d → %s (%s)",
-                         self.name, w, h, self._segment_file, self._codec_in_use)
+                LOG.info("[%s] first frame %dx%d → %s (%s, %s in)",
+                         self.name, w, h, self._segment_file, self._codec_in_use, self._pix_fmt_in)
 
             try:
-                self._ffmpeg.stdin.write(img.tobytes())
+                self._ffmpeg.stdin.write(self._to_pipe_bytes(img))
             except (BrokenPipeError, ValueError) as exc:
                 LOG.warning("[%s] ffmpeg pipe write failed: %s", self.name, exc)
                 return
@@ -330,8 +527,15 @@ class CameraWriter:
                 pass
             self._sub = None
         # let queued frames finish, then wake the worker with a sentinel
-        self._queue.put(None)
+        self._queue.close()
         self._worker.join(timeout=20)
+        if self._worker.is_alive():
+            # (a frame the encode thread has already taken but not written is
+            # not counted — this only happens after a 20 s stall)
+            lost = self._queue.drop_pending()
+            self.dropped_frames += lost
+            LOG.warning("[%s] encode thread still busy at stop: %d queued frames not written",
+                        self.name, lost)
         with self._lock:
             self._stopped = True
             if self._ffmpeg is not None:
@@ -536,6 +740,7 @@ class DepthVideoWriter:
         self._sidecar = FramesSidecar(self.output_dir / "frames.parquet")
         self._ffmpeg: Optional[subprocess.Popen] = None
         self._codec_in_use: str = ""
+        self._pix_fmt_in: str = ""       # p010le (hevc_nvenc) or yuv420p10le (libx265)
         self._uv_bytes: bytes = b""
         self._sub = None
         self._lock = threading.Lock()
@@ -548,7 +753,7 @@ class DepthVideoWriter:
         self.height = 0
         self.fps_actual = 0.0
         self._encoding_seen = ""
-        self._queue: queue.Queue = queue.Queue(maxsize=8)
+        self._queue = _IngestQueue(warm_frames=int(fps * _WARMUP_MAX_S))
         self._worker = threading.Thread(
             target=self._drain, name=f"depth10-{name}", daemon=True)
         self.dropped_frames = 0
@@ -589,42 +794,49 @@ class DepthVideoWriter:
         """rclpy callback: enqueue only (see CameraWriter._on_image)."""
         if self._stopped:
             return
-        try:
-            self._queue.put_nowait(msg)
-        except queue.Full:
+        if not self._queue.put(msg, len(msg.data)):
             self.dropped_frames += 1
 
     def _drain(self) -> None:
         while True:
-            msg = self._queue.get()
-            if msg is None:
+            item = self._queue.get()
+            if item is None:
                 return
             try:
-                self._process(msg)
+                self._process(*item)
             except Exception as exc:
                 LOG.warning("[%s] frame processing failed: %s", self.name, exc)
+            if self._queue.warming:
+                _maybe_end_warmup(self.name, self._queue, self._ffmpeg, self._segment_file)
 
-    def _process(self, msg: Image) -> None:
+    def _process(self, msg: Image, recv_ns: int) -> None:
         with self._lock:
             if self._stopped:
                 return
-            recv_ns = time.time_ns()
             self._encoding_seen = msg.encoding
             depth = self._to_counts(msg)
             if depth is None:
                 return
             h, w = depth.shape
+            if (h & 1) or (w & 1):
+                depth = depth[: h & ~1, : w & ~1]      # 4:2:0 needs even dimensions
+                h, w = depth.shape
             if self._ffmpeg is None:
                 spawned = _spawn_ffmpeg_hevc10_encoder(
                     self._segment_file, w, h, self.fps_nominal, self.cq)
                 if spawned is None:
                     LOG.error("[%s] no HEVC Main10 encoder — frame dropped", self.name)
                     return
-                self._ffmpeg, self._codec_in_use = spawned
+                self._ffmpeg, self._codec_in_use, self._pix_fmt_in = spawned
                 self.width, self.height = w, h
                 # flat chroma plane (10-bit neutral 512), built once
-                self._uv_bytes = np.full((h // 2, w // 2), 512,
-                                         dtype="<u2").tobytes() * 2
+                if self._pix_fmt_in == "p010le":
+                    # p010le: 10 bits MSB-aligned in 16-bit words, chroma interleaved (UVUV…)
+                    self._uv_bytes = np.full((h // 2, w), 512 << 6, dtype="<u2").tobytes()
+                else:
+                    # yuv420p10le: planar U then V, LSB-aligned
+                    self._uv_bytes = np.full((h // 2, w // 2), 512,
+                                             dtype="<u2").tobytes() * 2
                 depth10.write_meta(
                     self.output_dir, d_min=self.d_min, d_max=self.d_max,
                     depth_scale_mm=self.depth_scale_mm, width=w, height=h,
@@ -633,9 +845,11 @@ class DepthVideoWriter:
                 LOG.info("[%s] first depth frame %dx%d → %s (%s)",
                          self.name, w, h, self._segment_file, self._codec_in_use)
 
-            y = depth10.pack_luma10(depth, self.d_min, self.d_max, self._pack_lut)
+            y = depth10.pack_luma10(depth, self.d_min, self.d_max, self._pack_lut).astype("<u2")
+            if self._pix_fmt_in == "p010le":
+                y = y << 6                            # LSB-aligned 10-bit → MSB-aligned (p010)
             try:
-                self._ffmpeg.stdin.write(y.astype("<u2").tobytes())
+                self._ffmpeg.stdin.write(y.tobytes())
                 self._ffmpeg.stdin.write(self._uv_bytes)
             except (BrokenPipeError, ValueError) as exc:
                 LOG.warning("[%s] ffmpeg pipe write failed: %s", self.name, exc)
@@ -666,8 +880,15 @@ class DepthVideoWriter:
             except Exception:
                 pass
             self._sub = None
-        self._queue.put(None)
+        self._queue.close()
         self._worker.join(timeout=20)
+        if self._worker.is_alive():
+            # (a frame the encode thread has already taken but not written is
+            # not counted — this only happens after a 20 s stall)
+            lost = self._queue.drop_pending()
+            self.dropped_frames += lost
+            LOG.warning("[%s] encode thread still busy at stop: %d queued frames not written",
+                        self.name, lost)
         with self._lock:
             self._stopped = True
             if self._ffmpeg is not None:
@@ -723,9 +944,12 @@ class DepthVideoWriter:
 class CameraWriterPool:
     """Manage multiple CameraWriter instances for one episode."""
 
-    def __init__(self, node: Node):
+    def __init__(self, node: Node, warm_up: bool = True):
         self._node = node
         self._writers: dict[str, CameraWriter | DepthCameraWriter | DepthVideoWriter] = {}
+        if warm_up:
+            # probe the encoders now, not on the first episode's first frames
+            threading.Thread(target=warm_encoders, name="encoder-warmup", daemon=True).start()
         # Depth cameras don't have a writer (they go into the bag) but the
         # play modal still needs them in cameras[]. Stored here so stop_all
         # can re-emit the placeholders alongside the real writers' summaries.
