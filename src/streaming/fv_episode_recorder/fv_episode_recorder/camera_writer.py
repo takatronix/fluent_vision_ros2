@@ -39,24 +39,101 @@ from .calibration import camera_info_to_dict
 LOG = logging.getLogger("fv_episode_recorder.camera")
 
 
-def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> tuple[subprocess.Popen, str] | None:
-    """Try ffmpeg with H.264 encoders in priority order. Returns (proc, codec_used)
-    or None if all encoders failed. Output is faststart mp4 for HTML5 video.
+# ---------------------------------------------------------------------------
+# H.264 encoder selection (佐伯さん, fluent_vision_ros2 #26 / ec28653).
+#
+# Raw frames are piped to ffmpeg already in the encoder's input format
+# (yuv420p, converted with cv2 in CameraWriter._to_pipe_bytes) so NO
+# libavfilter conversion is needed. The Jetson ffmpeg package (7:8.0.1-nvidia1,
+# JetPack 7) ships NVENC but only ~30 filters: no `lavfi` (the old probe's test
+# source) and no `scale` (which ffmpeg inserts to convert bgr24 → yuv420p). On
+# that build the lavfi probe reported every encoder as unavailable and the pipe
+# would have died at the first frame anyway ("'scale' filter not present"), so
+# every episode had 0 video frames (aspa2 / aspa3, 2026-10-20). Probing with two
+# black rawvideo frames on stdin works on every ffmpeg build. (The depth path
+# probes the same way in depth10.probe_encoder.)
+# ---------------------------------------------------------------------------
+_PROBE_SIDE = 256   # NVENC rejects tiny frames: a 64x64 probe made h264_nvenc look unavailable
+_PROBE_BYTES_PER_PIXEL = {"yuv420p": 1.5, "bgr24": 3}
+_h264_ok: set[tuple[str, str]] = set()     # (codec, stdin pix_fmt) that encoded the test frames in this process
+_h264_failed: dict[tuple[str, str], tuple[float, str]] = {}   # key -> (time.monotonic() at the end, reason)
+_h264_locks: dict[tuple[str, str], threading.Lock] = {}
+_h264_locks_guard = threading.Lock()
 
-    Priority: h264_nvenc (Tegra HW encode) → libx264 (CPU). Both produce
-    browser-native H.264 mp4 (Chrome / Safari / Firefox HW decode)."""
+
+def _h264_tries() -> list[tuple[str, list[str], str]]:
+    return [
+        # (codec, extra args, stdin pix_fmt)
+        ("h264_nvenc", ["-preset", "p1", "-tune", "ll"], "yuv420p"),               # Tegra HW, fastest
+        ("libx264",    ["-preset", "ultrafast", "-tune", "zerolatency"], "yuv420p"),
+    ]
+
+
+def _run_h264_probe(codec: str, extra: list[str], pix_fmt: str) -> Optional[str]:
+    """Encode two black rawvideo frames from stdin. None = usable, else the reason (for the log)."""
+    n = int(_PROBE_SIDE * _PROBE_SIDE * _PROBE_BYTES_PER_PIXEL[pix_fmt]) * 2
+    try:
+        test = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{_PROBE_SIDE}x{_PROBE_SIDE}", "-r", "25",
+             "-i", "pipe:0", "-c:v", codec, *extra, "-frames:v", "2", "-f", "null", "-"],
+            input=bytes(n), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return f"probe failed: {exc}"
+    err = test.stderr.decode("utf-8", errors="replace").strip()
+    # "Nothing was written" comes with exit 0 when the encoder could not be opened
+    # (e.g. a pixel format conversion that needs the missing `scale` filter).
+    if test.returncode != 0 or "Nothing was written" in err:
+        return (err or f"exit {test.returncode}")[:200]
+    return None
+
+
+def _probe_h264(codec: str, extra: list[str], pix_fmt: str) -> Optional[str]:
+    """_run_h264_probe once per process per encoder, one at a time: cameras whose
+    episode starts while the warm-up probe runs wait for its answer instead of
+    opening NVENC again. A failure is shared only with those waiting; later
+    calls probe again (same rule as _choose_hevc10)."""
+    key = (codec, pix_fmt)
+    if key in _h264_ok:
+        return None
+    asked = time.monotonic()
+    with _h264_locks_guard:
+        lock = _h264_locks.setdefault(key, threading.Lock())
+    with lock:
+        if key in _h264_ok:
+            return None
+        failed = _h264_failed.get(key)
+        if failed is not None and failed[0] >= asked:
+            return failed[1]
+        why = _run_h264_probe(codec, extra, pix_fmt)
+        if why is None:
+            _h264_ok.add(key)
+        else:
+            _h264_failed[key] = (time.monotonic(), why)
+        return why
+
+
+def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int
+                          ) -> tuple[subprocess.Popen, str, str] | None:
+    """Try H.264 encoders in priority order. Returns (proc, codec, stdin pix_fmt)
+    or None if all encoders failed. Frames must be written in that pix_fmt
+    (yuv420p = planar I420, see CameraWriter._to_pipe_bytes). Output is
+    faststart mp4 for HTML5 video (browser-native H.264 4:2:0).
+
+    Priority: h264_nvenc (Tegra HW encode) → libx264 (CPU)."""
     if not shutil.which("ffmpeg"):
         LOG.error("ffmpeg not found in PATH")
         return None
-    encoder_tries = [
-        # (codec, extra args)
-        ("h264_nvenc", ["-preset", "p1", "-tune", "ll"]),    # Tegra HW, fastest
-        ("libx264",    ["-preset", "ultrafast", "-tune", "zerolatency"]),
-    ]
-    for codec, extra in encoder_tries:
+    encoder_tries = _h264_tries()
+    for codec, extra, pix_fmt in encoder_tries:
+        why = _probe_h264(codec, extra, pix_fmt)
+        if why is not None:
+            LOG.warning("[encoder probe] %s (%s in) unavailable: %s", codec, pix_fmt, why)
+            continue
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-f", "rawvideo", "-pix_fmt", pix_fmt,
             "-s", f"{width}x{height}", "-r", str(fps),
             "-i", "pipe:0",
             "-c:v", codec,
@@ -65,42 +142,22 @@ def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int) -> 
             "-movflags", "+faststart",
             str(out_path),
         ]
-        try:
-            # Probe encoder availability first (some builds list h264_nvenc but
-            # fail at runtime if no GPU). Spawn a tiny test pipe.
-            test = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                # 256x256: NVENC rejects tiny probe frames (min-size error) —
-                # a 64x64 probe made h264_nvenc look unavailable and silently
-                # forced libx264 on every camera.
-                 "-f", "lavfi", "-i", "color=c=black:s=256x256:d=0.04:r=25",
-                 "-c:v", codec, *extra, "-f", "null", "-"],
-                stderr=subprocess.PIPE, timeout=10,
-            )
-            if test.returncode != 0:
-                LOG.warning("[encoder probe] %s unavailable: %s", codec,
-                            test.stderr.decode("utf-8", errors="replace")[:200])
-                continue
-        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-            LOG.warning("[encoder probe] %s probe failed: %s", codec, exc)
-            continue
         # Launch the real encoder pipe.
         try:
             # stderr must NOT be an unread PIPE: ffmpeg blocks once the pipe
             # buffer fills, which freezes stdin.write in the subscriber
             # callback and stalls the whole recording. Log file instead.
-            errlog = open(out_path.parent / "ffmpeg.log", "ab")
-            proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errlog,
-            )
-            errlog.close()
-            LOG.info("ffmpeg encoder ready: %s → %s (%dx%d @ %dfps)",
-                     codec, out_path.name, width, height, fps)
-            return proc, codec
+            with open(out_path.parent / "ffmpeg.log", "ab") as errlog:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errlog,
+                )
+            LOG.info("ffmpeg encoder ready: %s (%s in) → %s (%dx%d @ %dfps)",
+                     codec, pix_fmt, out_path.name, width, height, fps)
+            return proc, codec, pix_fmt
         except Exception as exc:
             LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
             continue
-    LOG.error("no H.264 encoder available (tried %s)", [c for c, _ in encoder_tries])
+    LOG.error("no H.264 encoder available (tried %s)", [c for c, _, _ in encoder_tries])
     return None
 
 
@@ -187,9 +244,19 @@ def _choose_hevc10(cq: int) -> tuple[str, list[str], str | None, bool] | None:
 
 
 def warm_encoders(cq: int = 16) -> dict[str, str]:
-    """Pick the depth encoder now. Returns {"hevc10": codec} ("" = none works)."""
-    picked = _choose_hevc10(cq) if shutil.which("ffmpeg") else None
-    out = {"hevc10": picked[0] if picked else ""}
+    """Probe the H.264 encoders (in the order the writers try them) and pick the
+    depth encoder now. Returns {"h264": codec, "hevc10": codec} ("" = none works)."""
+    out = {"h264": "", "hevc10": ""}
+    if not shutil.which("ffmpeg"):
+        return out
+    for codec, extra, pix_fmt in _h264_tries():
+        why = _probe_h264(codec, extra, pix_fmt)
+        if why is None:
+            out["h264"] = codec
+            break
+        LOG.warning("[encoder warm-up] %s (%s in) unavailable: %s", codec, pix_fmt, why)
+    picked = _choose_hevc10(cq)
+    out["hevc10"] = picked[0] if picked else ""
     LOG.info("encoders warmed up: %s", out)
     return out
 
@@ -339,7 +406,7 @@ class CameraWriter(_CameraInfoMixin):
         self._node = node
         # raw_image: topic carries sensor_msgs/Image (bgr8/rgb8) instead of
         # CompressedImage — e.g. the X3 equirect stream, which has no
-        # /compressed sibling. Frames feed the same ffmpeg bgr24 pipe.
+        # /compressed sibling. Frames feed the same ffmpeg pipe.
         self.raw_image = raw_image
 
         self._segment_file = self.output_dir / "0000.mp4"
@@ -349,6 +416,7 @@ class CameraWriter(_CameraInfoMixin):
         # only had MPEG-4 part 2 — that codec is not browser-playable.
         self._ffmpeg: Optional[subprocess.Popen] = None
         self._codec_in_use: str = ""
+        self._pix_fmt_in: str = ""       # what ffmpeg expects on stdin (see _to_pipe_bytes)
         self._frame_index = 0
         self._segment_local = 0
         self._last_recv_ns = 0
@@ -410,6 +478,14 @@ class CameraWriter(_CameraInfoMixin):
         LOG.warning("[%s] unsupported raw encoding %s", self.name, msg.encoding)
         return None
 
+    def _to_pipe_bytes(self, img: np.ndarray) -> bytes:
+        """BGR frame → the bytes ffmpeg expects on stdin. yuv420p (planar I420)
+        is converted here with cv2 so ffmpeg needs no libavfilter `scale`
+        (absent on the Jetson ffmpeg package); the encoders take it as is."""
+        if self._pix_fmt_in == "yuv420p":
+            return cv2.cvtColor(img, cv2.COLOR_BGR2YUV_I420).tobytes()
+        return np.ascontiguousarray(img).tobytes()        # bgr24
+
     def _on_image(self, msg) -> None:
         """rclpy callback: enqueue only. Encoding happens on the worker
         thread — a blocking callback starves every other subscription
@@ -441,19 +517,22 @@ class CameraWriter(_CameraInfoMixin):
                 LOG.warning("[%s] decode failed, skipping frame", self.name)
                 return
             h, w = img.shape[:2]
+            if (h & 1) or (w & 1):
+                img = img[: h & ~1, : w & ~1]          # 4:2:0 needs even dimensions
+                h, w = img.shape[:2]
             if self._ffmpeg is None:
                 spawned = _spawn_ffmpeg_encoder(self._segment_file, w, h, self.fps_nominal)
                 if spawned is None:
                     LOG.error("[%s] no H.264 encoder available — frame dropped", self.name)
                     return
-                self._ffmpeg, self._codec_in_use = spawned
+                self._ffmpeg, self._codec_in_use, self._pix_fmt_in = spawned
                 self.width = w
                 self.height = h
-                LOG.info("[%s] first frame %dx%d → %s (%s)",
-                         self.name, w, h, self._segment_file, self._codec_in_use)
+                LOG.info("[%s] first frame %dx%d → %s (%s, %s in)",
+                         self.name, w, h, self._segment_file, self._codec_in_use, self._pix_fmt_in)
 
             try:
-                self._ffmpeg.stdin.write(img.tobytes())
+                self._ffmpeg.stdin.write(self._to_pipe_bytes(img))
             except (BrokenPipeError, ValueError) as exc:
                 LOG.warning("[%s] ffmpeg pipe write failed: %s", self.name, exc)
                 return
