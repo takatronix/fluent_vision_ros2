@@ -114,6 +114,7 @@ private:
     cv::VideoCapture camera_;
     cv::Mat current_frame_;
     std::mutex frame_mutex_;
+    bool idle_logged_ = false;   // no subscribers → grab() without decode (logged once per transition)
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr color_pub_;
