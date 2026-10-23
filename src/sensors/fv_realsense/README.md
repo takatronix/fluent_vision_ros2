@@ -62,6 +62,71 @@ ros2 launch fv_realsense fv_realsense_launch.py \
     config_file:=/path/to/custom_config.yaml
 ```
 
+### 4. D405のUSB転送バッファを拡張する
+
+D405のcolorとdepthを同時に30 FPSで使用すると、標準`uvcvideo`のUSB転送要求数ではフレームが欠損する場合があります。
+
+`fv-uvcvideo`は、実行中のカーネルと一致するソースおよびビルドツリーを検証し、`UVC_URBS=32`の任意モジュールを導入します。
+
+Jetson Linux R38.4ではNVIDIA公式ソースを使用します。
+
+通常のUbuntuでは、実行中カーネルと同一バージョンの`linux-headers`および`linux-source`をAPTで自動解決します。
+
+```bash
+sudo fv-uvcvideo install --reload
+fv-uvcvideo status
+```
+
+D405の欠番改善を実機で確認した環境はJetson Linux R38.4です。
+
+通常のUbuntu 24.04では、arm64とx86_64の標準`6.8.0-138-generic`カーネル用モジュールについて、ビルド、互換性検証および導入を確認しています。
+
+これら以外の環境では確認プロンプトを表示し、`y`を選んだ場合だけ厳密なソース、ビルドおよびモジュール互換性検証を実行します。
+
+非対話環境から未検証の構成を試す場合は、`--allow-unsupported`を明示します。
+
+Jetson Linux R38.4以外のL4T（R38.2、R39.xなど）や、`linux-source`のversionが一致しない派生カーネル（`-aws`、`-oem`など）では、実行中カーネルと一致するbuild treeとUVCソースを明示します。
+
+```bash
+sudo fv-uvcvideo install --allow-unsupported \
+    --kernel-build /usr/src/linux-headers-$(uname -r) \
+    --kernel-source /path/to/kernel-source --reload
+```
+
+導入は失敗時に自動で巻き戻ります（退避したoverrideの復元、導入記録の削除、`depmod`）。導入後は`depmod`が本モジュールを選択したことを`modinfo -n`で確認し、別のoverrideが優先される場合はエラーになります。
+
+元のモジュールへ戻す場合は、次を実行します。
+
+```bash
+sudo fv-uvcvideo uninstall --reload
+```
+
+署名強制が有効な環境では、登録済みのUbuntu Machine Owner Keyを使用します。
+
+鍵を明示する場合は、`--signing-key`と`--signing-cert`を同時に指定します。
+
+設計と検証条件は[`docs/design/fv_realsense_d405_streaming.ja.md`](../../../docs/design/fv_realsense_d405_streaming.ja.md)に記載しています。
+
+### 5. DDS socket bufferを設定する
+
+大容量画像をDDSで送受信するホストでは、socket buffer上限を設定します。
+
+```bash
+source <workspace>/install/setup.bash
+sudo "$(command -v setup_dds_receive_buffer.sh)"
+sudo "$(command -v setup_dds_send_buffer.sh)"
+```
+
+CycloneDDSを使うprocessは16 MiBのsend bufferを要求します。
+
+```xml
+<Internal>
+  <SocketSendBufferSize min="16 MiB" max="16 MiB"/>
+</Internal>
+```
+
+設定後にDDS processを再起動します。
+
 ## 設定
 
 `config/default_config.yaml`で以下の設定が可能です：
@@ -186,6 +251,16 @@ lsusb | grep RealSense
 sudo cat /etc/udev/rules.d/99-realsense-libusb.rules
 ```
 
+### D405のフレームが欠損する
+
+```bash
+fv-uvcvideo status
+```
+
+`Fluent Vision override: installed`と`UVC URBs: 32`が表示されることを確認します。
+
+`install`が「uvcvideoはすでに読み込まれている」と警告した場合は、カメラ利用プロセスを停止して`--reload`付きで再実行するか、OSを再起動します。
+
 ### ビルドエラー
 
 ```bash
@@ -199,4 +274,4 @@ colcon build --packages-select fv_realsense
 
 ## ライセンス
 
-MIT License 
+MIT License

@@ -1,0 +1,3 @@
+[submodule "core/fluent_scene"]
+	path = core/fluent_scene
+	url = https://github.com/takatronix/fluent_scene.git

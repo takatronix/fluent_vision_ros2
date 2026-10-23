@@ -406,10 +406,27 @@
     target.style.cursor = dragging ? 'grabbing' : markerCursor(e, m);
   }
 
+  // ---- 実時間タイムラインとカメラ毎の実尺写像 ----
+  // mp4 は公称 fps の CFR で書かれるため、フレーム落ちしたカメラ (sim の
+  // 仮想カメラ等) は実尺が実時間より短くなり、そのまま再生すると映像だけ
+  // 早回しになってジョイントチャート (実時間) とズレる。タイムライン
+  // (sharedTime) は wall 秒で統一し、各 video へは「実時間 ÷ その mp4 実尺」
+  // の比で写像する。学習データ側は frames.parquet が真のタイムスタンプを
+  // 持っているのでこの補正は表示専用。
+  function camFactor(camName: string): number {
+    const v = videoEls[camName];
+    const span = playEpisode?.duration_s || 0;
+    if (!v || !isFinite(v.duration) || v.duration <= 0 || span <= 0) return 1;
+    return span / v.duration;
+  }
+
   function onVideoMetadata(camName: string) {
     const v = videoEls[camName];
     if (!v) return;
-    if (v.duration > maxDuration) maxDuration = v.duration;
+    // タイムライン長は duration_s (wall) が正。無い旧エピソードだけ
+    // mp4 実尺で代用する
+    if (!playEpisode?.duration_s && v.duration > maxDuration) maxDuration = v.duration;
+    applyPlaybackRate();  // 実尺が確定したこのタイミングでペーシング反映
   }
 
   function syncPlayFrom(camName: string) {
@@ -435,10 +452,12 @@
     _isSyncing = true;
     const src = videoEls[camName];
     if (src) {
-      sharedTime = src.currentTime;
+      sharedTime = src.currentTime * camFactor(camName);
       for (const [n, v] of Object.entries(videoEls)) {
-        if (n !== camName && v && Math.abs(v.currentTime - src.currentTime) > 0.1) {
-          try { v.currentTime = src.currentTime; } catch {}
+        if (n === camName || !v) continue;
+        const want = sharedTime / camFactor(n);
+        if (Math.abs(v.currentTime - want) > 0.1) {
+          try { v.currentTime = want; } catch {}
         }
       }
     }
@@ -449,7 +468,7 @@
     const firstKey = Object.keys(videoEls)[0];
     if (camName === firstKey) {
       const v = videoEls[firstKey];
-      if (v) sharedTime = v.currentTime;
+      if (v) sharedTime = v.currentTime * camFactor(firstKey);
     }
   }
   function togglePlayAll() {
@@ -464,17 +483,27 @@
   function seekAll(t: number) {
     sharedTime = t;
     _isSyncing = true;
-    for (const v of Object.values(videoEls)) { if (v) { try { v.currentTime = t; } catch {} } }
+    for (const [n, v] of Object.entries(videoEls)) {
+      if (v) { try { v.currentTime = t / camFactor(n); } catch {} }
+    }
     _isSyncing = false;
   }
   function applyPlaybackRate() {
-    for (const v of Object.values(videoEls)) { if (v) v.playbackRate = playbackRate; }
+    // 1× = 実時間ペース。実尺の短い (フレーム落ちした) カメラは
+    // その分ゆっくり回して壁時計と歩調を合わせる
+    for (const [n, v] of Object.entries(videoEls)) {
+      if (v) v.playbackRate = playbackRate / camFactor(n);
+    }
   }
 
   // -------- Joint chart (Phase 3a) --------
   type JointSeries = { topic: string; names: string[]; t_ms: number[]; q: number[][] };
   let jointData = $state<JointSeries[]>([]);
   let jointSelectedTopic = $state<string>('');
+  // チャートはコンテナ実幅で 1:1 描画する (固定 viewBox +
+  // preserveAspectRatio=none だと横だけ引き伸ばされ、軸ラベルの文字まで
+  // 太る + 見た目の縦横比が画面幅依存になる)
+  let jointChartW = $state(1100);
   let jointLoading = $state(false);
 
   async function fetchJoints(epId: string) {
@@ -761,6 +790,273 @@
     if (next.has(id)) next.delete(id); else next.add(id);
     expandedBatches = next;
   }
+  // ---- Distribution overlay (batch trajectory fan) ----
+  // Data: GET /batches/{id}/metrics — generation-time quality_metrics.
+  // tcp_path is a world-frame polyline [m]; the view is a top-down XY plot
+  // so the operator can see path diversity / placement coverage at a glance.
+  type DistEp = {
+    episode_id: string;
+    task_description: string;
+    outcome: string | null;
+    duration_s: number | null;
+    tags: string[];
+    quality_metrics: {
+      gen?: { seed?: number; variant?: string; rms_vs_demo_deg?: number };
+      judge?: { ok?: boolean; reason?: string };
+      duration_s?: number;
+      tcp_path?: number[][];
+      pick_xy?: number[] | null;
+      place_xy?: number[] | null;
+      object_init?: Record<string, number[]> | null;
+    } | null;
+  };
+  let distBatchId = $state<string | null>(null);
+  let distEps = $state<DistEp[]>([]);
+  let distLoading = $state(false);
+  let distError = $state<string | null>(null);
+  let distHover = $state<string | null>(null);
+
+  async function openDist(batchId: string, e?: Event) {
+    e?.stopPropagation();
+    distBatchId = batchId;
+    distLoading = true;
+    distError = null;
+    distEps = [];
+    try {
+      const r = await fetch(`${API}/batches/${encodeURIComponent(batchId)}/metrics`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      distEps = (await r.json()).episodes ?? [];
+    } catch (err) {
+      distError = String(err);
+    } finally {
+      distLoading = false;
+    }
+  }
+  function closeDist() { distBatchId = null; distEps = []; distHover = null; }
+
+  const DIST_COLORS = ['#22d3ee', '#a78bfa', '#f59e0b', '#34d399', '#f472b6', '#60a5fa', '#c084fc', '#facc15'];
+  // 3D orbit view (DPEX 風): tcp_path は world [x,y,z][m] なので投影は
+  // 描画側で行う。ドラッグ=回転 / ホイール=ズーム / ボタンで上面⇔3D。
+  const DIST_VIEW_3D = { yaw: -0.7, pitch: 0.95, zoom: 1 };   // pitch π/2 = 真上
+  const DIST_VIEW_TOP = { yaw: 0, pitch: Math.PI / 2, zoom: 1 };
+  let distView = $state({ ...DIST_VIEW_3D });
+  let distCanvas = $state<HTMLCanvasElement | null>(null);
+  let _distDrag: { x: number; y: number } | null = null;
+
+  const distPlot = $derived.by(() => {
+    const eps = distEps.filter((e) => e.quality_metrics?.tcp_path?.length);
+    if (!eps.length) return null;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity,
+        minZ = Infinity, maxZ = -Infinity;
+    const feed = (p: number[]) => {
+      if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
+      if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1];
+      const z = p[2] ?? 0;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    };
+    for (const e of eps) {
+      const qm = e.quality_metrics!;
+      for (const p of qm.tcp_path!) feed(p);
+      for (const p of Object.values(qm.object_init ?? {})) feed(p);
+    }
+    const variants = [...new Set(eps.map((e) => e.quality_metrics?.gen?.variant ?? '—'))];
+    const colorOf = (v: string) => DIST_COLORS[Math.max(0, variants.indexOf(v)) % DIST_COLORS.length];
+    const rows = eps.map((e) => {
+      const qm = e.quality_metrics!;
+      const v = qm.gen?.variant ?? '—';
+      const path = qm.tcp_path as number[][];
+      // pick/place は XY のみ保存 (schema 1) — z は経路の最寄り点から補間
+      const at3d = (xy: number[] | null | undefined): number[] | null => {
+        if (!xy) return null;
+        let bz = path[0][2] ?? 0, bd = Infinity;
+        for (const p of path) {
+          const d = (p[0] - xy[0]) ** 2 + (p[1] - xy[1]) ** 2;
+          if (d < bd) { bd = d; bz = p[2] ?? 0; }
+        }
+        return [xy[0], xy[1], bz];
+      };
+      return {
+        id: e.episode_id,
+        ok: e.outcome === 'success',
+        variant: v,
+        color: colorOf(v),
+        seed: qm.gen?.seed,
+        reason: qm.judge?.reason,
+        durS: qm.duration_s ?? e.duration_s,
+        path,
+        pick: at3d(qm.pick_xy),
+        place: at3d(qm.place_xy),
+        objs: Object.values(qm.object_init ?? {}).map((p) => [p[0], p[1], p[2] ?? minZ]),
+      };
+    });
+    const varCounts = variants.map((v) => ({
+      v,
+      color: colorOf(v),
+      n: eps.filter((e) => (e.quality_metrics?.gen?.variant ?? '—') === v).length,
+    }));
+    const center = [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
+    const radius = Math.max((maxX - minX) / 2, (maxY - minY) / 2, (maxZ - minZ) / 2, 0.05);
+    return {
+      rows, varCounts, center, radius, groundZ: minZ,
+      bounds: { minX, maxX, minY, maxY },
+      nOk: eps.filter((e) => e.outcome === 'success').length,
+      nNg: eps.filter((e) => e.outcome !== 'success').length,
+      nNoMetrics: distEps.length - eps.length,
+    };
+  });
+
+  function _distProject(p: number[], W: number, H: number): [number, number] {
+    const plot = distPlot!;
+    const { yaw, pitch, zoom } = distView;
+    const x = p[0] - plot.center[0], y = p[1] - plot.center[1],
+          z = (p[2] ?? 0) - plot.center[2];
+    const cy0 = Math.cos(yaw), sy0 = Math.sin(yaw);
+    const x1 = x * cy0 - y * sy0;
+    const y1 = x * sy0 + y * cy0;
+    const sp = Math.sin(pitch), cp = Math.cos(pitch);
+    // pitch=π/2 → 真上 (画面上=+Y) / pitch→0 → 真横 (画面上=+Z)。正射影。
+    const sx = x1;
+    const sy = y1 * sp + z * cp;
+    const s = (Math.min(W, H) * 0.42 * zoom) / plot.radius;
+    return [W / 2 + sx * s, H / 2 - sy * s];
+  }
+
+  function _distDraw() {
+    const cv = distCanvas, plot = distPlot;
+    if (!cv || !plot) return;
+    const rect = cv.getBoundingClientRect();
+    if (rect.width < 10 || rect.height < 10) return;
+    const dpr = window.devicePixelRatio || 1;
+    const bw = Math.round(rect.width * dpr), bh = Math.round(rect.height * dpr);
+    if (cv.width !== bw || cv.height !== bh) { cv.width = bw; cv.height = bh; }
+    const ctx = cv.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const W = rect.width, H = rect.height;
+    ctx.clearRect(0, 0, W, H);
+    // 床グリッド (作業面 z): 5cm ピッチ、10cm 毎に濃く — スケール感の基準
+    const b = plot.bounds, gz = plot.groundZ;
+    const x0 = Math.floor(b.minX / 0.05) * 0.05, x1g = Math.ceil(b.maxX / 0.05) * 0.05;
+    const y0 = Math.floor(b.minY / 0.05) * 0.05, y1g = Math.ceil(b.maxY / 0.05) * 0.05;
+    ctx.lineWidth = 1;
+    for (let gx = x0; gx <= x1g + 1e-9; gx += 0.05) {
+      const major = Math.abs(Math.round(gx / 0.1) * 0.1 - gx) < 1e-9;
+      ctx.strokeStyle = major ? 'rgba(148,163,184,0.28)' : 'rgba(148,163,184,0.12)';
+      ctx.beginPath();
+      let [ax, ay] = _distProject([gx, y0, gz], W, H);
+      ctx.moveTo(ax, ay);
+      [ax, ay] = _distProject([gx, y1g, gz], W, H);
+      ctx.lineTo(ax, ay);
+      ctx.stroke();
+    }
+    for (let gy = y0; gy <= y1g + 1e-9; gy += 0.05) {
+      const major = Math.abs(Math.round(gy / 0.1) * 0.1 - gy) < 1e-9;
+      ctx.strokeStyle = major ? 'rgba(148,163,184,0.28)' : 'rgba(148,163,184,0.12)';
+      ctx.beginPath();
+      let [ax, ay] = _distProject([x0, gy, gz], W, H);
+      ctx.moveTo(ax, ay);
+      [ax, ay] = _distProject([x1g, gy, gz], W, H);
+      ctx.lineTo(ax, ay);
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(148,163,184,0.6)';
+    ctx.font = '11px sans-serif';
+    ctx.fillText('グリッド 5cm (濃線 10cm)', 10, H - 10);
+    // 物体初期位置 (淡い点) → 経路 → 把持○ / 設置■ の順に重ねる
+    for (const r of plot.rows) {
+      const dim = distHover && distHover !== r.id;
+      const col = r.ok ? r.color : '#f87171';
+      ctx.globalAlpha = dim ? 0.10 : 0.30;
+      ctx.fillStyle = col;
+      for (const o of r.objs) {
+        const [ox, oy] = _distProject(o, W, H);
+        ctx.beginPath(); ctx.arc(ox, oy, 3, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.globalAlpha = dim ? 0.10 : (r.ok ? 0.75 : 0.6);
+      ctx.strokeStyle = col;
+      ctx.lineWidth = distHover === r.id ? 2.5 : 1.2;
+      ctx.setLineDash(r.ok ? [] : [5, 4]);
+      ctx.beginPath();
+      r.path.forEach((p, i) => {
+        const [ax, ay] = _distProject(p, W, H);
+        if (i === 0) ctx.moveTo(ax, ay); else ctx.lineTo(ax, ay);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (r.pick) {
+        const [ax, ay] = _distProject(r.pick, W, H);
+        ctx.beginPath(); ctx.arc(ax, ay, distHover === r.id ? 5.5 : 4, 0, Math.PI * 2);
+        ctx.lineWidth = 1.6; ctx.stroke();
+      }
+      if (r.place) {
+        const [ax, ay] = _distProject(r.place, W, H);
+        ctx.fillRect(ax - 3.5, ay - 3.5, 7, 7);
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function _distPick(ev: PointerEvent | MouseEvent): string | null {
+    const cv = distCanvas, plot = distPlot;
+    if (!cv || !plot) return null;
+    const rect = cv.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    let best: string | null = null, bd = 8 * 8;  // 8px 以内
+    for (const r of plot.rows) {
+      let prev: [number, number] | null = null;
+      for (const p of r.path) {
+        const q = _distProject(p, rect.width, rect.height);
+        if (prev) {
+          const dx = q[0] - prev[0], dy = q[1] - prev[1];
+          const len2 = dx * dx + dy * dy;
+          const t = len2 > 0 ? Math.max(0, Math.min(1,
+            ((mx - prev[0]) * dx + (my - prev[1]) * dy) / len2)) : 0;
+          const ex = prev[0] + t * dx - mx, ey = prev[1] + t * dy - my;
+          const d = ex * ex + ey * ey;
+          if (d < bd) { bd = d; best = r.id; }
+        }
+        prev = q;
+      }
+    }
+    return best;
+  }
+
+  function distPointerDown(ev: PointerEvent) {
+    _distDrag = { x: ev.clientX, y: ev.clientY };
+    (ev.currentTarget as HTMLElement).setPointerCapture(ev.pointerId);
+  }
+  function distPointerMove(ev: PointerEvent) {
+    if (_distDrag) {
+      const dx = ev.clientX - _distDrag.x, dy = ev.clientY - _distDrag.y;
+      _distDrag = { x: ev.clientX, y: ev.clientY };
+      distView = {
+        ...distView,
+        yaw: distView.yaw - dx * 0.008,
+        pitch: Math.max(0.08, Math.min(Math.PI / 2, distView.pitch + dy * 0.008)),
+      };
+    } else {
+      distHover = _distPick(ev);
+    }
+  }
+  function distPointerUp(ev: PointerEvent) {
+    _distDrag = null;
+    try { (ev.currentTarget as HTMLElement).releasePointerCapture(ev.pointerId); } catch {}
+  }
+  function distWheel(ev: WheelEvent) {
+    ev.preventDefault();
+    const z = distView.zoom * Math.exp(-ev.deltaY * 0.0012);
+    distView = { ...distView, zoom: Math.max(0.25, Math.min(8, z)) };
+  }
+  function distClick(ev: MouseEvent) {
+    const id = _distPick(ev);
+    if (id) {
+      const row = distPlot?.rows.find((r) => r.id === id);
+      openPlay({ episode_id: id, duration_s: row?.durS } as any);
+    }
+  }
+  // 再描画: ビュー/ホバー/データが変わるたび (canvas は宣言的でないため)
+  $effect(() => { void distView; void distHover; void distPlot; void distCanvas; _distDraw(); });
+
   function computeBatchStats(eps: Episode[]): BatchStats {
     const rawTask = (eps[0]?.task_description || '').replace(/\s+#\d+\/\d+$/, '');
     const success = eps.filter(e => e.outcome === 'success').length;
@@ -867,7 +1163,13 @@
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(retentionPolicy),
       });
-      if (r.ok) retentionPolicy = await r.json();
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${r.status}`);
+      }
+      retentionPolicy = await r.json();
+    } catch (e: any) {
+      alert('ポリシー保存失敗: ' + (e.message || e));
     } finally { retentionBusy = false; }
   }
   async function previewRetention() {
@@ -895,16 +1197,51 @@
     } finally { retentionBusy = false; }
   }
 
+  // 全削除 walks every page of the current filter on the server. `episodes`
+  // only holds the pages scrolled into view (PAGE_SIZE each, and the poll in
+  // load() resets it to the first page), so filtering it deleted just the
+  // visible 50 and left the rest listed after the reload.
+  async function fetchAllEpisodes(): Promise<Episode[]> {
+    const all: Episode[] = [];
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; ; page++) {
+      if (page >= 200) throw new Error('episodes list did not terminate (cursor loop)');
+      const params = new URLSearchParams({ limit: '500' });
+      if (activeProfile) params.set('profile', activeProfile);
+      if (cursor) params.set('cursor', cursor);
+      const r = await fetch(`${API}/episodes?${params}`);
+      if (!r.ok) throw new Error(`episodes list failed: HTTP ${r.status}`);
+      const j = await r.json();
+      for (const e of (j.episodes || []) as Episode[]) {
+        if (seen.has(e.episode_id)) continue;
+        seen.add(e.episode_id);
+        all.push(e);
+      }
+      cursor = j.next_cursor || null;
+      if (!cursor) return all;
+    }
+  }
+
   async function deleteAllEpisodes() {
-    const targets = episodes.filter(e => !e.pinned && e.state !== 'recording');
+    let listed: Episode[];
+    try {
+      listed = await fetchAllEpisodes();
+    } catch (e: any) {
+      alert(`一覧の取得に失敗したため全削除を中止しました: ${e.message || String(e)}`);
+      return;
+    }
+    const targets = listed.filter(e => !e.pinned && e.state !== 'recording');
+    const protectedCount = listed.length - targets.length;
     if (targets.length === 0) {
       alert('削除対象なし (録画中・pinned を除く)');
       return;
     }
     const totalBytes = targets.reduce((s, e) => s + (e.size_bytes || 0), 0);
+    const scope = activeProfile ? `プロファイル ${activeProfile} の全エピソード` : '全プロファイルの全エピソード';
     // Two-step confirm so a stray click doesn't nuke everything.
-    if (!confirm(`【全削除】 ${targets.length} 件のエピソード (${fmtBytes(totalBytes)}) を削除します。\n\npinned エピソードは保護されます。録画中エピソードも対象外。\nこの操作は取り消せません。`)) return;
-    if (!confirm(`本当にすべて削除しますか？\n(${targets.length} 件 / ${fmtBytes(totalBytes)})`)) return;
+    if (!confirm(`【全削除】 ${scope}${targets.length}件 (${fmtBytes(totalBytes)}) を削除します。\n画面に表示中の分だけでなく、サーバー上の全ページが対象です。\n\npinned エピソードは保護されます。録画中エピソードも対象外${protectedCount ? ` (${protectedCount}件を除外)` : ''}。\nこの操作は取り消せません。`)) return;
+    if (!confirm(`本当にすべて削除しますか？\n(${targets.length}件 / ${fmtBytes(totalBytes)})`)) return;
     bulkDeleteProgress = { total: targets.length, done: 0, failed: 0 };
     for (const ep of targets) {
       try {
@@ -1498,6 +1835,12 @@
                 <td class="px-4 py-2.5 text-right font-mono text-xs text-(--color-text-dim)">{s.totalMarkers}</td>
                 <td class="px-2 py-2.5 text-right whitespace-nowrap">
                   <button
+                    onclick={(e) => openDist(row.batchId, e)}
+                    class="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-cyan-500/40 text-cyan-300 text-[11px] hover:bg-cyan-500/10 transition mr-2 align-middle"
+                    title="バッチ内全エピソードの TCP 経路を 3D で重ね描き (多様性の確認)">
+                    🗺 分布
+                  </button>
+                  <button
                     onclick={(e) => togglePinBatch(row.batchId, row.eps, e)}
                     class="{anyPinned ? 'opacity-100 text-amber-400' : 'opacity-0 group-hover:opacity-100 text-(--color-text-mute)'} hover:text-amber-400 transition p-1 rounded hover:bg-amber-500/10 mr-1"
                     title={allPinned ? `バッチ全体 ${s.count} 件を unpin` : anyPinned ? `バッチを完全 pin (現状 ${row.eps.filter(x => x.pinned).length}/${s.count} pinned)` : `バッチ全体 ${s.count} 件を 📌 pin (retention 保護)`}>
@@ -1953,7 +2296,7 @@
         {#if series && series.t_ms.length > 0}
           {@const totalMs = (maxDuration || 1) * 1000}
           {@const numJoints = series.names.length || (series.q[0]?.length ?? 0)}
-          {@const W = 1100}
+          {@const W = Math.max(320, jointChartW)}
           {@const H = 140}
           {@const PAD_L = 40}
           {@const PAD_R = 8}
@@ -1971,7 +2314,7 @@
           {@const xOf = (t_ms: number) => PAD_L + (t_ms / totalMs) * innerW}
           {@const yOf = (val_rad: number) => PAD_T + innerH - ((val_rad * 180 / Math.PI - yMin) / ySpan) * innerH}
           {@const palette = ['#22dd88','#00d9ff','#ffaa33','#ff6688','#bb88ff','#88ccff','#ffcc44','#66e0c0']}
-          <div class="shrink-0 mt-3 pt-3 border-t border-(--color-border)">
+          <div class="shrink-0 mt-3 pt-3 border-t border-(--color-border)" bind:clientWidth={jointChartW}>
             <div class="flex items-center gap-3 text-[11px] text-(--color-text-mute) mb-1.5">
               <span class="text-(--color-text-dim) font-medium">ジョイント角 (deg)</span>
               {#if jointData.length > 1}
@@ -2196,6 +2539,90 @@
         <button onclick={() => (attrEditor = null)} class="px-3 py-1.5 text-sm rounded bg-(--color-bg-3) text-(--color-text-dim) hover:text-white">キャンセル</button>
         <button onclick={saveAttrs} class="px-4 py-1.5 text-sm rounded bg-(--color-accent) text-(--color-bg) font-semibold hover:brightness-110">保存</button>
       </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Distribution overlay — batch trajectory fan (top view, world XY [m]) -->
+{#if distBatchId}
+  <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 backdrop-blur-sm p-4"
+       onclick={(e) => { if (e.target === e.currentTarget) closeDist(); }}
+       onkeydown={(e) => { if (e.key === 'Escape') closeDist(); }}
+       role="dialog"
+       tabindex="-1">
+    <div class="card w-full max-w-5xl p-5 flex flex-col" style="max-height: 92vh;">
+      <header class="flex items-start justify-between mb-3 shrink-0">
+        <div>
+          <h2 class="text-base font-semibold text-white">🗺 分布ビュー <span class="text-xs font-normal text-(--color-text-mute)">TCP 経路の 3D 重ね描き (world) — ドラッグで回転</span></h2>
+          <p class="text-xs text-(--color-text-mute) mt-1 font-mono">batch:{distBatchId}</p>
+        </div>
+        <button onclick={closeDist} class="text-(--color-text-mute) hover:text-white text-2xl leading-none">×</button>
+      </header>
+      {#if distLoading}
+        <p class="text-sm text-(--color-text-dim) py-8 text-center">読込中…</p>
+      {:else if distError}
+        <p class="text-sm text-red-400 py-8 text-center">取得失敗: {distError}</p>
+      {:else if !distPlot}
+        <p class="text-sm text-(--color-text-dim) py-8 text-center">
+          このバッチには軌道メトリクス (quality_metrics.tcp_path) がありません。<br />
+          自動生成 (datagen) エピソード、またはバックフィル済みのエピソードで利用できます。
+        </p>
+      {:else}
+        <div class="flex gap-4 min-h-0 overflow-auto flex-wrap md:flex-nowrap">
+          <div class="flex-1 min-w-[320px] relative">
+            <canvas bind:this={distCanvas}
+                    class="w-full rounded border border-(--color-border) bg-(--color-bg-2)"
+                    style="height: min(62vh, 560px); touch-action: none; cursor: {_distDrag ? 'grabbing' : distHover ? 'pointer' : 'grab'};"
+                    onpointerdown={distPointerDown}
+                    onpointermove={distPointerMove}
+                    onpointerup={distPointerUp}
+                    onpointercancel={distPointerUp}
+                    onwheel={distWheel}
+                    onclick={distClick}></canvas>
+            <div class="absolute top-2 right-2 flex gap-1">
+              <button onclick={() => (distView = { ...DIST_VIEW_3D })}
+                      class="px-2 py-1 rounded text-[11px] border {distView.pitch < Math.PI / 2 - 0.01 ? 'border-(--color-accent) text-(--color-accent)' : 'border-(--color-border) text-(--color-text-mute)'} bg-(--color-bg)/70 hover:text-(--color-accent)">3D</button>
+              <button onclick={() => (distView = { ...DIST_VIEW_TOP, zoom: distView.zoom })}
+                      class="px-2 py-1 rounded text-[11px] border {distView.pitch >= Math.PI / 2 - 0.01 ? 'border-(--color-accent) text-(--color-accent)' : 'border-(--color-border) text-(--color-text-mute)'} bg-(--color-bg)/70 hover:text-(--color-accent)">⬆ 上面</button>
+            </div>
+            <div class="absolute bottom-2 right-2 text-[10px] text-(--color-text-mute) pointer-events-none">
+              ドラッグ=回転 · ホイール=ズーム
+            </div>
+          </div>
+          <div class="w-full md:w-56 shrink-0 text-xs space-y-3">
+            <div class="rounded border border-(--color-border) bg-(--color-bg-2) p-3 space-y-1.5">
+              <div class="text-(--color-text-dim)">エピソード <span class="text-white font-mono">{distPlot.nOk + distPlot.nNg}</span></div>
+              <div><span class="text-emerald-400 font-mono">✓ {distPlot.nOk}</span> <span class="text-red-400 font-mono ml-2">✗ {distPlot.nNg}</span></div>
+              {#if distPlot.nNoMetrics > 0}
+                <div class="text-(--color-text-mute)">メトリクス無し {distPlot.nNoMetrics} 件 (非表示)</div>
+              {/if}
+            </div>
+            <div class="rounded border border-(--color-border) bg-(--color-bg-2) p-3 space-y-1">
+              <div class="text-(--color-text-dim) mb-1.5">変種 (色分け)</div>
+              {#each distPlot.varCounts as vc (vc.v)}
+                <div class="flex items-center gap-2">
+                  <span class="inline-block size-2.5 rounded-full" style={`background:${vc.color}`}></span>
+                  <span class="text-(--color-text) truncate flex-1">{vc.v}</span>
+                  <span class="font-mono text-(--color-text-dim)">×{vc.n}</span>
+                </div>
+              {/each}
+              <div class="text-[10px] text-(--color-text-mute) pt-1.5 border-t border-(--color-border) mt-1.5">
+                ○ = 把持点 ■ = 設置点 · 破線赤 = 失敗 EP<br />経路クリックで再生
+              </div>
+            </div>
+            {#if distHover}
+              {@const hr = distPlot.rows.find((r) => r.id === distHover)}
+              {#if hr}
+                <div class="rounded border border-(--color-accent)/40 bg-(--color-bg-2) p-3 space-y-1">
+                  <div class="font-mono text-(--color-accent)">…{hr.id.slice(-8)}</div>
+                  <div class="text-(--color-text)">{hr.variant} {hr.seed != null ? `· seed${hr.seed}` : ''}</div>
+                  <div class="text-(--color-text-dim)">{hr.ok ? '成功' : `失敗: ${hr.reason ?? '?'}`} {hr.durS != null ? `· ${Number(hr.durS).toFixed(1)}s` : ''}</div>
+                </div>
+              {/if}
+            {/if}
+          </div>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}

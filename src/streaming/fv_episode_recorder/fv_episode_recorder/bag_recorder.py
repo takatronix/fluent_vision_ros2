@@ -22,6 +22,73 @@ from typing import Optional
 
 LOG = logging.getLogger("fv_episode_recorder.bag")
 
+# rosbag2 storage plugins we know how to drive. "sqlite3" stays the default
+# (Humble default, what every existing reader expects). "mcap" needs
+# ros-<distro>-rosbag2-storage-mcap and is opt-in per profile
+# (episode_recorder.bag_storage).
+SUPPORTED_STORAGE = ("sqlite3", "mcap")
+DEFAULT_STORAGE = "sqlite3"
+# file suffix of the split files each storage plugin writes
+_STORAGE_SUFFIX = {"sqlite3": ".db3", "mcap": ".mcap"}
+
+
+def build_record_command(
+    bag_dir: Path,
+    topics: list[str],
+    *,
+    storage: Optional[str] = None,
+    max_bag_size_mb: int = 1024,
+    storage_preset: Optional[str] = None,
+) -> list[str]:
+    """Build the `ros2 bag record` argv.
+
+    storage=None/"sqlite3" (default) produces exactly the historical command
+    line. storage_preset (e.g. "zstd_fast") maps to
+    `--storage-preset-profile` and is only meaningful for mcap — with sqlite3
+    it is ignored with a warning instead of failing the episode start.
+    """
+    storage = (storage or DEFAULT_STORAGE).strip().lower()
+    if storage not in SUPPORTED_STORAGE:
+        raise ValueError(
+            f"unsupported bag storage {storage!r} (expected one of {SUPPORTED_STORAGE})")
+    cmd = [
+        "ros2", "bag", "record",
+        "-o", str(bag_dir),
+        "-s", storage,
+    ]
+    if storage_preset:
+        if storage == "mcap":
+            cmd += ["--storage-preset-profile", str(storage_preset)]
+        else:
+            LOG.warning("bag_storage_preset=%r ignored: only valid with bag_storage=mcap",
+                        storage_preset)
+    cmd += ["-b", str(int(max_bag_size_mb) * 1024 * 1024), *topics]
+    return cmd
+
+
+def detect_bag_storage(bag_dir: Path, default: str = DEFAULT_STORAGE) -> str:
+    """storage_id for rosbag2_py readers: metadata.yaml storage_identifier,
+    else guessed from split-file suffix (bag still recording → no
+    metadata.yaml yet), else ``default``."""
+    bag_dir = Path(bag_dir)
+    meta = bag_dir / "metadata.yaml"
+    if meta.exists():
+        try:
+            import yaml
+
+            info = (yaml.safe_load(meta.read_text()) or {}).get(
+                "rosbag2_bagfile_information") or {}
+            sid = str(info.get("storage_identifier") or "").strip()
+            if sid:
+                return sid
+        except Exception as exc:  # malformed yaml → fall through to suffix guess
+            LOG.warning("metadata.yaml unreadable in %s: %s", bag_dir, exc)
+    if bag_dir.is_dir():
+        for sid, suffix in _STORAGE_SUFFIX.items():
+            if any(bag_dir.glob(f"*{suffix}")):
+                return sid
+    return default
+
 
 class BagRecorder:
     """Single-instance bag recorder. Owns at most one `ros2 bag record` process."""
@@ -32,12 +99,18 @@ class BagRecorder:
         self._topics: list[str] = []
         self.max_bag_size_mb = max_bag_size_mb
         self.storage = storage  # "sqlite3" (rosbag2 default on Humble)
+        self._storage_in_use = storage
 
     @property
     def active(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def start(self, bag_dir: Path, topics: list[str]) -> None:
+    def start(self, bag_dir: Path, topics: list[str], *,
+              storage: Optional[str] = None,
+              storage_preset: Optional[str] = None) -> None:
+        """storage / storage_preset: per-episode override (profile keys
+        episode_recorder.bag_storage / bag_storage_preset). None keeps the
+        recorder default (sqlite3)."""
         if self.active:
             raise RuntimeError("bag recorder already active")
         if not topics:
@@ -53,13 +126,12 @@ class BagRecorder:
             # empty -> remove so `ros2 bag record -o` does not complain
             bag_dir.rmdir()
 
-        cmd = [
-            "ros2", "bag", "record",
-            "-o", str(bag_dir),
-            "-s", self.storage,
-            "-b", str(self.max_bag_size_mb * 1024 * 1024),
-            *topics,
-        ]
+        storage = storage or self.storage
+        cmd = build_record_command(
+            bag_dir, topics, storage=storage,
+            max_bag_size_mb=self.max_bag_size_mb, storage_preset=storage_preset,
+        )
+        self._storage_in_use = storage
         # ros2 needs an inherited env (ROS_DISTRO, AMENT_PREFIX_PATH, etc).
         env = os.environ.copy()
         LOG.info("starting bag recorder: %s", " ".join(cmd))
@@ -112,14 +184,17 @@ class BagRecorder:
             return {"bag_dir": None, "size_bytes": 0, "split_count": 0}
         size = 0
         splits = 0
-        for p in bag_dir.rglob("*.db3"):
-            size += p.stat().st_size
-            splits += 1
+        suffixes = tuple(_STORAGE_SUFFIX.values())
+        for p in bag_dir.rglob("*"):
+            if p.is_file() and p.name.endswith(suffixes):
+                size += p.stat().st_size
+                splits += 1
         # also include metadata.yaml etc
         for p in bag_dir.iterdir():
-            if p.is_file() and not p.name.endswith(".db3"):
+            if p.is_file() and not p.name.endswith(suffixes):
                 size += p.stat().st_size
-        return {"bag_dir": str(bag_dir), "size_bytes": size, "split_count": splits, "topics": self._topics}
+        return {"bag_dir": str(bag_dir), "size_bytes": size, "split_count": splits,
+                "topics": self._topics, "storage": self._storage_in_use}
 
     def abort(self) -> None:
         """Kill without waiting — for crash recovery / discard paths."""

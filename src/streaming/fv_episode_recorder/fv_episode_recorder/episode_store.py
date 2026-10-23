@@ -241,7 +241,8 @@ class EpisodeStore:
         tags / pinned + reason). Returns the updated meta dict, or None
         if the episode isn't found."""
         allowed = {"trim_start_s", "trim_end_s", "task_description",
-                   "tags", "pinned", "pin_reason", "outcome"}
+                   "tags", "pinned", "pin_reason", "outcome",
+                   "quality_metrics"}
         found = self.get_episode(episode_id)
         if found is None:
             return None

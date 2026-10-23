@@ -1,0 +1,30 @@
+schema: fluent.scene/v1alpha1
+kind: Scene
+metadata:
+  name: missing_bounds_fixture
+types:
+  Detection2D:
+    struct:
+      bbox: vec4f
+      score: f32
+      label: string
+inputs:
+  detections:
+    type: sequence<Detection2D, 128>
+    required: true
+    update: per_frame
+nodes:
+  - id: detection_layer
+    type: visual.boxes2d
+    inputs:
+      detections: $inputs.detections
+outputs:
+  frame:
+    type: layer
+    source: $nodes.detection_layer.layer
+budgets:
+  max_width: 1920
+  max_height: 1080
+  max_gpu_bytes: 268435456
+  max_upload_bytes_per_frame: 33554432
+  max_frames_in_flight: 2

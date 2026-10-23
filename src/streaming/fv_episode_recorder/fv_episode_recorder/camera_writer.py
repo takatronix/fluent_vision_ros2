@@ -34,36 +34,43 @@ from sensor_msgs.msg import CompressedImage, Image
 
 from .frames_sidecar import FramesSidecar
 from . import depth10
+from .calibration import camera_info_to_dict
 
 LOG = logging.getLogger("fv_episode_recorder.camera")
 
 
 # ---------------------------------------------------------------------------
-# ffmpeg encoder selection.
+# H.264 encoder selection (佐伯さん, fluent_vision_ros2 #26 / ec28653).
 #
-# Raw frames are piped to ffmpeg already in the encoder's native input format
-# (yuv420p for H.264, p010le for hevc_nvenc) so NO libavfilter conversion is
-# needed. The Jetson ffmpeg package (7:8.0.1-nvidia1, JetPack 7) ships NVENC
-# but only ~30 filters: no `lavfi` (the old probe's test source) and no
-# `scale` (which ffmpeg inserts to convert bgr24 → yuv420p). On that build the
-# lavfi probe reported every encoder as unavailable and the pipe would have
-# died at the first frame anyway ("'scale' filter not present"), so every
-# episode had 0 video frames (aspa2 / aspa3, 2026-10-20). Probing with two
-# black rawvideo frames on stdin works on every ffmpeg build.
+# Raw frames are piped to ffmpeg already in the encoder's input format
+# (yuv420p, converted with cv2 in CameraWriter._to_pipe_bytes) so NO
+# libavfilter conversion is needed. The Jetson ffmpeg package (7:8.0.1-nvidia1,
+# JetPack 7) ships NVENC but only ~30 filters: no `lavfi` (the old probe's test
+# source) and no `scale` (which ffmpeg inserts to convert bgr24 → yuv420p). On
+# that build the lavfi probe reported every encoder as unavailable and the pipe
+# would have died at the first frame anyway ("'scale' filter not present"), so
+# every episode had 0 video frames (aspa2 / aspa3, 2026-10-20). Probing with two
+# black rawvideo frames on stdin works on every ffmpeg build. (The depth path
+# probes the same way in depth10.probe_encoder.)
 # ---------------------------------------------------------------------------
 _PROBE_SIDE = 256   # NVENC rejects tiny frames: a 64x64 probe made h264_nvenc look unavailable
-_PROBE_BYTES_PER_PIXEL = {"yuv420p": 1.5, "bgr24": 3, "bgra": 4, "yuv420p10le": 3, "p010le": 3}
-_probe_ok: set[tuple[str, str]] = set()   # (codec, stdin pix_fmt) that encoded the test frames in this process
-_probe_failed: dict[tuple[str, str], tuple[float, str]] = {}   # key -> (monotonic end, reason)
-_probe_locks: dict[tuple[str, str], threading.Lock] = {}
-_probe_locks_guard = threading.Lock()
+_PROBE_BYTES_PER_PIXEL = {"yuv420p": 1.5, "bgr24": 3}
+_h264_ok: set[tuple[str, str]] = set()     # (codec, stdin pix_fmt) that encoded the test frames in this process
+_h264_failed: dict[tuple[str, str], tuple[float, str]] = {}   # key -> (time.monotonic() at the end, reason)
+_h264_locks: dict[tuple[str, str], threading.Lock] = {}
+_h264_locks_guard = threading.Lock()
 
 
-def _run_probe(codec: str, extra: list[str], pix_fmt: str) -> Optional[str]:
+def _h264_tries() -> list[tuple[str, list[str], str]]:
+    return [
+        # (codec, extra args, stdin pix_fmt)
+        ("h264_nvenc", ["-preset", "p1", "-tune", "ll"], "yuv420p"),               # Tegra HW, fastest
+        ("libx264",    ["-preset", "ultrafast", "-tune", "zerolatency"], "yuv420p"),
+    ]
+
+
+def _run_h264_probe(codec: str, extra: list[str], pix_fmt: str) -> Optional[str]:
     """Encode two black rawvideo frames from stdin. None = usable, else the reason (for the log)."""
-    key = (codec, pix_fmt)
-    if key in _probe_ok:
-        return None
     n = int(_PROBE_SIDE * _PROBE_SIDE * _PROBE_BYTES_PER_PIXEL[pix_fmt]) * 2
     try:
         test = subprocess.run(
@@ -79,71 +86,131 @@ def _run_probe(codec: str, extra: list[str], pix_fmt: str) -> Optional[str]:
     # (e.g. a pixel format conversion that needs the missing `scale` filter).
     if test.returncode != 0 or "Nothing was written" in err:
         return (err or f"exit {test.returncode}")[:200]
-    _probe_ok.add(key)
     return None
 
 
-def _probe_encoder(codec: str, extra: list[str], pix_fmt: str) -> Optional[str]:
-    """_run_probe, one at a time per encoder: cameras whose episode starts while
-    the warm-up probe runs wait for its answer instead of opening NVENC again
-    (a failure is shared only with those waiting; later calls probe again)."""
+def _probe_h264(codec: str, extra: list[str], pix_fmt: str) -> Optional[str]:
+    """_run_h264_probe once per process per encoder, one at a time: cameras whose
+    episode starts while the warm-up probe runs wait for its answer instead of
+    opening NVENC again. A failure is shared only with those waiting; later
+    calls probe again (same rule as _choose_hevc10)."""
     key = (codec, pix_fmt)
-    if key in _probe_ok:
+    if key in _h264_ok:
         return None
     asked = time.monotonic()
-    with _probe_locks_guard:
-        lock = _probe_locks.setdefault(key, threading.Lock())
+    with _h264_locks_guard:
+        lock = _h264_locks.setdefault(key, threading.Lock())
     with lock:
-        failed = _probe_failed.get(key)
+        if key in _h264_ok:
+            return None
+        failed = _h264_failed.get(key)
         if failed is not None and failed[0] >= asked:
             return failed[1]
-        why = _run_probe(codec, extra, pix_fmt)
-        if why is not None:
-            _probe_failed[key] = (time.monotonic(), why)
+        why = _run_h264_probe(codec, extra, pix_fmt)
+        if why is None:
+            _h264_ok.add(key)
+        else:
+            _h264_failed[key] = (time.monotonic(), why)
         return why
 
 
-def _spawn_pipe(cmd: list[str], out_path: Path) -> subprocess.Popen:
-    # stderr must NOT be an unread PIPE: ffmpeg blocks once the pipe buffer
-    # fills, which freezes stdin.write in the worker thread and stalls the
-    # whole recording. Log file instead.
-    with open(out_path.parent / "ffmpeg.log", "ab") as errlog:
-        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errlog)
+def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int
+                          ) -> tuple[subprocess.Popen, str, str] | None:
+    """Try H.264 encoders in priority order. Returns (proc, codec, stdin pix_fmt)
+    or None if all encoders failed. Frames must be written in that pix_fmt
+    (yuv420p = planar I420, see CameraWriter._to_pipe_bytes). Output is
+    faststart mp4 for HTML5 video (browser-native H.264 4:2:0).
+
+    Priority: h264_nvenc (Tegra HW encode) → libx264 (CPU)."""
+    if not shutil.which("ffmpeg"):
+        LOG.error("ffmpeg not found in PATH")
+        return None
+    encoder_tries = _h264_tries()
+    for codec, extra, pix_fmt in encoder_tries:
+        why = _probe_h264(codec, extra, pix_fmt)
+        if why is not None:
+            LOG.warning("[encoder probe] %s (%s in) unavailable: %s", codec, pix_fmt, why)
+            continue
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", pix_fmt,
+            "-s", f"{width}x{height}", "-r", str(fps),
+            "-i", "pipe:0",
+            "-c:v", codec,
+            *extra,
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        # Launch the real encoder pipe.
+        try:
+            # stderr must NOT be an unread PIPE: ffmpeg blocks once the pipe
+            # buffer fills, which freezes stdin.write in the subscriber
+            # callback and stalls the whole recording. Log file instead.
+            with open(out_path.parent / "ffmpeg.log", "ab") as errlog:
+                proc = subprocess.Popen(
+                    cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errlog,
+                )
+            LOG.info("ffmpeg encoder ready: %s (%s in) → %s (%dx%d @ %dfps)",
+                     codec, pix_fmt, out_path.name, width, height, fps)
+            return proc, codec, pix_fmt
+        except Exception as exc:
+            LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
+            continue
+    LOG.error("no H.264 encoder available (tried %s)", [c for c, _, _ in encoder_tries])
+    return None
 
 
-def _h264_tries() -> list[tuple[str, list[str], str]]:
-    return [
-        # (codec, extra args, stdin pix_fmt)
-        ("h264_nvenc", ["-preset", "p1", "-tune", "ll"], "yuv420p"),               # Tegra HW, fastest
-        ("libx264",    ["-preset", "ultrafast", "-tune", "zerolatency"], "yuv420p"),
-    ]
-
-
-def _hevc10_tries(cq: int) -> list[tuple[str, list[str], str]]:
-    return [
-        ("hevc_nvenc", ["-preset", "p5", "-rc", "vbr", "-cq", str(cq),
-                        "-pix_fmt", "p010le", "-profile:v", "main10"], "p010le"),
-        # CPU fallback must never stall the pipe: a blocked stdin.write blocks
-        # the subscriber callback (E2E: D555 depth dropped to 4 frames/77s
-        # while slower encodes hogged the executor). ultrafast + no lookahead.
-        ("libx265", ["-preset", "ultrafast", "-crf", str(cq + 2),
-                     "-pix_fmt", "yuv420p10le", "-profile:v", "main10",
-                     "-x265-params", "log-level=none:bframes=0:rc-lookahead=0"], "yuv420p10le"),
-    ]
+def _spawn_ffmpeg_hevc10_encoder(out_path: Path, width: int, height: int,
+                                 fps: int, cq: int) -> tuple[subprocess.Popen, str] | None:
+    """HEVC Main10 encoder pipe for 10-bit-luma depth video (yuv420p10le stdin).
+    Priority: hevc_nvenc (Tegra HW) → libx265 (CPU). Not browser-playable —
+    this stream is training data, decoded via fv_episode_recorder.depth10."""
+    if not shutil.which("ffmpeg"):
+        LOG.error("ffmpeg not found in PATH")
+        return None
+    encoder_tries = depth10.hevc10_encoder_tries(cq)
+    picked = _choose_hevc10(cq)
+    for codec, extra in ([picked[:2]] if picked else []):
+        # choose_hevc10_encoder probes with rawvideo on stdin (no lavfi — the
+        # Jetson ffmpeg has none) and ffprobes the result: prefer an encoder
+        # that really writes 10-bit; else keep the working one (e.g. hevc_nvenc
+        # → nv12 on the ASPA Jetson) so depth is still recorded, and say so.
+        if not picked[3]:
+            LOG.error("[encoder probe] no verified 10-bit HEVC encoder; using %s (writes %s) — "
+                      "depth is coarser than Main10 (materializer flags bit_depth_ok=false)",
+                      codec, picked[2] or "unknown pix_fmt")
+        cmd = depth10.hevc10_encode_cmd(codec, extra, out_path, width, height, fps)
+        try:
+            # stderr must NOT be an unread PIPE: ffmpeg blocks once the pipe
+            # buffer fills, which freezes stdin.write in the subscriber
+            # callback and stalls the whole recording. Log file instead.
+            errlog = open(out_path.parent / "ffmpeg.log", "ab")
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errlog,
+            )
+            errlog.close()
+            LOG.info("hevc10 encoder ready: %s → %s (%dx%d @ %dfps cq%d)",
+                     codec, out_path.name, width, height, fps, cq)
+            return proc, codec
+        except Exception as exc:
+            LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
+            continue
+    LOG.error("no HEVC Main10 encoder available (tried %s)", [c for c, _ in encoder_tries])
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Encoder warm-up.
 #
 # Opening an NVENC encoder takes ~2 s while aspa3's GPU is busy (CUDA context
-# + encode session). That happened on each camera's first frame — for the
-# first episode after a recorder restart the probe came on top — while the
-# encode thread sat blocked in ffmpeg's stdin, so the 8-frame ingest queue
-# overflowed and the head of the episode was dropped (2026-10-22, aspa3:
-# 69-90 frames per camera on the first episode after a restart, 2-24 later;
-# aspa2 1-12). Now:
-#   - warm_encoders() probes once when the recorder starts (CameraWriterPool),
-#     so no episode waits for a probe;
+# + encode session), and the encoder probes cost about as much again. Both
+# happened on each camera's first frame while the encode thread sat blocked,
+# so the 8-frame ingest queue overflowed and the head of the episode was
+# dropped (2026-10-22, aspa3: 69-90 frames per camera on the first episode
+# after a recorder restart, 2-24 later; aspa2 1-12). Now:
+#   - warm_encoders() runs the depth encoder choice once when the recorder
+#     starts (CameraWriterPool), so no episode waits for that probe;
 #   - _IngestQueue keeps the frames that arrive until the camera's encoder has
 #     written output (bounded), oldest first, with the time the callback got
 #     them.
@@ -152,20 +219,44 @@ _WARMUP_MAX_S = 8.0               # hold at most this long's worth of frames (fp
 _WARMUP_MAX_BYTES = 256 << 20     # … and at most this many message bytes per camera
 _STEADY_QUEUE = 8                 # afterwards: bounded latency, the newest frame is dropped
 
+_hevc10_lock = threading.Lock()
+_hevc10_pick: Optional[tuple] = None
+_hevc10_failed_at = float("-inf")    # time.monotonic() when the last choice found no encoder
+
+
+def _choose_hevc10(cq: int) -> tuple[str, list[str], str | None, bool] | None:
+    """depth10.choose_hevc10_encoder, probed once per process whatever the cq
+    (which encoder works does not depend on it; its options do) and one probe
+    at a time — depth cameras that start during the warm-up wait for it. "No
+    encoder" is shared only with those waiting; later calls probe again."""
+    global _hevc10_pick, _hevc10_failed_at
+    asked = time.monotonic()
+    with _hevc10_lock:
+        if _hevc10_pick is None and _hevc10_failed_at < asked:
+            _hevc10_pick = depth10.choose_hevc10_encoder(cq)
+            if _hevc10_pick is None:
+                _hevc10_failed_at = time.monotonic()
+        picked = _hevc10_pick
+    if picked is None:
+        return None
+    codec, _extra, pix_fmt, ten_bit = picked
+    return codec, dict(depth10.hevc10_encoder_tries(cq))[codec], pix_fmt, ten_bit
+
 
 def warm_encoders(cq: int = 16) -> dict[str, str]:
-    """Probe the H.264 and HEVC Main10 encoders once, in the order the writers
-    try them. Returns {"h264": codec, "hevc10": codec} ("" = none works)."""
+    """Probe the H.264 encoders (in the order the writers try them) and pick the
+    depth encoder now. Returns {"h264": codec, "hevc10": codec} ("" = none works)."""
     out = {"h264": "", "hevc10": ""}
     if not shutil.which("ffmpeg"):
         return out
-    for label, tries in (("h264", _h264_tries()), ("hevc10", _hevc10_tries(cq))):
-        for codec, extra, pix_fmt in tries:
-            why = _probe_encoder(codec, extra, pix_fmt)
-            if why is None:
-                out[label] = codec
-                break
-            LOG.warning("[encoder warm-up] %s (%s in) unavailable: %s", codec, pix_fmt, why)
+    for codec, extra, pix_fmt in _h264_tries():
+        why = _probe_h264(codec, extra, pix_fmt)
+        if why is None:
+            out["h264"] = codec
+            break
+        LOG.warning("[encoder warm-up] %s (%s in) unavailable: %s", codec, pix_fmt, why)
+    picked = _choose_hevc10(cq)
+    out["hevc10"] = picked[0] if picked else ""
     LOG.info("encoders warmed up: %s", out)
     return out
 
@@ -271,82 +362,31 @@ def _maybe_end_warmup(name: str, q: _IngestQueue, proc: Optional[subprocess.Pope
                  name, "up" if writing else "not writing yet", waited, q.peak)
 
 
-def _spawn_ffmpeg_encoder(out_path: Path, width: int, height: int, fps: int
-                          ) -> tuple[subprocess.Popen, str, str] | None:
-    """Try H.264 encoders in priority order. Returns (proc, codec, stdin pix_fmt)
-    or None if all encoders failed. Frames must be written in that pix_fmt
-    (yuv420p = planar I420, see CameraWriter._to_pipe_bytes). Output is
-    faststart mp4 (browser-native H.264 4:2:0).
+class _CameraInfoMixin:
+    """Optional intrinsics captured once per camera.
 
-    Priority: h264_nvenc (Tegra HW encode) → libx264 (CPU)."""
-    if not shutil.which("ffmpeg"):
-        LOG.error("ffmpeg not found in PATH")
-        return None
-    encoder_tries = _h264_tries()
-    for codec, extra, pix_fmt in encoder_tries:
-        why = _probe_encoder(codec, extra, pix_fmt)
-        if why is not None:
-            LOG.warning("[encoder probe] %s (%s in) unavailable: %s", codec, pix_fmt, why)
-            continue
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", pix_fmt,
-            "-s", f"{width}x{height}", "-r", str(fps),
-            "-i", "pipe:0",
-            "-c:v", codec,
-            *extra,
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            str(out_path),
-        ]
-        try:
-            proc = _spawn_pipe(cmd, out_path)
-        except Exception as exc:
-            LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
-            continue
-        LOG.info("ffmpeg encoder ready: %s (%s in) → %s (%dx%d @ %dfps)",
-                 codec, pix_fmt, out_path.name, width, height, fps)
-        return proc, codec, pix_fmt
-    LOG.error("no H.264 encoder available (tried %s)", [c for c, _, _ in encoder_tries])
-    return None
+    CameraWriterPool feeds the first sensor_msgs/CameraInfo from the
+    profile's ``camera_info_topic`` via set_camera_info(); summary() then
+    carries it as ``camera_info`` (meta.json cameras[]). Without a
+    configured topic nothing is added — meta.json stays byte-compatible."""
+
+    camera_info: Optional[dict] = None
+    camera_info_topic: Optional[str] = None
+
+    def set_camera_info(self, info: Optional[dict]) -> None:
+        # first message wins: intrinsics are static per episode
+        if info and self.camera_info is None:
+            self.camera_info = dict(info)
+
+    def _with_camera_info(self, summary: dict) -> dict:
+        if self.camera_info_topic:
+            summary["camera_info_topic"] = self.camera_info_topic
+        if self.camera_info is not None:
+            summary["camera_info"] = self.camera_info
+        return summary
 
 
-def _spawn_ffmpeg_hevc10_encoder(out_path: Path, width: int, height: int,
-                                 fps: int, cq: int) -> tuple[subprocess.Popen, str, str] | None:
-    """HEVC Main10 encoder pipe for 10-bit-luma depth video. Returns (proc,
-    codec, stdin pix_fmt): p010le for hevc_nvenc (its native 10-bit layout,
-    no filter needed), yuv420p10le for libx265. Not browser-playable — this
-    stream is training data, decoded via fv_episode_recorder.depth10."""
-    if not shutil.which("ffmpeg"):
-        LOG.error("ffmpeg not found in PATH")
-        return None
-    encoder_tries = _hevc10_tries(cq)
-    for codec, extra, pix_fmt in encoder_tries:
-        why = _probe_encoder(codec, extra, pix_fmt)
-        if why is not None:
-            LOG.warning("[encoder probe] %s (%s in) unavailable: %s", codec, pix_fmt, why)
-            continue
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", pix_fmt,
-            "-s", f"{width}x{height}", "-r", str(fps),
-            "-i", "pipe:0",
-            "-c:v", codec, *extra,
-            str(out_path),
-        ]
-        try:
-            proc = _spawn_pipe(cmd, out_path)
-        except Exception as exc:
-            LOG.warning("[encoder] %s spawn failed: %s", codec, exc)
-            continue
-        LOG.info("hevc10 encoder ready: %s (%s in) → %s (%dx%d @ %dfps cq%d)",
-                 codec, pix_fmt, out_path.name, width, height, fps, cq)
-        return proc, codec, pix_fmt
-    LOG.error("no HEVC Main10 encoder available (tried %s)", [c for c, _, _ in encoder_tries])
-    return None
-
-
-class CameraWriter:
+class CameraWriter(_CameraInfoMixin):
     """One worker per camera: subscribes, encodes, writes mp4 + sidecar."""
 
     def __init__(
@@ -444,8 +484,6 @@ class CameraWriter:
         (absent on the Jetson ffmpeg package); the encoders take it as is."""
         if self._pix_fmt_in == "yuv420p":
             return cv2.cvtColor(img, cv2.COLOR_BGR2YUV_I420).tobytes()
-        if self._pix_fmt_in == "bgra":
-            return cv2.cvtColor(img, cv2.COLOR_BGR2BGRA).tobytes()
         return np.ascontiguousarray(img).tobytes()        # bgr24
 
     def _on_image(self, msg) -> None:
@@ -560,7 +598,7 @@ class CameraWriter:
 
     def summary(self) -> dict:
         size_bytes = self._segment_file.stat().st_size if self._segment_file.exists() else 0
-        return {
+        return self._with_camera_info({
             "name": self.name,
             "topic": self.topic,
             "dropped_frames": self.dropped_frames,
@@ -578,10 +616,10 @@ class CameraWriter:
                     "size_bytes": size_bytes,
                 }
             ],
-        }
+        })
 
 
-class DepthCameraWriter:
+class DepthCameraWriter(_CameraInfoMixin):
     """16-bit depth (sensor_msgs/Image, encoding 16UC1) → PNG sequence sidecar.
 
     mp4 can't carry 16-bit single-channel losslessly without exotic codecs,
@@ -692,7 +730,7 @@ class DepthCameraWriter:
                 total_bytes += p.stat().st_size
         except OSError:
             pass
-        return {
+        return self._with_camera_info({
             "name": self.name,
             "topic": self.topic,
             "kind": "depth_png_seq",
@@ -706,10 +744,10 @@ class DepthCameraWriter:
             "sidecar_file": f"{self.output_dir.name}/frames.parquet",
             "segments": [],  # PNG sequence — listed via /files/ if needed
             "total_png_bytes": total_bytes,
-        }
+        })
 
 
-class DepthVideoWriter:
+class DepthVideoWriter(_CameraInfoMixin):
     """16-bit depth → 10-bit-luma HEVC Main10 video (lossy, ~30-60× smaller
     than the compressedDepth PNG bag path).
 
@@ -740,7 +778,6 @@ class DepthVideoWriter:
         self._sidecar = FramesSidecar(self.output_dir / "frames.parquet")
         self._ffmpeg: Optional[subprocess.Popen] = None
         self._codec_in_use: str = ""
-        self._pix_fmt_in: str = ""       # p010le (hevc_nvenc) or yuv420p10le (libx265)
         self._uv_bytes: bytes = b""
         self._sub = None
         self._lock = threading.Lock()
@@ -818,25 +855,17 @@ class DepthVideoWriter:
             if depth is None:
                 return
             h, w = depth.shape
-            if (h & 1) or (w & 1):
-                depth = depth[: h & ~1, : w & ~1]      # 4:2:0 needs even dimensions
-                h, w = depth.shape
             if self._ffmpeg is None:
                 spawned = _spawn_ffmpeg_hevc10_encoder(
                     self._segment_file, w, h, self.fps_nominal, self.cq)
                 if spawned is None:
                     LOG.error("[%s] no HEVC Main10 encoder — frame dropped", self.name)
                     return
-                self._ffmpeg, self._codec_in_use, self._pix_fmt_in = spawned
+                self._ffmpeg, self._codec_in_use = spawned
                 self.width, self.height = w, h
                 # flat chroma plane (10-bit neutral 512), built once
-                if self._pix_fmt_in == "p010le":
-                    # p010le: 10 bits MSB-aligned in 16-bit words, chroma interleaved (UVUV…)
-                    self._uv_bytes = np.full((h // 2, w), 512 << 6, dtype="<u2").tobytes()
-                else:
-                    # yuv420p10le: planar U then V, LSB-aligned
-                    self._uv_bytes = np.full((h // 2, w // 2), 512,
-                                             dtype="<u2").tobytes() * 2
+                self._uv_bytes = np.full((h // 2, w // 2), 512,
+                                         dtype="<u2").tobytes() * 2
                 depth10.write_meta(
                     self.output_dir, d_min=self.d_min, d_max=self.d_max,
                     depth_scale_mm=self.depth_scale_mm, width=w, height=h,
@@ -845,11 +874,9 @@ class DepthVideoWriter:
                 LOG.info("[%s] first depth frame %dx%d → %s (%s)",
                          self.name, w, h, self._segment_file, self._codec_in_use)
 
-            y = depth10.pack_luma10(depth, self.d_min, self.d_max, self._pack_lut).astype("<u2")
-            if self._pix_fmt_in == "p010le":
-                y = y << 6                            # LSB-aligned 10-bit → MSB-aligned (p010)
+            y = depth10.pack_luma10(depth, self.d_min, self.d_max, self._pack_lut)
             try:
-                self._ffmpeg.stdin.write(y.tobytes())
+                self._ffmpeg.stdin.write(y.astype("<u2").tobytes())
                 self._ffmpeg.stdin.write(self._uv_bytes)
             except (BrokenPipeError, ValueError) as exc:
                 LOG.warning("[%s] ffmpeg pipe write failed: %s", self.name, exc)
@@ -913,7 +940,7 @@ class DepthVideoWriter:
 
     def summary(self) -> dict:
         size_bytes = self._segment_file.stat().st_size if self._segment_file.exists() else 0
-        return {
+        return self._with_camera_info({
             "name": self.name,
             "topic": self.topic,
             "dropped_frames": self.dropped_frames,
@@ -938,7 +965,7 @@ class DepthVideoWriter:
                     "size_bytes": size_bytes,
                 }
             ],
-        }
+        })
 
 
 class CameraWriterPool:
@@ -948,12 +975,45 @@ class CameraWriterPool:
         self._node = node
         self._writers: dict[str, CameraWriter | DepthCameraWriter | DepthVideoWriter] = {}
         if warm_up:
-            # probe the encoders now, not on the first episode's first frames
+            # pick the depth encoder now, not on the first episode's first frames
             threading.Thread(target=warm_encoders, name="encoder-warmup", daemon=True).start()
         # Depth cameras don't have a writer (they go into the bag) but the
         # play modal still needs them in cameras[]. Stored here so stop_all
         # can re-emit the placeholders alongside the real writers' summaries.
         self._depth_placeholders: list[dict] = []
+        # camera_info_topic subscriptions (one per camera that declares it);
+        # torn down in stop_all.
+        self._info_subs: list = []
+
+    def _subscribe_camera_info(self, writer: _CameraInfoMixin, topic: str) -> None:
+        """Hand the first CameraInfo on ``topic`` to ``writer``. Best effort:
+        any failure is logged and the recording continues without it."""
+        try:
+            from sensor_msgs.msg import CameraInfo
+
+            def _cb(msg, _w=writer) -> None:
+                if _w.camera_info is None:
+                    try:
+                        _w.set_camera_info(camera_info_to_dict(msg))
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning("camera_info convert failed (%s): %s", topic, exc)
+
+            # sensor_data (best effort) also matches reliable publishers and
+            # the usual latched-less camera_info cadence (= image rate).
+            sub = self._node.create_subscription(
+                CameraInfo, topic, _cb, qos_profile_sensor_data)
+            self._info_subs.append(sub)
+            writer.camera_info_topic = topic
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("camera_info subscribe failed (%s): %s", topic, exc)
+
+    def _destroy_info_subs(self) -> None:
+        for sub in self._info_subs:
+            try:
+                self._node.destroy_subscription(sub)
+            except Exception:  # noqa: BLE001
+                pass
+        self._info_subs = []
 
     def start_all(self, episode_dir: Path, cameras: list[dict], fps: int = 30) -> list[dict]:
         """cameras: [{name, topic, kind?, codec?}, ...]. Color cameras get a
@@ -987,6 +1047,8 @@ class CameraWriterPool:
                 )
                 writer.start()
                 self._writers[name] = writer
+                if cam.get("camera_info_topic"):
+                    self._subscribe_camera_info(writer, str(cam["camera_info_topic"]))
                 continue
             if kind == "depth":
                 # No on-disk writer — depth lives in the bag. Synthesize a
@@ -1012,6 +1074,8 @@ class CameraWriterPool:
             )
             writer.start()
             self._writers[name] = writer
+            if cam.get("camera_info_topic"):
+                self._subscribe_camera_info(writer, str(cam["camera_info_topic"]))
         return [w.summary() for w in self._writers.values()] + self._depth_placeholders
 
     def apply_depth_frame_counts(self, counts: dict[str, int]) -> None:
@@ -1026,6 +1090,7 @@ class CameraWriterPool:
                 ph["frame_count"] = int(counts[name])
 
     def stop_all(self) -> list[dict]:
+        self._destroy_info_subs()
         summaries = []
         for name, writer in list(self._writers.items()):
             summaries.append(writer.stop())

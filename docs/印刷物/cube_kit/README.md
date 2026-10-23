@@ -19,7 +19,7 @@ compatibility.
 | cube100_c | 100 mm (printed body) | 50 mm (black 40) | 33–38   |
 
 The hand-eye calibration tag (ID 0) lives in
-`../field_tags/sheets/sheet_calibration_id000_x12_50mm.pdf`.
+`../field_tags/sheets/000_calib_x12_50mm.pdf`.
 
 IDs 19 and 20 are deliberately skipped (buffer + legacy calibration
 ID 20 still referenced in some scene_viewer labels at time of

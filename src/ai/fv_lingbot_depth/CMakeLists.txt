@@ -27,8 +27,9 @@ install(DIRECTORY resource/
 
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
-  ament_add_pytest_test(test_input_demand test/test_input_demand.py TIMEOUT 30
-    ENV ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)
+  # 需要駆動ゲートの単体テスト。ROS には触らないので実機でも安全に回せる
+  # (ROSノードを構築するテストは 2026-08-23 に 52GB 食ってスタックを落とした)。
+  ament_add_pytest_test(test_demand_gate test/test_demand_gate.py)
 endif()
 
 ament_package()

@@ -14,9 +14,7 @@ rtabmap/
 │   ├── localization.yaml       # ローカライゼーション設定
 │   └── performance.yaml        # パフォーマンス調整設定
 ├── launch/                      # Launch ファイル群
-│   ├── rtabmap_rgbd.launch.py  # RGB-D カメラ用
-│   ├── rtabmap_lidar.launch.py # LiDAR 用
-│   └── rtabmap_multi.launch.py # マルチセンサー用
+│   └── rtabmap_rgbd.launch.py  # RGB-D カメラ用
 └── scripts/                     # 実行スクリプト群
     ├── start_mapping.sh         # マッピング開始
     ├── start_localization.sh    # ローカライゼーション開始

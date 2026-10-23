@@ -60,7 +60,7 @@ class _FakeProc:
 
 
 def SPAWN_H264(open_s: float):
-    return lambda out, w, h, fps: (_FakeProc(out, open_s), "fake", "yuv420p")
+    return lambda out, w, h, fps: (_FakeProc(out, open_s), "fake", "bgr24")
 
 
 def _jpeg_msg(i: int) -> CompressedImage:
@@ -143,7 +143,7 @@ def test_queue_drop_pending_counts_what_stop_gave_up_on():
 @pytest.mark.parametrize("open_s", [1.0, 2.5])
 def test_camera_writer_keeps_head_while_encoder_opens(tmp_path, monkeypatch, open_s):
     monkeypatch.setattr(cw, "_spawn_ffmpeg_encoder",
-                        lambda out, w, h, fps: (_FakeProc(out, open_s), "fake", "yuv420p"))
+                        SPAWN_H264(open_s))
     w = cw.CameraWriter("main", "/t", tmp_path / "main", fps=30, node=_FakeNode())
     w.start()
     sent = _feed(w, _jpeg_msg, 90)
@@ -162,7 +162,7 @@ def test_camera_writer_old_queue_would_drop_the_head(tmp_path, monkeypatch):
     """Control: with the steady 8-frame bound from the start (the old queue)
     the same encoder open loses the head — the test above is meaningful."""
     monkeypatch.setattr(cw, "_spawn_ffmpeg_encoder",
-                        lambda out, w, h, fps: (_FakeProc(out, 1.0), "fake", "yuv420p"))
+                        SPAWN_H264(1.0))
     w = cw.CameraWriter("main", "/t", tmp_path / "main", fps=30, node=_FakeNode())
     w._queue = cw._IngestQueue(warm_frames=8)
     w._queue.end_warmup()
@@ -173,7 +173,7 @@ def test_camera_writer_old_queue_would_drop_the_head(tmp_path, monkeypatch):
 
 def test_depth_writer_keeps_head_while_encoder_opens(tmp_path, monkeypatch):
     monkeypatch.setattr(cw, "_spawn_ffmpeg_hevc10_encoder",
-                        lambda out, w, h, fps, cq: (_FakeProc(out, 1.0), "fake", "p010le"))
+                        lambda out, w, h, fps, cq: (_FakeProc(out, 1.0), "fake"))
     w = cw.DepthVideoWriter("depth", "/d", tmp_path / "depth", fps=30, node=_FakeNode(),
                             d_min=400, d_max=4000)
     w.start()
@@ -197,7 +197,7 @@ def test_warmup_clock_starts_at_the_first_frame(tmp_path, monkeypatch):
 
 def test_warmup_ends_once_encoder_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(cw, "_spawn_ffmpeg_encoder",
-                        lambda out, w, h, fps: (_FakeProc(out, 0.5), "fake", "yuv420p"))
+                        SPAWN_H264(0.5))
     w = cw.CameraWriter("main", "/t", tmp_path / "main", fps=30, node=_FakeNode())
     w.start()
     _feed(w, _jpeg_msg, 30)
@@ -206,70 +206,159 @@ def test_warmup_ends_once_encoder_writes(tmp_path, monkeypatch):
     w.stop()
 
 
-# --- probe once, at recorder start ----------------------------------------
+# --- depth encoder chosen once, at recorder start --------------------------
 
-def _fake_run(calls, fail=(), delay=0.0):
-    def run(cmd, **kw):
-        codec = cmd[cmd.index("-c:v") + 1]
-        calls.append(codec)
+def _fake_choose(calls, delay=0.0):
+    def choose(cq, probe=None):
+        calls.append(cq)
         time.sleep(delay)
-        return subprocess.CompletedProcess(cmd, 1 if codec in fail else 0, b"", b"")
-    return run
+        return ("hevc_nvenc", dict(cw.depth10.hevc10_encoder_tries(cq))["hevc_nvenc"], "p010le", True)
+    return choose
 
 
-def test_probe_runs_once_for_concurrent_callers(monkeypatch):
-    calls: list[str] = []
-    monkeypatch.setattr(cw, "_probe_ok", set())
-    monkeypatch.setattr(cw, "_probe_failed", {})
-    monkeypatch.setattr(cw.subprocess, "run", _fake_run(calls, delay=0.3))
+def test_hevc10_choice_probed_once_whatever_cq(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(cw, "_hevc10_pick", None)
+    monkeypatch.setattr(cw, "_hevc10_failed_at", float("-inf"))
+    monkeypatch.setattr(cw.depth10, "choose_hevc10_encoder", _fake_choose(calls, delay=0.3))
     out: list = []
-    ts = [threading.Thread(target=lambda: out.append(cw._probe_encoder("h264_nvenc", [], "yuv420p")))
-          for _ in range(4)]
+    ts = [threading.Thread(target=lambda cq=cq: out.append(cw._choose_hevc10(cq))) for cq in (16, 18, 16, 18)]
     for t in ts:
         t.start()
     for t in ts:
         t.join()
-    assert out == [None] * 4
-    assert calls == ["h264_nvenc"]
+    assert len(calls) == 1                                # one probe, the others waited for it
+    for picked in out:
+        assert picked[0] == "hevc_nvenc" and picked[3] is True
+    assert {p[1][p[1].index("-cq") + 1] for p in out} == {"16", "18"}   # options follow each camera's cq
 
 
-def test_failed_probe_is_shared_with_waiters_only(monkeypatch):
-    calls: list[str] = []
-    monkeypatch.setattr(cw, "_probe_ok", set())
-    monkeypatch.setattr(cw, "_probe_failed", {})
-    monkeypatch.setattr(cw.subprocess, "run", _fake_run(calls, fail={"h264_nvenc"}, delay=0.3))
-    out: list = []
-    ts = [threading.Thread(target=lambda: out.append(cw._probe_encoder("h264_nvenc", [], "yuv420p")))
-          for _ in range(4)]
-    for t in ts:
-        t.start()
-    for t in ts:
-        t.join()
-    assert len(out) == 4 and None not in out
-    assert calls == ["h264_nvenc"]                        # not 4 probes one after another
-    assert cw._probe_encoder("h264_nvenc", [], "yuv420p") is not None
-    assert calls == ["h264_nvenc"] * 2                    # a later episode tries again
+def _fresh_h264(monkeypatch, probe):
+    monkeypatch.setattr(cw, "_h264_ok", set())
+    monkeypatch.setattr(cw, "_h264_failed", {})
+    monkeypatch.setattr(cw, "_h264_locks", {})
+    monkeypatch.setattr(cw, "_run_h264_probe", probe)
 
 
-def test_warm_encoders_probes_in_writer_order_and_caches(monkeypatch):
-    calls: list[str] = []
-    monkeypatch.setattr(cw, "_probe_ok", set())
-    monkeypatch.setattr(cw, "_probe_failed", {})
+def test_warm_encoders_picks_the_depth_encoder(monkeypatch):
+    calls: list[int] = []
+    h264: list[str] = []
+    monkeypatch.setattr(cw, "_hevc10_pick", None)
+    monkeypatch.setattr(cw, "_hevc10_failed_at", float("-inf"))
     monkeypatch.setattr(cw.shutil, "which", lambda name: "/usr/bin/" + name)
-    monkeypatch.setattr(cw.subprocess, "run", _fake_run(calls, fail={"h264_nvenc"}))
+    monkeypatch.setattr(cw.depth10, "choose_hevc10_encoder", _fake_choose(calls))
+    _fresh_h264(monkeypatch, lambda codec, extra, pix_fmt: h264.append(codec) or (
+        "no NVENC" if codec == "h264_nvenc" else None))
     assert cw.warm_encoders() == {"h264": "libx264", "hevc10": "hevc_nvenc"}
-    assert calls == ["h264_nvenc", "libx264", "hevc_nvenc"]
-    calls.clear()
-    assert cw._probe_encoder("libx264", [], "yuv420p") is None
-    assert cw._probe_encoder("hevc_nvenc", [], "p010le") is None
-    assert calls == []                                    # episodes don't probe again
+    cw._choose_hevc10(18)
+    assert calls == [16]                                  # episodes don't probe again
+    assert cw._probe_h264("libx264", [], "yuv420p") is None and h264 == ["h264_nvenc", "libx264"]
+
+
+# --- H.264 encoder probe (佐伯さん, #26): rawvideo on stdin, no lavfi / scale ----
+
+def test_h264_probe_feeds_rawvideo_on_stdin_not_lavfi(monkeypatch):
+    seen = {}
+
+    def run(cmd, input=None, **kwargs):
+        seen["cmd"], seen["n"] = cmd, len(input or b"")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(cw.subprocess, "run", run)
+    assert cw._run_h264_probe("h264_nvenc", ["-preset", "p1"], "yuv420p") is None
+    assert "lavfi" not in seen["cmd"] and seen["cmd"][seen["cmd"].index("-i") + 1] == "pipe:0"
+    assert seen["cmd"][seen["cmd"].index("-pix_fmt") + 1] == "yuv420p"
+    assert seen["n"] == int(256 * 256 * 1.5) * 2          # two black I420 frames
+
+
+def test_h264_probe_nothing_written_is_a_failure(monkeypatch):
+    # The Jetson ffmpeg exits 0 with "Nothing was written" when it cannot open the encoder.
+    monkeypatch.setattr(cw.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, b"", b"Nothing was written into output file"))
+    assert "Nothing was written" in cw._run_h264_probe("h264_nvenc", [], "yuv420p")
+
+
+def test_h264_probe_once_and_failure_shared_with_waiters_only(monkeypatch):
+    calls: list[str] = []
+
+    def failing(codec, extra, pix_fmt):
+        calls.append(codec)
+        time.sleep(0.3)
+        return "no encoder"
+
+    _fresh_h264(monkeypatch, failing)
+    out: list = []
+    ts = [threading.Thread(target=lambda: out.append(cw._probe_h264("h264_nvenc", [], "yuv420p"))) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert out == ["no encoder"] * 3 and calls == ["h264_nvenc"]
+    assert cw._probe_h264("h264_nvenc", [], "yuv420p") == "no encoder" and len(calls) == 2   # later: probe again
+    _fresh_h264(monkeypatch, lambda *a: calls.append("ok") and None)
+    assert cw._probe_h264("libx264", [], "yuv420p") is None
+    assert cw._probe_h264("libx264", [], "yuv420p") is None and calls.count("ok") == 1      # success is cached
+
+
+def test_h264_frames_are_written_as_i420_with_even_dimensions(tmp_path, monkeypatch):
+    sizes: list = []
+    written: list[int] = []
+
+    class _Stdin:
+        def write(self, data):
+            written.append(len(data))
+
+        def close(self):
+            pass
+
+    class _Proc:
+        stdin = _Stdin()
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    def spawn(out, w, h, fps):
+        sizes.append((w, h))
+        return _Proc(), "fake", "yuv420p"
+
+    monkeypatch.setattr(cw, "_spawn_ffmpeg_encoder", spawn)
+    w = cw.CameraWriter("main", "/t", tmp_path / "main", fps=30, node=_FakeNode())
+    w.start()
+    m = CompressedImage()
+    m.format = "jpeg"
+    m.data = cv2.imencode(".jpg", np.zeros((47, 63, 3), np.uint8))[1].tobytes()
+    w._on_image(m)
+    w.stop()
+    assert sizes == [(62, 46)] and written == [62 * 46 * 3 // 2]
+
+
+def test_no_hevc10_encoder_is_shared_with_waiters_only(monkeypatch):
+    calls: list[int] = []
+
+    def none(cq, probe=None):
+        calls.append(cq)
+        time.sleep(0.3)
+
+    monkeypatch.setattr(cw, "_hevc10_pick", None)
+    monkeypatch.setattr(cw, "_hevc10_failed_at", float("-inf"))
+    monkeypatch.setattr(cw.depth10, "choose_hevc10_encoder", none)
+    out: list = []
+    ts = [threading.Thread(target=lambda: out.append(cw._choose_hevc10(16))) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert out == [None] * 3 and calls == [16]            # not 3 probes one after another
+    assert cw._choose_hevc10(16) is None and calls == [16, 16]   # a later episode tries again
 
 
 # --- real ffmpeg ------------------------------------------------------------
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg unavailable")
 def test_real_encoder_round_trip(tmp_path):
-    cw.warm_encoders()
     w = cw.CameraWriter("main", "/t", tmp_path / "main", fps=30, node=_FakeNode())
     w.start()
     _feed(w, _jpeg_msg, 45)
@@ -281,3 +370,24 @@ def test_real_encoder_round_trip(tmp_path):
     while cap.read()[0]:
         n += 1
     assert n == 45
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg unavailable")
+def test_real_encoder_keeps_colours_through_i420(tmp_path):
+    """BGR → I420 (cv2) → ffmpeg: red stays red (U/V not swapped), odd sizes are cropped to even."""
+    w = cw.CameraWriter("main", "/t", tmp_path / "main", fps=30, node=_FakeNode())
+    w.start()
+    for i in range(10):
+        m = CompressedImage()
+        m.format = "png"
+        img = np.zeros((101, 161, 3), np.uint8)
+        img[:, :] = (0, 0, 255)                                   # BGR red
+        m.data = cv2.imencode(".png", img)[1].tobytes()
+        w._on_image(m)
+        time.sleep(1 / 30)
+    s = w.stop()
+    assert s["frame_count"] == 10 and (s["width"], s["height"]) == (160, 100)
+    ok, frame = cv2.VideoCapture(str(tmp_path / "main" / "0000.mp4")).read()
+    assert ok and frame.shape[:2] == (100, 160)
+    b, g, r = frame.reshape(-1, 3).mean(axis=0)
+    assert r > 200 and g < 40 and b < 40

@@ -16,14 +16,14 @@
 ### 🧠 記憶再構築（必須実行）
 ```bash
 # 1. プロジェクト状況確認
-cat /home/aspara/seedbox-r1/fluent_vision_ros2/README.md
-find /home/aspara/seedbox-r1/fluent_vision_ros2 -name "TODO*.md" -o -name "TODO*.txt" | xargs cat
+cat <リポジトリルート>/README.md
+find <リポジトリルート> -name "TODO*.md" -o -name "TODO*.txt" | xargs cat
 
 # 2. 最新の作業履歴確認
-ls -la /home/aspara/seedbox-r1/fluent_vision_ros2/_history/sessions/
+ls -la <リポジトリルート>/_history/sessions/
 
 # 3. git状況確認
-cd /home/aspara/seedbox-r1/fluent_vision_ros2 && git status
+cd <リポジトリルート> && git status
 ```
 
 ### 報告テンプレート
@@ -138,10 +138,10 @@ echo "停止方法: kill $NODE_PID"
 
 ### ビルドコマンド
 ```bash
-cd /home/aspara/seedbox-r1/fluent_vision_ros2
+cd <リポジトリルート>
 
-# 標準ビルド
-colcon build --symlink-install
+# 標準ビルド（--symlink-install は禁止 — aarch64/Tegra で install/ が壊れる）
+colcon build
 
 # 特定パッケージ
 colcon build --packages-select [package_name]
@@ -154,10 +154,10 @@ source install/setup.bash
 ### システム起動
 ```bash
 # 起動（必須方法）
-./script/start_fv
+./scripts/start_fv
 
 # 停止
-./script/stop_fv
+./scripts/stop_fv
 
 # 状態確認
 ros2 topic list

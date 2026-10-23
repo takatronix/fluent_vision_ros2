@@ -12,6 +12,7 @@ Other endpoints (markers, replay, export, disk, retention) land in later steps.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -24,7 +25,7 @@ from aiohttp import web
 from .active_lock import ActiveLock
 from .batch_runner import BatchConfig, BatchRunner
 from .replay_runner import ReplayRunner
-from .bag_recorder import BagRecorder
+from .bag_recorder import BagRecorder, detect_bag_storage
 from .camera_writer import CameraWriterPool
 from .episode_store import EpisodeMeta, EpisodeStore, new_episode_id, utc_now_iso
 from .marker_manager import MarkerManager
@@ -73,7 +74,7 @@ async def _cors_middleware(request, handler):
             status=204,
             headers={
                 "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+                "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
                 "Access-Control-Allow-Headers": "Content-Type,Authorization",
                 "Access-Control-Max-Age": "86400",
             },
@@ -119,6 +120,8 @@ def build_app(
     app.router.add_get("/api/v1/episodes/{episode_id}/depth_preview/{camera}/{frame}", _depth_preview)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints", _episode_joints)
     app.router.add_get("/api/v1/episodes/{episode_id}/joints.csv", _episode_joints_csv)
+    # Bulk quality_metrics for one batch (distribution overlay in the UI).
+    app.router.add_get("/api/v1/batches/{batch_id}/metrics", _batch_metrics)
     # Batch loop (LeRobot-style auto-cycle) so the operator clicks once for 100 runs.
     app.router.add_post("/api/v1/episodes/batch_start", _batch_start)
     app.router.add_get("/api/v1/episodes/batch_status", _batch_status)
@@ -476,7 +479,11 @@ async def _start_episode(request: web.Request) -> web.Response:
             LOG.warning("ros2 not available, skipping bag record")
         else:
             try:
-                bag_recorder.start(ep_dir / "bag", bag_topics)
+                from .topic_discovery import discover_bag_options
+                bag_opts = discover_bag_options(profile_dict or {})
+                bag_recorder.start(ep_dir / "bag", bag_topics,
+                                   storage=bag_opts["storage"],
+                                   storage_preset=bag_opts["storage_preset"])
                 bag_started = True
             except Exception as exc:
                 LOG.error("bag recorder start failed: %s", exc)
@@ -668,6 +675,47 @@ async def _list_episodes(request: web.Request) -> web.Response:
         "next_cursor": next_cursor,
         "total": total,
     })
+
+
+async def _batch_metrics(request: web.Request) -> web.Response:
+    """Bulk quality_metrics for one batch (distribution overlay).
+
+    One request instead of N x GET /episodes/{id}: episode dirs come from
+    the sqlite index (no filesystem glob) and the meta.json reads happen
+    off the event loop. Episodes without quality_metrics report null so
+    the UI can distinguish "no metrics yet" from an empty payload.
+    """
+    batch_id = request.match_info["batch_id"]
+    store: EpisodeStore = request.app["store"]
+    rows, _cursor, _total = store.list_episodes_indexed(
+        limit=500, cursor=None, profile=None,
+        batch_id=batch_id, pinned_only=False, env=None)
+
+    def _collect() -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            qm = None
+            ep_dir = r.get("ep_dir")
+            if ep_dir:
+                try:
+                    with (Path(ep_dir) / "meta.json").open() as f:
+                        qm = json.load(f).get("quality_metrics")
+                except (OSError, ValueError):
+                    qm = None
+            out.append({
+                "episode_id": r["episode_id"],
+                "task_description": r["task_description"],
+                "outcome": r.get("outcome"),
+                "duration_s": r.get("duration_s"),
+                "tags": r.get("tags") or [],
+                "quality_metrics": qm,
+            })
+        return out
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    episodes = await loop.run_in_executor(None, _collect)
+    return web.json_response({"batch_id": batch_id, "episodes": episodes})
 
 
 def _summarize_controller(snap: Optional[dict[str, Any]]) -> Optional[str]:
@@ -874,7 +922,10 @@ async def _episode_joints(request: web.Request) -> web.Response:
         from rclpy.serialization import deserialize_message
         from rosidl_runtime_py.utilities import get_message
 
-        storage_options = rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id="sqlite3")
+        # sqlite3 (default) or mcap (profile bag_storage) — read the id
+        # from metadata.yaml instead of assuming sqlite3.
+        storage_options = rosbag2_py.StorageOptions(
+            uri=str(bag_dir), storage_id=detect_bag_storage(bag_dir))
         converter_options = rosbag2_py.ConverterOptions(
             input_serialization_format="cdr", output_serialization_format="cdr"
         )
@@ -1078,7 +1129,10 @@ async def _depth_preview(request: web.Request) -> web.Response:
             import rosbag2_py
             from rclpy.serialization import deserialize_message
             from rosidl_runtime_py.utilities import get_message
-            storage_options = rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id="sqlite3")
+            # sqlite3 (default) or mcap (profile bag_storage) — read the id
+            # from metadata.yaml instead of assuming sqlite3.
+            storage_options = rosbag2_py.StorageOptions(
+                uri=str(bag_dir), storage_id=detect_bag_storage(bag_dir))
             converter_options = rosbag2_py.ConverterOptions(
                 input_serialization_format="cdr", output_serialization_format="cdr"
             )

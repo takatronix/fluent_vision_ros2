@@ -37,6 +37,21 @@ set(REALSENSE2_LIBRARIES "")
 # 方法0: CMake config (正規)。ros-jazzy-librealsense2 は
 # /opt/ros/<distro>/lib/<arch>/cmake/realsense2/ に config を置く
 # (lib 本体も <arch> サブディレクトリ側 — 方法2 の固定パスには載らない)。
+# 同じ版のSDKが ~/.local と /usr/local に共存する機体では、ユーザー側configを
+# 拾うとビルド時と実行時で別librealsenseになり得る。librealsense内蔵FastCDRと
+# ROS 2 FastCDRのABIが衝突し、rmw participant生成時に即死するため、システム側
+# configを先に固定する。明示された realsense2_DIR は尊重する。
+if(NOT realsense2_DIR)
+  foreach(_rs2_config_dir
+      "/opt/ros/$ENV{ROS_DISTRO}/lib/${CMAKE_LIBRARY_ARCHITECTURE}/cmake/realsense2"
+      "/usr/local/lib/cmake/realsense2")
+    if(EXISTS "${_rs2_config_dir}/realsense2Config.cmake")
+      set(realsense2_DIR "${_rs2_config_dir}" CACHE PATH
+          "Preferred RealSense SDK CMake config")
+      break()
+    endif()
+  endforeach()
+endif()
 find_package(realsense2 CONFIG QUIET)
 if(realsense2_FOUND)
   set(REALSENSE2_FOUND TRUE)
@@ -59,7 +74,7 @@ if(NOT REALSENSE2_FOUND AND REALSENSE2_PKG_FOUND)
   set(REALSENSE2_INCLUDE_DIRS ${REALSENSE2_PKG_INCLUDE_DIRS})
   set(REALSENSE2_LIBRARIES ${REALSENSE2_PKG_LIBRARIES})
   message(STATUS "Found RealSense SDK via pkg-config")
-else()
+elseif(NOT REALSENSE2_FOUND)
   # 方法2: 直接ライブラリを検索
   find_library(REALSENSE2_LIB
     NAMES realsense2 librealsense2
@@ -215,6 +230,11 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}  # インストール先：share/fv_realsense/
 )
 
+install(PROGRAMS
+  scripts/fv-uvcvideo
+  DESTINATION bin
+)
+
 # ヘッダーファイルのインストール
 install(DIRECTORY include/
   DESTINATION include/       # インストール先：include/
@@ -224,6 +244,11 @@ install(DIRECTORY include/
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)                    # 自動リントツール
   ament_lint_auto_find_test_dependencies()                  # テスト依存関係検索
+
+  add_test(
+    NAME test_fv_uvcvideo
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_fv_uvcvideo.sh
+  )
 endif()
 
 # ===== パッケージエクスポート設定 =====
