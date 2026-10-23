@@ -8,6 +8,8 @@
  */
 
 #include "fv_realsense/fv_realsense_node.hpp"
+#include "fv_realsense/pointcloud_geometry.hpp"
+#include <librealsense2/rsutil.h>
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
 #include "fv_realsense/srv/set_mode.hpp"
@@ -30,6 +32,28 @@
 #include <pthread.h>
 #include <stdexcept>
 #include <thread>
+
+namespace {
+
+// XYZ remains in the depth optical frame. Only the RGB lookup is projected
+// through the calibrated depth-to-color extrinsics and color intrinsics.
+cv::Vec3b pointColor(const cv::Mat& color, const rs2_intrinsics& intrinsics,
+                    const rs2_extrinsics& depth_to_color, const float depth_point[3]) {
+    float color_point[3];
+    rs2_transform_point_to_point(color_point, &depth_to_color, depth_point);
+    if (!std::isfinite(color_point[2]) || color_point[2] <= 0.0f) {
+        return cv::Vec3b(0, 0, 0);
+    }
+    float pixel[2];
+    rs2_project_point_to_pixel(pixel, &intrinsics, color_point);
+    int u, v;
+    if (!fv_realsense::projectedColorPixel(pixel[0], pixel[1], color.cols, color.rows, u, v)) {
+        return cv::Vec3b(0, 0, 0);
+    }
+    return color.at<cv::Vec3b>(v, u);
+}
+
+} // namespace
 
 /**
  * @brief コンストラクタ
@@ -1729,9 +1753,9 @@ void FVDepthCameraNode::queueFramesForPublish(
 
             sensor_msgs::msg::PointCloud2 cloud_msg;
             cloud_msg.header.stamp = now;
-            cloud_msg.header.frame_id = align_to_color_ ? tf_config_.color_optical_frame : tf_config_.depth_optical_frame;
-            cloud_msg.width = dw / step;
-            cloud_msg.height = dh / step;
+            cloud_msg.header.frame_id = tf_config_.depth_optical_frame;
+            cloud_msg.width = fv_realsense::sampledExtent(dw, step);
+            cloud_msg.height = fv_realsense::sampledExtent(dh, step);
             cloud_msg.is_bigendian = false;
             cloud_msg.is_dense = false;
 
@@ -1743,11 +1767,13 @@ void FVDepthCameraNode::queueFramesForPublish(
             cloud_msg.fields = fields;
             cloud_msg.point_step = point_step;
             cloud_msg.row_step = cloud_msg.point_step * cloud_msg.width;
-            cloud_msg.data.resize(cloud_msg.row_step * cloud_msg.height);
+            cloud_msg.data.resize(static_cast<size_t>(cloud_msg.row_step) * cloud_msg.height);
 
             cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
             cv::Mat color_image;
+            rs2_extrinsics depth_to_color{};
             if (include_rgb) {
+                depth_to_color = depth_frame.get_profile().get_extrinsics_to(color_frame.get_profile());
                 color_image = cv::Mat(cv::Size(color_intrinsics_.width, color_intrinsics_.height), CV_8UC3, (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
             }
 
@@ -1777,7 +1803,8 @@ void FVDepthCameraNode::queueFramesForPublish(
                     if (include_rgb) {
                         float rgbf = std::numeric_limits<float>::quiet_NaN();
                         if (!color_image.empty()) {
-                            cv::Vec3b c = color_image.at<cv::Vec3b>(v,u);
+                            const float point[3] = {x, y, z};
+                            cv::Vec3b c = pointColor(color_image, color_intrinsics_, depth_to_color, point);
                             uint32_t rgb = (uint32_t(c[2])<<16) | (uint32_t(c[1])<<8) | uint32_t(c[0]);
                             memcpy(&rgbf,&rgb,4);
                         }
@@ -1901,7 +1928,7 @@ void FVDepthCameraNode::queueFramesForPublish(
     // Optional point cloud (requires both frames)
     if (include_depth_messages && current_mode == 2 &&
         stream_config_.pointcloud_enabled && color_frame && depth_frame) {
-        bundle.pointcloud = buildPointCloud(color_frame, depth_frame);
+        bundle.pointcloud = buildPointCloud(color_frame, depth_frame, stamp);
     }
 
     enqueuePublishBundle(std::move(bundle));
@@ -1938,7 +1965,8 @@ cv::Rect FVDepthCameraNode::resolveDepthRoi() const
 
 std::unique_ptr<sensor_msgs::msg::PointCloud2> FVDepthCameraNode::buildPointCloud(
     const rs2::frame& color_frame,
-    const rs2::frame& depth_frame)
+    const rs2::frame& depth_frame,
+    const rclcpp::Time& stamp)
 {
     RCLCPP_DEBUG(this->get_logger(), "🔍 buildPointCloud called");
     
@@ -1959,6 +1987,11 @@ std::unique_ptr<sensor_msgs::msg::PointCloud2> FVDepthCameraNode::buildPointClou
     size_t sub_count = pointcloud_pub_->get_subscription_count();
     RCLCPP_DEBUG(this->get_logger(), "📊 Point cloud publisher - subscribers: %zu", sub_count);
     
+    if (sub_count == 0) {
+        return nullptr;
+    }
+    const auto depth_to_color = depth_frame.get_profile().get_extrinsics_to(color_frame.get_profile());
+
     // Create point cloud
     pcl::PointCloud<pcl::PointXYZRGB> cloud;
     
@@ -1990,7 +2023,7 @@ std::unique_ptr<sensor_msgs::msg::PointCloud2> FVDepthCameraNode::buildPointClou
                 pcl_point.z = point[2];
                 
                 // Get color
-                cv::Vec3b color = color_image.at<cv::Vec3b>(y, x);
+                cv::Vec3b color = pointColor(color_image, color_intrinsics_, depth_to_color, point);
                 pcl_point.r = color[2];
                 pcl_point.g = color[1];
                 pcl_point.b = color[0];
@@ -2012,8 +2045,8 @@ std::unique_ptr<sensor_msgs::msg::PointCloud2> FVDepthCameraNode::buildPointClou
     
     auto cloud_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
     pcl::toROSMsg(cloud, *cloud_msg);
-    cloud_msg->header.stamp = rclcpp::Clock(RCL_SYSTEM_TIME).now();
-    cloud_msg->header.frame_id = tf_config_.color_optical_frame;
+    cloud_msg->header.stamp = stamp;
+    cloud_msg->header.frame_id = tf_config_.depth_optical_frame;
     return cloud_msg;
 }
 

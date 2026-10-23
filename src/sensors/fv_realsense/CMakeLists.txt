@@ -245,6 +245,9 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)                    # 自動リントツール
   ament_lint_auto_find_test_dependencies()                  # テスト依存関係検索
 
+  add_executable(test_pointcloud_geometry test/test_pointcloud_geometry.cpp)
+  add_test(NAME test_pointcloud_geometry COMMAND test_pointcloud_geometry)
+
   add_test(
     NAME test_fv_uvcvideo
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_fv_uvcvideo.sh

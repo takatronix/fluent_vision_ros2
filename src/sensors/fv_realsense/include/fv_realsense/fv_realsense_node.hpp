@@ -369,7 +369,8 @@ private:
         bool include_depth_messages);
     std::unique_ptr<sensor_msgs::msg::PointCloud2> buildPointCloud(
         const rs2::frame& color_frame,
-        const rs2::frame& depth_frame);
+        const rs2::frame& depth_frame,
+        const rclcpp::Time& stamp);
     // depth_roi_config_ と depth 内部パラメータから切り出し矩形を決める。
     // 画像内へクランプ済みなので、返り値はそのまま cv::Mat の部分行列に使える。
     cv::Rect resolveDepthRoi() const;
