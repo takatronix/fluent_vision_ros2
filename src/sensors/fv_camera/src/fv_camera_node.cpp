@@ -431,8 +431,16 @@ void FVUSBCameraNode::processingLoop()
             continue;
         }
 
-        // Capture frame
-        if (!camera_.read(frame)) {
+        // Capture frame. With nobody subscribed to the color or compressed
+        // stream, grab() only: the frame is pulled from the driver but never
+        // decoded (MJPG → BGR), rotated or published. A 1080p MJPG decode +
+        // rotate cost ~0.35 core at 15 fps on aspa3 (2026-10-23) while the
+        // only consumer (gripper perception) was switched off. read() resumes
+        // on the next loop as soon as a subscriber appears.
+        const bool wanted =
+            (color_pub_ && color_pub_->get_subscription_count() > 0) ||
+            (color_compressed_pub_ && color_compressed_pub_->get_subscription_count() > 0);
+        if (!(wanted ? camera_.read(frame) : camera_.grab())) {
             read_fail_streak += 1;
             if (read_fail_streak == 1 || read_fail_streak % 50 == 0) {
                 RCLCPP_WARN(this->get_logger(),
@@ -456,6 +464,33 @@ void FVUSBCameraNode::processingLoop()
             continue;
         }
         read_fail_streak = 0;
+
+        if (!wanted) {
+            if (!idle_logged_) {
+                RCLCPP_INFO(this->get_logger(),
+                            "💤 No subscribers on color/compressed: grabbing without decode until someone subscribes");
+                idle_logged_ = true;
+            }
+            // Keep camera_info flowing while idle (a few hundred bytes): health
+            // checks and the camera settings page use it as the liveness signal.
+            if (camera_info_config_.enable_camera_info && camera_info_pub_) {
+                camera_info_msg_.header.stamp = this->now();
+                camera_info_msg_.header.frame_id = tf_config_.optical_frame;
+                camera_info_pub_->publish(camera_info_msg_);
+            }
+            if (camera_config_.fps > 0) {
+                auto target = std::chrono::milliseconds(1000 / std::max(1, camera_config_.fps));
+                auto elapsed_loop = std::chrono::steady_clock::now() - loop_start;
+                if (elapsed_loop < target) {
+                    std::this_thread::sleep_for(target - elapsed_loop);
+                }
+            }
+            continue;
+        }
+        if (idle_logged_) {
+            RCLCPP_INFO(this->get_logger(), "▶️ Subscriber appeared: decoding and publishing frames again");
+            idle_logged_ = false;
+        }
 
         if (frame.empty()) {
             empty_frame_streak += 1;
