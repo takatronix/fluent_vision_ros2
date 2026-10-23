@@ -471,6 +471,13 @@ void FVUSBCameraNode::processingLoop()
                             "💤 No subscribers on color/compressed: grabbing without decode until someone subscribes");
                 idle_logged_ = true;
             }
+            // Keep camera_info flowing while idle (a few hundred bytes): health
+            // checks and the camera settings page use it as the liveness signal.
+            if (camera_info_config_.enable_camera_info && camera_info_pub_) {
+                camera_info_msg_.header.stamp = this->now();
+                camera_info_msg_.header.frame_id = tf_config_.optical_frame;
+                camera_info_pub_->publish(camera_info_msg_);
+            }
             if (camera_config_.fps > 0) {
                 auto target = std::chrono::milliseconds(1000 / std::max(1, camera_config_.fps));
                 auto elapsed_loop = std::chrono::steady_clock::now() - loop_start;
