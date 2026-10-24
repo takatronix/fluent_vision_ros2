@@ -1,10 +1,15 @@
 fv_tts:
   ros__parameters:
-    # エンジン: "pyopenjtalk"(軽量・既定) | "aivis" (AivisSpeech。不通・遅いときは Open JTalk)
+    # 起動時のエンジン: "pyopenjtalk"(軽量・既定) | "aivis" (AivisSpeech)。viewer の設定
+    # (/aspa/tts/settings の tts_engine: aivis | pyopenjtalk | openai→aivis) が届けばそちら。
+    # 選んだエンジンが失敗しても別の声では喋らない (飛ばしてログに残す)。
     engine: "pyopenjtalk"
     # AivisSpeech Engine の URL。"" = 未設定 (engine=aivis なら http://127.0.0.1:10101)
     aivis_url: ""
-    aivis_speaker: 135718976       # 女 (男は 1310138977)。viewer の設定で切り替わる
+    aivis_speaker: 1310138977      # 男 (女は 135718976)。viewer の設定で切り替わる
+    aivis_speed: 1.3               # 少し速め (speedScale)。viewer の設定 aivis_speed で切り替わる
+    aivis_timeout_s: 15.0          # 1 文の合成をここまで待つ。超えたら飛ばす
+    aivis_keepalive_s: 180.0       # 暇がこれだけ続いたら短い文を裏で合成して温める
     # 出力パイプライン(fv_audio_output)のサンプルレート。AivisSpeech は 44.1kHz を返すので
     # このレートへリサンプルしてから publish する(fv_audio_output の audio.sample_rate と合わせる)。
     output_sample_rate: 48000
