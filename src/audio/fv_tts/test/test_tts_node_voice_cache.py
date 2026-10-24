@@ -123,6 +123,16 @@ def _spoken(backend):
     return [c for c in backend.calls if c[0] != tts_node.KEEPALIVE_TEXT]
 
 
+def _wait_cached(node, key, timeout=2.0):
+    """保存は合成の done callback の中 (speak_text が戻った後に終わることがある): 期限付きで待つ。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if key in node.voice_store and not node._vc_futures:
+            return True
+        time.sleep(0.01)
+    return key in node.voice_store
+
+
 class _Backend:
     def __init__(self, delay=0.0, exc=None):
         self.delay, self.exc, self.calls = delay, exc, []
@@ -169,7 +179,7 @@ def test_live_sentence_is_synthesized_with_speed_and_cached(node):
     assert node.vc_backend.calls[0][1] == 1310138977
     assert node.vc_backend.calls[0][2]["speedScale"] == 1.3
     key = node._voice_key("テストです。", 8.0)
-    assert key in node.voice_store
+    assert _wait_cached(node, key)
     assert node.voice_store.index[key]["speed"] == 1.3 and node.voice_store.index[key]["speaker"] == 1310138977
     node.speak_text("テストです。", "", 8.0)  # 2 回目はキャッシュ
     assert len(node.vc_backend.calls) == 1
@@ -496,9 +506,8 @@ def test_timeout_is_not_waited_twice_and_the_same_sentence_is_not_rendered_twice
     assert node.speak_text("一つ目の文です。", "", 8.0) == []    # 2 回目は待たずに飛ばす
     assert time.monotonic() - t0 < 0.25
     assert "秒前まで不通" in node.log.errors()[1]
-    time.sleep(0.4)
+    assert _wait_cached(node, node._voice_key("一つ目の文です。", 8.0))
     assert len(node.vc_backend.calls) == 1                     # 同じ文を二重に投入していない
-    assert node._voice_key("一つ目の文です。", 8.0) in node.voice_store
     assert node._vc_futures == {} and node._vc_inflight == set()
 
 
@@ -518,6 +527,7 @@ def test_two_requests_for_the_same_sentence_share_one_synthesis(node):
     assert len(results) == 2 and all(len(r) == 1 for r in results)
     assert len(node.vc_backend.calls) == 1
     assert any("合成中だった声を待った" in m for m in node.log.lines)
+    assert _wait_cached(node, node._voice_key("同じ文です。", 8.0))
 
 
 def test_speed_change_during_synthesis_keeps_key_query_and_meta_consistent(node):
@@ -531,7 +541,7 @@ def test_speed_change_during_synthesis_keeps_key_query_and_meta_consistent(node)
     node.speak_text("テストです。", "", 8.0)
     spoken = _spoken(node.vc_backend)
     assert len(spoken) == 1 and spoken[0][2]["speedScale"] == 1.3   # 合成は作り始めた時の速さ
-    assert key_before in node.voice_store                        # その速さのキーに保存
+    assert _wait_cached(node, key_before)                        # その速さのキーに保存
     assert node.voice_store.index[key_before]["speed"] == 1.3    # メタも同じ
     assert node._voice_key("テストです。", 8.0) != key_before       # いまの設定 (1.0) のキーとは別
 
@@ -603,6 +613,7 @@ def test_completed_future_callback_does_not_deadlock(node):
     t.start()
     t.join(timeout=3.0)
     assert not t.is_alive() and len(done) == 1 and len(done[0]) == 1
+    assert _wait_cached(node, node._voice_key("一瞬です。", 8.0))
     assert node._vc_futures == {} and node._vc_inflight == set()
 
 
@@ -619,6 +630,10 @@ def test_long_sentence_is_not_rendered_twice_even_if_not_cached(node):
         t.join()
     assert all(len(r) == 1 for r in results)
     assert len(_spoken(node.vc_backend)) == 1
+    for _ in range(100):
+        if not node._vc_futures:
+            break
+        time.sleep(0.01)
     assert node.voice_store.index == {}                             # 長文は保存しない
     assert node._vc_futures == {} and node._vc_inflight == set()
 

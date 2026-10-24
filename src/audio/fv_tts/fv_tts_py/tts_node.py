@@ -665,9 +665,12 @@ class FvTtsNode(Node):
         if queue_ is not None:
             thread = getattr(self, "_say_thread", None)
             if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-                thread.join(timeout=5.0)
+                # Open JTalk の同期合成 (1〜2 秒) は途中で止められないので、終わるまで待つ (上限 15 秒)。
+                # それでも残った時は、出す側 (_publish / _report_spoken / begin_speaking) が _closing を見て
+                # 壊された publisher に触らない
+                thread.join(timeout=15.0)
                 if thread.is_alive():
-                    self.get_logger().warn("fv_tts の作業スレッドが 5 秒で終わりませんでした")
+                    self.get_logger().warn("fv_tts の作業スレッドが 15 秒で終わりませんでした (出力は止めてあります)")
         if self.voice_worker is not None:
             self.voice_worker.stop()
         if self._vc_pool is not None:
@@ -856,13 +859,17 @@ class FvTtsNode(Node):
         for c in clips:
             bps = c.channels * (c.bit_depth // 8)
             seconds += len(c.audio_bytes) / bps / c.sample_rate if bps and c.sample_rate else 0.0
-        try:
-            pub.publish(String(data=json.dumps({
-                "text": text, "engine": engine, "ok": bool(clips), "clips": len(clips),
-                "seconds": round(seconds, 2), "ms": int((time.monotonic() - t_start) * 1000),
-                "error": error}, ensure_ascii=False)))
-        except Exception as exc:  # pylint: disable=broad-except
-            self.get_logger().debug(f"spoken publish failed: {exc}")
+        payload = json.dumps({
+            "text": text, "engine": engine, "ok": bool(clips), "clips": len(clips),
+            "seconds": round(seconds, 2), "ms": int((time.monotonic() - t_start) * 1000),
+            "error": error}, ensure_ascii=False)
+        with self._speaking_lock:          # 終了処理の後は (publisher が壊された後なので) 出さない
+            if self._closing:
+                return
+            try:
+                pub.publish(String(data=payload))
+            except Exception as exc:  # pylint: disable=broad-except
+                self.get_logger().debug(f"spoken publish failed: {exc}")
 
     def _publish(self, cached: CachedAudio, *, stamp, epoch: int, play: bool) -> bool:
         """出す。先に出した音が playback_backlog_s 秒ぶん残っていれば減るまで待つ (fv_audio_output の
@@ -918,6 +925,8 @@ class FvTtsNode(Node):
         duration = len(cached.audio_bytes) / bytes_per_sample / cached.sample_rate if bytes_per_sample else 0.0
         self.get_logger().info(f"TTS published to playback: {duration:.2f}s")
         with self._speaking_lock:
+            if self._closing:
+                return
             if not self._speaking:
                 self._speaking = True
                 self.speaking_pub.publish(Bool(data=True))
