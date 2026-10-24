@@ -576,9 +576,24 @@ def test_switching_to_aivis_warms_with_the_new_voice_after_settings_apply(node):
 
 
 # ── レビュー 2 回目 (2026-10-24) で足した試験 ──────────────────
+class _DonePool:
+    """submit した時点で完了している Future を返す executor の代用 (コールバック登録前に完了するケース)。"""
+    def submit(self, fn, *args):
+        fut = concurrent.futures.Future()
+        try:
+            fut.set_result(fn(*args))
+        except BaseException as exc:  # noqa: BLE001
+            fut.set_exception(exc)
+        return fut
+
+    def shutdown(self, **_k):
+        pass
+
+
 def test_completed_future_callback_does_not_deadlock(node):
     """合成が一瞬で終わる (完了済みの Future にコールバックを付ける) 時に止まらない。"""
     node.vc_backend = _Backend(delay=0.0)
+    node._vc_pool = _DonePool()
     done = []
 
     def run():
@@ -673,3 +688,24 @@ def test_settings_snapshot_is_atomic_with_updates(node):
     stop.set()
     t.join(timeout=2.0)
     assert bad == []
+
+
+def test_dedupe_mark_stays_until_the_cache_write_is_done(node):
+    """合成が終わってから保存が終わるまでの間に同じ文が来ても、再合成しない。"""
+    node.vc_backend = _Backend(delay=0.1)
+    slow_put = threading.Event()
+    real_put = node.voice_store.put
+
+    def put(key, pcm, sr, meta):
+        slow_put.wait(0.5)            # 保存に時間がかかる
+        real_put(key, pcm, sr, meta)
+
+    node.voice_store.put = put
+    first = threading.Thread(target=node.speak_text, args=("同じ文です。", "", 8.0))
+    first.start()
+    time.sleep(0.15)                  # 合成は済み、保存の途中
+    second = node.speak_text("同じ文です。", "", 8.0)
+    slow_put.set()
+    first.join()
+    assert len(second) == 1
+    assert len(_spoken(node.vc_backend)) == 1

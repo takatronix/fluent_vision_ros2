@@ -530,20 +530,25 @@ class FvTtsNode(Node):
             self._vc_futures.pop(key, None)
 
     def _vc_late_done(self, key: str, text: str, job: Dict, t0: float, fut) -> None:
-        """合成が終わった (待っていた側が受け取る・タイムアウトで飛ばした後でも): 次回のために保存する。"""
-        self._vc_discard(key)
-        if self._closing or fut.cancelled():
-            return
-        exc = fut.exception()
-        if exc is None:
-            pcm, sr = fut.result()
-            self._vc_put(key, text, job, pcm, sr, time.monotonic() - t0)
-            self._aivis_last_use = time.monotonic()
-            self.get_logger().info(f"voice cache: 遅れて保存 '{text[:30]}'")
-            return
-        if isinstance(exc, vc.EngineDown):
-            self._vc_skip_until = time.monotonic() + self.vc_down_skip
-            self._vc_skip_reason = str(exc)
+        """合成が終わった (待っていた側が受け取る・タイムアウトで飛ばした後でも): 次回のために保存する。
+
+        保存が終わるまで処理中の印 (_vc_futures) は残す: その間に同じ文が来てもキャッシュか Future のどちらかで見つかる。
+        """
+        try:
+            if self._closing or fut.cancelled():
+                return
+            exc = fut.exception()
+            if exc is None:
+                pcm, sr = fut.result()
+                self._vc_put(key, text, job, pcm, sr, time.monotonic() - t0)
+                self._aivis_last_use = time.monotonic()
+                self.get_logger().info(f"voice cache: 遅れて保存 '{text[:30]}'")
+                return
+            if isinstance(exc, vc.EngineDown):
+                self._vc_skip_until = time.monotonic() + self.vc_down_skip
+                self._vc_skip_reason = str(exc)
+        finally:
+            self._vc_discard(key)
 
     def aivis_sentence(self, text: str, volume_db: float) -> CachedAudio:
         """1 文を AivisSpeech で: 1) 声キャッシュ 2) その場で合成 (timeout まで待つ)。失敗は SpeakFailed。
@@ -575,6 +580,15 @@ class FvTtsNode(Node):
         shared = False
         with self._vc_lock:
             fut = self._vc_futures.get(dedupe_key)
+            if fut is None and key is not None:
+                # 直前に別の要求が保存を終えたかもしれない (印を外すのは保存の後なので、ここでもう一度見れば空白が無い)
+                try:
+                    hit = self.voice_store.get(key)
+                except Exception:  # pylint: disable=broad-except
+                    hit = None
+                if hit is not None:
+                    self.get_logger().info(f"voice: キャッシュの声 ({self.vc_kind}:{speaker})")
+                    return self._to_cached_audio(*hit)
             if fut is None:
                 self._vc_inflight.add(dedupe_key)
                 fut = self._vc_pool.submit(self._render_voice, dedupe_key, text, None, job)
@@ -631,22 +645,24 @@ class FvTtsNode(Node):
 
     def destroy_node(self):
         # 受付をやめ、喋りかけを止め、作業スレッドを終えてから ROS のものを壊す
+        queue_ = getattr(self, "_say_queue", None)
         with self._speaking_lock:
             self._closing = True
             self.playback_epoch += 1
-            for timer in (self._warmup_timer, self._keepalive_timer):
+            for timer in (self._warmup_timer, self._keepalive_timer, self._speaking_timer):
                 if timer is not None:
                     timer.cancel()
-            self._warmup_timer = self._keepalive_timer = None
-        queue_ = getattr(self, "_say_queue", None)
+            self._warmup_timer = self._keepalive_timer = self._speaking_timer = None
+            self._speaking = False
+            if queue_ is not None:
+                # 残っている依頼は捨てて、番兵で作業スレッドを終える (on_say と同じロックの中なので、後から入らない)
+                try:
+                    while True:
+                        queue_.get_nowait()
+                except queue.Empty:
+                    pass
+                queue_.put(None)
         if queue_ is not None:
-            # 残っている依頼は捨てて、番兵で作業スレッドを終える (合成待ちは _wait_future が 0.25 秒刻みでやめる)
-            try:
-                while True:
-                    queue_.get_nowait()
-            except queue.Empty:
-                pass
-            queue_.put(None)
             thread = getattr(self, "_say_thread", None)
             if thread is not None and thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=5.0)
@@ -760,10 +776,13 @@ class FvTtsNode(Node):
     def on_say(self, msg: String) -> None:
         """Event Bus: 任意テキストを喋る (/aspa/tts/say)。常に再生する。順番に 1 本のスレッドで。"""
         text = (msg.data or "").strip()
-        if not text or self._closing:
+        if not text:
             return
-        self.get_logger().info(f"say topic: text={text[:50]}")
-        self._say_queue.put((text, self.get_clock().now().to_msg(), self.playback_epoch))
+        with self._speaking_lock:            # 終了処理 (キューを捨てて番兵を入れる) と排他
+            if self._closing:
+                return
+            self.get_logger().info(f"say topic: text={text[:50]}")
+            self._say_queue.put((text, self.get_clock().now().to_msg(), self.playback_epoch))
 
     def _say_loop(self) -> None:
         while True:
@@ -917,6 +936,8 @@ class FvTtsNode(Node):
 
     def _end_speaking(self) -> None:
         with self._speaking_lock:
+            if self._closing:
+                return
             # 後続発話でタイマが更新された場合はまだ喋っているので降ろさない
             if time.monotonic() + 0.02 < self._speaking_end:
                 return
