@@ -120,6 +120,9 @@ ros2 topic pub -1 /aspa/tts/say std_msgs/String "{data: 'アスパラを見つ�
 ## Event Bus 契約 (v1)
 - `/aspa/tts/say` (std_msgs/String): 任意テキスト→発話 (本ノードが消費)
 - `/aspa/audio/speaking` (std_msgs/Bool): 再生中フラグ (本ノードが publish)
+- `/aspa/tts/spoken` (std_msgs/String, JSON): 喋った / 飛ばした発話の知らせ (本ノードが publish)。
+  `{"text", "engine": "aivis"|"pyopenjtalk", "ok", "clips", "seconds", "ms", "error"}`。
+  viewer がブラウザへ流し、aspa_agent が「どの声で喋ったか」を記録する
 
 ## キャッシュ
 `cache_dir`（既定 `~/.fluent_voice_cache`）にPCMとメタ情報を保存します。`cache_key`で共有可能。

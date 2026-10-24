@@ -71,7 +71,7 @@ def node(tmp_path, monkeypatch):
     n._speaking_timer = None
     n._speaking_lock = threading.RLock()
     n._closing = False
-    n.tts_pub, n.play_pub, n.speaking_pub = _Pub(), _Pub(), _Pub()
+    n.tts_pub, n.play_pub, n.speaking_pub, n.spoken_pub = _Pub(), _Pub(), _Pub(), _Pub()
     n.cache, n.cache_dir = {}, None
     n.vc_kind, n.vc_speaker, n.vc_query, n.vc_max_chars = "aivis", 1310138977, {"speedScale": 1.3}, 200
     n.vc_speed = 1.3
@@ -86,6 +86,7 @@ def node(tmp_path, monkeypatch):
     n._vc_inflight = set()
     n._vc_futures = {}
     n._vc_lock = threading.Lock()
+    n._cfg_lock = threading.Lock()
     n._vc_skip_until = 0.0
     n._vc_skip_reason = ""
     n._aivis_last_use = 0.0
@@ -541,22 +542,25 @@ def test_destroy_stops_the_say_thread_and_further_output(node):
     node._say_thread = threading.Thread(target=node._say_loop, daemon=True)
     node._say_thread.start()
     node.voice_worker.stop = lambda: None
-    node.destroy_node = lambda: None  # super() は ROS 無しでは呼べない
-    tts_node.FvTtsNode.destroy_node.__wrapped__ if hasattr(tts_node.FvTtsNode.destroy_node, "__wrapped__") else None
-    # destroy_node の中身を手で (super().destroy_node() を除く)
-    node._closing = True
-    with node._speaking_lock:
-        node.playback_epoch += 1
-    node._say_queue.put(None)
-    node._say_thread.join(timeout=2.0)
+    node.vc_backend = _Backend(delay=1.0)
+    node.vc_timeout = 15.0
+    node.vc_keepalive_s = 60.0
+    node._arm_keepalive()
+    # 15 秒待つ合成の途中で終了 → 待ちをやめてスレッドが終わる
+    node._say_queue.put(("長い合成の途中です。", 0, node.playback_epoch))
+    time.sleep(0.1)
+    t0 = time.monotonic()
+    assert node.destroy_node() is True                            # 代用の Node.destroy_node まで届く
+    assert time.monotonic() - t0 < 3.0
     assert not node._say_thread.is_alive()
-    node.vc_backend = _Backend()
-    node.voice_store.put(node._voice_key("テストです。", 8.0),
-                         vc.float_to_pcm16(np.full(480, 0.1, np.float32)), 48000, {})
-    assert node.speak_text("テストです。", "", 8.0) == []            # 閉じた後は出さない
+    assert node._keepalive_timer is None
+    node._arm_keepalive()                                         # 終了後は登録し直さない
+    assert node._keepalive_timer is None
+    node.on_say(type("M", (), {"data": "もう受けない"})())
+    assert node._say_queue.empty()
+    assert node.speak_text("テストです。", "", 8.0) == []           # 閉じた後は出さない
     node._keepalive_now("x")                                      # 閉じた後は温めない
-    time.sleep(0.05)
-    assert node.vc_backend.calls == []
+    assert [c for c in node.vc_backend.calls if c[0] == tts_node.KEEPALIVE_TEXT] == []
 
 
 def test_switching_to_aivis_warms_with_the_new_voice_after_settings_apply(node):
@@ -569,3 +573,103 @@ def test_switching_to_aivis_warms_with_the_new_voice_after_settings_apply(node):
         time.sleep(0.02)
     assert node.vc_backend.calls[0][0] == tts_node.KEEPALIVE_TEXT
     assert node.vc_backend.calls[0][1] == 135718976 and node.vc_backend.calls[0][2]["speedScale"] == 1.0
+
+
+# ── レビュー 2 回目 (2026-10-24) で足した試験 ──────────────────
+def test_completed_future_callback_does_not_deadlock(node):
+    """合成が一瞬で終わる (完了済みの Future にコールバックを付ける) 時に止まらない。"""
+    node.vc_backend = _Backend(delay=0.0)
+    done = []
+
+    def run():
+        done.append(node.speak_text("一瞬です。", "", 8.0))
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=3.0)
+    assert not t.is_alive() and len(done) == 1 and len(done[0]) == 1
+    assert node._vc_futures == {} and node._vc_inflight == set()
+
+
+def test_long_sentence_is_not_rendered_twice_even_if_not_cached(node):
+    node.vc_max_chars = 10
+    node.vc_timeout = 2.0
+    node.vc_backend = _Backend(delay=0.2)
+    text = "保存しないほど長い文を同時に二つの経路から頼みます。"
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(node.speak_text(text, "", 8.0))) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(len(r) == 1 for r in results)
+    assert len(_spoken(node.vc_backend)) == 1
+    assert node.voice_store.index == {}                             # 長文は保存しない
+    assert node._vc_futures == {} and node._vc_inflight == set()
+
+
+def test_backlog_limit_holds_when_two_speakers_race(node):
+    node.playback_backlog_s = 1.0
+    node.vc_backend = _Backend()
+    for i in range(6):
+        node.voice_store.put(node._voice_key(f"{i}番目の文です。", 8.0),
+                             vc.float_to_pcm16(np.full(48000, 0.1, np.float32)), 48000, {})
+    seen_backlog = []
+    real_publish = node.play_pub.publish
+
+    def spy(frame):
+        with node._speaking_lock:
+            now = time.monotonic()
+            seen_backlog.append(sum(1 for t in node._published_ends if t > now))
+        real_publish(frame)
+
+    node.play_pub.publish = spy
+    texts = ["0番目の文です。1番目の文です。2番目の文です。", "3番目の文です。4番目の文です。5番目の文です。"]
+    threads = [threading.Thread(target=node.speak_text, args=(t, "", 8.0)) for t in texts]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(node.play_pub.frames) == 6
+    assert max(seen_backlog) <= 1                                   # 残り 1 秒 (=1 枠) を超えて同時に出さない
+
+
+def test_spoken_topic_reports_engine_and_result(node):
+    node.vc_backend = _Backend()
+    node.speak_text("一つ目の文です。二つ目の文です。", "", 8.0)
+    report = json.loads(node.spoken_pub.frames[-1].data)
+    assert report["engine"] == "aivis" and report["ok"] is True and report["clips"] == 2
+    assert report["text"] == "一つ目の文です。二つ目の文です。" and report["seconds"] > 0
+    node.vc_backend = _Backend(exc=AivisUnreachable("down"))
+    node._vc_skip_until = 0.0
+    node.speak_text("だめな文です。", "", 8.0)
+    report = json.loads(node.spoken_pub.frames[-1].data)
+    assert report["ok"] is False and report["clips"] == 0 and "不通" in report["error"]
+    node.engine_selected = "pyopenjtalk"
+    node.speak_text("軽い声です。", "", 8.0)
+    assert json.loads(node.spoken_pub.frames[-1].data)["engine"] == "pyopenjtalk"
+
+
+def test_settings_snapshot_is_atomic_with_updates(node):
+    """写しを取る間に設定が変わっても、話者と速さがちぐはぐな写しにならない。"""
+    stop = threading.Event()
+    bad = []
+
+    def flip():
+        i = 0
+        while not stop.is_set():
+            node._apply_voice_settings({"aivis_speaker": [135718976, 1310138977][i % 2],
+                                        "aivis_speed": [1.0, 1.3][i % 2]})
+            i += 1
+
+    t = threading.Thread(target=flip, daemon=True)
+    t.start()
+    for _ in range(300):
+        snap = node._aivis_snapshot()
+        if (snap["speaker"], snap["speed"]) not in ((135718976, 1.0), (1310138977, 1.3)):
+            bad.append(snap)
+        if snap["query"]["speedScale"] != snap["speed"]:
+            bad.append(snap)
+    stop.set()
+    t.join(timeout=2.0)
+    assert bad == []

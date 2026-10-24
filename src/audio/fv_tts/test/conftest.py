@@ -26,6 +26,9 @@ def _install_ros_stubs() -> None:
         def __init__(self, *_a, **_k):
             pass
 
+        def destroy_node(self):
+            return True
+
     class _Enum:
         def __init__(self, *_a, **_k):
             pass
