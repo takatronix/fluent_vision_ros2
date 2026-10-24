@@ -269,9 +269,11 @@ class FvTtsNode(Node):
         self._speaking = False
         self._speaking_end = 0.0
         self._speaking_timer: Optional[threading.Timer] = None
-        self._speaking_lock = threading.Lock()
+        # 出す側の共通ロック (再生中フラグ・出した音の終わる時刻・停止の世代。say スレッドとサービスが重なる)
+        self._speaking_lock = threading.RLock()
         # 出した音の終わる時刻 (文ごとに流す時の詰まり防止)
         self._published_ends: List[float] = []
+        self._closing = False
         self.playback_backlog_s = float(self.get_parameter("playback_backlog_s").value)
 
         self.cache: Dict[str, CachedAudio] = {}
@@ -282,11 +284,15 @@ class FvTtsNode(Node):
         self._keepalive_timer: Optional[threading.Timer] = None
         self._warmup_path: Optional[Path] = None
         self._warmup_due = False
-        # AivisSpeech の声を使うか。起動時は engine=aivis なら ON、viewer の設定
-        # (tts_engine=aivis|openai → ON, pyopenjtalk → OFF) で再起動なしに切り替える。
-        self.vc_active = False
+        # 選んだエンジン (aivis | pyopenjtalk)。起動時は engine パラメータ、viewer の設定
+        # (tts_engine=aivis|openai → aivis, pyopenjtalk) で再起動なしに切り替える。AivisSpeech の
+        # 準備 (voice_store / _vc_pool) ができていなくても選択は保つ: その間の発話は失敗として飛ばす
+        # (Open JTalk では喋らない)。
+        self.engine_selected = self.engine
         self._vc_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._vc_inflight: set = set()
+        # いま合成中の文 (key → Future)。同じ文の要求は同じ合成を待つ (二重に投入しない)
+        self._vc_futures: Dict[str, concurrent.futures.Future] = {}
         self._vc_lock = threading.Lock()
         self._vc_skip_until = 0.0
         self._vc_skip_reason = ""
@@ -346,7 +352,6 @@ class FvTtsNode(Node):
         self.voice_worker.start()
         self._vc_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="voice_live")
-        self.vc_active = self.engine == "aivis"
         self.get_logger().info(
             f"AivisSpeech {'ON' if self.vc_active else '準備のみ (viewer の tts_engine=aivis で ON)'}: {url} "
             f"timeout={self.vc_timeout:.0f}s speaker={self.vc_speaker} speed={self.vc_speed:.2f} "
@@ -372,6 +377,16 @@ class FvTtsNode(Node):
             self._keepalive_now("起動時")
         self._arm_keepalive()
 
+    @property
+    def vc_active(self) -> bool:
+        """AivisSpeech で喋る: 選ばれていて、準備もできている。"""
+        return (self.engine_selected == "aivis" and self.voice_store is not None
+                and self._vc_pool is not None)
+
+    def _aivis_snapshot(self) -> Dict:
+        """いまの声の設定 (話者・速さ・query) の写し。キー作成・合成・保存まで同じ値を使う。"""
+        return {"speaker": int(self.vc_speaker), "speed": float(self.vc_speed), "query": dict(self.vc_query)}
+
     @staticmethod
     def _clamp_speed(value, default: float) -> float:
         try:
@@ -382,9 +397,10 @@ class FvTtsNode(Node):
             return float(default)
         return round(min(AIVIS_SPEED_RANGE[1], max(AIVIS_SPEED_RANGE[0], speed)), 2)
 
-    def _voice_key(self, text: str, volume_db: float, speaker: Optional[int] = None) -> str:
+    def _voice_key(self, text: str, volume_db: float, speaker: Optional[int] = None,
+                   query: Optional[Dict] = None) -> str:
         spk = self.vc_speaker if speaker is None else int(speaker)
-        return vc.make_key(self.vc_kind, spk, self.vc_query, volume_db, text)
+        return vc.make_key(self.vc_kind, spk, self.vc_query if query is None else query, volume_db, text)
 
     def _warmup_fire(self) -> None:
         self._warmup_due = True
@@ -397,14 +413,15 @@ class FvTtsNode(Node):
         except Exception as exc:  # pylint: disable=broad-except
             self.get_logger().warn(f"voice cache warmup 読込失敗 {path}: {exc}")
             return
-        speaker = self.vc_speaker
+        job = self._aivis_snapshot()
+        speaker = job["speaker"]
         n = 0
         for text in texts:
             for sentence in split_sentences(text):
                 if self.voice_worker and len(sentence) <= self.vc_max_chars:
                     n += self.voice_worker.submit(
-                        self._voice_key(sentence, self.default_volume_db, speaker), sentence, None,
-                        priority=False, job={"speaker": speaker, "speed": float(self.vc_speed)})
+                        self._voice_key(sentence, self.default_volume_db, speaker, job["query"]), sentence, None,
+                        priority=False, job=dict(job))
         self.get_logger().info(
             f"voice cache warmup: {len(texts)} 文中 {n} 文を裏で作成予定 "
             f"(speaker={speaker}, {path.name})")
@@ -424,36 +441,45 @@ class FvTtsNode(Node):
         try:
             period = float(getattr(self, "vc_keepalive_s", 0.0) or 0.0)
             idle = time.monotonic() - self._aivis_last_use
-            if self.vc_active and self._vc_pool is not None and idle >= period:
+            if self.vc_active and idle >= period:
                 self._keepalive_now("暇が続いた")
         finally:
-            self._arm_keepalive()
+            if not self._closing:
+                self._arm_keepalive()
 
     def _keepalive_now(self, why: str) -> None:
         """短い文を 1 つ裏で合成して捨てる (声の読込を保つ)。失敗しても何もしない。"""
         pool = self._vc_pool
-        if pool is None:
+        if pool is None or self._closing:
             return
+        job = self._aivis_snapshot()
 
         def run() -> None:
             t0 = time.monotonic()
             try:
-                self._render_voice("", KEEPALIVE_TEXT, None, {"speaker": self.vc_speaker})
+                self._render_voice("", KEEPALIVE_TEXT, None, job)
             except Exception as exc:  # pylint: disable=broad-except
                 self.get_logger().warn(f"AivisSpeech の温め ({why}) に失敗: {exc}")
                 return
             self._aivis_last_use = time.monotonic()
-            self.get_logger().info(f"AivisSpeech の温め ({why}): {time.monotonic() - t0:.2f}s")
+            self.get_logger().info(
+                f"AivisSpeech の温め ({why}): {time.monotonic() - t0:.2f}s (speaker={job['speaker']} speed={job['speed']})")
 
-        pool.submit(run)
+        try:
+            pool.submit(run)
+        except RuntimeError:  # shutdown 済み
+            pass
 
     # ── 合成 ───────────────────────────────────────────
     def _render_voice(self, _key: str, text: str, ref_rms: Optional[float],
                       job: Optional[Dict] = None):
         """高品質エンジンで合成→出力レートへ→音量 (固定ゲイン or Open JTalk 版に合わせる)。"""
         speaker = int((job or {}).get("speaker", self.vc_speaker))
+        query = (job or {}).get("query")
+        if not isinstance(query, dict):
+            query = self.vc_query
         try:
-            pcm, sr, channels, bit_depth = self.vc_backend.synthesize(text, speaker, self.vc_query)
+            pcm, sr, channels, bit_depth = self.vc_backend.synthesize(text, speaker, query)
         except AivisUnreachable as exc:
             raise vc.EngineDown(str(exc)) from exc
         if channels != 1 or bit_depth != 16:
@@ -479,10 +505,10 @@ class FvTtsNode(Node):
         peak = float(np.max(np.abs(samples))) if samples.size else 0.0
         return CachedAudio(pcm, sr, 1, 16, rms, peak)
 
-    def _vc_put(self, key: str, text: str, speaker: int, pcm: bytes, sr: int, render_s: float) -> None:
+    def _vc_put(self, key: str, text: str, job: Dict, pcm: bytes, sr: int, render_s: float) -> None:
         try:
             self.voice_store.put(key, pcm, sr, {
-                "engine": self.vc_kind, "speaker": int(speaker), "speed": float(self.vc_speed),
+                "engine": self.vc_kind, "speaker": int(job["speaker"]), "speed": float(job["speed"]),
                 "text": vc.normalize_text(text), "render_s": round(render_s, 2)})
         except OSError as exc:
             self.get_logger().warn(f"voice cache: 保存失敗 {exc}")
@@ -492,14 +518,15 @@ class FvTtsNode(Node):
             return
         with self._vc_lock:
             self._vc_inflight.discard(key)
+            self._vc_futures.pop(key, None)
 
-    def _vc_late_done(self, key: str, text: str, speaker: int, t0: float, fut) -> None:
+    def _vc_late_done(self, key: str, text: str, job: Dict, t0: float, fut) -> None:
         """タイムアウトで飛ばした文の合成が後から終わった: 次回のために保存だけする。"""
         exc = fut.exception()
         self._vc_discard(key)
         if exc is None:
             pcm, sr = fut.result()
-            self._vc_put(key, text, speaker, pcm, sr, time.monotonic() - t0)
+            self._vc_put(key, text, job, pcm, sr, time.monotonic() - t0)
             self._aivis_last_use = time.monotonic()
             self.get_logger().info(f"voice cache: 遅れて保存 '{text[:30]}'")
             return
@@ -508,12 +535,16 @@ class FvTtsNode(Node):
             self._vc_skip_reason = str(exc)
 
     def aivis_sentence(self, text: str, volume_db: float) -> CachedAudio:
-        """1 文を AivisSpeech で: 1) 声キャッシュ 2) その場で合成 (timeout まで待つ)。失敗は SpeakFailed。"""
+        """1 文を AivisSpeech で: 1) 声キャッシュ 2) その場で合成 (timeout まで待つ)。失敗は SpeakFailed。
+
+        同じ文が同時に来たら (2 枚のページ・遅れて保存の途中) 同じ合成を待つ (二重に投入しない)。
+        """
         if self.voice_store is None or self._vc_pool is None:
             raise SpeakFailed("aivis", "AivisSpeech の準備ができていません (aivis_url / 声キャッシュ)")
-        speaker = self.vc_speaker
+        job = self._aivis_snapshot()
+        speaker = job["speaker"]
         cacheable = len(vc.normalize_text(text)) <= self.vc_max_chars
-        key = self._voice_key(text, volume_db, speaker) if cacheable else None
+        key = self._voice_key(text, volume_db, speaker, job["query"]) if cacheable else None
         if key is not None:
             try:
                 hit = self.voice_store.get(key)
@@ -527,48 +558,60 @@ class FvTtsNode(Node):
         if now < self._vc_skip_until:
             raise SpeakFailed("aivis", f"{self._vc_skip_until - now:.0f} 秒前まで不通 ({self._vc_skip_reason})",
                               engine_down=True)
+        timeout = float(getattr(self, "vc_timeout", 15.0))
+        shared = False
         if key is not None:
             with self._vc_lock:
-                if key in self._vc_inflight:
-                    key_inflight = True
-                else:
+                fut = self._vc_futures.get(key)
+                if fut is None:
                     self._vc_inflight.add(key)
-                    key_inflight = False
-            if key_inflight:
-                # 同じ文を今まさに作っている (遅れて保存の途中): 別に作らず、その結果を待たない
-                key = None
-        fut = self._vc_pool.submit(self._render_voice, key or "", text, None, {"speaker": speaker})
-        timeout = float(getattr(self, "vc_timeout", 15.0))
+                    fut = self._vc_pool.submit(self._render_voice, key, text, None, job)
+                    self._vc_futures[key] = fut
+                    fut.add_done_callback(lambda f, k=key, t=text, j=job, t0=now: self._vc_late_done(k, t, j, t0, f))
+                else:
+                    shared = True
+        else:
+            fut = self._vc_pool.submit(self._render_voice, "", text, None, job)
         try:
             pcm, sr = fut.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
-            # 合成はそのまま続け、できたら保存 (次回はキャッシュから)
-            if key is not None:
-                fut.add_done_callback(lambda f: self._vc_late_done(key, text, speaker, now, f))
-            raise SpeakFailed("aivis", f"{timeout:.0f} 秒で合成が終わらない", engine_down=True)
+            # 合成はそのまま続け、できたら保存 (次回はキャッシュから)。しばらくは待たずに飛ばす
+            self._vc_skip_until = time.monotonic() + min(5.0, self.vc_down_skip)
+            self._vc_skip_reason = f"{timeout:.0f} 秒で合成が終わらない"
+            raise SpeakFailed("aivis", self._vc_skip_reason, engine_down=True)
         except vc.EngineDown as exc:
             self._vc_skip_until = time.monotonic() + self.vc_down_skip
             self._vc_skip_reason = str(exc)
-            self._vc_discard(key)
             raise SpeakFailed("aivis", f"不通 {exc}", engine_down=True) from exc
         except Exception as exc:  # pylint: disable=broad-except
-            self._vc_discard(key)
             raise SpeakFailed("aivis", str(exc)) from exc
         dt = time.monotonic() - now
         self._aivis_last_use = time.monotonic()
-        if key is not None:
-            self._vc_put(key, text, speaker, pcm, sr, dt)
-            self._vc_discard(key)
-        self.get_logger().info(f"voice: その場で高品質合成 {dt:.2f}s (speaker={speaker})")
+        if key is None:
+            self.get_logger().info(f"voice: その場で高品質合成 {dt:.2f}s (speaker={speaker}, 長文なので保存しない)")
+        elif shared:
+            self.get_logger().info(f"voice: 合成中だった声を待った {dt:.2f}s (speaker={speaker})")
+        else:
+            self.get_logger().info(f"voice: その場で高品質合成 {dt:.2f}s (speaker={speaker})")
         return self._to_cached_audio(pcm, sr)
 
     def active_engine(self) -> str:
-        return "aivis" if getattr(self, "vc_active", False) else "pyopenjtalk"
+        return self.engine_selected
 
     def destroy_node(self):
+        # 受付をやめ、喋りかけを止め、作業スレッドを終えてから ROS のものを壊す
+        self._closing = True
+        with self._speaking_lock:
+            self.playback_epoch += 1
         for timer in (self._warmup_timer, self._keepalive_timer):
             if timer is not None:
                 timer.cancel()
+        queue_ = getattr(self, "_say_queue", None)
+        if queue_ is not None:
+            queue_.put(None)
+            thread = getattr(self, "_say_thread", None)
+            if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+                thread.join(timeout=3.0)
         if self.voice_worker is not None:
             self.voice_worker.stop()
         if self._vc_pool is not None:
@@ -588,33 +631,30 @@ class FvTtsNode(Node):
 
     def _apply_voice_settings(self, obj: Dict) -> None:
         """viewer の設定: tts_engine (aivis|openai → AivisSpeech、pyopenjtalk → Open JTalk)、
-        aivis_speaker で男/女、aivis_speed で速さ。"""
+        aivis_speaker で男/女、aivis_speed で速さ。選択は AivisSpeech の準備ができていなくても保つ。"""
         engine = str(obj.get("tts_engine", "") or "").strip().lower()
-        if engine and self.voice_store is None:
-            if engine in AIVIS_SETTING_VALUES:
+        switched = False
+        if engine:
+            selected = "aivis" if engine in AIVIS_SETTING_VALUES else "pyopenjtalk"
+            if selected != self.engine_selected:
+                self.engine_selected = selected
+                switched = True
+                self.get_logger().info(
+                    f"読み上げエンジン: {'AivisSpeech' if selected == 'aivis' else 'Open JTalk'} (設定 {engine})")
+            if selected == "aivis" and self.voice_store is None:
                 self.get_logger().error(
                     "設定は AivisSpeech ですが、このノードは AivisSpeech の準備ができていません "
-                    "(aivis_url 未設定か準備に失敗)。アナウンスは読み上げできません")
-            return
+                    "(aivis_url 未設定か準備に失敗)。アナウンスは読み上げできません (別の声では喋りません)")
         if self.voice_store is None:
             return
-        if engine:
-            active = engine in AIVIS_SETTING_VALUES
-            if active != self.vc_active:
-                self.vc_active = active
-                self.get_logger().info(
-                    f"読み上げエンジン: {'AivisSpeech' if active else 'Open JTalk'} (設定 {engine})")
-                if active:
-                    self._vc_skip_until = 0.0
-                    self._keepalive_now("切り替え")
-        rewarm = False
+        changed = False
         if "aivis_speed" in obj:
             speed = self._clamp_speed(obj.get("aivis_speed"), self.vc_speed)
             if abs(speed - self.vc_speed) > 1e-6:
                 self.get_logger().info(f"速さの切替: {self.vc_speed:.2f} -> {speed:.2f}")
                 self.vc_speed = speed
                 self.vc_query["speedScale"] = speed
-                rewarm = True
+                changed = True
         if "aivis_speaker" in obj:
             try:
                 speaker = int(obj["aivis_speaker"])
@@ -627,16 +667,20 @@ class FvTtsNode(Node):
                 self.get_logger().info(
                     f"声の切替: speaker {self.vc_speaker} -> {speaker} ({obj.get('voice', '')})")
                 self.vc_speaker = speaker
-                self._vc_skip_until = 0.0
-                rewarm = True
-        # 起動直後の待ち時間が過ぎていれば、新しい声・速さの決まり文句を裏で作り直す
-        if rewarm and self.vc_active and self._warmup_due and self._warmup_path is not None:
-            self._enqueue_warmup(self._warmup_path)
+                changed = True
+        if (switched or changed) and self.vc_active:
+            self._vc_skip_until = 0.0
+            # 設定を全部映してから、新しい声・速さで温める (最初の 1 文目から速く)
+            self._keepalive_now("切り替え")
+            # 起動直後の待ち時間が過ぎていれば、新しい声・速さの決まり文句を裏で作り直す
+            if changed and self._warmup_due and self._warmup_path is not None:
+                self._enqueue_warmup(self._warmup_path)
 
     def on_stop(self, _msg: Empty) -> None:
         """音声停止を受けたら再生世代を進める (喋りかけの残りの文も出さない)。"""
-        self.playback_epoch += 1
-        self._published_ends = []
+        with self._speaking_lock:
+            self.playback_epoch += 1
+            self._published_ends = []
 
     # ── 発話 ───────────────────────────────────────────
     def handle_speak(self, request: Speak.Request, response: Speak.Response) -> Speak.Response:
@@ -701,15 +745,14 @@ class FvTtsNode(Node):
         """
         epoch = self.playback_epoch if epoch is None else int(epoch)
         out: List[CachedAudio] = []
-        if not self.vc_active:
+        if self.engine_selected != "aivis":
             cache_key = cache_key or self.make_cache_key(text, voice_id, volume_db)
             try:
                 cached = self.get_cached(text, voice_id, volume_db, cache_key)
             except Exception as exc:  # pylint: disable=broad-except
                 self.get_logger().error(str(SpeakFailed("pyopenjtalk", str(exc))))
                 return out
-            if epoch == self.playback_epoch:
-                self._publish(cached, stamp=stamp, epoch=epoch, play=play)
+            if self._publish(cached, stamp=stamp, epoch=epoch, play=play):
                 out.append(cached)
             return out
         if voice_id:
@@ -731,28 +774,37 @@ class FvTtsNode(Node):
             if epoch != self.playback_epoch:
                 break
             self._wait_backlog(epoch)
-            self._publish(cached, stamp=stamp, epoch=epoch, play=play)
+            if not self._publish(cached, stamp=stamp, epoch=epoch, play=play):
+                break
             out.append(cached)
         return out
 
-    def _publish(self, cached: CachedAudio, *, stamp, epoch: int, play: bool) -> None:
-        frame = self.build_frame(cached, stamp=stamp, epoch=epoch)
-        self.tts_pub.publish(frame)
-        if play:
-            self.play_pub.publish(frame)
-            self.begin_speaking(cached)
+    def _publish(self, cached: CachedAudio, *, stamp, epoch: int, play: bool) -> bool:
+        """出す (停止の世代の確認と出すことを 1 つのロックの中で)。停止されていれば出さず False。"""
+        with self._speaking_lock:
+            if self._closing or epoch != self.playback_epoch:
+                return False
+            frame = self.build_frame(cached, stamp=stamp, epoch=epoch)
+            self.tts_pub.publish(frame)
+            if play:
+                self.play_pub.publish(frame)
+                self.begin_speaking(cached)
+            return True
 
     def _wait_backlog(self, epoch: int) -> None:
         """出した音がまだ playback_backlog_s 秒ぶん残っていれば、減るまで待つ (待ち行列あふれ防止)。"""
         limit = float(getattr(self, "playback_backlog_s", 0.0) or 0.0)
         if limit <= 0:
             return
-        while epoch == self.playback_epoch:
-            now = time.monotonic()
-            self._published_ends = [t for t in self._published_ends if t > now]
-            backlog = (max(self._published_ends) - now) if self._published_ends else 0.0
-            if backlog <= limit and len(self._published_ends) < 6:
-                return
+        while not self._closing:
+            with self._speaking_lock:
+                if epoch != self.playback_epoch:
+                    return
+                now = time.monotonic()
+                self._published_ends = [t for t in self._published_ends if t > now]
+                backlog = (max(self._published_ends) - now) if self._published_ends else 0.0
+                if backlog <= limit and len(self._published_ends) < 6:
+                    return
             time.sleep(min(0.25, max(0.05, backlog - limit)))
 
     @staticmethod

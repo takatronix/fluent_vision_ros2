@@ -69,13 +69,14 @@ def node(tmp_path, monkeypatch):
     n._speaking = False
     n._speaking_end = 0.0
     n._speaking_timer = None
-    n._speaking_lock = threading.Lock()
+    n._speaking_lock = threading.RLock()
+    n._closing = False
     n.tts_pub, n.play_pub, n.speaking_pub = _Pub(), _Pub(), _Pub()
     n.cache, n.cache_dir = {}, None
     n.vc_kind, n.vc_speaker, n.vc_query, n.vc_max_chars = "aivis", 1310138977, {"speedScale": 1.3}, 200
     n.vc_speed = 1.3
     n.voice_store = vc.VoiceCacheStore(tmp_path, 10 ** 8)
-    n.vc_active = True
+    n.engine_selected = "aivis"
     n.vc_timeout = 0.5
     n.vc_volume_db = 0.0
     n.vc_match_loudness = False
@@ -83,6 +84,7 @@ def node(tmp_path, monkeypatch):
     n.vc_keepalive_s = 0.0
     n._vc_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     n._vc_inflight = set()
+    n._vc_futures = {}
     n._vc_lock = threading.Lock()
     n._vc_skip_until = 0.0
     n._vc_skip_reason = ""
@@ -113,6 +115,11 @@ def node(tmp_path, monkeypatch):
     n.get_cached = fake_get_cached
     yield n
     n._vc_pool.shutdown(wait=True)
+
+
+def _spoken(backend):
+    """温め (「はい。」) を除いた合成の呼び出し。"""
+    return [c for c in backend.calls if c[0] != tts_node.KEEPALIVE_TEXT]
 
 
 class _Backend:
@@ -251,8 +258,17 @@ def test_backlog_waits_before_publishing_more(node):
 
 def test_not_prepared_aivis_fails_the_utterance(node):
     node.voice_store = None
+    assert node.vc_active is False and node.engine_selected == "aivis"
     assert node.speak_text("テストです。", "", 8.0) == []
     assert node.ojt_calls == [] and "準備ができていません" in node.log.errors()[0]
+    # 準備が無いままでも、設定の選択は保つ (Open JTalk に流れない)
+    node._apply_voice_settings({"tts_engine": "aivis"})
+    assert node.engine_selected == "aivis"
+    assert node.speak_text("もう一度。", "", 8.0) == [] and node.ojt_calls == []
+    node._apply_voice_settings({"tts_engine": "pyopenjtalk"})
+    assert node.engine_selected == "pyopenjtalk"
+    node.speak_text("今度は。", "", 8.0)
+    assert node.ojt_calls == ["今度は。"]
 
 
 # ── Open JTalk: 選んだ時だけ、失敗は飛ばす ─────────────────
@@ -266,7 +282,7 @@ def test_open_jtalk_when_selected(node):
 
 
 def test_open_jtalk_failure_is_logged_not_replaced(node):
-    node.vc_active = False
+    node.engine_selected = "pyopenjtalk"
 
     def boom(text, voice_id, volume_db, cache_key):
         raise RuntimeError("pyopenjtalk is not available")
@@ -322,7 +338,7 @@ def test_male_and_female_are_cached_separately(node):
     assert len(node.vc_backend.calls) == 1          # 男はまだ無い → その場で合成
     node._apply_voice_settings({"aivis_speaker": 135718976})
     node.speak_text("収穫を始めます。", "", 8.0)
-    assert len(node.vc_backend.calls) == 1          # 女はキャッシュ
+    assert len(_spoken(node.vc_backend)) == 1       # 女はキャッシュ (声を変えた時の温めは数えない)
 
 
 def test_voice_change_rewarms_after_startup(node, tmp_path):
@@ -332,9 +348,10 @@ def test_voice_change_rewarms_after_startup(node, tmp_path):
     node._apply_voice_settings({"tts_engine": "aivis", "aivis_speaker": 135718976})
     assert node.submitted == []  # 起動直後の待ち時間中は作らない
     node._warmup_fire()
-    assert [s[4] for s in node.submitted] == [{"speaker": 135718976, "speed": 1.3}] * 2
+    assert [(s[4]["speaker"], s[4]["speed"]) for s in node.submitted] == [(135718976, 1.3)] * 2
     node._apply_voice_settings({"aivis_speed": 1.0})
     assert len(node.submitted) == 4               # 速さが変わっても作り直す
+    assert [(s[4]["speaker"], s[4]["speed"], s[4]["query"]["speedScale"]) for s in node.submitted[2:]] == [(135718976, 1.0, 1.0)] * 2
     assert all(not s[3] for s in node.submitted)  # ウォームアップは低優先
 
 
@@ -363,7 +380,7 @@ def test_keepalive_renders_a_short_text_when_idle(node):
 def test_keepalive_is_off_while_open_jtalk_is_selected(node):
     node.vc_backend = _Backend()
     node.vc_keepalive_s = 60.0
-    node.vc_active = False
+    node.engine_selected = "pyopenjtalk"
     node._aivis_last_use = 0.0
     node._keepalive_tick()
     node._keepalive_timer.cancel()
@@ -454,3 +471,101 @@ def test_speak_service_returns_one_frame_for_all_sentences(node):
     req.text = "三つ目。"
     res = node.handle_speak(req, tts_node.Speak.Response())
     assert not res.success and "読み上げできませんでした" in res.message
+
+
+# ── レビュー (2026-10-24) で足した試験 ───────────────────────
+def test_stop_during_backlog_wait_publishes_nothing_more(node):
+    node.playback_backlog_s = 0.3
+    node.vc_backend = _Backend()
+    for i in range(3):
+        node.voice_store.put(node._voice_key(f"{i}番目の文です。", 8.0),
+                             vc.float_to_pcm16(np.full(48000, 0.1, np.float32)), 48000, {})
+    # 2 文目で待ちに入ったところで停止
+    threading.Timer(0.1, node.on_stop, args=(None,)).start()
+    clips = node.speak_text("0番目の文です。1番目の文です。2番目の文です。", "", 8.0)
+    assert len(clips) == 1 and len(node.play_pub.frames) == 1   # 待った後にもう 1 文出さない
+
+
+def test_timeout_is_not_waited_twice_and_the_same_sentence_is_not_rendered_twice(node):
+    node.vc_timeout = 0.05
+    node.vc_down_skip = 10.0
+    node.vc_backend = _Backend(delay=0.3)
+    t0 = time.monotonic()
+    assert node.speak_text("一つ目の文です。", "", 8.0) == []
+    assert node.speak_text("一つ目の文です。", "", 8.0) == []    # 2 回目は待たずに飛ばす
+    assert time.monotonic() - t0 < 0.25
+    assert "秒前まで不通" in node.log.errors()[1]
+    time.sleep(0.4)
+    assert len(node.vc_backend.calls) == 1                     # 同じ文を二重に投入していない
+    assert node._voice_key("一つ目の文です。", 8.0) in node.voice_store
+    assert node._vc_futures == {} and node._vc_inflight == set()
+
+
+def test_two_requests_for_the_same_sentence_share_one_synthesis(node):
+    node.vc_timeout = 2.0
+    node.vc_backend = _Backend(delay=0.2)
+    results = []
+
+    def speak():
+        results.append(node.speak_text("同じ文です。", "", 8.0))
+
+    threads = [threading.Thread(target=speak) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(results) == 2 and all(len(r) == 1 for r in results)
+    assert len(node.vc_backend.calls) == 1
+    assert any("合成中だった声を待った" in m for m in node.log.lines)
+
+
+def test_speed_change_during_synthesis_keeps_key_query_and_meta_consistent(node):
+    class Slow(_Backend):
+        def synthesize(self, text, speaker, query):
+            node._apply_voice_settings({"aivis_speed": 1.0})   # 合成中に設定が変わる
+            return super().synthesize(text, speaker, query)
+
+    node.vc_backend = Slow()
+    key_before = node._voice_key("テストです。", 8.0)             # speed 1.3 のキー
+    node.speak_text("テストです。", "", 8.0)
+    spoken = _spoken(node.vc_backend)
+    assert len(spoken) == 1 and spoken[0][2]["speedScale"] == 1.3   # 合成は作り始めた時の速さ
+    assert key_before in node.voice_store                        # その速さのキーに保存
+    assert node.voice_store.index[key_before]["speed"] == 1.3    # メタも同じ
+    assert node._voice_key("テストです。", 8.0) != key_before       # いまの設定 (1.0) のキーとは別
+
+
+def test_destroy_stops_the_say_thread_and_further_output(node):
+    import queue as queue_mod
+    node._say_queue = queue_mod.Queue()
+    node._say_thread = threading.Thread(target=node._say_loop, daemon=True)
+    node._say_thread.start()
+    node.voice_worker.stop = lambda: None
+    node.destroy_node = lambda: None  # super() は ROS 無しでは呼べない
+    tts_node.FvTtsNode.destroy_node.__wrapped__ if hasattr(tts_node.FvTtsNode.destroy_node, "__wrapped__") else None
+    # destroy_node の中身を手で (super().destroy_node() を除く)
+    node._closing = True
+    with node._speaking_lock:
+        node.playback_epoch += 1
+    node._say_queue.put(None)
+    node._say_thread.join(timeout=2.0)
+    assert not node._say_thread.is_alive()
+    node.vc_backend = _Backend()
+    node.voice_store.put(node._voice_key("テストです。", 8.0),
+                         vc.float_to_pcm16(np.full(480, 0.1, np.float32)), 48000, {})
+    assert node.speak_text("テストです。", "", 8.0) == []            # 閉じた後は出さない
+    node._keepalive_now("x")                                      # 閉じた後は温めない
+    time.sleep(0.05)
+    assert node.vc_backend.calls == []
+
+
+def test_switching_to_aivis_warms_with_the_new_voice_after_settings_apply(node):
+    node.vc_backend = _Backend()
+    node.engine_selected = "pyopenjtalk"
+    node._apply_voice_settings({"tts_engine": "aivis", "aivis_speaker": 135718976, "aivis_speed": 1.0})
+    for _ in range(50):
+        if node.vc_backend.calls:
+            break
+        time.sleep(0.02)
+    assert node.vc_backend.calls[0][0] == tts_node.KEEPALIVE_TEXT
+    assert node.vc_backend.calls[0][1] == 135718976 and node.vc_backend.calls[0][2]["speedScale"] == 1.0
