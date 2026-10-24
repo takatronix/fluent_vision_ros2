@@ -546,8 +546,10 @@ def test_speed_change_during_synthesis_keeps_key_query_and_meta_consistent(node)
     assert node._voice_key("テストです。", 8.0) != key_before       # いまの設定 (1.0) のキーとは別
 
 
-def test_destroy_stops_the_say_thread_and_further_output(node):
+def test_destroy_stops_the_say_thread_and_further_output(node, monkeypatch):
     import queue as queue_mod
+    # 親 (rclpy の Node) の destroy_node は、__init__ を飛ばした素のインスタンスでは呼べない: 呼ばれたことだけ見る
+    monkeypatch.setattr(tts_node.Node, "destroy_node", lambda self: True)
     node._say_queue = queue_mod.Queue()
     node._say_thread = threading.Thread(target=node._say_loop, daemon=True)
     node._say_thread.start()
