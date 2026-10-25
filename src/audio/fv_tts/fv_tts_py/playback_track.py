@@ -36,6 +36,8 @@ CUT = "cut"
 FAILED = "failed"
 UNKNOWN = "unknown"
 FRAME_PREFIX = "fv_tts:"
+# frame_id の末尾の宛先 (fv_audio_output は自分の playback_done の publisher の gid でなければ鳴らさない)
+FRAME_TO = "@to="
 
 
 @dataclass
@@ -107,9 +109,13 @@ class PlaybackTracker:
         return f"{self.boot}-{next(self._n)}"
 
     @staticmethod
-    def frame_id(uid: str, index: int) -> str:
-        """AudioFrame.header.frame_id (fv_audio_output が PlaybackDone.request_id で返す)。"""
-        return f"{FRAME_PREFIX}{uid}:{index}"
+    def frame_id(uid: str, index: int, output: object = None) -> str:
+        """AudioFrame.header.frame_id (fv_audio_output が PlaybackDone.request_id で返す)。output (出力の publisher の gid、
+        bytes) があれば宛先を付ける: その出力だけが鳴らす (ほかの出力が同じ音を遅れて鳴らさない)。"""
+        fid = f"{FRAME_PREFIX}{uid}:{index}"
+        if isinstance(output, (bytes, bytearray)) and output:
+            fid += FRAME_TO + bytes(output).hex()
+        return fid
 
     def in_flight(self) -> int:
         return len(self._utts)
@@ -174,7 +180,7 @@ class PlaybackTracker:
                        output: object = None) -> str:
         """出した (play=True なら出力の待ち行列へ)。frame_id を返す (AudioFrame.header.frame_id に入れる)。"""
         utt = self._utts.get(uid)
-        fid = self.frame_id(uid, index)
+        fid = self.frame_id(uid, index, output if played else None)
         if utt is None:
             return fid
         clip = _Clip(index=index, text=text, frame_id=fid, epoch=int(epoch), seconds=float(seconds or 0.0),
@@ -199,7 +205,8 @@ class PlaybackTracker:
         self._check(utt)
 
     # ------------------------------------------------------ output side
-    def on_done(self, request_id: str, epoch: int, *, output: object = None, drained: bool = False) -> None:
+    def on_done(self, request_id: str, epoch: int, *, output: object = None, drained: bool = False,
+                complete: bool = True) -> None:
         """audio/output/playback_done (fv_audio_output が 1 フレームを鳴らし終えた)。output = 送り手の印 (publisher_gid)、
         drained = 鳴らし切ってから出した。送り手がクリップを出した時の出力でなければ (別の出力も鳴らした)、そのクリップは
         unknown。"""
@@ -211,6 +218,12 @@ class PlaybackTracker:
                 return
             if self._output_key is not None and (output is None or output != clip.output):
                 clip.sure = False             # 出した時の出力でない (別の出力・送り手の分からない古い出力)
+                if clip.done_at is None:
+                    clip.done_at = self._clock()
+                return
+            if not complete:
+                clip.sure = False             # 途中で装置を失った・drain に失敗した: 欠けたかもしれない
+                clip.reason = "incomplete"
                 if clip.done_at is None:
                     clip.done_at = self._clock()
                 return
@@ -236,13 +249,17 @@ class PlaybackTracker:
                     utt.sound = True
 
     def on_stop(self, reason: str = "stop") -> None:
-        """audio/output/stop・pause: 鳴っている・待っているクリップは cut。出している途中の発話も cut。"""
+        """audio/output/stop・pause: 鳴っている・待っているクリップは cut。出している途中の発話も cut。
+        ただし、その出力が「鳴らし切った」と言った done を既に受けたクリップ (drained) は、もう音が残っていないので done。"""
         for utt in list(self._utts.values()):
-            if utt.started:
-                utt.stopped = True
+            if utt.started and not utt.finished:
+                utt.stopped = True            # まだ出している途中: 残りの文は出さない (出し終えた発話はクリップの終わり方で決まる)
             for clip in utt.clips:
                 if not clip.status:
-                    clip.status, clip.reason = CUT, reason
+                    if clip.done_at is not None and clip.drained and clip.sure and self._same_output(clip.output):
+                        clip.status = DONE
+                    else:
+                        clip.status, clip.reason = CUT, reason
                     self._frames.pop(clip.frame_id, None)
                     self._clip_notice(utt, clip)
         for utt in list(self._utts.values()):

@@ -754,7 +754,8 @@ def _notices(node, kind=None):
 def _done(node, frame, epoch=None):
     gid = node.done_gid if node.done_gid is not None else getattr(node, "output_gid", b"")
     msg = tts_node.PlaybackDone(request_id=frame.header.frame_id, epoch=frame.epoch if epoch is None else epoch,
-                                drained=getattr(node, "drains", False), publisher_gid=list(gid or b""))
+                                drained=getattr(node, "drains", False), publisher_gid=list(gid or b""),
+                                complete=getattr(node, "complete", True))
     node.on_playback_done(msg)
 
 
@@ -770,7 +771,7 @@ def test_utterance_id_frame_ids_and_natural_completion(node):
     assert len(clips) == 1
     frame = node.play_pub.frames[0]
     start, = _notices(node, "start")
-    assert frame.header.frame_id == f"fv_tts:{start['id']}:0" and start["of"] == 1 and start["engine"] == "aivis"
+    assert frame.header.frame_id == f"fv_tts:{start['id']}:0@to=010f" and start["of"] == 1 and start["engine"] == "aivis"
     spoken = json.loads(node.spoken_pub.frames[-1].data)
     assert spoken["id"] == start["id"] and spoken["clips"] == 1 and spoken["of"] == 1   # 今の知らせに足しただけ
     assert {"text", "engine", "ok", "clips", "seconds", "ms", "error"} <= set(spoken)
@@ -1066,3 +1067,37 @@ def test_done_from_another_output_or_an_old_output_is_unknown(node):
         _settle(node, 1.2)
         end = _notices(node, "end")[-1]
         assert end["status"] == "unknown" and end["drained"] is False, (gid, end)
+
+
+def test_incomplete_done_is_unknown(node):
+    """fv_audio_output が途中で装置を失った・drain に失敗した (complete=false): 欠けたかもしれないので unknown (GPT 4 回目)。"""
+    _with_tracking(node, drained=True)
+    node.complete = False
+    node.vc_backend = _Backend()
+    node.speak_text("途中で装置が切れる文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "unknown" and end["drained"] is False
+
+
+def test_drained_done_before_a_stop_stays_done(node):
+    """鳴らし切った done を受けた後、確かめる tick の前に stop が来ても done (もう音は残っていない)。drain でない done は cut。"""
+    for drains, want in ((True, ("done", True)), (False, ("cut", False))):
+        _with_tracking(node, drained=drains)
+        node.vc_backend = _Backend()
+        node.speak_text("止められる前に鳴り終えた文です。", "", 8.0)
+        _done(node, node.play_pub.frames[-1])
+        node.on_stop(None)
+        end = _notices(node, "end")[-1]
+        assert (end["status"], end["drained"]) == want, (drains, end)
+
+
+def test_frames_are_addressed_to_the_single_output_only(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("宛先つきの文です。", "", 8.0)
+    assert node.play_pub.frames[-1].header.frame_id.endswith("@to=010f")
+    node.outputs = 2                                      # 出力が 1 つでない: 宛先なし (どれが鳴らしても unknown)
+    node.speak_text("宛先なしの文です。", "", 8.0)
+    assert "@to=" not in node.play_pub.frames[-1].header.frame_id
