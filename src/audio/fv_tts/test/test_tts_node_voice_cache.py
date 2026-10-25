@@ -726,3 +726,417 @@ def test_dedupe_mark_stays_until_the_cache_write_is_done(node):
     first.join()
     assert len(second) == 1
     assert len(_spoken(node.vc_backend)) == 1
+
+
+# ── 発話ごとの id とクリップの終わり方 (/aspa/tts/playback、playback_track.py) ─────────
+pt = pytest.importorskip("fv_tts_py.playback_track")
+
+
+def _with_tracking(node, outputs=1, latency=0.05, sound_unknown=False, drained=False):
+    node.playback_pub = _Pub()
+    node.tts_speaking_pub = _Pub()
+    node.outputs = outputs
+    node.drains = drained                                 # 偽の出力の done が「鳴らし切った」と言うか
+    node.output_gid = b"\x01\x0f"                         # graph で見える出力の publisher の gid
+    node.done_gid = None                                  # done の送り手 (None = 出力と同じ)
+    node._output_state = lambda: node.output_gid if node.outputs == 1 else None
+    node._sound_unknown = lambda: sound_unknown
+    node._track = pt.PlaybackTracker(node._emit_playback, latency_s=latency, grace_s=1.0, boot="t35t",
+                                     output_key=node._output_state)
+    return node
+
+
+def _notices(node, kind=None):
+    out = [json.loads(m.data) for m in node.playback_pub.frames]
+    return [e for e in out if kind is None or e["event"] == kind]
+
+
+def _done(node, frame, epoch=None):
+    gid = node.done_gid if node.done_gid is not None else getattr(node, "output_gid", b"")
+    msg = tts_node.PlaybackDone(request_id=frame.header.frame_id, epoch=frame.epoch if epoch is None else epoch,
+                                drained=getattr(node, "drains", False), publisher_gid=list(gid or b""),
+                                complete=getattr(node, "complete", True))
+    node.on_playback_done(msg)
+
+
+def _settle(node, seconds=0.12):
+    time.sleep(seconds)
+    node._track_tick()
+
+
+def test_utterance_id_frame_ids_and_natural_completion(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    clips = node.speak_text("実際に収穫するか確認してください。", "", 8.0)
+    assert len(clips) == 1
+    frame = node.play_pub.frames[0]
+    start, = _notices(node, "start")
+    assert frame.header.frame_id == f"fv_tts:{start['id']}:0@to=010f" and start["of"] == 1 and start["engine"] == "aivis"
+    spoken = json.loads(node.spoken_pub.frames[-1].data)
+    assert spoken["id"] == start["id"] and spoken["clips"] == 1 and spoken["of"] == 1   # 今の知らせに足しただけ
+    assert {"text", "engine", "ok", "clips", "seconds", "ms", "error"} <= set(spoken)
+    assert _notices(node, "end") == []                   # 出しただけ (鳴り終わりはまだ)
+    _done(node, frame)
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["id"] == start["id"] and end["clips"] == 1 and end["sound"] is False
+
+
+def test_say_topic_gets_an_id_when_queued(node):
+    import queue as queue_mod
+    _with_tracking(node)
+    node._say_queue = queue_mod.Queue()
+    node.on_say(tts_node.String(data="  走行を再開できます\x1f\x1e "))
+    queued, = _notices(node, "queued")
+    item = node._say_queue.get_nowait()
+    assert item[0] == "走行を再開できます" and item[3] == queued["id"] and queued["text"] == "走行を再開できます"
+
+
+def test_between_sentences_speaking_goes_off_but_the_utterance_is_not_done(node):
+    """AivisSpeech は文ごと: 2 文目の合成が遅れると speaking は文の間で OFF (タイマー)。発話の end は 2 文とも鳴り終えてから、of=2。"""
+    _with_tracking(node)
+
+    class SlowSecond(_Backend):
+        def synthesize(self, text, speaker, query):
+            if text.startswith("二"):
+                time.sleep(2.0)                           # 1 文目 (1 秒) の再生 + 尾が終わってから
+            return super().synthesize(text, speaker, query)
+
+    node.vc_backend = SlowSecond()
+    node.vc_timeout = 5.0
+    done_first = []
+
+    def first_done():
+        # 1 文目が鳴り終えた (出力の playback_done)
+        while not node.play_pub.frames:
+            time.sleep(0.01)
+        time.sleep(1.3)
+        _done(node, node.play_pub.frames[0])
+        _settle(node)
+        done_first.append([m.data for m in node.tts_speaking_pub.frames])
+
+    t = threading.Thread(target=first_done)
+    t.start()
+    clips = node.speak_text("一つ目の文です。二つ目の文です。", "", 8.0)
+    t.join()
+    assert len(clips) == 2
+    assert done_first[0] == [True, False]               # 文の間で読み上げの speaking が OFF になった
+    assert [c["status"] for c in _notices(node, "clip")] == ["done"] and _notices(node, "end") == []
+    _done(node, node.play_pub.frames[1])
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["of"] == 2 and end["clips"] == 2
+
+
+def test_stop_while_playing_cuts_the_clip(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("止められる文です。", "", 8.0)
+    frame = node.play_pub.frames[0]
+    node.on_stop(None)
+    _done(node, frame)                                   # 止めた後の done (別の世代) は数えない
+    _settle(node)
+    clip, = _notices(node, "clip")
+    end, = _notices(node, "end")
+    assert clip["status"] == "cut" and end["status"] == "cut"
+
+
+def test_stop_during_the_second_sentence_is_cut(node):
+    _with_tracking(node)
+
+    class Stopper(_Backend):
+        def synthesize(self, text, speaker, query):
+            out = super().synthesize(text, speaker, query)
+            if text.startswith("二"):
+                node.on_stop(None)
+            return out
+
+    node.vc_backend = Stopper()
+    clips = node.speak_text("一つ目の文です。二つ目の文です。", "", 8.0)
+    assert len(clips) == 1
+    end, = _notices(node, "end")
+    assert end["status"] == "cut" and end["of"] == 2
+    # 文ごとに 1 つずつ結果がある: 1 文目は鳴っている途中で cut、2 文目は止められて出さなかった cut (GPT P1)
+    assert sorted((c["index"], c["status"]) for c in _notices(node, "clip")) == [(0, "cut"), (1, "cut")]
+    assert end["statuses"] == ["cut", "cut"] or sorted(end["statuses"]) == ["cut", "cut"]
+
+
+def test_sound_effect_during_the_utterance_is_reported(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("効果音と重なる文です。", "", 8.0)
+    node.on_sound_speaking(tts_node.Bool(data=True))
+    node.on_sound_speaking(tts_node.Bool(data=False))
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["sound"] is True
+
+
+def test_open_jtalk_utterance_is_tracked_as_one_clip(node):
+    _with_tracking(node)
+    node.engine_selected = "pyopenjtalk"
+    node.speak_text("テストです。二つ目。", "", 8.0)
+    start, = _notices(node, "start")
+    assert start["of"] == 1 and start["engine"] == "pyopenjtalk"
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["status"] == "done"
+
+
+def test_unknown_when_outputs_are_not_exactly_one(node):
+    _with_tracking(node, outputs=0)
+    node.vc_backend = _Backend()
+    node.speak_text("出力が無い文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["status"] == "unknown"
+
+
+def test_tts_only_speaking_topic_mirrors_the_shared_one(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("短い文です。", "", 8.0)
+    time.sleep(1.3)
+    assert [m.data for m in node.speaking_pub.frames] == [True, False]
+    assert [m.data for m in node.tts_speaking_pub.frames] == [True, False]
+
+
+def test_nothing_is_published_after_destroy(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("終わる前の文です。", "", 8.0)
+    n = len(node.playback_pub.frames)
+    node._closing = True
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    node.on_stop(None)
+    assert len(node.playback_pub.frames) == n
+
+
+def test_pause_cuts_the_clip(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("一時停止される文です。", "", 8.0)
+    node.on_pause(None)                                  # fv_audio_output は鳴っている音を捨てる (done は出さない)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["status"] == "cut"
+
+
+def test_a_late_check_after_a_blocked_executor_is_unknown(node):
+    """done を受けた後、Speak サービスなどで実行器が塞がり tick が遅れた: その間の stop の callback がまだかもしれない (GPT P0)。"""
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("確かめが遅れる文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    time.sleep(0.05 + node._track.late_s + 0.1)
+    node._track_tick()
+    end, = _notices(node, "end")
+    assert end["status"] == "unknown"
+    assert _notices(node, "clip")[0]["reason"] == "late check"
+
+
+def test_a_second_output_appearing_before_the_check_is_unknown(node):
+    _with_tracking(node, outputs=1)
+    node.vc_backend = _Backend()
+    node.speak_text("出力が増える文です。", "", 8.0)
+    node.outputs = 2                                     # 合成中・再生中に 2 つ目の fv_audio_output が上がった
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["status"] == "unknown"
+
+
+def test_sound_unknown_at_start_marks_the_utterance(node):
+    _with_tracking(node, sound_unknown=True)             # 起動直後・古い soundboard (出どころの分からない speaking)
+    node.vc_backend = _Backend()
+    node.speak_text("効果音が分からない文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["sound"] is True
+
+
+def test_sound_unknown_rules(node):
+    """共用の speaking の出し手 (自分以外) が全部、効果音だけの印も出しているノードの時だけ「分かる」(GPT: 数ではなくノードで)。"""
+    from types import SimpleNamespace as NS
+    node.speaking_topic, node.sound_speaking_topic = "/aspa/audio/speaking", "/aspa/soundboard/speaking"
+    node.resolve_topic_name = lambda t: t
+    node.get_name, node.get_namespace = (lambda: "fv_tts"), (lambda: "/")
+    pubs = {"/aspa/audio/speaking": [NS(node_name="fv_tts", node_namespace="/"), NS(node_name="fv_soundboard", node_namespace="/")],
+            "/aspa/soundboard/speaking": [NS(node_name="fv_soundboard", node_namespace="/")]}
+    node.get_publishers_info_by_topic = lambda topic: list(pubs[topic])
+    node._t_boot = time.monotonic() - 10.0
+    assert tts_node.FvTtsNode._sound_unknown(node) is False      # soundboard (新しい) だけ
+    pubs["/aspa/audio/speaking"].append(NS(node_name="other_player", node_namespace="/"))
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 別の音の出し手 (効果音だけの印を出さない) が増えた
+    pubs["/aspa/audio/speaking"].pop()
+    pubs["/aspa/audio/speaking"].append(NS(node_name="fv_soundboard2", node_namespace="/"))
+    pubs["/aspa/soundboard/speaking"].append(NS(node_name="fv_soundboard2", node_namespace="/"))
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 効果音だけの印の出し手が 2 つ (状態が上書きされる)
+    pubs["/aspa/audio/speaking"].pop()
+    pubs["/aspa/soundboard/speaking"][-1] = NS(node_name="fv_soundboard", node_namespace="/")
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 同じ名前・同じ名前空間の soundboard が 2 つ (別の publisher)
+    pubs["/aspa/soundboard/speaking"].pop()
+    assert tts_node.FvTtsNode._sound_unknown(node) is False
+    pubs["/aspa/audio/speaking"].append(NS(node_name="fv_soundboard", node_namespace="/"))
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 新しい soundboard と同じ名前の古い soundboard (印を出さない)
+    pubs["/aspa/audio/speaking"].pop()
+    pubs["/aspa/audio/speaking"].append(NS(node_name="fv_tts", node_namespace="/"))
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 自分と同じ名前の出し手がほかにもいる
+    pubs["/aspa/audio/speaking"].pop()
+    assert tts_node.FvTtsNode._sound_unknown(node) is False
+    pubs["/aspa/soundboard/speaking"] = []
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 古い soundboard: 効果音だけの印が無い
+    pubs["/aspa/audio/speaking"] = [NS(node_name="fv_tts", node_namespace="/")]
+    assert tts_node.FvTtsNode._sound_unknown(node) is False      # 自分だけ (効果音を出すノードが無い)
+    node._t_boot = time.monotonic()
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 起動直後
+
+
+def test_pause_while_synthesizing_does_not_cut_a_sentence_played_after_resume(node):
+    """合成中に pause → 再開の後に出した文は最後まで鳴る: cut ではない (GPT)。鳴っていたクリップは cut。"""
+    _with_tracking(node, drained=True)
+
+    class PauseDuring(_Backend):
+        def synthesize(self, text, speaker, query):
+            node.on_pause(None)                          # 合成中に pause (鳴っているクリップは無い)
+            return super().synthesize(text, speaker, query)
+
+    node.vc_backend = PauseDuring()
+    node.speak_text("合成中に一時停止された文です。", "", 8.0)
+    _done(node, node.play_pub.frames[-1])
+    node._track_tick()
+    assert _notices(node, "end")[-1]["status"] == "done"
+
+
+def test_extra_speaking_publish_failure_keeps_speaking(node):
+    _with_tracking(node)
+
+    class Broken:
+        frames = []
+
+        def publish(self, _msg):
+            raise RuntimeError("publisher gone")
+
+    node.tts_speaking_pub = Broken()
+    node.vc_backend = _Backend()
+    clips = node.speak_text("一つ目の文です。二つ目の文です。", "", 8.0)
+    assert len(clips) == 2 and len(node.play_pub.frames) == 2      # 足した印が壊れても残りの文を出す
+    assert [m.data for m in node.speaking_pub.frames][:1] == [True]
+    starts = [c for c in _notices(node, "start")]
+    assert starts and node._track.in_flight() == 1                 # 2 クリップとも数えている
+
+
+def test_destroy_ends_every_pending_utterance_as_cut(node, monkeypatch):
+    import queue as queue_mod
+    monkeypatch.setattr(tts_node.Node, "destroy_node", lambda self: True)
+    _with_tracking(node)
+    node._say_queue = queue_mod.Queue()
+    node.voice_worker.stop = lambda: None
+    node.vc_backend = _Backend()
+    node.speak_text("鳴っている間に終了する文です。", "", 8.0)
+    node.on_say(tts_node.String(data="受付だけされた文です。"))
+    node.destroy_node()
+    ends = _notices(node, "end")
+    assert sorted(e["text"] for e in ends) == sorted(["鳴っている間に終了する文です。", "受付だけされた文です。"])
+    assert {e["status"] for e in ends} == {"cut"}
+    n = len(node.playback_pub.frames)
+    node.on_stop(None)
+    node._track_tick()
+    assert len(node.playback_pub.frames) == n                       # 終了の後は何も出さない
+
+
+def test_drained_output_reports_drained_and_needs_no_latency(node):
+    """鳴らし切ってから done を出す出力 (aspa: drain_after_frame=true): done の時にはもう音は残っていない。"""
+    _with_tracking(node, drained=True, latency=0.4)
+    node.vc_backend = _Backend()
+    node.speak_text("鳴らし切る出力の文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    node._track_tick()                                     # 待たずに確定 (出力の遅れを待つ必要が無い)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["drained"] is True
+    assert _notices(node, "clip")[0]["drained"] is True
+
+
+def test_not_drained_output_reports_drained_false(node):
+    _with_tracking(node, drained=False)
+    node.vc_backend = _Backend()
+    node.speak_text("鳴らし切らない出力の文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["drained"] is False      # 聞く側は証拠にしない
+
+
+def test_output_restarted_between_publish_and_done_is_unknown(node):
+    _with_tracking(node, drained=True)
+    node.vc_backend = _Backend()
+    node.speak_text("出力が入れ替わる文です。", "", 8.0)
+    node.output_gid = b"\x02"                               # fv_audio_output が再起動した (gid が変わる)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["status"] == "unknown"
+
+
+def test_output_state_is_the_single_done_publisher_that_plays(node):
+    """_output_state: playback_done の出し手がちょうど 1 つで、再生の topic の購読者でもある時だけ、その publisher の gid。"""
+    from types import SimpleNamespace as NS
+    node.playback_done_topic, node.playback_topic = "audio/output/playback_done", "audio/output/frame"
+    node.resolve_topic_name = lambda t: "/" + t
+    pubs = [NS(node_name="fv_audio_output", node_namespace="/", endpoint_gid=[7, 7])]
+    subs = [NS(node_name="fv_audio_output", node_namespace="/"), NS(node_name="bridge", node_namespace="/")]
+    node.get_publishers_info_by_topic = lambda topic: list(pubs)
+    node.get_subscriptions_info_by_topic = lambda topic: list(subs)
+    assert tts_node.FvTtsNode._output_state(node) == bytes([7, 7])
+    pubs.append(NS(node_name="fv_audio_output2", node_namespace="/", endpoint_gid=[8]))
+    assert tts_node.FvTtsNode._output_state(node) is None                   # 出力が 2 つ
+    pubs.pop()
+    subs.pop(0)
+    assert tts_node.FvTtsNode._output_state(node) is None                   # done を出すが再生の購読者でない
+
+
+def test_done_from_another_output_or_an_old_output_is_unknown(node):
+    """done の送り手 (PlaybackDone.publisher_gid) がクリップを出した時の出力でなければ unknown (GPT: 一時的な 2 つ目の出力)。"""
+    for gid in (b"\x09", b""):                            # 別の出力 / 送り手の分からない古い出力
+        _with_tracking(node, drained=True)
+        node.done_gid = gid
+        node.vc_backend = _Backend()
+        node.speak_text("送り手が違う文です。", "", 8.0)
+        _done(node, node.play_pub.frames[-1])
+        _settle(node, 1.2)
+        end = _notices(node, "end")[-1]
+        assert end["status"] == "unknown" and end["drained"] is False, (gid, end)
+
+
+def test_incomplete_done_is_unknown(node):
+    """fv_audio_output が途中で装置を失った・drain に失敗した (complete=false): 欠けたかもしれないので unknown (GPT 4 回目)。"""
+    _with_tracking(node, drained=True)
+    node.complete = False
+    node.vc_backend = _Backend()
+    node.speak_text("途中で装置が切れる文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "unknown" and end["drained"] is False
+
+
+def test_drained_done_before_a_stop_stays_done(node):
+    """鳴らし切った done を受けた後、確かめる tick の前に stop が来ても done (もう音は残っていない)。drain でない done は cut。"""
+    for drains, want in ((True, ("done", True)), (False, ("cut", False))):
+        _with_tracking(node, drained=drains)
+        node.vc_backend = _Backend()
+        node.speak_text("止められる前に鳴り終えた文です。", "", 8.0)
+        _done(node, node.play_pub.frames[-1])
+        node.on_stop(None)
+        end = _notices(node, "end")[-1]
+        assert (end["status"], end["drained"]) == want, (drains, end)
+
+
+def test_frames_are_addressed_to_the_single_output_only(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("宛先つきの文です。", "", 8.0)
+    assert node.play_pub.frames[-1].header.frame_id.endswith("@to=010f")
+    node.outputs = 2                                      # 出力が 1 つでない: 宛先なし (どれが鳴らしても unknown)
+    node.speak_text("宛先なしの文です。", "", 8.0)
+    assert "@to=" not in node.play_pub.frames[-1].header.frame_id

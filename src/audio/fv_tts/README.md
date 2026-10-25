@@ -121,8 +121,39 @@ ros2 topic pub -1 /aspa/tts/say std_msgs/String "{data: 'アスパラを見つ�
 - `/aspa/tts/say` (std_msgs/String): 任意テキスト→発話 (本ノードが消費)
 - `/aspa/audio/speaking` (std_msgs/Bool): 再生中フラグ (本ノードが publish)
 - `/aspa/tts/spoken` (std_msgs/String, JSON): 喋った / 飛ばした発話の知らせ (本ノードが publish)。
-  `{"text", "engine": "aivis"|"pyopenjtalk", "ok", "clips", "seconds", "ms", "error"}`。
-  viewer がブラウザへ流し、aspa_agent が「どの声で喋ったか」を記録する
+  `{"id", "text", "engine": "aivis"|"pyopenjtalk", "ok", "clips", "of", "seconds", "ms", "error"}`。
+  viewer がブラウザへ流し、aspa_agent が「どの声で喋ったか」を記録する。出し終えた時に出す (鳴り終わりではない)
+- `/aspa/tts/playback` (std_msgs/String, JSON): 発話ごとの id と、分けて読んだクリップ (文) ごとの終わり方
+  (`fv_tts_py/playback_track.py`)。どれも `event` `id` `seq` `boot` `text` `t` を持つ:
+  - `queued` (/aspa/tts/say を受けた)・`start` (`of` = 分けた文の数, `engine`)
+  - `clip` (`index` `of` `clip_text` `status` `seconds` `drained` `reason`):
+    - `done` = 出力 (fv_audio_output) が最後まで鳴らした (`audio/output/playback_done` を受けた)。done の送り手
+      (`PlaybackDone.publisher_gid`) は、クリップを出した時の出力 (graph の endpoint_gid) と同じでなければならない (違えば unknown)。
+      `drained` = その出力の done が `PlaybackDone.drained` (snd_pcm_drain で鳴らし切ってから出した。`audio.drain_after_frame=true`
+      で drain に成功した時) と言った: done の時にはもう音は残っていない。false なら `playback_done_latency_s` (0.4 s) 待って、
+      その間に止められなければ done (聞く側は false を「鳴り終わりの証拠」にしない: 実行器の callback の順番で、後の stop を
+      見落としうる)。
+    - `cut` = 止められた (`audio/output/stop`・`audio/output/pause`・終了処理)。止められて出さなかった残りの文も 1 つずつ。
+    - `failed` = 合成できなかった。
+    - `unknown` = 鳴り終わりが分からない: done が見込みの尺 + `playback_done_grace_s` (5 s) で来ない、playback_done を出す
+      ノードがちょうど 1 つでない・それが再生の topic の購読者でない・クリップを出した時と確かめる時で出力が違う (再起動)・
+      done の送り手が違う (別の出力も鳴らした・送り手の分からない古い出力)、
+      drained でない done を確かめる tick が遅れた (実行器が塞がっていた)、鳴らさない設定。
+  - `end` (`status`: `done` = 全部の文が done / `cut` / `failed` / `partial` / `unknown`、`of` `clips` `done` `drained`
+    (done の全部が drained) `sound` (ほかの音と重なった) `statuses` `seconds` `error`)。全部のクリップの終わり方が決まってから出す。
+    `sound` は、効果音だけの印が立っている間に始まった・立った、自分の物でない playback_done (soundboard の audio_frame の音) が
+    始まってから終わるまでに来た・その後出力の遅れの間に始まった、起動から 2 秒、`/aspa/audio/speaking` に自分以外の出し手が
+    いるのに効果音だけの印の出し手がいない (古い soundboard) 時に true
+  - `seq` は起動 (`boot`) ごとに 1 から: 聞く側は飛び・入れ替わり・再起動を見分ける
+  - AudioFrame の `header.frame_id` に `fv_tts:<id>:<文の番号>` を入れる (PlaybackDone.request_id で返る)。出力がちょうど 1 つの
+    時は末尾に宛先 `@to=<その出力の playback_done の publisher の gid>` を付け、fv_audio_output は自分宛てでないフレームを
+    鳴らさない (ほかの出力が同じ音を遅れて鳴らすと「鳴り終わった」が嘘になる)。宛先の無いフレームは今までどおり全部の出力が鳴らす
+  - fv_audio_output の PlaybackDone に足した項目: `complete` (書き始めた後に装置を失わず、drain するなら drain・prepare も成功)、
+    `drained` (complete かつ drain_after_frame)、`publisher_gid`。complete=false の done は unknown ("incomplete")
+- `/aspa/tts/speaking` (std_msgs/Bool): 読み上げ (本ノード) だけの再生中フラグ (`/aspa/audio/speaking` と同じタイマー。
+  そちらは fv_soundboard の効果音でも立つ)
+- `/aspa/soundboard/speaking` (std_msgs/Bool): fv_soundboard の効果音だけの再生中フラグ (再生尺が過ぎてもシンクが鳴らし終える
+  まで下ろさない。上がっている間は 1 秒ごとに出し直す。本ノードが購読し、立っている間の発話を `sound` にする)
 
 ## キャッシュ
 `cache_dir`（既定 `~/.fluent_voice_cache`）にPCMとメタ情報を保存します。`cache_key`で共有可能。

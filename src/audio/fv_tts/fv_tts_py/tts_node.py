@@ -32,11 +32,12 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from std_msgs.msg import Bool, Empty, String
 
-from fv_audio.msg import AudioFrame
+from fv_audio.msg import AudioFrame, PlaybackDone
 from fv_tts.srv import Speak
 
 from fv_tts_py.aivis_backend import DEFAULT_URL as AIVIS_DEFAULT_URL, AivisBackend, AivisUnreachable
 from fv_tts_py import voice_cache as vc
+from fv_tts_py.playback_track import PlaybackTracker
 
 # Disable tqdm progress bar for pyopenjtalk downloads
 os.environ["TQDM_DISABLE"] = "1"
@@ -63,6 +64,9 @@ KEEPALIVE_TEXT = "はい。"
 _SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?\n])")
 _CLAUSE_SPLIT = re.compile(r"(?<=[、,])")
 _SENTENCE_MIN = 6      # これより短い切れ端は前の文につなぐ
+# 起動からこの秒数は、効果音が鳴っているかを知れない (fv_soundboard は鳴っている間 1 秒ごとに印を出し直す)
+SOUND_BOOT_UNKNOWN_S = 2.0
+
 _SENTENCE_MAX = 120    # これより長い文は読点で分ける (合成の待ち時間を揃える)
 
 
@@ -194,8 +198,21 @@ class FvTtsNode(Node):
         self.declare_parameter("say_topic", "/aspa/tts/say")
         self.declare_parameter("speaking_topic", "/aspa/audio/speaking")
         self.declare_parameter("settings_topic", "/aspa/tts/settings")
-        # 実際に喋った (または飛ばした) 発話の知らせ: JSON {text, engine, ok, clips, ms, error}
+        # 実際に喋った (または飛ばした) 発話の知らせ: JSON {id, text, engine, ok, clips, of, ms, error}
         self.declare_parameter("spoken_topic", "/aspa/tts/spoken")
+        # 発話ごとの id と、クリップ (文) ごとの終わり方 (完走・中断・失敗・不明) と発話全体の終わり: JSON
+        # (playback_track.py)。完走は出力 (fv_audio_output) の playback_done で本当に鳴り終えた時に出す
+        self.declare_parameter("playback_events_topic", "/aspa/tts/playback")
+        self.declare_parameter("playback_done_topic", "audio/output/playback_done")
+        # playback_done の後、出力の先にまだ残っているかもしれない音 (drain_after_frame=false の ALSA バッファ ≈ 0.34 s)。
+        # この間に止められたら完走ではない
+        self.declare_parameter("playback_done_latency_s", 0.4)
+        # 見込みの鳴り終わりからこれだけ過ぎても playback_done が来ないクリップは「不明」
+        self.declare_parameter("playback_done_grace_s", 5.0)
+        # 読み上げ (このノード) だけの再生中フラグ。/aspa/audio/speaking は fv_soundboard の効果音でも立つ (同じ topic)
+        self.declare_parameter("tts_speaking_topic", "/aspa/tts/speaking")
+        # fv_soundboard の効果音だけの再生中フラグ。立っている間に喋った発話は「ほかの音と重なった」(sound) と知らせる
+        self.declare_parameter("sound_speaking_topic", "/aspa/soundboard/speaking")
 
         self.default_voice = self.get_parameter("default_voice").get_parameter_value().string_value
         self.output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
@@ -213,6 +230,10 @@ class FvTtsNode(Node):
         self.speaking_topic = self.get_parameter("speaking_topic").get_parameter_value().string_value
         self.settings_topic = self.get_parameter("settings_topic").value
         self.spoken_topic = str(self.get_parameter("spoken_topic").value or "")
+        self.playback_events_topic = str(self.get_parameter("playback_events_topic").value or "")
+        self.playback_done_topic = str(self.get_parameter("playback_done_topic").value or "")
+        self.tts_speaking_topic = str(self.get_parameter("tts_speaking_topic").value or "")
+        self.sound_speaking_topic = str(self.get_parameter("sound_speaking_topic").value or "")
 
         # AivisSpeech の声 + 声キャッシュ: 保存済みの文はその WAV、無ければその場で合成して保存。
         self.declare_parameter("aivis_query", "{}")  # audio_query 上書き JSON (speedScale は aivis_speed が入る)
@@ -251,6 +272,14 @@ class FvTtsNode(Node):
         self.play_pub = self.create_publisher(AudioFrame, self.playback_topic, qos)
         self.speaking_pub = self.create_publisher(Bool, self.speaking_topic, 10)
         self.spoken_pub = self.create_publisher(String, self.spoken_topic, 10) if self.spoken_topic else None
+        self.tts_speaking_pub = (self.create_publisher(Bool, self.tts_speaking_topic, 10)
+                                 if self.tts_speaking_topic else None)
+        events_qos = QoSProfile(depth=50)
+        events_qos.reliability = ReliabilityPolicy.RELIABLE
+        events_qos.durability = DurabilityPolicy.VOLATILE
+        events_qos.history = HistoryPolicy.KEEP_LAST
+        self.playback_pub = (self.create_publisher(String, self.playback_events_topic, events_qos)
+                             if self.playback_events_topic else None)
         self.srv = self.create_service(Speak, "speak", self.handle_speak)
 
         # Event Bus 契約: soundboard 等が /aspa/tts/say に流す任意テキストを喋る
@@ -267,6 +296,25 @@ class FvTtsNode(Node):
         # epoch は AudioFrame.epoch に埋め込み、audio_output 側で stop 時に世代を進めて破棄する。
         self.playback_epoch = 1
         self.stop_sub = self.create_subscription(Empty, self.stop_topic, self.on_stop, qos)
+
+        # 発話ごとの id とクリップの終わり方 (playback_track.py)。出す側の共通ロック (_speaking_lock) の中で触る
+        self._t_boot = time.monotonic()
+        self._track = PlaybackTracker(
+            self._emit_playback,
+            latency_s=float(self.get_parameter("playback_done_latency_s").value),
+            grace_s=float(self.get_parameter("playback_done_grace_s").value),
+            output_key=self._output_state)
+        if self.playback_done_topic:
+            self.done_sub = self.create_subscription(
+                PlaybackDone, self.playback_done_topic, self.on_playback_done, qos)
+        if self.sound_speaking_topic:
+            self.sound_sub = self.create_subscription(Bool, self.sound_speaking_topic, self.on_sound_speaking, 10)
+        # 出力の一時停止 (fv_audio_output は鳴っている音を捨てる。done は出さない): 鳴っている・待っているクリップは「中断」
+        self.declare_parameter("pause_topic", "audio/output/pause")
+        pause_topic = str(self.get_parameter("pause_topic").value or "")
+        if pause_topic:
+            self.pause_sub = self.create_subscription(Empty, pause_topic, self.on_pause, qos)
+        self._track_timer = self.create_timer(0.05, self._track_tick)
 
         # /aspa/audio/speaking (再生中フラグ) を再生尺ベースで上げ下げする。
         # 実再生は fv_audio_output が非同期で行うため、再生尺 + tail からタイマで戻す。
@@ -647,6 +695,10 @@ class FvTtsNode(Node):
         # 受付をやめ、喋りかけを止め、作業スレッドを終えてから ROS のものを壊す
         queue_ = getattr(self, "_say_queue", None)
         with self._speaking_lock:
+            track = getattr(self, "_track", None)
+            if track is not None and not self._closing:
+                # 受付済み・合成中・再生待ちの発話は「中断」で終える (publisher を壊す前に。この後は何も出さない)
+                track.close_all("shutdown")
             self._closing = True
             self.playback_epoch += 1
             for timer in (self._warmup_timer, self._keepalive_timer, self._speaking_timer):
@@ -737,10 +789,110 @@ class FvTtsNode(Node):
                 self._enqueue_warmup(self._warmup_path)
 
     def on_stop(self, _msg: Empty) -> None:
-        """音声停止を受けたら再生世代を進める (喋りかけの残りの文も出さない)。"""
+        """音声停止を受けたら再生世代を進める (喋りかけの残りの文も出さない)。鳴っている・待っているクリップは「中断」。"""
         with self._speaking_lock:
             self.playback_epoch += 1
             self._published_ends = []
+            track = getattr(self, "_track", None)
+            if track is not None and not self._closing:
+                track.on_stop()
+
+    # ── 発話ごとの終わり方 (playback_track.py) ─────────────────
+    def _emit_playback(self, payload: Dict) -> None:
+        """/aspa/tts/playback へ 1 つ出す (呼び手が _speaking_lock を持っている)。終了処理の後は出さない。"""
+        pub = getattr(self, "playback_pub", None)
+        if pub is None or self._closing:
+            return
+        try:
+            pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
+        except Exception as exc:  # pylint: disable=broad-except
+            self.get_logger().debug(f"playback publish failed: {exc}")
+
+    def on_playback_done(self, msg) -> None:
+        """fv_audio_output が 1 フレームを鳴らし終えた (request_id = 出した AudioFrame.header.frame_id)。drained = 鳴らし切って
+        から出した (snd_pcm_drain が成功)、publisher_gid = 知らせを出した publisher (古い出力は既定値 = false / 空)。"""
+        rid = str(getattr(msg, "request_id", "") or getattr(getattr(msg, "header", None), "frame_id", "") or "")
+        try:
+            gid = bytes(bytearray(int(b) & 0xFF for b in (getattr(msg, "publisher_gid", None) or [])))
+        except (TypeError, ValueError):
+            gid = b""
+        drained = getattr(msg, "drained", False) is True
+        complete = getattr(msg, "complete", False) is True
+        with self._speaking_lock:
+            track = getattr(self, "_track", None)
+            if track is not None and not self._closing:
+                track.on_done(rid, int(getattr(msg, "epoch", 0) or 0), output=gid or None, drained=drained,
+                              complete=complete)
+
+    def on_pause(self, _msg: Empty) -> None:
+        """audio/output/pause: 鳴っている音は捨てられる (fv_audio_output)。鳴っている・待っているクリップは「中断」。
+        stop と違って再生の世代は進めない (再開の後に出す文は鳴る) ので、出している途中の発話は止めない。"""
+        with self._speaking_lock:
+            track = getattr(self, "_track", None)
+            if track is not None and not self._closing:
+                track.on_stop("pause", stop_publishing=False)
+
+    def on_sound_speaking(self, msg: Bool) -> None:
+        """fv_soundboard の効果音だけの再生中フラグ。"""
+        with self._speaking_lock:
+            track = getattr(self, "_track", None)
+            if track is not None and not self._closing:
+                track.on_sound(bool(msg.data))
+
+    def _track_tick(self) -> None:
+        with self._speaking_lock:
+            track = getattr(self, "_track", None)
+            if track is not None and not self._closing and track.in_flight():
+                track.tick()
+
+    def _output_state(self):
+        """いまの出力の印 (playback_done の publisher の gid)。出力 (playback_done を出すノード = fv_audio_output) がちょうど
+        1 つで、それがこの音の再生の topic を購読している時だけ。そうでなければ None: 「その出力の done = 鳴り終わり」とは
+        言えない (クリップを出す時と done を確かめる時の両方で見る。done の publisher_gid もこの印と照らす)。"""
+        done_topic = getattr(self, "playback_done_topic", "")
+        play_topic = getattr(self, "playback_topic", "")
+        if not done_topic or not play_topic:
+            return None
+        try:
+            outputs = self.get_publishers_info_by_topic(self.resolve_topic_name(done_topic))
+            if len(outputs) != 1:
+                return None
+            info = outputs[0]
+            node = (info.node_name, info.node_namespace)
+            players = {(i.node_name, i.node_namespace)
+                       for i in self.get_subscriptions_info_by_topic(self.resolve_topic_name(play_topic))}
+            if node not in players:
+                return None
+            gid = bytes(bytearray(int(b) & 0xFF for b in info.endpoint_gid))
+        except Exception:  # pylint: disable=broad-except
+            return None
+        return gid or None
+
+    def _sound_unknown(self) -> bool:
+        """効果音が鳴っているかを知れない: 起動直後 (鳴っている途中の効果音の印は 1 秒ごとにしか来ない)、または
+        /aspa/audio/speaking (共用) に、自分以外で、効果音だけの印 (sound_speaking_topic) も出していないノードがいる
+        (古い soundboard・ほかの音の出し手。出し手の数ではなくノードで照らす)。"""
+        if time.monotonic() - getattr(self, "_t_boot", 0.0) < SOUND_BOOT_UNKNOWN_S:
+            return True
+        sound_topic = getattr(self, "sound_speaking_topic", "")
+        try:
+            me = (self.get_name(), self.get_namespace())
+            shared = list(self.get_publishers_info_by_topic(self.resolve_topic_name(self.speaking_topic)))
+            own_endpoints = (list(self.get_publishers_info_by_topic(self.resolve_topic_name(sound_topic)))
+                             if sound_topic else [])
+        except Exception:  # pylint: disable=broad-except
+            return True
+        # 名前ではなく publisher (endpoint) で数える: 同じ名前・同じ名前空間のノードが 2 つあっても別に数える
+        mine = [i for i in shared if (i.node_name, i.node_namespace) == me]
+        others = [i for i in shared if (i.node_name, i.node_namespace) != me]
+        if len(mine) != 1:
+            return True     # 自分と同じ名前の出し手がほかにもいる (それが鳴らしているか分からない)
+        if len(own_endpoints) > 1:
+            return True     # 効果音だけの印の出し手が 2 つ以上: 印は 1 つの状態に上書きされる
+        own = {(i.node_name, i.node_namespace) for i in own_endpoints}
+        if len(others) > len(own_endpoints) or any((i.node_name, i.node_namespace) not in own for i in others):
+            return True     # 共用の speaking に、効果音だけの印を出していない出し手がいる (古い soundboard・ほかの音)
+        return False
 
     # ── 発話 ───────────────────────────────────────────
     def handle_speak(self, request: Speak.Request, response: Speak.Response) -> Speak.Response:
@@ -764,8 +916,9 @@ class FvTtsNode(Node):
         if request.play and not self.publish_playback:
             self.get_logger().warn(f"TTS NOT published to playback: play={request.play}, publish_playback={self.publish_playback}")
 
+        uid = self._new_utterance(text)
         clips = self.speak_text(text, voice_id, volume_db, stamp=request_stamp, epoch=request_epoch,
-                                play=play, cache_key=request.cache_key or "")
+                                play=play, cache_key=request.cache_key or "", uid=uid)
         if not clips:
             response.success = False
             response.message = f"読み上げできませんでした（{self.active_engine()}）"
@@ -785,27 +938,42 @@ class FvTtsNode(Node):
             if self._closing:
                 return
             self.get_logger().info(f"say topic: text={text[:50]}")
-            self._say_queue.put((text, self.get_clock().now().to_msg(), self.playback_epoch))
+            uid = self._new_utterance(text)
+            self._say_queue.put((text, self.get_clock().now().to_msg(), self.playback_epoch, uid))
+
+    def _new_utterance(self, text: str) -> str:
+        """発話の id (起動ごとの印 + 番号)。受けた時に「queued」を知らせる。"""
+        with self._speaking_lock:
+            track = getattr(self, "_track", None)
+            if track is None:
+                return ""
+            uid = track.new_id()
+            if not self._closing:
+                track.queued(uid, text)
+            return uid
 
     def _say_loop(self) -> None:
         while True:
             item = self._say_queue.get()
             if item is None:
                 return
-            text, stamp, epoch = item
+            text, stamp, epoch = item[:3]
+            uid = item[3] if len(item) > 3 else ""
             try:
                 self.speak_text(text, self.default_voice, self.default_volume_db,
-                                stamp=stamp, epoch=epoch, play=self.publish_playback)
+                                stamp=stamp, epoch=epoch, play=self.publish_playback, uid=uid)
             except Exception as exc:  # pylint: disable=broad-except
                 self.get_logger().error(f"say TTS failed: {exc}")
 
     def speak_text(self, text: str, voice_id: str, volume_db: float, *, stamp=None,
-                   epoch: Optional[int] = None, play: bool = True, cache_key: str = "") -> List[CachedAudio]:
+                   epoch: Optional[int] = None, play: bool = True, cache_key: str = "",
+                   uid: str = "") -> List[CachedAudio]:
         """選んだエンジンで text を喋る。AivisSpeech は文ごとに合成し、できた文から順に出す。
 
         失敗した発話は飛ばして「読み上げできませんでした（<engine>: 理由）」をログに残す
         (別の声では喋らない)。出した音の列を返す (何も出せなければ [])。喋った / 飛ばした結果は
         spoken_topic (JSON) にも知らせる (viewer → ブラウザ・agent が「どの声か」を記録する)。
+        uid: 発話の id (on_say が受けた時に付ける)。クリップごとの終わり方は playback_events_topic へ (playback_track.py)。
         """
         epoch = self.playback_epoch if epoch is None else int(epoch)
         out: List[CachedAudio] = []
@@ -814,25 +982,39 @@ class FvTtsNode(Node):
         error = ""
         if self._closing:
             return out
+        uid = uid or self._new_utterance(text)
+        sound_unknown = self._sound_unknown()
         if engine != "aivis":
+            self._track_call("start", uid, text, engine, 1, sound_unknown=sound_unknown, sentences=[text])
             cache_key = cache_key or self.make_cache_key(text, voice_id, volume_db)
             try:
                 cached = self.get_cached(text, voice_id, volume_db, cache_key)
             except Exception as exc:  # pylint: disable=broad-except
                 failure = SpeakFailed("pyopenjtalk", str(exc))
                 self.get_logger().error(str(failure))
-                self._report_spoken(text, engine, out, t_start, error=failure.reason)
+                self._track_call("clip_failed", uid, 0, text, failure.reason)
+                self._track_call("finish", uid, error=failure.reason)
+                self._report_spoken(text, engine, out, t_start, error=failure.reason, uid=uid, planned=1)
                 return out
-            if self._publish(cached, stamp=stamp, epoch=epoch, play=play):
+            published = self._publish(cached, stamp=stamp, epoch=epoch, play=play, track=(uid, 0, text))
+            if published:
                 out.append(cached)
-            self._report_spoken(text, engine, out, t_start)
+            else:
+                self._track_call("clip_cut", uid, 0, text, "止められたので出さなかった")
+            self._track_call("finish", uid, stopped=not published)
+            self._report_spoken(text, engine, out, t_start, uid=uid, planned=1)
             return out
         if voice_id:
             self.get_logger().debug(f"aivis: voice_id='{voice_id}' は使わない (viewer の男/女の設定)")
         sentences = split_sentences(text) or [text]
+        self._track_call("start", uid, text, engine, len(sentences), sound_unknown=sound_unknown, sentences=sentences)
+        stopped = False
         for index, sentence in enumerate(sentences):
             if epoch != self.playback_epoch or self._closing:
                 self.get_logger().info(f"停止されたので残り {len(sentences) - index} 文は出さない")
+                stopped = True
+                for rest, unsent in enumerate(sentences[index:], start=index):
+                    self._track_call("clip_cut", uid, rest, unsent, "止められたので出さなかった")
                 break
             try:
                 cached = self.aivis_sentence(sentence, volume_db)
@@ -841,17 +1023,32 @@ class FvTtsNode(Node):
                 self.get_logger().error(
                     f"{exc} 「{sentence[:30]}」" + (f" (残り {left - 1} 文も飛ばす)" if exc.engine_down and left > 1 else ""))
                 error = error or exc.reason
+                self._track_call("clip_failed", uid, index, sentence, exc.reason)
                 if exc.engine_down:
+                    for rest, skipped in enumerate(sentences[index + 1:], start=index + 1):
+                        self._track_call("clip_failed", uid, rest, skipped, f"飛ばした ({exc.reason})")
                     break
                 continue
-            if not self._publish(cached, stamp=stamp, epoch=epoch, play=play):
+            if not self._publish(cached, stamp=stamp, epoch=epoch, play=play, track=(uid, index, sentence)):
+                stopped = True
+                for rest, unsent in enumerate(sentences[index:], start=index):
+                    self._track_call("clip_cut", uid, rest, unsent, "止められたので出さなかった")
                 break
             out.append(cached)
-        self._report_spoken(text, engine, out, t_start, error=error)
+        self._track_call("finish", uid, stopped=stopped, error=error)
+        self._report_spoken(text, engine, out, t_start, error=error, uid=uid, planned=len(sentences))
         return out
 
+    def _track_call(self, name: str, *args, **kwargs) -> None:
+        """PlaybackTracker の 1 つの操作を出す側のロックの中で (終了処理の後は何もしない)。"""
+        with self._speaking_lock:
+            track = getattr(self, "_track", None)
+            if track is None or self._closing:
+                return
+            getattr(track, name)(*args, **kwargs)
+
     def _report_spoken(self, text: str, engine: str, clips: List[CachedAudio], t_start: float,
-                       error: str = "") -> None:
+                       error: str = "", uid: str = "", planned: int = 0) -> None:
         pub = getattr(self, "spoken_pub", None)
         if pub is None:
             return
@@ -859,10 +1056,14 @@ class FvTtsNode(Node):
         for c in clips:
             bps = c.channels * (c.bit_depth // 8)
             seconds += len(c.audio_bytes) / bps / c.sample_rate if bps and c.sample_rate else 0.0
-        payload = json.dumps({
+        info = {
             "text": text, "engine": engine, "ok": bool(clips), "clips": len(clips),
             "seconds": round(seconds, 2), "ms": int((time.monotonic() - t_start) * 1000),
-            "error": error}, ensure_ascii=False)
+            "error": error}
+        if uid:
+            # 発話の id と分けた文の数 (足しただけ。終わり方は playback_events_topic の end)
+            info.update({"id": uid, "of": int(planned or len(clips))})
+        payload = json.dumps(info, ensure_ascii=False)
         with self._speaking_lock:          # 終了処理の後は (publisher が壊された後なので) 出さない
             if self._closing:
                 return
@@ -871,11 +1072,13 @@ class FvTtsNode(Node):
             except Exception as exc:  # pylint: disable=broad-except
                 self.get_logger().debug(f"spoken publish failed: {exc}")
 
-    def _publish(self, cached: CachedAudio, *, stamp, epoch: int, play: bool) -> bool:
+    def _publish(self, cached: CachedAudio, *, stamp, epoch: int, play: bool, track=None) -> bool:
         """出す。先に出した音が playback_backlog_s 秒ぶん残っていれば減るまで待つ (fv_audio_output の
         待ち行列あふれ防止)。空きの確認・予約・出すこと・停止の世代の確認は 1 つのロックの中で。
-        停止されていれば出さず False。"""
+        停止されていれば出さず False。track = (発話の id, 何番目の文, 文): クリップを数える
+        (frame_id に印を入れ、fv_audio_output の playback_done で鳴り終わりを知る。数えるのも同じロックの中)。"""
         limit = float(getattr(self, "playback_backlog_s", 0.0) or 0.0)
+
         while True:
             with self._speaking_lock:
                 if self._closing or epoch != self.playback_epoch:
@@ -884,11 +1087,21 @@ class FvTtsNode(Node):
                 self._published_ends = [t for t in self._published_ends if t > now]
                 backlog = (max(self._published_ends) - now) if self._published_ends else 0.0
                 if limit <= 0 or (backlog <= limit and len(self._published_ends) < 6):
-                    frame = self.build_frame(cached, stamp=stamp, epoch=epoch)
+                    track_ = getattr(self, "_track", None) if track else None
+                    # 出力がちょうど 1 つの時だけ、その出力の playback_done を鳴り終わりと見る (出す時に見る。done の送り手と、
+                    # done を確かめる時の出力がこれと同じか見る)。その出力を宛先に付ける (ほかの出力は鳴らさない)
+                    output = self._output_state() if (track_ is not None and play) else None
+                    frame_id = track_.frame_id(track[0], track[1], output) if track_ is not None else ""
+                    frame = self.build_frame(cached, stamp=stamp, epoch=epoch, frame_id=frame_id)
                     self.tts_pub.publish(frame)
+                    end = None
                     if play:
                         self.play_pub.publish(frame)
-                        self.begin_speaking(cached)
+                        end = self.begin_speaking(cached)
+                    if track_ is not None:
+                        track_.clip_published(track[0], track[1], track[2], epoch=epoch,
+                                              seconds=self._duration(cached), expected_end=end,
+                                              sure=output is not None, played=play, output=output)
                     return True
             time.sleep(min(0.25, max(0.05, backlog - limit)))
 
@@ -919,17 +1132,32 @@ class FvTtsNode(Node):
             f"TTS synthesized: {len(cached.audio_bytes)} bytes, {cached.sample_rate}Hz")
         return cached
 
-    def begin_speaking(self, cached: CachedAudio) -> None:
-        """再生尺ぶん /aspa/audio/speaking=True を立て、tail 経過後 False に戻す。"""
+    @staticmethod
+    def _duration(cached: CachedAudio) -> float:
         bytes_per_sample = cached.channels * (cached.bit_depth // 8)
-        duration = len(cached.audio_bytes) / bytes_per_sample / cached.sample_rate if bytes_per_sample else 0.0
+        return len(cached.audio_bytes) / bytes_per_sample / cached.sample_rate if bytes_per_sample and cached.sample_rate else 0.0
+
+    def _publish_speaking(self, on: bool) -> None:
+        """再生中フラグ: /aspa/audio/speaking (効果音と共用) と読み上げだけの tts_speaking_topic の両方へ。
+        足した方の失敗は喋ること・今までのフラグを止めない。"""
+        self.speaking_pub.publish(Bool(data=on))
+        pub = getattr(self, "tts_speaking_pub", None)
+        if pub is not None:
+            try:
+                pub.publish(Bool(data=on))
+            except Exception as exc:  # pylint: disable=broad-except
+                self.get_logger().debug(f"tts speaking publish failed: {exc}")
+
+    def begin_speaking(self, cached: CachedAudio) -> Optional[float]:
+        """再生尺ぶん /aspa/audio/speaking=True を立て、tail 経過後 False に戻す。見込みの鳴り終わり (単調時計) を返す。"""
+        duration = self._duration(cached)
         self.get_logger().info(f"TTS published to playback: {duration:.2f}s")
         with self._speaking_lock:
             if self._closing:
-                return
+                return None
             if not self._speaking:
                 self._speaking = True
-                self.speaking_pub.publish(Bool(data=True))
+                self._publish_speaking(True)
             # tail 0.15s: 再生完了とフラグ降下のずれを吸収
             now = time.monotonic()
             start = max(now, max(self._published_ends) if self._published_ends else now)
@@ -942,6 +1170,7 @@ class FvTtsNode(Node):
             self._speaking_timer = threading.Timer(delay, self._end_speaking)
             self._speaking_timer.daemon = True
             self._speaking_timer.start()
+            return end
 
     def _end_speaking(self) -> None:
         with self._speaking_lock:
@@ -952,7 +1181,7 @@ class FvTtsNode(Node):
                 return
             self._speaking = False
             self._speaking_timer = None
-            self.speaking_pub.publish(Bool(data=False))
+            self._publish_speaking(False)
 
     def synthesize(self, text: str, voice_id: str, volume_db: float) -> CachedAudio:
         """Open JTalk で合成。CachedAudio(16bit mono)を返す (AivisSpeech は aivis_sentence 側)。"""
@@ -990,9 +1219,13 @@ class FvTtsNode(Node):
         peak = float(np.max(np.abs(float_samples))) if float_samples.size else 0.0
         return CachedAudio(audio_bytes, int(sample_rate), 1, 16, rms, peak)
 
-    def build_frame(self, cached: CachedAudio, *, stamp=None, epoch: int | None = None) -> AudioFrame:
+    def build_frame(self, cached: CachedAudio, *, stamp=None, epoch: int | None = None,
+                    frame_id: str = "") -> AudioFrame:
         frame = AudioFrame()
         frame.header.stamp = stamp if stamp is not None else self.get_clock().now().to_msg()
+        if frame_id:
+            # fv_audio_output が PlaybackDone.request_id でそのまま返す (どのクリップが鳴り終えたか)
+            frame.header.frame_id = frame_id
         frame.encoding = "PCM16LE"
         frame.sample_rate = cached.sample_rate
         frame.channels = cached.channels

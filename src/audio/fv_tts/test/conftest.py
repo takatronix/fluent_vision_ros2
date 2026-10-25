@@ -67,10 +67,19 @@ def _install_ros_stubs() -> None:
             self.data = b""
             self.epoch = 0
 
+    class _PlaybackDone:
+        def __init__(self, request_id="", epoch=0, drained=False, publisher_gid=None, complete=False):
+            self.header = _Header()
+            self.request_id = request_id
+            self.epoch = epoch
+            self.complete = complete
+            self.drained = drained
+            self.publisher_gid = list(publisher_gid or [])
+
     _stub("std_msgs")
     _stub("std_msgs.msg", Bool=_Msg, Empty=_Msg, String=_Msg)
     _stub("fv_audio")
-    _stub("fv_audio.msg", AudioFrame=_AudioFrame)
+    _stub("fv_audio.msg", AudioFrame=_AudioFrame, PlaybackDone=_PlaybackDone)
 
     class _Speak:
         class Request:
