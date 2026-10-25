@@ -8,13 +8,17 @@ echo_guard) が「この文は最後まで鳴って、もう鳴っていない�
 知らせ (JSON。どれも ``event`` ``id`` ``seq`` ``boot`` ``text`` ``t`` を持つ):
   queued  /aspa/tts/say を受けた (まだ合成していない)
   start   喋り始める。``of`` = 分けた文の数、``engine``
-  clip    1 クリップの終わり方。``index`` ``of`` ``clip_text`` ``status`` ``seconds`` (``reason``)
-            done     出力が最後まで鳴らした (playback_done を受け、出力の遅れ ``latency_s`` の間に止められなかった)
+  clip    1 クリップの終わり方。``index`` ``of`` ``clip_text`` ``status`` ``seconds`` ``drained`` (``reason``)
+            done     出力が最後まで鳴らした (playback_done を受け、出力の遅れ ``latency_s`` の間に止められなかった)。
+                     ``drained`` = 出力が鳴らし切ってから playback_done を出す設定 (fv_audio_output の
+                     audio.drain_after_frame=true) だった: done の時にはもう音は残っていない (後の stop で切れる音も無い)。
+                     false なら出力の先に残っていた音を、callback の順番しだいで知らずに done と言いうる (聞く側は証拠にしない)
             cut      止められた (audio/output/stop・終了)。鳴る前に止められた文も
             failed   合成できなかった (鳴っていない)
             unknown  鳴り終わりが分からない (playback_done が来ない・出力が 1 つでない・鳴らさない設定)
   end     発話全体の終わり。``status`` (done = 全部の文が done / cut / failed / partial / unknown)、``of`` ``clips``
-          (出したクリップの数) ``done`` (done の数) ``sound`` (ほかの音と重なった) ``statuses`` ``seconds`` ``error``
+          (出したクリップの数) ``done`` (done の数) ``drained`` (done の全部が drained) ``sound`` (ほかの音と重なった)
+          ``statuses`` ``seconds`` ``error``
 ``seq`` はノードの起動 (``boot``) ごとに 1 から増える: 聞く側は飛び・入れ替わり・再起動を見分けられる。
 
 ROS に依らない部品 (呼び手が 1 つのロックの中で呼ぶ。時計は差し替えられる)。
@@ -43,6 +47,8 @@ class _Clip:
     seconds: float = 0.0
     expected_end: float = 0.0       # 出した時に見込んだ鳴り終わり (単調時計)。これ + grace で来なければ unknown
     sure: bool = True               # 出力がちょうど 1 つ (最初の playback_done = 鳴り終わり)
+    output: object = None           # 出した時の出力の印 (確かめる時に同じか見る)
+    drained: bool = False           # 出力が鳴らし切ってから playback_done を出す (drain_after_frame)
     done_at: Optional[float] = None  # playback_done を受けた時刻
     status: str = ""
     reason: str = ""
@@ -54,6 +60,7 @@ class _Utt:
     text: str
     engine: str = ""
     planned: int = 0
+    sentences: List[str] = field(default_factory=list)
     clips: List[_Clip] = field(default_factory=list)
     started: bool = False
     finished: bool = False          # 出す側が出し終えた (この後クリップは増えない)
@@ -71,13 +78,14 @@ class PlaybackTracker:
     grace_s: 見込みの鳴り終わりからこれだけ過ぎても playback_done が来なければ unknown。
     late_s: done を確かめる tick が latency_s の後これ以上遅れたら (ROS の実行器が Speak サービスなどで塞がっていた =
         その間の stop / pause の callback がまだ回っていないかもしれない) unknown。
-    outputs_ok(): 出力 (playback_done を出すノード) がちょうど 1 つで、それがこの音の再生の topic を購読しているか。
-        クリップを出した時と done を確かめる時の両方で見る (途中で出力が増えた・減ったら unknown)。
+    output_key(): いまの出力 (playback_done を出すノード) の印。ちょうど 1 つで、それがこの音の再生の topic を購読して
+        いなければ None。クリップを出した時の印と done を確かめる時の印が同じ時だけ done (途中で出力が増えた・減った・
+        入れ替わった (再起動) なら unknown)。
     """
 
     def __init__(self, emit: Callable[[dict], None], *, clock: Callable[[], float] = time.monotonic,
                  wall: Callable[[], float] = time.time, latency_s: float = 0.4, grace_s: float = 5.0,
-                 late_s: float = 0.25, outputs_ok: Optional[Callable[[], bool]] = None,
+                 late_s: float = 0.25, output_key: Optional[Callable[[], object]] = None,
                  boot: Optional[str] = None) -> None:
         self._emit_fn = emit
         self._clock = clock
@@ -85,13 +93,14 @@ class PlaybackTracker:
         self.latency_s = max(0.0, float(latency_s))
         self.grace_s = max(0.5, float(grace_s))
         self.late_s = max(0.05, float(late_s))
-        self._outputs_ok = outputs_ok
+        self._output_key = output_key
         self.boot = boot or uuid.uuid4().hex[:8]
         self._n = itertools.count(1)
         self._seq = 0
         self._utts: Dict[str, _Utt] = {}
         self._frames: Dict[str, Tuple[_Utt, _Clip]] = {}
         self._sound_on = False
+        self._sound_until = 0.0             # ほかの音の playback_done の後、出力の先に残っているかもしれない間
 
     # ------------------------------------------------------------ ids
     def new_id(self) -> str:
@@ -119,7 +128,7 @@ class PlaybackTracker:
     def _clip_notice(self, utt: _Utt, clip: _Clip) -> None:
         extra = {"reason": clip.reason} if clip.reason else {}
         self._emit("clip", utt, index=clip.index, of=utt.planned, clip_text=clip.text, status=clip.status,
-                   seconds=round(clip.seconds, 2), **extra)
+                   seconds=round(clip.seconds, 2), drained=bool(clip.drained and clip.status == DONE), **extra)
 
     # ----------------------------------------------------- speaking side
     def queued(self, uid: str, text: str) -> None:
@@ -129,14 +138,17 @@ class PlaybackTracker:
         self._utts[uid] = utt
         self._emit("queued", utt)
 
-    def start(self, uid: str, text: str, engine: str, planned: int, *, sound_unknown: bool = False) -> None:
-        """sound_unknown: 効果音が鳴っているかを知れない (起動直後・出どころの分からない speaking がある) → sound にする。"""
+    def start(self, uid: str, text: str, engine: str, planned: int, *, sound_unknown: bool = False,
+              sentences: Optional[List[str]] = None) -> None:
+        """sound_unknown: 効果音が鳴っているかを知れない (起動直後・出どころの分からない speaking がある) → sound にする。
+        sentences: 分けた文 (終了処理で、まだ出していない文も 1 つずつ cut にする)。"""
         utt = self._utts.get(uid)
         if utt is None:
             self.queued(uid, text)
             utt = self._utts[uid]
         utt.engine, utt.planned, utt.started = str(engine or ""), int(planned), True
-        if self._sound_on or sound_unknown:
+        utt.sentences = list(sentences or [])
+        if self._sound_on or sound_unknown or self._clock() < self._sound_until:
             utt.sound = True                # 効果音が鳴っている間に始まった / 鳴っているか分からない
         self._emit("start", utt, engine=utt.engine, of=utt.planned)
 
@@ -158,7 +170,8 @@ class PlaybackTracker:
         self._clip_notice(utt, clip)
 
     def clip_published(self, uid: str, index: int, text: str, *, epoch: int, seconds: float,
-                       expected_end: Optional[float], sure: bool, played: bool = True) -> str:
+                       expected_end: Optional[float], sure: bool, played: bool = True, drained: bool = False,
+                       output: object = None) -> str:
         """出した (play=True なら出力の待ち行列へ)。frame_id を返す (AudioFrame.header.frame_id に入れる)。"""
         utt = self._utts.get(uid)
         fid = self.frame_id(uid, index)
@@ -166,7 +179,7 @@ class PlaybackTracker:
             return fid
         clip = _Clip(index=index, text=text, frame_id=fid, epoch=int(epoch), seconds=float(seconds or 0.0),
                      expected_end=float(expected_end if expected_end is not None else self._clock() + seconds),
-                     sure=bool(sure))
+                     sure=bool(sure), drained=bool(drained), output=output)
         utt.clips.append(clip)
         if not played:
             clip.status, clip.reason = UNKNOWN, "not played"
@@ -197,7 +210,9 @@ class PlaybackTracker:
             return
         if rid.startswith(FRAME_PREFIX):
             return                          # 自分の音 (終えた後の 2 つ目の知らせ・前の起動の音)
-        # ほかの音 (効果音・ファイル・別のノード) が鳴り終えた: 喋り始めている発話はほかの音と重なった
+        # ほかの音 (効果音・ファイル・別のノード) が鳴り終えた: 喋り始めている発話はほかの音と重なった。出力の先に
+        # 残っているかもしれない間 (latency_s) に始まる発話も
+        self._sound_until = max(self._sound_until, self._clock() + self.latency_s)
         for utt in self._utts.values():
             if utt.started:
                 utt.sound = True
@@ -224,9 +239,13 @@ class PlaybackTracker:
             self._check(utt)
 
     def close_all(self, reason: str = "shutdown") -> None:
-        """終了処理: 受付済み・合成中・再生待ちの発話を全部 cut で終える (この後は何も出さない)。"""
+        """終了処理: 受付済み・合成中・再生待ちの発話を全部 cut で終える (まだ出していない文も 1 つずつ。この後は何も出さない)。"""
         self.on_stop(reason)
         for utt in list(self._utts.values()):
+            seen = {c.index for c in utt.clips}
+            for index, sentence in enumerate(utt.sentences):
+                if index not in seen:
+                    self._clip_final(utt.id, index, sentence, CUT, reason)
             utt.stopped = True
             utt.finished = True
             self._check(utt)
@@ -239,9 +258,11 @@ class PlaybackTracker:
             if clip.status:
                 self._frames.pop(fid, None)
                 continue
-            if clip.done_at is not None and now - clip.done_at >= self.latency_s:
-                late = now - clip.done_at - self.latency_s > self.late_s
-                outputs = clip.sure and self._outputs_now()
+            # 鳴らし切ってから done を出す出力: done の時にはもう音は残っていない (待つ必要も、遅れた確かめを疑う必要も無い)
+            latency = 0.0 if clip.drained else self.latency_s
+            if clip.done_at is not None and now - clip.done_at >= latency:
+                late = not clip.drained and now - clip.done_at - latency > self.late_s
+                outputs = clip.sure and self._same_output(clip.output)
                 if late:
                     clip.status, clip.reason = UNKNOWN, "late check"
                 elif not outputs:
@@ -258,13 +279,14 @@ class PlaybackTracker:
         for utt in touched:
             self._check(utt)
 
-    def _outputs_now(self) -> bool:
-        if self._outputs_ok is None:
+    def _same_output(self, output: object) -> bool:
+        if self._output_key is None:
             return True
         try:
-            return bool(self._outputs_ok())
+            now = self._output_key()
         except Exception:  # pylint: disable=broad-except
             return False
+        return now is not None and now == output
 
     # ------------------------------------------------------------- end
     @staticmethod
@@ -287,8 +309,10 @@ class PlaybackTracker:
         if self._utts.pop(utt.id, None) is None:
             return
         status = self.end_status(utt)
+        done = [c for c in utt.clips if c.status == DONE]
         self._emit("end", utt, status=status, of=utt.planned, clips=sum(1 for c in utt.clips if c.status != FAILED),
-                   done=sum(1 for c in utt.clips if c.status == DONE), sound=bool(utt.sound), engine=utt.engine,
+                   done=len(done), drained=bool(done) and all(c.drained for c in done),
+                   sound=bool(utt.sound), engine=utt.engine,
                    statuses=[c.status for c in utt.clips], seconds=round(sum(c.seconds for c in utt.clips), 2),
                    error=utt.error)
 

@@ -247,15 +247,16 @@ def test_late_tick_is_unknown(tr):
 
 
 def test_outputs_rechecked_when_done_is_confirmed(tr):
-    ok = {"v": True}
+    cur = {"v": "out-1"}
     t = pt.PlaybackTracker(tr.out.append, clock=tr.clock, wall=lambda: 1.0, latency_s=0.4, boot="b",
-                           outputs_ok=lambda: ok["v"])
+                           output_key=lambda: cur["v"])
     uid = t.new_id()
     t.queued(uid, "文です")
     t.start(uid, "文です", "aivis", 1)
-    fid = t.clip_published(uid, 0, "文です", epoch=1, seconds=1.0, expected_end=tr.clock.t + 1, sure=True)
+    fid = t.clip_published(uid, 0, "文です", epoch=1, seconds=1.0, expected_end=tr.clock.t + 1, sure=True,
+                           output="out-1")
     t.finish(uid)
-    ok["v"] = False
+    cur["v"] = "out-2"                                     # 出力が入れ替わった (再起動・2 つ目)
     tr.clock.t += 1.0
     t.on_done(fid, 1)
     tr.clock.t += 0.41
@@ -294,3 +295,57 @@ def test_sound_unknown_at_start(tr):
     tr.clock.t += 0.41
     tr.tick()
     assert events(tr, "end")[0]["sound"] is True
+
+
+def test_drained_clip_is_final_at_once_and_end_says_drained(tr):
+    uid = tr.new_id()
+    tr.queued(uid, "文です")
+    tr.start(uid, "文です", "aivis", 1)
+    fid = tr.clip_published(uid, 0, "文です", epoch=1, seconds=1.0, expected_end=tr.clock.t + 1, sure=True,
+                            drained=True)
+    tr.finish(uid)
+    tr.clock.t += 1.0
+    tr.on_done(fid, 1)
+    tr.clock.t += 3.0                                      # 実行器が塞がっていても: 鳴らし切った後の done なので確か
+    tr.tick()
+    end, = events(tr, "end")
+    assert end["status"] == "done" and end["drained"] is True
+
+
+def test_not_drained_end_says_drained_false(tr):
+    uid, fid = say_one(tr)
+    tr.clock.t += 2.0
+    tr.on_done(fid, 1)
+    tr.clock.t += 0.45
+    tr.tick()
+    assert events(tr, "end")[0]["drained"] is False
+
+
+def test_utterance_starting_right_after_another_sound_is_flagged(tr):
+    tr.on_done("", 0)                                      # 効果音が鳴り終えた (出力の先にまだ残っているかもしれない)
+    tr.clock.t += 0.2
+    uid, fid = say_one(tr)
+    tr.clock.t += 2.0
+    tr.on_done(fid, 1)
+    tr.clock.t += 0.45
+    tr.tick()
+    assert events(tr, "end")[0]["sound"] is True
+    tr.clock.t += 5.0
+    uid2, fid2 = say_one(tr, text="ずっと後の文")
+    tr.clock.t += 2.0
+    tr.on_done(fid2, 1)
+    tr.clock.t += 0.45
+    tr.tick()
+    assert events(tr, "end")[1]["sound"] is False
+
+
+def test_shutdown_cuts_sentences_not_yet_published(tr):
+    text = "一つ目の文です。二つ目の文です。"
+    uid = tr.new_id()
+    tr.queued(uid, text)
+    tr.start(uid, text, "aivis", 2, sentences=["一つ目の文です。", "二つ目の文です。"])
+    tr.clip_published(uid, 0, "一つ目の文です。", epoch=1, seconds=1.0, expected_end=101.0, sure=True)
+    tr.close_all()
+    end, = events(tr, "end")
+    assert end["status"] == "cut" and end["of"] == 2 and sorted(end["statuses"]) == ["cut", "cut"]
+    assert sorted(e["index"] for e in events(tr, "clip")) == [0, 1]
