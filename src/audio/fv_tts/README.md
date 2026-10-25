@@ -127,14 +127,17 @@ ros2 topic pub -1 /aspa/tts/say std_msgs/String "{data: 'アスパラを見つ�
   (`fv_tts_py/playback_track.py`)。どれも `event` `id` `seq` `boot` `text` `t` を持つ:
   - `queued` (/aspa/tts/say を受けた)・`start` (`of` = 分けた文の数, `engine`)
   - `clip` (`index` `of` `clip_text` `status` `seconds` `drained` `reason`):
-    - `done` = 出力 (fv_audio_output) が最後まで鳴らした (`audio/output/playback_done` を受けた)。`drained` = 出力が
-      鳴らし切ってから done を出す設定 (`audio.drain_after_frame=true`。fv_tts が出力ノードのパラメータを非同期に聞く) なら
-      true: done の時にはもう音は残っていない。false なら `playback_done_latency_s` (0.4 s) 待って、その間に止められなければ done
-      (聞く側は false を「鳴り終わりの証拠」にしない: 実行器の callback の順番で、後の stop を見落としうる)。
+    - `done` = 出力 (fv_audio_output) が最後まで鳴らした (`audio/output/playback_done` を受けた)。done の送り手
+      (`PlaybackDone.publisher_gid`) は、クリップを出した時の出力 (graph の endpoint_gid) と同じでなければならない (違えば unknown)。
+      `drained` = その出力の done が `PlaybackDone.drained` (snd_pcm_drain で鳴らし切ってから出した。`audio.drain_after_frame=true`
+      で drain に成功した時) と言った: done の時にはもう音は残っていない。false なら `playback_done_latency_s` (0.4 s) 待って、
+      その間に止められなければ done (聞く側は false を「鳴り終わりの証拠」にしない: 実行器の callback の順番で、後の stop を
+      見落としうる)。
     - `cut` = 止められた (`audio/output/stop`・`audio/output/pause`・終了処理)。止められて出さなかった残りの文も 1 つずつ。
     - `failed` = 合成できなかった。
     - `unknown` = 鳴り終わりが分からない: done が見込みの尺 + `playback_done_grace_s` (5 s) で来ない、playback_done を出す
-      ノードがちょうど 1 つでない・それが再生の topic の購読者でない・クリップを出した時と確かめる時で出力が違う (再起動)、
+      ノードがちょうど 1 つでない・それが再生の topic の購読者でない・クリップを出した時と確かめる時で出力が違う (再起動)・
+      done の送り手が違う (別の出力も鳴らした・送り手の分からない古い出力)、
       drained でない done を確かめる tick が遅れた (実行器が塞がっていた)、鳴らさない設定。
   - `end` (`status`: `done` = 全部の文が done / `cut` / `failed` / `partial` / `unknown`、`of` `clips` `done` `drained`
     (done の全部が drained) `sound` (ほかの音と重なった) `statuses` `seconds` `error`)。全部のクリップの終わり方が決まってから出す。

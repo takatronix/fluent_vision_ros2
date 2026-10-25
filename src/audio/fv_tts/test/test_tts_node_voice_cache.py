@@ -736,13 +736,13 @@ def _with_tracking(node, outputs=1, latency=0.05, sound_unknown=False, drained=F
     node.playback_pub = _Pub()
     node.tts_speaking_pub = _Pub()
     node.outputs = outputs
-    node.drains = drained
-    node.output_gid = (1,)
-    node._output_state = lambda: ((("fv_audio_output", "/", node.output_gid), node.drains) if node.outputs == 1
-                                  else (None, False))
+    node.drains = drained                                 # 偽の出力の done が「鳴らし切った」と言うか
+    node.output_gid = b"\x01\x0f"                         # graph で見える出力の publisher の gid
+    node.done_gid = None                                  # done の送り手 (None = 出力と同じ)
+    node._output_state = lambda: node.output_gid if node.outputs == 1 else None
     node._sound_unknown = lambda: sound_unknown
     node._track = pt.PlaybackTracker(node._emit_playback, latency_s=latency, grace_s=1.0, boot="t35t",
-                                     output_key=lambda: node._output_state()[0])
+                                     output_key=node._output_state)
     return node
 
 
@@ -752,7 +752,9 @@ def _notices(node, kind=None):
 
 
 def _done(node, frame, epoch=None):
-    msg = tts_node.PlaybackDone(request_id=frame.header.frame_id, epoch=frame.epoch if epoch is None else epoch)
+    gid = node.done_gid if node.done_gid is not None else getattr(node, "output_gid", b"")
+    msg = tts_node.PlaybackDone(request_id=frame.header.frame_id, epoch=frame.epoch if epoch is None else epoch,
+                                drained=getattr(node, "drains", False), publisher_gid=list(gid or b""))
     node.on_playback_done(msg)
 
 
@@ -1030,29 +1032,37 @@ def test_output_restarted_between_publish_and_done_is_unknown(node):
     _with_tracking(node, drained=True)
     node.vc_backend = _Backend()
     node.speak_text("出力が入れ替わる文です。", "", 8.0)
-    node.output_gid = (2,)                                  # fv_audio_output が再起動した (gid が変わる)
+    node.output_gid = b"\x02"                               # fv_audio_output が再起動した (gid が変わる)
     _done(node, node.play_pub.frames[0])
-    node._track_tick()
+    _settle(node)
     assert _notices(node, "end")[0]["status"] == "unknown"
 
 
-def test_output_state_and_drain_query(node, monkeypatch):
-    """_output_state: playback_done の出し手がちょうど 1 つで、再生の topic の購読者でもある時だけ印。drain は聞いてから。"""
+def test_output_state_is_the_single_done_publisher_that_plays(node):
+    """_output_state: playback_done の出し手がちょうど 1 つで、再生の topic の購読者でもある時だけ、その publisher の gid。"""
     from types import SimpleNamespace as NS
     node.playback_done_topic, node.playback_topic = "audio/output/playback_done", "audio/output/frame"
     node.resolve_topic_name = lambda t: "/" + t
-    node._drain_cache, node._drain_wanted, node._drain_query, node._param_clients = {}, None, None, {}
     pubs = [NS(node_name="fv_audio_output", node_namespace="/", endpoint_gid=[7, 7])]
     subs = [NS(node_name="fv_audio_output", node_namespace="/"), NS(node_name="bridge", node_namespace="/")]
     node.get_publishers_info_by_topic = lambda topic: list(pubs)
     node.get_subscriptions_info_by_topic = lambda topic: list(subs)
-    key, drained = tts_node.FvTtsNode._output_state(node)
-    assert key == ("fv_audio_output", "/", (7, 7)) and drained is False      # まだ聞いていない
-    assert node._drain_wanted == (key, "/fv_audio_output")
-    node._drain_cache[key] = True
-    assert tts_node.FvTtsNode._output_state(node) == (key, True)
+    assert tts_node.FvTtsNode._output_state(node) == bytes([7, 7])
     pubs.append(NS(node_name="fv_audio_output2", node_namespace="/", endpoint_gid=[8]))
-    assert tts_node.FvTtsNode._output_state(node) == (None, False)          # 出力が 2 つ
+    assert tts_node.FvTtsNode._output_state(node) is None                   # 出力が 2 つ
     pubs.pop()
     subs.pop(0)
-    assert tts_node.FvTtsNode._output_state(node) == (None, False)          # done を出すが再生の購読者でない
+    assert tts_node.FvTtsNode._output_state(node) is None                   # done を出すが再生の購読者でない
+
+
+def test_done_from_another_output_or_an_old_output_is_unknown(node):
+    """done の送り手 (PlaybackDone.publisher_gid) がクリップを出した時の出力でなければ unknown (GPT: 一時的な 2 つ目の出力)。"""
+    for gid in (b"\x09", b""):                            # 別の出力 / 送り手の分からない古い出力
+        _with_tracking(node, drained=True)
+        node.done_gid = gid
+        node.vc_backend = _Backend()
+        node.speak_text("送り手が違う文です。", "", 8.0)
+        _done(node, node.play_pub.frames[-1])
+        _settle(node, 1.2)
+        end = _notices(node, "end")[-1]
+        assert end["status"] == "unknown" and end["drained"] is False, (gid, end)

@@ -772,6 +772,7 @@ void FvAudioOutputNode::playbackThread()
         // Discrete cues can be shorter than the ALSA buffer. Optionally wait
         // until the hardware has consumed the complete frame before reporting
         // completion or accepting an interrupting cue.
+        bool drained = false;
         if (config_.drain_after_frame) {
           int drain_result = 0;
           int prepare_result = 0;
@@ -798,12 +799,18 @@ void FvAudioOutputNode::playbackThread()
               this->get_logger(), "snd_pcm_prepare after drain failed: %s",
               snd_strerror(prepare_result));
           }
+          // 鳴らし切った (drain が成功した) ことを知らせに載せる。失敗 (装置が消えた等) なら false
+          drained = drain_result >= 0 && prepare_result >= 0;
         }
         RCLCPP_INFO(this->get_logger(), "Playback done, publishing notification");
         fv_audio::msg::PlaybackDone done_msg;
         done_msg.header = queued_frame.header;
         done_msg.request_id = queued_frame.header.frame_id;
         done_msg.epoch = queued_frame.epoch;
+        done_msg.drained = drained;
+        // どの出力の知らせかを受け手が ROS graph (endpoint_gid) と照合できるように、自分の publisher の gid を載せる
+        const rmw_gid_t & gid = playback_done_pub_->get_gid();
+        done_msg.publisher_gid.assign(gid.data, gid.data + RMW_GID_STORAGE_SIZE);
         playback_done_pub_->publish(done_msg);
       }
     } else {

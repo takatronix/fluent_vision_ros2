@@ -258,7 +258,7 @@ def test_outputs_rechecked_when_done_is_confirmed(tr):
     t.finish(uid)
     cur["v"] = "out-2"                                     # 出力が入れ替わった (再起動・2 つ目)
     tr.clock.t += 1.0
-    t.on_done(fid, 1)
+    t.on_done(fid, 1, output="out-1")
     tr.clock.t += 0.41
     t.tick()
     assert [e["status"] for e in tr.out if e["event"] == "end"] == ["unknown"]
@@ -301,11 +301,10 @@ def test_drained_clip_is_final_at_once_and_end_says_drained(tr):
     uid = tr.new_id()
     tr.queued(uid, "文です")
     tr.start(uid, "文です", "aivis", 1)
-    fid = tr.clip_published(uid, 0, "文です", epoch=1, seconds=1.0, expected_end=tr.clock.t + 1, sure=True,
-                            drained=True)
+    fid = tr.clip_published(uid, 0, "文です", epoch=1, seconds=1.0, expected_end=tr.clock.t + 1, sure=True)
     tr.finish(uid)
     tr.clock.t += 1.0
-    tr.on_done(fid, 1)
+    tr.on_done(fid, 1, drained=True)
     tr.clock.t += 3.0                                      # 実行器が塞がっていても: 鳴らし切った後の done なので確か
     tr.tick()
     end, = events(tr, "end")
@@ -349,3 +348,23 @@ def test_shutdown_cuts_sentences_not_yet_published(tr):
     end, = events(tr, "end")
     assert end["status"] == "cut" and end["of"] == 2 and sorted(end["statuses"]) == ["cut", "cut"]
     assert sorted(e["index"] for e in events(tr, "clip")) == [0, 1]
+
+
+def test_done_sender_must_be_the_output_the_clip_went_to(tr):
+    cur = {"v": "out-1"}
+    t = pt.PlaybackTracker(tr.out.append, clock=tr.clock, wall=lambda: 1.0, latency_s=0.4, boot="b",
+                           output_key=lambda: cur["v"])
+    for sender, drained, want in (("out-2", True, ("unknown", False)), (None, True, ("unknown", False)),
+                                  ("out-1", True, ("done", True)), ("out-1", False, ("done", False))):
+        uid = t.new_id()
+        t.queued(uid, "文です")
+        t.start(uid, "文です", "aivis", 1)
+        fid = t.clip_published(uid, 0, "文です", epoch=1, seconds=1.0, expected_end=tr.clock.t + 1, sure=True,
+                               output="out-1")
+        t.finish(uid)
+        tr.clock.t += 1.0
+        t.on_done(fid, 1, output=sender, drained=drained)
+        tr.clock.t += 0.41
+        t.tick()
+        end = [e for e in tr.out if e["event"] == "end"][-1]
+        assert (end["status"], end["drained"]) == want, (sender, drained, end)
