@@ -877,18 +877,22 @@ class FvTtsNode(Node):
         sound_topic = getattr(self, "sound_speaking_topic", "")
         try:
             me = (self.get_name(), self.get_namespace())
-            shared = {(i.node_name, i.node_namespace)
-                      for i in self.get_publishers_info_by_topic(self.resolve_topic_name(self.speaking_topic))}
+            shared = list(self.get_publishers_info_by_topic(self.resolve_topic_name(self.speaking_topic)))
             own_endpoints = (list(self.get_publishers_info_by_topic(self.resolve_topic_name(sound_topic)))
                              if sound_topic else [])
         except Exception:  # pylint: disable=broad-except
             return True
+        # 名前ではなく publisher (endpoint) で数える: 同じ名前・同じ名前空間のノードが 2 つあっても別に数える
+        mine = [i for i in shared if (i.node_name, i.node_namespace) == me]
+        others = [i for i in shared if (i.node_name, i.node_namespace) != me]
+        if len(mine) != 1:
+            return True     # 自分と同じ名前の出し手がほかにもいる (それが鳴らしているか分からない)
         if len(own_endpoints) > 1:
-            # 効果音だけの印の出し手 (publisher。同じ名前のノードが 2 つでも別に数える) が 2 つ以上: 印は 1 つの状態に
-            # 上書きされる (どれかが鳴っているか分からない)
-            return True
+            return True     # 効果音だけの印の出し手が 2 つ以上: 印は 1 つの状態に上書きされる
         own = {(i.node_name, i.node_namespace) for i in own_endpoints}
-        return bool(shared - {me} - own)
+        if len(others) > len(own_endpoints) or any((i.node_name, i.node_namespace) not in own for i in others):
+            return True     # 共用の speaking に、効果音だけの印を出していない出し手がいる (古い soundboard・ほかの音)
+        return False
 
     # ── 発話 ───────────────────────────────────────────
     def handle_speak(self, request: Speak.Request, response: Speak.Response) -> Speak.Response:

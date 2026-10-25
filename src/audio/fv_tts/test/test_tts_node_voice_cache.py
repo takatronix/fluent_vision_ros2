@@ -978,6 +978,13 @@ def test_sound_unknown_rules(node):
     assert tts_node.FvTtsNode._sound_unknown(node) is True       # 同じ名前・同じ名前空間の soundboard が 2 つ (別の publisher)
     pubs["/aspa/soundboard/speaking"].pop()
     assert tts_node.FvTtsNode._sound_unknown(node) is False
+    pubs["/aspa/audio/speaking"].append(NS(node_name="fv_soundboard", node_namespace="/"))
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 新しい soundboard と同じ名前の古い soundboard (印を出さない)
+    pubs["/aspa/audio/speaking"].pop()
+    pubs["/aspa/audio/speaking"].append(NS(node_name="fv_tts", node_namespace="/"))
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 自分と同じ名前の出し手がほかにもいる
+    pubs["/aspa/audio/speaking"].pop()
+    assert tts_node.FvTtsNode._sound_unknown(node) is False
     pubs["/aspa/soundboard/speaking"] = []
     assert tts_node.FvTtsNode._sound_unknown(node) is True       # 古い soundboard: 効果音だけの印が無い
     pubs["/aspa/audio/speaking"] = [NS(node_name="fv_tts", node_namespace="/")]
