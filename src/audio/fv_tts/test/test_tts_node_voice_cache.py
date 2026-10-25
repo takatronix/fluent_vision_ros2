@@ -732,11 +732,14 @@ def test_dedupe_mark_stays_until_the_cache_write_is_done(node):
 pt = pytest.importorskip("fv_tts_py.playback_track")
 
 
-def _with_tracking(node, outputs=1, latency=0.05):
+def _with_tracking(node, outputs=1, latency=0.05, sound_unknown=False):
     node.playback_pub = _Pub()
     node.tts_speaking_pub = _Pub()
-    node._track = pt.PlaybackTracker(node._emit_playback, latency_s=latency, grace_s=1.0, boot="t35t")
-    node._count_outputs = lambda: outputs
+    node.outputs = outputs
+    node._outputs_ok = lambda: node.outputs == 1
+    node._sound_unknown = lambda: sound_unknown
+    node._track = pt.PlaybackTracker(node._emit_playback, latency_s=latency, grace_s=1.0, boot="t35t",
+                                     outputs_ok=lambda: node._outputs_ok())
     return node
 
 
@@ -847,6 +850,9 @@ def test_stop_during_the_second_sentence_is_cut(node):
     assert len(clips) == 1
     end, = _notices(node, "end")
     assert end["status"] == "cut" and end["of"] == 2
+    # 文ごとに 1 つずつ結果がある: 1 文目は鳴っている途中で cut、2 文目は止められて出さなかった cut (GPT P1)
+    assert sorted((c["index"], c["status"]) for c in _notices(node, "clip")) == [(0, "cut"), (1, "cut")]
+    assert end["statuses"] == ["cut", "cut"] or sorted(end["statuses"]) == ["cut", "cut"]
 
 
 def test_sound_effect_during_the_utterance_is_reported(node):
@@ -900,3 +906,96 @@ def test_nothing_is_published_after_destroy(node):
     _settle(node)
     node.on_stop(None)
     assert len(node.playback_pub.frames) == n
+
+
+def test_pause_cuts_the_clip(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("一時停止される文です。", "", 8.0)
+    node.on_pause(None)                                  # fv_audio_output は鳴っている音を捨てる (done は出さない)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["status"] == "cut"
+
+
+def test_a_late_check_after_a_blocked_executor_is_unknown(node):
+    """done を受けた後、Speak サービスなどで実行器が塞がり tick が遅れた: その間の stop の callback がまだかもしれない (GPT P0)。"""
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("確かめが遅れる文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    time.sleep(0.05 + node._track.late_s + 0.1)
+    node._track_tick()
+    end, = _notices(node, "end")
+    assert end["status"] == "unknown"
+    assert _notices(node, "clip")[0]["reason"] == "late check"
+
+
+def test_a_second_output_appearing_before_the_check_is_unknown(node):
+    _with_tracking(node, outputs=1)
+    node.vc_backend = _Backend()
+    node.speak_text("出力が増える文です。", "", 8.0)
+    node.outputs = 2                                     # 合成中・再生中に 2 つ目の fv_audio_output が上がった
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["status"] == "unknown"
+
+
+def test_sound_unknown_at_start_marks_the_utterance(node):
+    _with_tracking(node, sound_unknown=True)             # 起動直後・古い soundboard (出どころの分からない speaking)
+    node.vc_backend = _Backend()
+    node.speak_text("効果音が分からない文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["sound"] is True
+
+
+def test_sound_unknown_rules(node):
+    node.speaking_topic, node.sound_speaking_topic = "/aspa/audio/speaking", "/aspa/soundboard/speaking"
+    counts = {"/aspa/audio/speaking": 2, "/aspa/soundboard/speaking": 1}
+    node.count_publishers = lambda topic: counts[topic]
+    node._t_boot = time.monotonic() - 10.0
+    assert tts_node.FvTtsNode._sound_unknown(node) is False      # soundboard (新しい) がいる
+    counts["/aspa/soundboard/speaking"] = 0
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 古い soundboard: 効果音だけの印が無い
+    counts["/aspa/audio/speaking"] = 1
+    assert tts_node.FvTtsNode._sound_unknown(node) is False      # 自分だけ (効果音を出すノードが無い)
+    node._t_boot = time.monotonic()
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 起動直後
+
+
+def test_extra_speaking_publish_failure_keeps_speaking(node):
+    _with_tracking(node)
+
+    class Broken:
+        frames = []
+
+        def publish(self, _msg):
+            raise RuntimeError("publisher gone")
+
+    node.tts_speaking_pub = Broken()
+    node.vc_backend = _Backend()
+    clips = node.speak_text("一つ目の文です。二つ目の文です。", "", 8.0)
+    assert len(clips) == 2 and len(node.play_pub.frames) == 2      # 足した印が壊れても残りの文を出す
+    assert [m.data for m in node.speaking_pub.frames][:1] == [True]
+    starts = [c for c in _notices(node, "start")]
+    assert starts and node._track.in_flight() == 1                 # 2 クリップとも数えている
+
+
+def test_destroy_ends_every_pending_utterance_as_cut(node, monkeypatch):
+    import queue as queue_mod
+    monkeypatch.setattr(tts_node.Node, "destroy_node", lambda self: True)
+    _with_tracking(node)
+    node._say_queue = queue_mod.Queue()
+    node.voice_worker.stop = lambda: None
+    node.vc_backend = _Backend()
+    node.speak_text("鳴っている間に終了する文です。", "", 8.0)
+    node.on_say(tts_node.String(data="受付だけされた文です。"))
+    node.destroy_node()
+    ends = _notices(node, "end")
+    assert sorted(e["text"] for e in ends) == sorted(["鳴っている間に終了する文です。", "受付だけされた文です。"])
+    assert {e["status"] for e in ends} == {"cut"}
+    n = len(node.playback_pub.frames)
+    node.on_stop(None)
+    node._track_tick()
+    assert len(node.playback_pub.frames) == n                       # 終了の後は何も出さない
