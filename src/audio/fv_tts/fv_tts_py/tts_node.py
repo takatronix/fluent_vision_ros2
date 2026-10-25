@@ -846,7 +846,7 @@ class FvTtsNode(Node):
 
     def _ask_drain(self) -> None:
         """出力に audio.drain_after_frame を聞く (実行器のスレッドから、答えは非同期)。5 秒で答えが無ければ聞き直す。"""
-        if self._closing:
+        if self._closing or not hasattr(self, "_drain_cache"):
             return
         now = time.monotonic()
         # 出力の印がまだ分からない (答えを持っていない) 間は 1 秒ごと、分かっていれば 5 秒ごとに見る
