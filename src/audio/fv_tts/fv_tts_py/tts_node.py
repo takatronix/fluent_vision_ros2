@@ -884,6 +884,8 @@ class FvTtsNode(Node):
                    if sound_topic else set())
         except Exception:  # pylint: disable=broad-except
             return True
+        if len(own) > 1:
+            return True     # 効果音だけの印の出し手が 2 つ以上: 印は 1 つの状態に上書きされる (どれかが鳴っているか分からない)
         return bool(shared - {me} - own)
 
     # ── 発話 ───────────────────────────────────────────
