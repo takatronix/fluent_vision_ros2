@@ -248,11 +248,12 @@ class PlaybackTracker:
                 if utt.started:
                     utt.sound = True
 
-    def on_stop(self, reason: str = "stop") -> None:
-        """audio/output/stop・pause: 鳴っている・待っているクリップは cut。出している途中の発話も cut。
-        ただし、その出力が「鳴らし切った」と言った done を既に受けたクリップ (drained) は、もう音が残っていないので done。"""
+    def on_stop(self, reason: str = "stop", *, stop_publishing: bool = True) -> None:
+        """audio/output/stop・pause: 鳴っている・待っているクリップは cut。stop なら出している途中の発話も cut
+        (残りの文は出さない)。pause (stop_publishing=False) は再生の世代を進めないので、後から出す文はそのまま。
+        その出力が「鳴らし切った」と言った done を既に受けたクリップ (drained) は、もう音が残っていないので done。"""
         for utt in list(self._utts.values()):
-            if utt.started and not utt.finished:
+            if stop_publishing and utt.started and not utt.finished:
                 utt.stopped = True            # まだ出している途中: 残りの文は出さない (出し終えた発話はクリップの終わり方で決まる)
             for clip in utt.clips:
                 if not clip.status:

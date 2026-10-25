@@ -825,11 +825,12 @@ class FvTtsNode(Node):
                               complete=complete)
 
     def on_pause(self, _msg: Empty) -> None:
-        """audio/output/pause: 鳴っている音は捨てられる (fv_audio_output)。クリップは「中断」。"""
+        """audio/output/pause: 鳴っている音は捨てられる (fv_audio_output)。鳴っている・待っているクリップは「中断」。
+        stop と違って再生の世代は進めない (再開の後に出す文は鳴る) ので、出している途中の発話は止めない。"""
         with self._speaking_lock:
             track = getattr(self, "_track", None)
             if track is not None and not self._closing:
-                track.on_stop("pause")
+                track.on_stop("pause", stop_publishing=False)
 
     def on_sound_speaking(self, msg: Bool) -> None:
         """fv_soundboard の効果音だけの再生中フラグ。"""
@@ -869,16 +870,21 @@ class FvTtsNode(Node):
 
     def _sound_unknown(self) -> bool:
         """効果音が鳴っているかを知れない: 起動直後 (鳴っている途中の効果音の印は 1 秒ごとにしか来ない)、または
-        /aspa/audio/speaking に自分以外の出し手がいるのに効果音だけの印の出し手がいない (古い soundboard など)。"""
+        /aspa/audio/speaking (共用) に、自分以外で、効果音だけの印 (sound_speaking_topic) も出していないノードがいる
+        (古い soundboard・ほかの音の出し手。出し手の数ではなくノードで照らす)。"""
         if time.monotonic() - getattr(self, "_t_boot", 0.0) < SOUND_BOOT_UNKNOWN_S:
             return True
         sound_topic = getattr(self, "sound_speaking_topic", "")
         try:
-            others = int(self.count_publishers(self.speaking_topic)) > 1
-            own = int(self.count_publishers(sound_topic)) if sound_topic else 0
+            me = (self.get_name(), self.get_namespace())
+            shared = {(i.node_name, i.node_namespace)
+                      for i in self.get_publishers_info_by_topic(self.resolve_topic_name(self.speaking_topic))}
+            own = ({(i.node_name, i.node_namespace)
+                    for i in self.get_publishers_info_by_topic(self.resolve_topic_name(sound_topic))}
+                   if sound_topic else set())
         except Exception:  # pylint: disable=broad-except
             return True
-        return others and own == 0
+        return bool(shared - {me} - own)
 
     # ── 発話 ───────────────────────────────────────────
     def handle_speak(self, request: Speak.Request, response: Speak.Response) -> Speak.Response:
