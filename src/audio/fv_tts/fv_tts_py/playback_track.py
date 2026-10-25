@@ -10,9 +10,9 @@ echo_guard) が「この文は最後まで鳴って、もう鳴っていない�
   start   喋り始める。``of`` = 分けた文の数、``engine``
   clip    1 クリップの終わり方。``index`` ``of`` ``clip_text`` ``status`` ``seconds`` ``drained`` (``reason``)
             done     出力が最後まで鳴らした (playback_done を受け、出力の遅れ ``latency_s`` の間に止められなかった)。
-                     ``drained`` = 出力が鳴らし切ってから playback_done を出す設定 (fv_audio_output の
-                     audio.drain_after_frame=true) だった: done の時にはもう音は残っていない (後の stop で切れる音も無い)。
-                     false なら出力の先に残っていた音を、callback の順番しだいで知らずに done と言いうる (聞く側は証拠にしない)
+                     ``drained`` = その出力が知らせ (PlaybackDone.drained) で「snd_pcm_drain で鳴らし切ってから出した」と
+                     言った: done の時にはもう音は残っていない (後の stop で切れる音も無い)。false なら出力の先に残って
+                     いた音を、callback の順番しだいで知らずに done と言いうる (聞く側は証拠にしない)
             cut      止められた (audio/output/stop・終了)。鳴る前に止められた文も
             failed   合成できなかった (鳴っていない)
             unknown  鳴り終わりが分からない (playback_done が来ない・出力が 1 つでない・鳴らさない設定)
@@ -48,7 +48,7 @@ class _Clip:
     expected_end: float = 0.0       # 出した時に見込んだ鳴り終わり (単調時計)。これ + grace で来なければ unknown
     sure: bool = True               # 出力がちょうど 1 つ (最初の playback_done = 鳴り終わり)
     output: object = None           # 出した時の出力の印 (確かめる時に同じか見る)
-    drained: bool = False           # 出力が鳴らし切ってから playback_done を出す (drain_after_frame)
+    drained: bool = False           # その出力の done が「鳴らし切ってから出した」と言った (PlaybackDone.drained)
     done_at: Optional[float] = None  # playback_done を受けた時刻
     status: str = ""
     reason: str = ""
@@ -78,9 +78,9 @@ class PlaybackTracker:
     grace_s: 見込みの鳴り終わりからこれだけ過ぎても playback_done が来なければ unknown。
     late_s: done を確かめる tick が latency_s の後これ以上遅れたら (ROS の実行器が Speak サービスなどで塞がっていた =
         その間の stop / pause の callback がまだ回っていないかもしれない) unknown。
-    output_key(): いまの出力 (playback_done を出すノード) の印。ちょうど 1 つで、それがこの音の再生の topic を購読して
-        いなければ None。クリップを出した時の印と done を確かめる時の印が同じ時だけ done (途中で出力が増えた・減った・
-        入れ替わった (再起動) なら unknown)。
+    output_key(): いまの出力 (playback_done を出すノード) の印 (publisher の gid)。ちょうど 1 つで、それがこの音の再生の
+        topic を購読していなければ None。クリップを出した時の印・done の送り手 (PlaybackDone.publisher_gid)・done を確かめる
+        時の印が全部同じ時だけ done (途中で出力が増えた・減った・入れ替わった (再起動)・別の出力も鳴らした なら unknown)。
     """
 
     def __init__(self, emit: Callable[[dict], None], *, clock: Callable[[], float] = time.monotonic,
@@ -170,7 +170,7 @@ class PlaybackTracker:
         self._clip_notice(utt, clip)
 
     def clip_published(self, uid: str, index: int, text: str, *, epoch: int, seconds: float,
-                       expected_end: Optional[float], sure: bool, played: bool = True, drained: bool = False,
+                       expected_end: Optional[float], sure: bool, played: bool = True,
                        output: object = None) -> str:
         """出した (play=True なら出力の待ち行列へ)。frame_id を返す (AudioFrame.header.frame_id に入れる)。"""
         utt = self._utts.get(uid)
@@ -179,7 +179,7 @@ class PlaybackTracker:
             return fid
         clip = _Clip(index=index, text=text, frame_id=fid, epoch=int(epoch), seconds=float(seconds or 0.0),
                      expected_end=float(expected_end if expected_end is not None else self._clock() + seconds),
-                     sure=bool(sure), drained=bool(drained), output=output)
+                     sure=bool(sure), output=output)
         utt.clips.append(clip)
         if not played:
             clip.status, clip.reason = UNKNOWN, "not played"
@@ -199,14 +199,24 @@ class PlaybackTracker:
         self._check(utt)
 
     # ------------------------------------------------------ output side
-    def on_done(self, request_id: str, epoch: int) -> None:
-        """audio/output/playback_done (fv_audio_output が 1 フレームを鳴らし終えた)。"""
+    def on_done(self, request_id: str, epoch: int, *, output: object = None, drained: bool = False) -> None:
+        """audio/output/playback_done (fv_audio_output が 1 フレームを鳴らし終えた)。output = 送り手の印 (publisher_gid)、
+        drained = 鳴らし切ってから出した。送り手がクリップを出した時の出力でなければ (別の出力も鳴らした)、そのクリップは
+        unknown。"""
         rid = str(request_id or "")
         hit = self._frames.get(rid)
         if hit is not None:
             _utt, clip = hit
-            if not clip.status and clip.done_at is None and int(epoch) == clip.epoch:
+            if clip.status or int(epoch) != clip.epoch:
+                return
+            if self._output_key is not None and (output is None or output != clip.output):
+                clip.sure = False             # 出した時の出力でない (別の出力・送り手の分からない古い出力)
+                if clip.done_at is None:
+                    clip.done_at = self._clock()
+                return
+            if clip.done_at is None:
                 clip.done_at = self._clock()
+                clip.drained = bool(drained)
             return
         if rid.startswith(FRAME_PREFIX):
             return                          # 自分の音 (終えた後の 2 つ目の知らせ・前の起動の音)

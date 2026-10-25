@@ -66,8 +66,7 @@ _CLAUSE_SPLIT = re.compile(r"(?<=[、,])")
 _SENTENCE_MIN = 6      # これより短い切れ端は前の文につなぐ
 # 起動からこの秒数は、効果音が鳴っているかを知れない (fv_soundboard は鳴っている間 1 秒ごとに印を出し直す)
 SOUND_BOOT_UNKNOWN_S = 2.0
-# fv_audio_output のパラメータ: true なら鳴らし切ってから (snd_pcm_drain) playback_done を出す
-DRAIN_PARAM = "audio.drain_after_frame"
+
 _SENTENCE_MAX = 120    # これより長い文は読点で分ける (合成の待ち時間を揃える)
 
 
@@ -300,17 +299,11 @@ class FvTtsNode(Node):
 
         # 発話ごとの id とクリップの終わり方 (playback_track.py)。出す側の共通ロック (_speaking_lock) の中で触る
         self._t_boot = time.monotonic()
-        # 出力 (fv_audio_output) が鳴らし切ってから playback_done を出すか (audio.drain_after_frame)。出力の印 → True/False。
-        # パラメータは実行器のスレッド (tick) から非同期に聞く
-        self._drain_cache: Dict = {}
-        self._drain_wanted = None
-        self._drain_query = None
-        self._param_clients: Dict = {}
         self._track = PlaybackTracker(
             self._emit_playback,
             latency_s=float(self.get_parameter("playback_done_latency_s").value),
             grace_s=float(self.get_parameter("playback_done_grace_s").value),
-            output_key=lambda: self._output_state()[0])
+            output_key=self._output_state)
         if self.playback_done_topic:
             self.done_sub = self.create_subscription(
                 PlaybackDone, self.playback_done_topic, self.on_playback_done, qos)
@@ -816,12 +809,18 @@ class FvTtsNode(Node):
             self.get_logger().debug(f"playback publish failed: {exc}")
 
     def on_playback_done(self, msg) -> None:
-        """fv_audio_output が 1 フレームを鳴らし終えた (request_id = 出した AudioFrame.header.frame_id)。"""
+        """fv_audio_output が 1 フレームを鳴らし終えた (request_id = 出した AudioFrame.header.frame_id)。drained = 鳴らし切って
+        から出した (snd_pcm_drain が成功)、publisher_gid = 知らせを出した publisher (古い出力は既定値 = false / 空)。"""
         rid = str(getattr(msg, "request_id", "") or getattr(getattr(msg, "header", None), "frame_id", "") or "")
+        try:
+            gid = bytes(bytearray(int(b) & 0xFF for b in (getattr(msg, "publisher_gid", None) or [])))
+        except (TypeError, ValueError):
+            gid = b""
+        drained = getattr(msg, "drained", False) is True
         with self._speaking_lock:
             track = getattr(self, "_track", None)
             if track is not None and not self._closing:
-                track.on_done(rid, int(getattr(msg, "epoch", 0) or 0))
+                track.on_done(rid, int(getattr(msg, "epoch", 0) or 0), output=gid or None, drained=drained)
 
     def on_pause(self, _msg: Empty) -> None:
         """audio/output/pause: 鳴っている音は捨てられる (fv_audio_output)。クリップは「中断」。"""
@@ -838,87 +837,33 @@ class FvTtsNode(Node):
                 track.on_sound(bool(msg.data))
 
     def _track_tick(self) -> None:
-        self._ask_drain()
         with self._speaking_lock:
             track = getattr(self, "_track", None)
             if track is not None and not self._closing and track.in_flight():
                 track.tick()
 
-    def _ask_drain(self) -> None:
-        """出力に audio.drain_after_frame を聞く (実行器のスレッドから、答えは非同期)。5 秒で答えが無ければ聞き直す。"""
-        if self._closing or not hasattr(self, "_drain_cache"):
-            return
-        now = time.monotonic()
-        # 出力の印がまだ分からない (答えを持っていない) 間は 1 秒ごと、分かっていれば 5 秒ごとに見る
-        period = 5.0 if self._drain_cache else 1.0
-        if getattr(self, "_drain_wanted", None) is None and now - getattr(self, "_drain_probe_at", 0.0) > period:
-            # 出力を前もって見つけて聞いておく (起動直後の最初の発話から drained が分かるように)
-            self._drain_probe_at = now
-            with self._speaking_lock:
-                self._output_state()
-        wanted = getattr(self, "_drain_wanted", None)
-        if wanted is None:
-            return
-        key, fq = wanted
-        if key in self._drain_cache:
-            self._drain_wanted = None
-            return
-        pending = self._drain_query
-        if pending is not None and pending[0] == key and time.monotonic() - pending[1] < 5.0:
-            return
-        try:
-            from rclpy.parameter_client import AsyncParameterClient  # noqa: PLC0415 — Jazzy
-            client = self._param_clients.get(fq)
-            if client is None:
-                client = AsyncParameterClient(self, fq)
-                self._param_clients[fq] = client
-            future = client.get_parameters([DRAIN_PARAM])
-        except Exception as exc:  # pylint: disable=broad-except
-            self.get_logger().debug(f"drain query failed: {exc}")
-            self._drain_query = (key, time.monotonic())
-            return
-        self._drain_query = (key, time.monotonic())
-
-        def answered(fut, key=key) -> None:
-            try:
-                values = list(getattr(fut.result(), "values", []) or [])
-            except Exception:  # pylint: disable=broad-except
-                return
-            value = values[0] if values else None
-            drains = value is not None and int(getattr(value, "type", 0)) == 1 and bool(getattr(value, "bool_value", False))
-            with self._speaking_lock:
-                self._drain_cache[key] = drains
-            self.get_logger().info(f"出力 {key[1].rstrip('/')}/{key[0]} の {DRAIN_PARAM} = {drains}"
-                                   + ("" if drains else " (完走の知らせは drained=false: 聞く側は証拠にしない)"))
-
-        future.add_done_callback(answered)
-
     def _output_state(self):
-        """(出力の印, 鳴らし切ってから done を出すか)。出力 (playback_done を出すノード = fv_audio_output) がちょうど 1 つで、
-        それがこの音の再生の topic を購読している時だけ印 (名前・名前空間・publisher の gid。再起動で変わる) を返す。
-        そうでなければ (None, False): 「最初の done = 鳴り終わり」とは言えない (クリップを出す時と done を確かめる時の両方で見る)。"""
+        """いまの出力の印 (playback_done の publisher の gid)。出力 (playback_done を出すノード = fv_audio_output) がちょうど
+        1 つで、それがこの音の再生の topic を購読している時だけ。そうでなければ None: 「その出力の done = 鳴り終わり」とは
+        言えない (クリップを出す時と done を確かめる時の両方で見る。done の publisher_gid もこの印と照らす)。"""
         done_topic = getattr(self, "playback_done_topic", "")
         play_topic = getattr(self, "playback_topic", "")
         if not done_topic or not play_topic:
-            return None, False
+            return None
         try:
             outputs = self.get_publishers_info_by_topic(self.resolve_topic_name(done_topic))
             if len(outputs) != 1:
-                return None, False
+                return None
             info = outputs[0]
             node = (info.node_name, info.node_namespace)
             players = {(i.node_name, i.node_namespace)
                        for i in self.get_subscriptions_info_by_topic(self.resolve_topic_name(play_topic))}
             if node not in players:
-                return None, False
-            key = (info.node_name, info.node_namespace, tuple(info.endpoint_gid))
+                return None
+            gid = bytes(bytearray(int(b) & 0xFF for b in info.endpoint_gid))
         except Exception:  # pylint: disable=broad-except
-            return None, False
-        drains = self._drain_cache.get(key)
-        if drains is None:
-            ns = info.node_namespace.rstrip("/")
-            self._drain_wanted = (key, f"{ns}/{info.node_name}")
-        return key, drains is True
+            return None
+        return gid or None
 
     def _sound_unknown(self) -> bool:
         """効果音が鳴っているかを知れない: 起動直後 (鳴っている途中の効果音の印は 1 秒ごとにしか来ない)、または
@@ -1128,9 +1073,9 @@ class FvTtsNode(Node):
                 if limit <= 0 or (backlog <= limit and len(self._published_ends) < 6):
                     track_ = getattr(self, "_track", None) if track else None
                     frame_id = track_.frame_id(track[0], track[1]) if track_ is not None else ""
-                    # 出力がちょうど 1 つの時だけ、最初の playback_done を鳴り終わりと見る (出す時に見る。done を確かめる時に
-                    # 同じ出力か見る)。鳴らし切ってから done を出す出力なら drained
-                    output, drained = self._output_state() if (track_ is not None and play) else (None, False)
+                    # 出力がちょうど 1 つの時だけ、その出力の playback_done を鳴り終わりと見る (出す時に見る。done の送り手と、
+                    # done を確かめる時の出力がこれと同じか見る)
+                    output = self._output_state() if (track_ is not None and play) else None
                     frame = self.build_frame(cached, stamp=stamp, epoch=epoch, frame_id=frame_id)
                     self.tts_pub.publish(frame)
                     end = None
@@ -1140,8 +1085,7 @@ class FvTtsNode(Node):
                     if track_ is not None:
                         track_.clip_published(track[0], track[1], track[2], epoch=epoch,
                                               seconds=self._duration(cached), expected_end=end,
-                                              sure=output is not None, played=play, drained=drained,
-                                              output=output)
+                                              sure=output is not None, played=play, output=output)
                     return True
             time.sleep(min(0.25, max(0.05, backlog - limit)))
 
