@@ -11,7 +11,8 @@
 | `/fv/event` | std_msgs/String | 入力 | 状況イベント (登録名 / JSON / `say:<text>`) |
 | `/fv/event/active` | std_msgs/String | 出力 | 正規化した記録マーカー (recorder/UI が購読) |
 | `/aspa/tts/say` | std_msgs/String | 出力 | 任意テキスト→発話 (fv_tts が消費) |
-| `/aspa/audio/speaking` | std_msgs/Bool | 出力 | 再生中フラグ |
+| `/aspa/audio/speaking` | std_msgs/Bool | 出力 | 再生中フラグ (fv_tts の読み上げと共用) |
+| `/aspa/soundboard/speaking` | std_msgs/Bool | 出力 | 効果音だけの再生中フラグ (`own_speaking_topic`。読み上げと見分けるため。fv_tts も見る) |
 
 ## `/fv/event` の与え方
 

@@ -227,6 +227,8 @@ class SoundboardNode(Node):
         self.declare_parameter("settings_topic", "/fv/sound/settings")
         self.declare_parameter("tts_say_topic", "/aspa/tts/say")
         self.declare_parameter("speaking_topic", "/aspa/audio/speaking")
+        # 効果音だけの再生中フラグ (speaking_topic は fv_tts の読み上げと共用なので、聞く側が出どころを見分けられない)。"" = 出さない
+        self.declare_parameter("own_speaking_topic", "/aspa/soundboard/speaking")
         self.declare_parameter("enable_tts", True)
         # 出力シンク (複数指定で同時多シンク): "aplay" | "audio_frame"
         self.declare_parameter("output_backends", ["aplay"])
@@ -258,6 +260,8 @@ class SoundboardNode(Node):
         self.say_pub = self.create_publisher(String, gp("tts_say_topic"), 10)
         self.event_out_pub = self.create_publisher(String, gp("event_out_topic"), 10)
         self.speaking_pub = self.create_publisher(Bool, gp("speaking_topic"), 10)
+        own = str(gp("own_speaking_topic") or "").strip()
+        self.own_speaking_pub = self.create_publisher(Bool, own, 10) if own else None
 
         # 出力シンク構築
         self.sinks = self._build_sinks(
@@ -553,7 +557,7 @@ class SoundboardNode(Node):
         with self._speaking_lock:
             if not self._speaking:
                 self._speaking = True
-                self.speaking_pub.publish(Bool(data=True))
+                self._publish_speaking(True)
             end = time.monotonic() + duration + 0.15
             self._speaking_end = max(self._speaking_end, end)
             if self._speaking_timer is not None:
@@ -569,7 +573,14 @@ class SoundboardNode(Node):
                 return
             self._speaking = False
             self._speaking_timer = None
-            self.speaking_pub.publish(Bool(data=False))
+            self._publish_speaking(False)
+
+    def _publish_speaking(self, on):
+        """共用の speaking_topic と、効果音だけの own_speaking_topic の両方へ。"""
+        self.speaking_pub.publish(Bool(data=on))
+        own = getattr(self, "own_speaking_pub", None)
+        if own is not None:
+            own.publish(Bool(data=on))
 
     # ── audio helpers (シンクから共有) ──────────────────
     def _read_wav(self, path):

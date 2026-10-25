@@ -20,6 +20,7 @@ fv_soundboard:
     event_out_topic: "/fv/event/active"
     tts_say_topic: "/aspa/tts/say"
     speaking_topic: "/aspa/audio/speaking"
+    own_speaking_topic: "/aspa/soundboard/speaking"   # 効果音だけ (speaking_topic は fv_tts と共用)
 
     # パラメトリック・ソニフィケーション (連続パラメータ→合成)
     enable_sonification: true
