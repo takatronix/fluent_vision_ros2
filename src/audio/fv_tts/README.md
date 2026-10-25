@@ -121,8 +121,23 @@ ros2 topic pub -1 /aspa/tts/say std_msgs/String "{data: 'アスパラを見つ�
 - `/aspa/tts/say` (std_msgs/String): 任意テキスト→発話 (本ノードが消費)
 - `/aspa/audio/speaking` (std_msgs/Bool): 再生中フラグ (本ノードが publish)
 - `/aspa/tts/spoken` (std_msgs/String, JSON): 喋った / 飛ばした発話の知らせ (本ノードが publish)。
-  `{"text", "engine": "aivis"|"pyopenjtalk", "ok", "clips", "seconds", "ms", "error"}`。
-  viewer がブラウザへ流し、aspa_agent が「どの声で喋ったか」を記録する
+  `{"id", "text", "engine": "aivis"|"pyopenjtalk", "ok", "clips", "of", "seconds", "ms", "error"}`。
+  viewer がブラウザへ流し、aspa_agent が「どの声で喋ったか」を記録する。出し終えた時に出す (鳴り終わりではない)
+- `/aspa/tts/playback` (std_msgs/String, JSON): 発話ごとの id と、分けて読んだクリップ (文) ごとの終わり方
+  (`fv_tts_py/playback_track.py`)。どれも `event` `id` `seq` `boot` `text` `t` を持つ:
+  - `queued` (/aspa/tts/say を受けた)・`start` (`of` = 分けた文の数, `engine`)
+  - `clip` (`index` `of` `clip_text` `status` `seconds` `reason`): `done` = 出力 (fv_audio_output) が最後まで鳴らした
+    (`audio/output/playback_done` を受け、`playback_done_latency_s` (0.4 s) の間に止められなかった)、`cut` = 止められた、
+    `failed` = 合成できなかった、`unknown` = 鳴り終わりが分からない (done が見込みの尺 + `playback_done_grace_s` (5 s) で
+    来ない・playback_done を出すノードが 1 つでない・鳴らさない設定)
+  - `end` (`status`: `done` = 全部の文が done / `cut` / `failed` / `partial` / `unknown`、`of` `clips` `done` `sound`
+    (ほかの音 = 効果音・別のノードの音と重なった) `statuses` `seconds` `error`)。全部のクリップの終わり方が決まってから出す
+  - `seq` は起動 (`boot`) ごとに 1 から: 聞く側は飛び・入れ替わり・再起動を見分ける
+  - AudioFrame の `header.frame_id` に `fv_tts:<id>:<文の番号>` を入れる (PlaybackDone.request_id で返る)
+- `/aspa/tts/speaking` (std_msgs/Bool): 読み上げ (本ノード) だけの再生中フラグ (`/aspa/audio/speaking` と同じタイマー。
+  そちらは fv_soundboard の効果音でも立つ)
+- `/aspa/soundboard/speaking` (std_msgs/Bool): fv_soundboard の効果音だけの再生中フラグ (本ノードが購読し、立っている間の
+  発話を `sound` にする)
 
 ## キャッシュ
 `cache_dir`（既定 `~/.fluent_voice_cache`）にPCMとメタ情報を保存します。`cache_key`で共有可能。
