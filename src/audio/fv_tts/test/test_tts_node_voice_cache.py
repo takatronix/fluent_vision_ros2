@@ -732,14 +732,17 @@ def test_dedupe_mark_stays_until_the_cache_write_is_done(node):
 pt = pytest.importorskip("fv_tts_py.playback_track")
 
 
-def _with_tracking(node, outputs=1, latency=0.05, sound_unknown=False):
+def _with_tracking(node, outputs=1, latency=0.05, sound_unknown=False, drained=False):
     node.playback_pub = _Pub()
     node.tts_speaking_pub = _Pub()
     node.outputs = outputs
-    node._outputs_ok = lambda: node.outputs == 1
+    node.drains = drained
+    node.output_gid = (1,)
+    node._output_state = lambda: ((("fv_audio_output", "/", node.output_gid), node.drains) if node.outputs == 1
+                                  else (None, False))
     node._sound_unknown = lambda: sound_unknown
     node._track = pt.PlaybackTracker(node._emit_playback, latency_s=latency, grace_s=1.0, boot="t35t",
-                                     outputs_ok=lambda: node._outputs_ok())
+                                     output_key=lambda: node._output_state()[0])
     return node
 
 
@@ -999,3 +1002,57 @@ def test_destroy_ends_every_pending_utterance_as_cut(node, monkeypatch):
     node.on_stop(None)
     node._track_tick()
     assert len(node.playback_pub.frames) == n                       # 終了の後は何も出さない
+
+
+def test_drained_output_reports_drained_and_needs_no_latency(node):
+    """鳴らし切ってから done を出す出力 (aspa: drain_after_frame=true): done の時にはもう音は残っていない。"""
+    _with_tracking(node, drained=True, latency=0.4)
+    node.vc_backend = _Backend()
+    node.speak_text("鳴らし切る出力の文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    node._track_tick()                                     # 待たずに確定 (出力の遅れを待つ必要が無い)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["drained"] is True
+    assert _notices(node, "clip")[0]["drained"] is True
+
+
+def test_not_drained_output_reports_drained_false(node):
+    _with_tracking(node, drained=False)
+    node.vc_backend = _Backend()
+    node.speak_text("鳴らし切らない出力の文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["drained"] is False      # 聞く側は証拠にしない
+
+
+def test_output_restarted_between_publish_and_done_is_unknown(node):
+    _with_tracking(node, drained=True)
+    node.vc_backend = _Backend()
+    node.speak_text("出力が入れ替わる文です。", "", 8.0)
+    node.output_gid = (2,)                                  # fv_audio_output が再起動した (gid が変わる)
+    _done(node, node.play_pub.frames[0])
+    node._track_tick()
+    assert _notices(node, "end")[0]["status"] == "unknown"
+
+
+def test_output_state_and_drain_query(node, monkeypatch):
+    """_output_state: playback_done の出し手がちょうど 1 つで、再生の topic の購読者でもある時だけ印。drain は聞いてから。"""
+    from types import SimpleNamespace as NS
+    node.playback_done_topic, node.playback_topic = "audio/output/playback_done", "audio/output/frame"
+    node.resolve_topic_name = lambda t: "/" + t
+    node._drain_cache, node._drain_wanted, node._drain_query, node._param_clients = {}, None, None, {}
+    pubs = [NS(node_name="fv_audio_output", node_namespace="/", endpoint_gid=[7, 7])]
+    subs = [NS(node_name="fv_audio_output", node_namespace="/"), NS(node_name="bridge", node_namespace="/")]
+    node.get_publishers_info_by_topic = lambda topic: list(pubs)
+    node.get_subscriptions_info_by_topic = lambda topic: list(subs)
+    key, drained = tts_node.FvTtsNode._output_state(node)
+    assert key == ("fv_audio_output", "/", (7, 7)) and drained is False      # まだ聞いていない
+    assert node._drain_wanted == (key, "/fv_audio_output")
+    node._drain_cache[key] = True
+    assert tts_node.FvTtsNode._output_state(node) == (key, True)
+    pubs.append(NS(node_name="fv_audio_output2", node_namespace="/", endpoint_gid=[8]))
+    assert tts_node.FvTtsNode._output_state(node) == (None, False)          # 出力が 2 つ
+    pubs.pop()
+    subs.pop(0)
+    assert tts_node.FvTtsNode._output_state(node) == (None, False)          # done を出すが再生の購読者でない
