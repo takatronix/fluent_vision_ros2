@@ -726,3 +726,177 @@ def test_dedupe_mark_stays_until_the_cache_write_is_done(node):
     first.join()
     assert len(second) == 1
     assert len(_spoken(node.vc_backend)) == 1
+
+
+# ── 発話ごとの id とクリップの終わり方 (/aspa/tts/playback、playback_track.py) ─────────
+pt = pytest.importorskip("fv_tts_py.playback_track")
+
+
+def _with_tracking(node, outputs=1, latency=0.05):
+    node.playback_pub = _Pub()
+    node.tts_speaking_pub = _Pub()
+    node._track = pt.PlaybackTracker(node._emit_playback, latency_s=latency, grace_s=1.0, boot="t35t")
+    node._count_outputs = lambda: outputs
+    return node
+
+
+def _notices(node, kind=None):
+    out = [json.loads(m.data) for m in node.playback_pub.frames]
+    return [e for e in out if kind is None or e["event"] == kind]
+
+
+def _done(node, frame, epoch=None):
+    msg = tts_node.PlaybackDone(request_id=frame.header.frame_id, epoch=frame.epoch if epoch is None else epoch)
+    node.on_playback_done(msg)
+
+
+def _settle(node, seconds=0.12):
+    time.sleep(seconds)
+    node._track_tick()
+
+
+def test_utterance_id_frame_ids_and_natural_completion(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    clips = node.speak_text("実際に収穫するか確認してください。", "", 8.0)
+    assert len(clips) == 1
+    frame = node.play_pub.frames[0]
+    start, = _notices(node, "start")
+    assert frame.header.frame_id == f"fv_tts:{start['id']}:0" and start["of"] == 1 and start["engine"] == "aivis"
+    spoken = json.loads(node.spoken_pub.frames[-1].data)
+    assert spoken["id"] == start["id"] and spoken["clips"] == 1 and spoken["of"] == 1   # 今の知らせに足しただけ
+    assert {"text", "engine", "ok", "clips", "seconds", "ms", "error"} <= set(spoken)
+    assert _notices(node, "end") == []                   # 出しただけ (鳴り終わりはまだ)
+    _done(node, frame)
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["id"] == start["id"] and end["clips"] == 1 and end["sound"] is False
+
+
+def test_say_topic_gets_an_id_when_queued(node):
+    import queue as queue_mod
+    _with_tracking(node)
+    node._say_queue = queue_mod.Queue()
+    node.on_say(tts_node.String(data="  走行を再開できます\x1f\x1e "))
+    queued, = _notices(node, "queued")
+    item = node._say_queue.get_nowait()
+    assert item[0] == "走行を再開できます" and item[3] == queued["id"] and queued["text"] == "走行を再開できます"
+
+
+def test_between_sentences_speaking_goes_off_but_the_utterance_is_not_done(node):
+    """AivisSpeech は文ごと: 2 文目の合成が遅れると speaking は文の間で OFF (タイマー)。発話の end は 2 文とも鳴り終えてから、of=2。"""
+    _with_tracking(node)
+
+    class SlowSecond(_Backend):
+        def synthesize(self, text, speaker, query):
+            if text.startswith("二"):
+                time.sleep(2.0)                           # 1 文目 (1 秒) の再生 + 尾が終わってから
+            return super().synthesize(text, speaker, query)
+
+    node.vc_backend = SlowSecond()
+    node.vc_timeout = 5.0
+    done_first = []
+
+    def first_done():
+        # 1 文目が鳴り終えた (出力の playback_done)
+        while not node.play_pub.frames:
+            time.sleep(0.01)
+        time.sleep(1.3)
+        _done(node, node.play_pub.frames[0])
+        _settle(node)
+        done_first.append([m.data for m in node.tts_speaking_pub.frames])
+
+    t = threading.Thread(target=first_done)
+    t.start()
+    clips = node.speak_text("一つ目の文です。二つ目の文です。", "", 8.0)
+    t.join()
+    assert len(clips) == 2
+    assert done_first[0] == [True, False]               # 文の間で読み上げの speaking が OFF になった
+    assert [c["status"] for c in _notices(node, "clip")] == ["done"] and _notices(node, "end") == []
+    _done(node, node.play_pub.frames[1])
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["of"] == 2 and end["clips"] == 2
+
+
+def test_stop_while_playing_cuts_the_clip(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("止められる文です。", "", 8.0)
+    frame = node.play_pub.frames[0]
+    node.on_stop(None)
+    _done(node, frame)                                   # 止めた後の done (別の世代) は数えない
+    _settle(node)
+    clip, = _notices(node, "clip")
+    end, = _notices(node, "end")
+    assert clip["status"] == "cut" and end["status"] == "cut"
+
+
+def test_stop_during_the_second_sentence_is_cut(node):
+    _with_tracking(node)
+
+    class Stopper(_Backend):
+        def synthesize(self, text, speaker, query):
+            out = super().synthesize(text, speaker, query)
+            if text.startswith("二"):
+                node.on_stop(None)
+            return out
+
+    node.vc_backend = Stopper()
+    clips = node.speak_text("一つ目の文です。二つ目の文です。", "", 8.0)
+    assert len(clips) == 1
+    end, = _notices(node, "end")
+    assert end["status"] == "cut" and end["of"] == 2
+
+
+def test_sound_effect_during_the_utterance_is_reported(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("効果音と重なる文です。", "", 8.0)
+    node.on_sound_speaking(tts_node.Bool(data=True))
+    node.on_sound_speaking(tts_node.Bool(data=False))
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    end, = _notices(node, "end")
+    assert end["status"] == "done" and end["sound"] is True
+
+
+def test_open_jtalk_utterance_is_tracked_as_one_clip(node):
+    _with_tracking(node)
+    node.engine_selected = "pyopenjtalk"
+    node.speak_text("テストです。二つ目。", "", 8.0)
+    start, = _notices(node, "start")
+    assert start["of"] == 1 and start["engine"] == "pyopenjtalk"
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["status"] == "done"
+
+
+def test_unknown_when_outputs_are_not_exactly_one(node):
+    _with_tracking(node, outputs=0)
+    node.vc_backend = _Backend()
+    node.speak_text("出力が無い文です。", "", 8.0)
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    assert _notices(node, "end")[0]["status"] == "unknown"
+
+
+def test_tts_only_speaking_topic_mirrors_the_shared_one(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("短い文です。", "", 8.0)
+    time.sleep(1.3)
+    assert [m.data for m in node.speaking_pub.frames] == [True, False]
+    assert [m.data for m in node.tts_speaking_pub.frames] == [True, False]
+
+
+def test_nothing_is_published_after_destroy(node):
+    _with_tracking(node)
+    node.vc_backend = _Backend()
+    node.speak_text("終わる前の文です。", "", 8.0)
+    n = len(node.playback_pub.frames)
+    node._closing = True
+    _done(node, node.play_pub.frames[0])
+    _settle(node)
+    node.on_stop(None)
+    assert len(node.playback_pub.frames) == n
