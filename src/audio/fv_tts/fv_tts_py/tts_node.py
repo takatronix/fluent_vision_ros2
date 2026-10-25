@@ -879,13 +879,15 @@ class FvTtsNode(Node):
             me = (self.get_name(), self.get_namespace())
             shared = {(i.node_name, i.node_namespace)
                       for i in self.get_publishers_info_by_topic(self.resolve_topic_name(self.speaking_topic))}
-            own = ({(i.node_name, i.node_namespace)
-                    for i in self.get_publishers_info_by_topic(self.resolve_topic_name(sound_topic))}
-                   if sound_topic else set())
+            own_endpoints = (list(self.get_publishers_info_by_topic(self.resolve_topic_name(sound_topic)))
+                             if sound_topic else [])
         except Exception:  # pylint: disable=broad-except
             return True
-        if len(own) > 1:
-            return True     # 効果音だけの印の出し手が 2 つ以上: 印は 1 つの状態に上書きされる (どれかが鳴っているか分からない)
+        if len(own_endpoints) > 1:
+            # 効果音だけの印の出し手 (publisher。同じ名前のノードが 2 つでも別に数える) が 2 つ以上: 印は 1 つの状態に
+            # 上書きされる (どれかが鳴っているか分からない)
+            return True
+        own = {(i.node_name, i.node_namespace) for i in own_endpoints}
         return bool(shared - {me} - own)
 
     # ── 発話 ───────────────────────────────────────────
