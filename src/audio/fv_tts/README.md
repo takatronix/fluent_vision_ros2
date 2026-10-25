@@ -145,7 +145,11 @@ ros2 topic pub -1 /aspa/tts/say std_msgs/String "{data: 'アスパラを見つ�
     始まってから終わるまでに来た・その後出力の遅れの間に始まった、起動から 2 秒、`/aspa/audio/speaking` に自分以外の出し手が
     いるのに効果音だけの印の出し手がいない (古い soundboard) 時に true
   - `seq` は起動 (`boot`) ごとに 1 から: 聞く側は飛び・入れ替わり・再起動を見分ける
-  - AudioFrame の `header.frame_id` に `fv_tts:<id>:<文の番号>` を入れる (PlaybackDone.request_id で返る)
+  - AudioFrame の `header.frame_id` に `fv_tts:<id>:<文の番号>` を入れる (PlaybackDone.request_id で返る)。出力がちょうど 1 つの
+    時は末尾に宛先 `@to=<その出力の playback_done の publisher の gid>` を付け、fv_audio_output は自分宛てでないフレームを
+    鳴らさない (ほかの出力が同じ音を遅れて鳴らすと「鳴り終わった」が嘘になる)。宛先の無いフレームは今までどおり全部の出力が鳴らす
+  - fv_audio_output の PlaybackDone に足した項目: `complete` (書き始めた後に装置を失わず、drain するなら drain・prepare も成功)、
+    `drained` (complete かつ drain_after_frame)、`publisher_gid`。complete=false の done は unknown ("incomplete")
 - `/aspa/tts/speaking` (std_msgs/Bool): 読み上げ (本ノード) だけの再生中フラグ (`/aspa/audio/speaking` と同じタイマー。
   そちらは fv_soundboard の効果音でも立つ)
 - `/aspa/soundboard/speaking` (std_msgs/Bool): fv_soundboard の効果音だけの再生中フラグ (再生尺が過ぎてもシンクが鳴らし終える
