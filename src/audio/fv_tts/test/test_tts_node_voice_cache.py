@@ -957,17 +957,41 @@ def test_sound_unknown_at_start_marks_the_utterance(node):
 
 
 def test_sound_unknown_rules(node):
+    """共用の speaking の出し手 (自分以外) が全部、効果音だけの印も出しているノードの時だけ「分かる」(GPT: 数ではなくノードで)。"""
+    from types import SimpleNamespace as NS
     node.speaking_topic, node.sound_speaking_topic = "/aspa/audio/speaking", "/aspa/soundboard/speaking"
-    counts = {"/aspa/audio/speaking": 2, "/aspa/soundboard/speaking": 1}
-    node.count_publishers = lambda topic: counts[topic]
+    node.resolve_topic_name = lambda t: t
+    node.get_name, node.get_namespace = (lambda: "fv_tts"), (lambda: "/")
+    pubs = {"/aspa/audio/speaking": [NS(node_name="fv_tts", node_namespace="/"), NS(node_name="fv_soundboard", node_namespace="/")],
+            "/aspa/soundboard/speaking": [NS(node_name="fv_soundboard", node_namespace="/")]}
+    node.get_publishers_info_by_topic = lambda topic: list(pubs[topic])
     node._t_boot = time.monotonic() - 10.0
-    assert tts_node.FvTtsNode._sound_unknown(node) is False      # soundboard (新しい) がいる
-    counts["/aspa/soundboard/speaking"] = 0
+    assert tts_node.FvTtsNode._sound_unknown(node) is False      # soundboard (新しい) だけ
+    pubs["/aspa/audio/speaking"].append(NS(node_name="other_player", node_namespace="/"))
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 別の音の出し手 (効果音だけの印を出さない) が増えた
+    pubs["/aspa/audio/speaking"].pop()
+    pubs["/aspa/soundboard/speaking"] = []
     assert tts_node.FvTtsNode._sound_unknown(node) is True       # 古い soundboard: 効果音だけの印が無い
-    counts["/aspa/audio/speaking"] = 1
+    pubs["/aspa/audio/speaking"] = [NS(node_name="fv_tts", node_namespace="/")]
     assert tts_node.FvTtsNode._sound_unknown(node) is False      # 自分だけ (効果音を出すノードが無い)
     node._t_boot = time.monotonic()
     assert tts_node.FvTtsNode._sound_unknown(node) is True       # 起動直後
+
+
+def test_pause_while_synthesizing_does_not_cut_a_sentence_played_after_resume(node):
+    """合成中に pause → 再開の後に出した文は最後まで鳴る: cut ではない (GPT)。鳴っていたクリップは cut。"""
+    _with_tracking(node, drained=True)
+
+    class PauseDuring(_Backend):
+        def synthesize(self, text, speaker, query):
+            node.on_pause(None)                          # 合成中に pause (鳴っているクリップは無い)
+            return super().synthesize(text, speaker, query)
+
+    node.vc_backend = PauseDuring()
+    node.speak_text("合成中に一時停止された文です。", "", 8.0)
+    _done(node, node.play_pub.frames[-1])
+    node._track_tick()
+    assert _notices(node, "end")[-1]["status"] == "done"
 
 
 def test_extra_speaking_publish_failure_keeps_speaking(node):
