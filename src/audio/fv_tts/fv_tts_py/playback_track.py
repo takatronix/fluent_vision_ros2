@@ -69,16 +69,23 @@ class PlaybackTracker:
     latency_s: playback_done の後、まだ出力の先に残っているかもしれない音の長さ (fv_audio_output の
         drain_after_frame=false なら ALSA のバッファ ≈ 0.34 s)。この間に止められたら cut。
     grace_s: 見込みの鳴り終わりからこれだけ過ぎても playback_done が来なければ unknown。
+    late_s: done を確かめる tick が latency_s の後これ以上遅れたら (ROS の実行器が Speak サービスなどで塞がっていた =
+        その間の stop / pause の callback がまだ回っていないかもしれない) unknown。
+    outputs_ok(): 出力 (playback_done を出すノード) がちょうど 1 つで、それがこの音の再生の topic を購読しているか。
+        クリップを出した時と done を確かめる時の両方で見る (途中で出力が増えた・減ったら unknown)。
     """
 
     def __init__(self, emit: Callable[[dict], None], *, clock: Callable[[], float] = time.monotonic,
                  wall: Callable[[], float] = time.time, latency_s: float = 0.4, grace_s: float = 5.0,
+                 late_s: float = 0.25, outputs_ok: Optional[Callable[[], bool]] = None,
                  boot: Optional[str] = None) -> None:
         self._emit_fn = emit
         self._clock = clock
         self._wall = wall
         self.latency_s = max(0.0, float(latency_s))
         self.grace_s = max(0.5, float(grace_s))
+        self.late_s = max(0.05, float(late_s))
+        self._outputs_ok = outputs_ok
         self.boot = boot or uuid.uuid4().hex[:8]
         self._n = itertools.count(1)
         self._seq = 0
@@ -122,22 +129,32 @@ class PlaybackTracker:
         self._utts[uid] = utt
         self._emit("queued", utt)
 
-    def start(self, uid: str, text: str, engine: str, planned: int) -> None:
+    def start(self, uid: str, text: str, engine: str, planned: int, *, sound_unknown: bool = False) -> None:
+        """sound_unknown: 効果音が鳴っているかを知れない (起動直後・出どころの分からない speaking がある) → sound にする。"""
         utt = self._utts.get(uid)
         if utt is None:
             self.queued(uid, text)
             utt = self._utts[uid]
         utt.engine, utt.planned, utt.started = str(engine or ""), int(planned), True
-        if self._sound_on:
-            utt.sound = True                # 効果音が鳴っている間に始まった
+        if self._sound_on or sound_unknown:
+            utt.sound = True                # 効果音が鳴っている間に始まった / 鳴っているか分からない
         self._emit("start", utt, engine=utt.engine, of=utt.planned)
 
     def clip_failed(self, uid: str, index: int, text: str, reason: str) -> None:
+        self._clip_final(uid, index, text, FAILED, reason)
+
+    def clip_cut(self, uid: str, index: int, text: str, reason: str) -> None:
+        """止められて出さなかった文 (鳴っていない)。"""
+        self._clip_final(uid, index, text, CUT, reason)
+
+    def _clip_final(self, uid: str, index: int, text: str, status: str, reason: str) -> None:
         utt = self._utts.get(uid)
         if utt is None:
             return
-        clip = _Clip(index=index, text=text, status=FAILED, reason=str(reason or "")[:200])
+        clip = _Clip(index=index, text=text, status=status, reason=str(reason or "")[:200])
         utt.clips.append(clip)
+        if status == CUT:
+            utt.stopped = True
         self._clip_notice(utt, clip)
 
     def clip_published(self, uid: str, index: int, text: str, *, epoch: int, seconds: float,
@@ -193,17 +210,25 @@ class PlaybackTracker:
                 if utt.started:
                     utt.sound = True
 
-    def on_stop(self) -> None:
-        """audio/output/stop: 鳴っている・待っているクリップは cut。出している途中の発話も cut。"""
+    def on_stop(self, reason: str = "stop") -> None:
+        """audio/output/stop・pause: 鳴っている・待っているクリップは cut。出している途中の発話も cut。"""
         for utt in list(self._utts.values()):
             if utt.started:
                 utt.stopped = True
             for clip in utt.clips:
                 if not clip.status:
-                    clip.status, clip.reason = CUT, "stop"
+                    clip.status, clip.reason = CUT, reason
                     self._frames.pop(clip.frame_id, None)
                     self._clip_notice(utt, clip)
         for utt in list(self._utts.values()):
+            self._check(utt)
+
+    def close_all(self, reason: str = "shutdown") -> None:
+        """終了処理: 受付済み・合成中・再生待ちの発話を全部 cut で終える (この後は何も出さない)。"""
+        self.on_stop(reason)
+        for utt in list(self._utts.values()):
+            utt.stopped = True
+            utt.finished = True
             self._check(utt)
 
     def tick(self) -> None:
@@ -215,9 +240,14 @@ class PlaybackTracker:
                 self._frames.pop(fid, None)
                 continue
             if clip.done_at is not None and now - clip.done_at >= self.latency_s:
-                clip.status = DONE if clip.sure else UNKNOWN
-                if not clip.sure:
-                    clip.reason = "outputs != 1"
+                late = now - clip.done_at - self.latency_s > self.late_s
+                outputs = clip.sure and self._outputs_now()
+                if late:
+                    clip.status, clip.reason = UNKNOWN, "late check"
+                elif not outputs:
+                    clip.status, clip.reason = UNKNOWN, "outputs != 1"
+                else:
+                    clip.status = DONE
             elif clip.done_at is None and now >= clip.expected_end + self.grace_s:
                 clip.status, clip.reason = UNKNOWN, "no playback_done"
             else:
@@ -227,6 +257,14 @@ class PlaybackTracker:
             touched.append(utt)
         for utt in touched:
             self._check(utt)
+
+    def _outputs_now(self) -> bool:
+        if self._outputs_ok is None:
+            return True
+        try:
+            return bool(self._outputs_ok())
+        except Exception:  # pylint: disable=broad-except
+            return False
 
     # ------------------------------------------------------------- end
     @staticmethod

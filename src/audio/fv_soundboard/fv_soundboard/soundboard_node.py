@@ -80,22 +80,32 @@ class AplaySink:
         self._q: "queue.Queue[Cue]" = queue.Queue()
         self._cur = None
         self._lock = threading.Lock()
+        self._active = 0            # 受けて、まだ鳴らし終えていない音の数 (busy: 効果音だけの印を下ろさない)
         self._t = threading.Thread(target=self._run, daemon=True)
         self._t.start()
 
     def pending(self):
         return self._q.qsize()
 
+    def busy(self):
+        with self._lock:
+            return self._active > 0
+
     def enqueue(self, cue):
+        with self._lock:
+            self._active += 1
         self._q.put(cue)
 
     def interrupt(self):
+        dropped = 0
         try:
             while True:
                 self._q.get_nowait()
+                dropped += 1
         except queue.Empty:
             pass
         with self._lock:
+            self._active = max(0, self._active - dropped)
             if self._cur and self._cur.poll() is None:
                 self._cur.terminate()
 
@@ -106,6 +116,9 @@ class AplaySink:
                 self._play(cue)
             except Exception as exc:  # noqa: BLE001
                 self.node.get_logger().error(f"[aplay] 再生失敗: {exc}")
+            finally:
+                with self._lock:
+                    self._active = max(0, self._active - 1)
 
     def _play(self, cue: Cue):
         tmp = None
@@ -150,21 +163,35 @@ class AudioFrameSink:
         self.pub = node.create_publisher(audio_frame_cls, frame_topic, qos)
         self.stop_pub = node.create_publisher(Empty, stop_topic, 10)
         self._q: "queue.Queue[Cue]" = queue.Queue()
+        self._lock = threading.Lock()
+        self._active = 0
         self._t = threading.Thread(target=self._run, daemon=True)
         self._t.start()
 
     def pending(self):
         return self._q.qsize()
 
+    def busy(self):
+        # 出した後の実際の再生は fv_audio_output (fv_tts の音と同じ待ち行列で直列。fv_tts は自分の物でない playback_done で
+        # 重なりを知る)。ここでは出し終えるまで
+        with self._lock:
+            return self._active > 0
+
     def enqueue(self, cue):
+        with self._lock:
+            self._active += 1
         self._q.put(cue)
 
     def interrupt(self):
+        dropped = 0
         try:
             while True:
                 self._q.get_nowait()
+                dropped += 1
         except queue.Empty:
             pass
+        with self._lock:
+            self._active = max(0, self._active - dropped)
         # 実機側 fv_audio_output のキューを flush (best-effort)
         self.stop_pub.publish(Empty())
 
@@ -175,6 +202,9 @@ class AudioFrameSink:
                 self._play(cue)
             except Exception as exc:  # noqa: BLE001
                 self.node.get_logger().error(f"[audio_frame] 再生失敗: {exc}")
+            finally:
+                with self._lock:
+                    self._active = max(0, self._active - 1)
 
     def _play(self, cue: Cue):
         if cue.pcm is not None:
@@ -290,6 +320,11 @@ class SoundboardNode(Node):
         self._speaking_end = 0.0
         self._speaking_timer = None
         self._speaking_lock = threading.Lock()
+        # 効果音だけの印 (own_speaking_topic): 再生尺が過ぎても、シンクが鳴らし終えるまでは下ろさない。上がっている間は
+        # 1 秒ごとに出し直す (後から起きた fv_tts も 1 秒で知る)。起動時に OFF を 1 回
+        self._own_on = False
+        self._own_timer = None
+        self._publish_own(False)
 
     # ── setup ───────────────────────────────────────────
     def _build_sinks(self, backends, frame_topic, stop_topic):
@@ -549,9 +584,13 @@ class SoundboardNode(Node):
     def _note_speaking(self, duration):
         """/aspa/audio/speaking を再生尺ベースで上げ下げ (シンク非依存の best-effort)。"""
         with self._speaking_lock:
+            if not self._own_on:
+                self._own_on = True
+                self._publish_own(True)
+                self._arm_own(1.0)
             if not self._speaking:
                 self._speaking = True
-                self._publish_speaking(True)
+                self.speaking_pub.publish(Bool(data=True))
             end = time.monotonic() + duration + 0.15
             self._speaking_end = max(self._speaking_end, end)
             if self._speaking_timer is not None:
@@ -567,14 +606,48 @@ class SoundboardNode(Node):
                 return
             self._speaking = False
             self._speaking_timer = None
-            self._publish_speaking(False)
+            self.speaking_pub.publish(Bool(data=False))
 
-    def _publish_speaking(self, on):
-        """共用の speaking_topic と、効果音だけの own_speaking_topic の両方へ。"""
-        self.speaking_pub.publish(Bool(data=on))
+    # ── 効果音だけの印 (own_speaking_topic) ──────────────
+    def _publish_own(self, on):
         own = getattr(self, "own_speaking_pub", None)
-        if own is not None:
-            own.publish(Bool(data=on))
+        if own is None:
+            return
+        try:
+            own.publish(Bool(data=bool(on)))
+        except Exception as exc:  # noqa: BLE001 — 足した印の失敗で音は止めない
+            self.get_logger().debug(f"own speaking publish failed: {exc}")
+
+    def _arm_own(self, delay):
+        if self._own_timer is not None:
+            self._own_timer.cancel()
+        self._own_timer = threading.Timer(delay, self._own_check)
+        self._own_timer.daemon = True
+        self._own_timer.start()
+
+    def _sinks_busy(self):
+        for sink in getattr(self, "sinks", []):
+            busy = getattr(sink, "busy", None)
+            try:
+                if busy is None or busy():
+                    return True            # busy の分からないシンクは鳴っていると見る
+            except Exception:  # noqa: BLE001
+                return True
+        return False
+
+    def _own_check(self):
+        """再生尺が過ぎ、全部のシンクが鳴らし終えたら下ろす。まだなら印を出し直して 1 秒後にもう一度。"""
+        with self._speaking_lock:
+            if not self._own_on:
+                return
+            if time.monotonic() + 0.02 < self._speaking_end or self._sinks_busy():
+                self._publish_own(True)
+                self._arm_own(min(1.0, max(0.05, self._speaking_end - time.monotonic())) if
+                              time.monotonic() < self._speaking_end else 1.0)
+                return
+            self._own_on = False
+            self._own_timer = None
+            self._publish_own(False)
 
     # ── audio helpers (シンクから共有) ──────────────────
     def _read_wav(self, path):

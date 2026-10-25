@@ -115,7 +115,7 @@ def test_more_than_one_output_is_unknown(tr):
     uid, fid = say_one(tr, sure=False)
     tr.clock.t += 2.0
     tr.on_done(fid, 1)
-    tr.clock.t += 1.0
+    tr.clock.t += 0.45
     tr.tick()
     clip, = events(tr, "clip")
     assert clip["status"] == "unknown" and clip["reason"] == "outputs != 1"
@@ -234,3 +234,63 @@ def test_emit_failure_does_not_break_speaking(tr):
     t.start(uid, "文", "aivis", 1)
     t.finish(uid, stopped=True)
     assert t.in_flight() == 0
+
+
+def test_late_tick_is_unknown(tr):
+    uid, fid = say_one(tr)
+    tr.clock.t += 2.0
+    tr.on_done(fid, 1)
+    tr.clock.t += tr.latency_s + tr.late_s + 0.01                    # 実行器が塞がっていた
+    tr.tick()
+    clip, = events(tr, "clip")
+    assert clip["status"] == "unknown" and clip["reason"] == "late check"
+
+
+def test_outputs_rechecked_when_done_is_confirmed(tr):
+    ok = {"v": True}
+    t = pt.PlaybackTracker(tr.out.append, clock=tr.clock, wall=lambda: 1.0, latency_s=0.4, boot="b",
+                           outputs_ok=lambda: ok["v"])
+    uid = t.new_id()
+    t.queued(uid, "文です")
+    t.start(uid, "文です", "aivis", 1)
+    fid = t.clip_published(uid, 0, "文です", epoch=1, seconds=1.0, expected_end=tr.clock.t + 1, sure=True)
+    t.finish(uid)
+    ok["v"] = False
+    tr.clock.t += 1.0
+    t.on_done(fid, 1)
+    tr.clock.t += 0.41
+    t.tick()
+    assert [e["status"] for e in tr.out if e["event"] == "end"] == ["unknown"]
+
+
+def test_unsent_sentences_after_a_stop_are_cut_and_close_all_ends_everything(tr):
+    text = "一つ目の文です。二つ目の文です。"
+    uid = tr.new_id()
+    tr.queued(uid, text)
+    tr.start(uid, text, "aivis", 2)
+    tr.clip_published(uid, 0, "一つ目の文です。", epoch=1, seconds=1.0, expected_end=101.0, sure=True)
+    tr.on_stop()
+    tr.clip_cut(uid, 1, "二つ目の文です。", "止められたので出さなかった")
+    tr.finish(uid, stopped=True)
+    end, = events(tr, "end")
+    assert end["status"] == "cut" and end["statuses"] == ["cut", "cut"]
+    uid2, uid3 = tr.new_id(), tr.new_id()
+    tr.queued(uid2, "受付だけ")
+    tr.queued(uid3, "合成中")
+    tr.start(uid3, "合成中", "aivis", 1)
+    tr.close_all()
+    assert sorted((e["text"], e["status"]) for e in events(tr, "end")[1:]) == [("受付だけ", "cut"), ("合成中", "cut")]
+    assert tr.in_flight() == 0
+
+
+def test_sound_unknown_at_start(tr):
+    uid = tr.new_id()
+    tr.queued(uid, "文です")
+    tr.start(uid, "文です", "aivis", 1, sound_unknown=True)
+    fid = tr.clip_published(uid, 0, "文です", epoch=1, seconds=1.0, expected_end=tr.clock.t + 1, sure=True)
+    tr.finish(uid)
+    tr.clock.t += 1.0
+    tr.on_done(fid, 1)
+    tr.clock.t += 0.41
+    tr.tick()
+    assert events(tr, "end")[0]["sound"] is True
