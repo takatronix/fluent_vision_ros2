@@ -817,10 +817,12 @@ class FvTtsNode(Node):
         except (TypeError, ValueError):
             gid = b""
         drained = getattr(msg, "drained", False) is True
+        complete = getattr(msg, "complete", False) is True
         with self._speaking_lock:
             track = getattr(self, "_track", None)
             if track is not None and not self._closing:
-                track.on_done(rid, int(getattr(msg, "epoch", 0) or 0), output=gid or None, drained=drained)
+                track.on_done(rid, int(getattr(msg, "epoch", 0) or 0), output=gid or None, drained=drained,
+                              complete=complete)
 
     def on_pause(self, _msg: Empty) -> None:
         """audio/output/pause: 鳴っている音は捨てられる (fv_audio_output)。クリップは「中断」。"""
@@ -1072,10 +1074,10 @@ class FvTtsNode(Node):
                 backlog = (max(self._published_ends) - now) if self._published_ends else 0.0
                 if limit <= 0 or (backlog <= limit and len(self._published_ends) < 6):
                     track_ = getattr(self, "_track", None) if track else None
-                    frame_id = track_.frame_id(track[0], track[1]) if track_ is not None else ""
                     # 出力がちょうど 1 つの時だけ、その出力の playback_done を鳴り終わりと見る (出す時に見る。done の送り手と、
-                    # done を確かめる時の出力がこれと同じか見る)
+                    # done を確かめる時の出力がこれと同じか見る)。その出力を宛先に付ける (ほかの出力は鳴らさない)
                     output = self._output_state() if (track_ is not None and play) else None
+                    frame_id = track_.frame_id(track[0], track[1], output) if track_ is not None else ""
                     frame = self.build_frame(cached, stamp=stamp, epoch=epoch, frame_id=frame_id)
                     self.tts_pub.publish(frame)
                     end = None

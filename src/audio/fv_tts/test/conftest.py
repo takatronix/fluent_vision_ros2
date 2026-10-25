@@ -68,10 +68,11 @@ def _install_ros_stubs() -> None:
             self.epoch = 0
 
     class _PlaybackDone:
-        def __init__(self, request_id="", epoch=0, drained=False, publisher_gid=None):
+        def __init__(self, request_id="", epoch=0, drained=False, publisher_gid=None, complete=False):
             self.header = _Header()
             self.request_id = request_id
             self.epoch = epoch
+            self.complete = complete
             self.drained = drained
             self.publisher_gid = list(publisher_gid or [])
 
