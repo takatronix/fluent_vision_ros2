@@ -562,6 +562,8 @@ void FvAudioOutputNode::handleStop(const std_msgs::msg::Empty::SharedPtr /*msg*/
   // ALSA バッファをドロップ（即座に停止）
   {
     std::lock_guard<std::mutex> lock(pcm_mutex_);
+    // 捨てる前に (同じロックの中で) 数を進める: 再生中のフレームの drain の後の確かめが必ずこれを見る
+    drop_gen_.fetch_add(1);
     if (pcm_handle_) {
       const int drop_result = snd_pcm_drop(pcm_handle_);
       const int prepare_result = snd_pcm_prepare(pcm_handle_);
@@ -700,6 +702,8 @@ void FvAudioOutputNode::playbackThread()
         has_frame = true;
       }
     }
+    // このフレームを取った時の「stop が捨てた回数」(完了の知らせの前に変わっていれば、途中を捨てられた)
+    const uint64_t drop_gen_at_start = drop_gen_.load();
 
     if (has_frame && !queued_frame.data.empty()) {
       const float master_volume = volume_.load();
@@ -805,6 +809,7 @@ void FvAudioOutputNode::playbackThread()
         // until the hardware has consumed the complete frame before reporting
         // completion or accepting an interrupting cue.
         bool drain_ok = true;
+        bool dropped_by_stop = false;
         if (config_.drain_after_frame) {
           int drain_result = 0;
           int prepare_result = 0;
@@ -821,6 +826,11 @@ void FvAudioOutputNode::playbackThread()
             } else {
               drain_result = -ENODEV;
             }
+            // drain と同じロックの中で: その前に stop がバッファを捨てていれば (このフレームの音の一部が消えた) 数が違う。
+            // drain の後の stop は、もう鳴り終えた後なので数えなくてよい
+            if (drop_gen_.load() != drop_gen_at_start) {
+              dropped_by_stop = true;
+            }
           }
           if (drain_result < 0) {
             RCLCPP_WARN(
@@ -834,11 +844,14 @@ void FvAudioOutputNode::playbackThread()
           // 鳴らし切った (drain が成功した) か。失敗 (装置が消えた等) なら false
           drain_ok = drain_result >= 0 && prepare_result >= 0;
         }
-        // 途中で装置を失わずに全部書き (drain するなら drain も成功): このフレームは欠けていない
-        const bool complete = !device_lost && drain_ok;
+        if (!config_.drain_after_frame && drop_gen_.load() != drop_gen_at_start) {
+          dropped_by_stop = true;              // drain しない時は、知らせを出す直前に見る
+        }
+        // 途中で装置を失わず、stop に捨てられず、全部書き (drain するなら drain も成功): このフレームは欠けていない
+        const bool complete = !device_lost && drain_ok && !dropped_by_stop;
         if (!complete) {
-          RCLCPP_WARN(this->get_logger(), "Playback done but incomplete (device lost=%d, drain ok=%d)",
-            device_lost ? 1 : 0, drain_ok ? 1 : 0);
+          RCLCPP_WARN(this->get_logger(), "Playback done but incomplete (device lost=%d, drain ok=%d, dropped by stop=%d)",
+            device_lost ? 1 : 0, drain_ok ? 1 : 0, dropped_by_stop ? 1 : 0);
         }
         RCLCPP_INFO(this->get_logger(), "Playback done, publishing notification");
         fv_audio::msg::PlaybackDone done_msg;

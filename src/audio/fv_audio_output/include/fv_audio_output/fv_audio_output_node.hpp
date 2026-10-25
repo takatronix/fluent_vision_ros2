@@ -116,6 +116,9 @@ private:
   // stop 世代（epoch）。
   // stop を受けたらインクリメントし、古い epoch のフレームは破棄する。
   std::atomic<uint32_t> current_epoch_{1};
+  // stop が ALSA のバッファを捨てた回数 (pcm_mutex_ の中で進める)。再生スレッドはフレームを取った時の値と、drain (または
+  // 知らせを出す直前) の値を比べ、違えば「途中を捨てられた」= complete=false にする
+  std::atomic<uint64_t> drop_gen_{0};
 };
 
 }  // namespace fv_audio_output

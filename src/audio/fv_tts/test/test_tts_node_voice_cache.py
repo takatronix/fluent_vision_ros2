@@ -970,6 +970,10 @@ def test_sound_unknown_rules(node):
     pubs["/aspa/audio/speaking"].append(NS(node_name="other_player", node_namespace="/"))
     assert tts_node.FvTtsNode._sound_unknown(node) is True       # 別の音の出し手 (効果音だけの印を出さない) が増えた
     pubs["/aspa/audio/speaking"].pop()
+    pubs["/aspa/audio/speaking"].append(NS(node_name="fv_soundboard2", node_namespace="/"))
+    pubs["/aspa/soundboard/speaking"].append(NS(node_name="fv_soundboard2", node_namespace="/"))
+    assert tts_node.FvTtsNode._sound_unknown(node) is True       # 効果音だけの印の出し手が 2 つ (状態が上書きされる)
+    pubs["/aspa/audio/speaking"].pop()
     pubs["/aspa/soundboard/speaking"] = []
     assert tts_node.FvTtsNode._sound_unknown(node) is True       # 古い soundboard: 効果音だけの印が無い
     pubs["/aspa/audio/speaking"] = [NS(node_name="fv_tts", node_namespace="/")]
