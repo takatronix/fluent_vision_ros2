@@ -33,6 +33,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, Image
 
 from .frames_sidecar import FramesSidecar
+from .executor_guard import destroy_on_executor
 from . import depth10
 from .calibration import camera_info_to_dict
 
@@ -559,11 +560,14 @@ class CameraWriter(_CameraInfoMixin):
 
     def stop(self) -> dict:
         if self._sub is not None and self._node is not None:
+            # On the executor thread: destroying from here (HTTP thread) races
+            # the executor's wait-set rebuild and kills its spin thread
+            # (rclpy InvalidHandle) — see executor_guard.
+            sub, self._sub = self._sub, None
             try:
-                self._node.destroy_subscription(self._sub)
+                destroy_on_executor(self._node, lambda: self._node.destroy_subscription(sub))
             except Exception:
                 pass
-            self._sub = None
         # let queued frames finish, then wake the worker with a sentinel
         self._queue.close()
         self._worker.join(timeout=20)
@@ -710,11 +714,11 @@ class DepthCameraWriter(_CameraInfoMixin):
         with self._lock:
             self._stopped = True
             if self._sub is not None and self._node is not None:
+                sub, self._sub = self._sub, None
                 try:
-                    self._node.destroy_subscription(self._sub)
+                    destroy_on_executor(self._node, lambda: self._node.destroy_subscription(sub))
                 except Exception:
                     pass
-                self._sub = None
             self._sidecar.close()
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
@@ -902,11 +906,14 @@ class DepthVideoWriter(_CameraInfoMixin):
 
     def stop(self) -> dict:
         if self._sub is not None and self._node is not None:
+            # On the executor thread: destroying from here (HTTP thread) races
+            # the executor's wait-set rebuild and kills its spin thread
+            # (rclpy InvalidHandle) — see executor_guard.
+            sub, self._sub = self._sub, None
             try:
-                self._node.destroy_subscription(self._sub)
+                destroy_on_executor(self._node, lambda: self._node.destroy_subscription(sub))
             except Exception:
                 pass
-            self._sub = None
         self._queue.close()
         self._worker.join(timeout=20)
         if self._worker.is_alive():
