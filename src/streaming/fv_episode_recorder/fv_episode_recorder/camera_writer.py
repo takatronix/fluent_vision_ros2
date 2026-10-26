@@ -369,8 +369,11 @@ def _unsubscribe(node, subs: list, name: str) -> str:
     InvalidHandle), see executor_guard. Returns where it ran; "pending" = the
     executor did not get to it in time (left with it, a stop failure)."""
     def _destroy() -> None:
-        for sub in subs:
-            node.destroy_subscription(sub)
+        for sub in subs:  # one failing must not leave the others subscribed
+            try:
+                node.destroy_subscription(sub)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("[%s] destroy_subscription failed: %s", name, exc)
     try:
         return destroy_on_executor(node, _destroy)
     except Exception as exc:  # noqa: BLE001 — a teardown problem must not fail the stop
