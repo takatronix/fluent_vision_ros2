@@ -275,3 +275,10 @@ colcon build --packages-select fv_realsense
 ## ライセンス
 
 MIT License
+
+### 点群の境界・座標系の回帰検証
+
+[点群安全性の設計・検証メモ](../../../docs/design/realsense_pointcloud_safety.md)に、
+ROS/カメラ不要のASan/UBSanテスト手順と適用範囲を記載しています。
+点群のXYZは深度optical frame、時刻は深度の取得時刻です。
+RGBは校正済みの深度→カラー投影で取得し、カラー画角外は黒になります。
