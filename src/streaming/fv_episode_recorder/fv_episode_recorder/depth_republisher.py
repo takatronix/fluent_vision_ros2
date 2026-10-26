@@ -25,6 +25,8 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, Image
 
+from .executor_guard import destroy_on_executor
+
 LOG = logging.getLogger("fv_episode_recorder.depth_republish")
 
 
@@ -63,20 +65,40 @@ class _DepthRepublisher:
         )
         LOG.info("depth republish: %s → %s", self.raw_topic, self.compressed_topic)
 
-    def stop(self) -> None:
+    def stop(self) -> str:
+        # Detach under the lock, destroy on the executor thread without it:
+        # from the HTTP thread the destroy races the executor's wait-set
+        # rebuild (rclpy InvalidHandle, see executor_guard), and _on_image
+        # takes the same lock on the executor thread.
         with self._lock:
-            if self.sub is not None:
-                try: self.node.destroy_subscription(self.sub)
-                except Exception: pass
-                self.sub = None
-            if self.pub is not None:
-                try: self.node.destroy_publisher(self.pub)
-                except Exception: pass
-                self.pub = None
-            LOG.info("depth republish stopped: %s (frames=%d)", self.raw_topic, self._frame_count)
+            sub, self.sub = self.sub, None
+            pub, self.pub = self.pub, None
+            frames = self._frame_count
+
+        def _destroy() -> None:
+            # each on its own: a failing unsubscribe must not leak the publisher
+            for kind, ent, fn in (("subscription", sub, self.node.destroy_subscription),
+                                  ("publisher", pub, self.node.destroy_publisher)):
+                if ent is None:
+                    continue
+                try:
+                    fn(ent)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("depth republish: destroy %s failed (%s): %s",
+                                kind, self.raw_topic, exc)
+        where = "none"
+        if sub is not None or pub is not None:
+            try:
+                where = destroy_on_executor(self.node, _destroy)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("depth republish teardown failed (%s): %s", self.raw_topic, exc)
+                where = "error"
+        LOG.info("depth republish stopped: %s (frames=%d)", self.raw_topic, frames)
+        return where
 
     def _on_image(self, msg: Image) -> None:
-        if self.pub is None:
+        pub = self.pub
+        if pub is None:
             return
         try:
             if msg.encoding in ("16UC1", "mono16"):
@@ -97,7 +119,7 @@ class _DepthRepublisher:
         out.format = "16UC1; compressedDepth png"
         out.data = _CONFIG_HEADER + png.tobytes()
         try:
-            self.pub.publish(out)
+            pub.publish(out)
             with self._lock:
                 self._frame_count += 1
         except Exception as exc:
@@ -110,6 +132,7 @@ class DepthRepublisherPool:
     def __init__(self, node: Node):
         self._node = node
         self._pubs: list[_DepthRepublisher] = []
+        self.teardown_pending: list[str] = []   # see CameraWriterPool.stop_all
 
     def start_all(self, depth_cameras: list[dict]) -> list[dict]:
         """depth_cameras: [{name, topic, ...}, ...] — only kind=depth entries.
@@ -137,13 +160,15 @@ class DepthRepublisherPool:
         Without this the play modal sees frame_count=0 and renders the
         '0 frames' empty-state even though the bag has the frames."""
         counts: dict[str, int] = {}
+        self.teardown_pending = []
         for r in self._pubs:
             try:
                 counts[r.name] = int(getattr(r, "_frame_count", 0))
             except Exception:
                 counts[r.name] = 0
             try:
-                r.stop()
+                if r.stop() == "pending":
+                    self.teardown_pending.append(r.name)
             except Exception as exc:
                 LOG.warning("republisher stop failed for %s: %s", r.raw_topic, exc)
         self._pubs = []

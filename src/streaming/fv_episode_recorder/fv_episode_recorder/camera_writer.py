@@ -363,6 +363,24 @@ def _maybe_end_warmup(name: str, q: _IngestQueue, proc: Optional[subprocess.Pope
                  name, "up" if writing else "not writing yet", waited, q.peak)
 
 
+def _unsubscribe(node, subs: list, name: str) -> str:
+    """Destroy ``subs`` on the executor thread — from the HTTP thread it races
+    the executor's wait-set rebuild and kills its spin thread (rclpy
+    InvalidHandle), see executor_guard. Returns where it ran; "pending" = the
+    executor did not get to it in time (left with it, a stop failure)."""
+    def _destroy() -> None:
+        for sub in subs:  # one failing must not leave the others subscribed
+            try:
+                node.destroy_subscription(sub)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("[%s] destroy_subscription failed: %s", name, exc)
+    try:
+        return destroy_on_executor(node, _destroy)
+    except Exception as exc:  # noqa: BLE001 — a teardown problem must not fail the stop
+        LOG.warning("[%s] unsubscribe failed: %s", name, exc)
+        return "error"
+
+
 class _CameraInfoMixin:
     """Optional intrinsics captured once per camera.
 
@@ -423,6 +441,7 @@ class CameraWriter(_CameraInfoMixin):
         self._last_recv_ns = 0
         self._lock = threading.Lock()
         self._sub = None
+        self.unsubscribe: Optional[str] = None   # where stop() destroyed the subscription
         self._first_frame_received = False
         self.frame_count = 0
         self.width = 0
@@ -560,14 +579,8 @@ class CameraWriter(_CameraInfoMixin):
 
     def stop(self) -> dict:
         if self._sub is not None and self._node is not None:
-            # On the executor thread: destroying from here (HTTP thread) races
-            # the executor's wait-set rebuild and kills its spin thread
-            # (rclpy InvalidHandle) — see executor_guard.
             sub, self._sub = self._sub, None
-            try:
-                destroy_on_executor(self._node, lambda: self._node.destroy_subscription(sub))
-            except Exception:
-                pass
+            self.unsubscribe = _unsubscribe(self._node, [sub], self.name)
         # let queued frames finish, then wake the worker with a sentinel
         self._queue.close()
         self._worker.join(timeout=20)
@@ -642,6 +655,7 @@ class DepthCameraWriter(_CameraInfoMixin):
         self._node = node
         self._sidecar = FramesSidecar(self.output_dir / "frames.parquet")
         self._sub = None
+        self.unsubscribe: Optional[str] = None
         self._lock = threading.Lock()
         self._frame_index = 0
         self._last_recv_ns = 0
@@ -669,6 +683,8 @@ class DepthCameraWriter(_CameraInfoMixin):
         if self._stopped:
             return
         with self._lock:
+            if self._stopped:  # stop() ran while this callback waited for the lock
+                return
             recv_ns = time.time_ns()
             self._encoding_seen = msg.encoding
             # Depth conventions: 16UC1 (mm, RealSense) or mono16 (also 16-bit).
@@ -711,14 +727,15 @@ class DepthCameraWriter(_CameraInfoMixin):
             self._last_recv_ns = recv_ns
 
     def stop(self) -> dict:
+        # Only flag + detach under the lock: _on_image takes the same lock on
+        # the executor thread, so waiting for the executor while holding it
+        # would stall every callback until the destroy timed out.
         with self._lock:
             self._stopped = True
-            if self._sub is not None and self._node is not None:
-                sub, self._sub = self._sub, None
-                try:
-                    destroy_on_executor(self._node, lambda: self._node.destroy_subscription(sub))
-                except Exception:
-                    pass
+            sub, self._sub = self._sub, None
+        if sub is not None and self._node is not None:
+            self.unsubscribe = _unsubscribe(self._node, [sub], self.name)
+        with self._lock:
             self._sidecar.close()
             elapsed_s = max((self._last_recv_ns - self._start_wall_ns) / 1e9, 1e-6)
             self.fps_actual = self.frame_count / elapsed_s if self.frame_count else 0.0
@@ -784,6 +801,7 @@ class DepthVideoWriter(_CameraInfoMixin):
         self._codec_in_use: str = ""
         self._uv_bytes: bytes = b""
         self._sub = None
+        self.unsubscribe: Optional[str] = None
         self._lock = threading.Lock()
         self._frame_index = 0
         self._last_recv_ns = 0
@@ -906,14 +924,8 @@ class DepthVideoWriter(_CameraInfoMixin):
 
     def stop(self) -> dict:
         if self._sub is not None and self._node is not None:
-            # On the executor thread: destroying from here (HTTP thread) races
-            # the executor's wait-set rebuild and kills its spin thread
-            # (rclpy InvalidHandle) — see executor_guard.
             sub, self._sub = self._sub, None
-            try:
-                destroy_on_executor(self._node, lambda: self._node.destroy_subscription(sub))
-            except Exception:
-                pass
+            self.unsubscribe = _unsubscribe(self._node, [sub], self.name)
         self._queue.close()
         self._worker.join(timeout=20)
         if self._worker.is_alive():
@@ -991,6 +1003,7 @@ class CameraWriterPool:
         # camera_info_topic subscriptions (one per camera that declares it);
         # torn down in stop_all.
         self._info_subs: list = []
+        self.teardown_pending: list[str] = []   # see stop_all
 
     def _subscribe_camera_info(self, writer: _CameraInfoMixin, topic: str) -> None:
         """Hand the first CameraInfo on ``topic`` to ``writer``. Best effort:
@@ -1014,13 +1027,11 @@ class CameraWriterPool:
         except Exception as exc:  # noqa: BLE001
             LOG.warning("camera_info subscribe failed (%s): %s", topic, exc)
 
-    def _destroy_info_subs(self) -> None:
-        for sub in self._info_subs:
-            try:
-                self._node.destroy_subscription(sub)
-            except Exception:  # noqa: BLE001
-                pass
-        self._info_subs = []
+    def _destroy_info_subs(self) -> str:
+        subs, self._info_subs = self._info_subs, []
+        if not subs:
+            return "none"
+        return _unsubscribe(self._node, subs, "camera_info")
 
     def start_all(self, episode_dir: Path, cameras: list[dict], fps: int = 30) -> list[dict]:
         """cameras: [{name, topic, kind?, codec?}, ...]. Color cameras get a
@@ -1097,11 +1108,16 @@ class CameraWriterPool:
                 ph["frame_count"] = int(counts[name])
 
     def stop_all(self) -> list[dict]:
-        self._destroy_info_subs()
+        pending = ["camera_info"] if self._destroy_info_subs() == "pending" else []
         summaries = []
         for name, writer in list(self._writers.items()):
             summaries.append(writer.stop())
+            if writer.unsubscribe == "pending":
+                pending.append(name)
         self._writers.clear()
+        # subscriptions the executor had not destroyed yet when stop gave up
+        # waiting (a stop failure; the executor still runs them later)
+        self.teardown_pending = pending
         # Re-emit depth placeholders so meta.cameras keeps them.
         out = summaries + list(self._depth_placeholders)
         self._depth_placeholders = []

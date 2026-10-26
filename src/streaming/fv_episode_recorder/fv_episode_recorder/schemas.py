@@ -50,6 +50,12 @@ class StopEpisodeResponse(BaseModel):
     bag_size_bytes: int = 0
     video_size_bytes: int = 0
     manifest_pending: bool = True
+    outcome: Optional[str] = None  # stored outcome ("abort" when a success could not be kept)
+    # set when the recorder itself failed during the episode (e.g. its ROS
+    # executor stopped: kind="spin_dead"); the episode is then saved as failed
+    recorder_error: Optional[dict[str, Any]] = None
+    # subscriptions the executor had not torn down when stop gave up waiting
+    teardown_pending: list[str] = Field(default_factory=list)
 
 
 # ---------- List / Get ----------

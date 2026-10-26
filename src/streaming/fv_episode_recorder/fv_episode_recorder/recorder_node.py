@@ -34,7 +34,7 @@ from .api_server import build_app
 from .bag_recorder import BagRecorder
 from .event_bridge import EventMarkerBridge
 from .camera_writer import CameraWriterPool
-from .executor_guard import SpinState, spin_forever
+from .executor_guard import SpinState, attach, spin_forever
 from .depth_republisher import DepthRepublisherPool
 from .episode_store import EpisodeStore
 from .marker_manager import MarkerManager
@@ -217,15 +217,18 @@ def main(args=None):
     executor.add_node(node)
     # Survive rclpy's entity-destruction race instead of dying silently
     # (every later episode would be written with 0 video frames). The spin
-    # state is exposed on /healthz; subscription teardown is routed to this
-    # thread via executor_guard.destroy_on_executor.
+    # state is exposed on /healthz and gates the episode API (no new episode,
+    # no "success" while it is not spinning); subscription teardown is routed
+    # to this thread via executor_guard.destroy_on_executor.
     spin_state = SpinState()
+    spin_stop = threading.Event()
     spin_thread = threading.Thread(
         target=spin_forever,
-        args=(lambda: executor.spin_once(timeout_sec=0.5), rclpy.ok),
+        args=(lambda: executor.spin_once(timeout_sec=0.5),
+              lambda: rclpy.ok() and not spin_stop.is_set()),
         kwargs={"state": spin_state, "logger": node.get_logger()},
         daemon=True, name="fv-recorder-spin")
-    executor._fv_spin_thread = spin_thread  # type: ignore[attr-defined]
+    attach(executor, spin_thread, spin_state)
     spin_thread.start()
 
     # aiohttp loop in main thread
@@ -283,9 +286,23 @@ def main(args=None):
         node.get_logger().info("shutdown requested")
     finally:
         loop.run_until_complete(runner.cleanup())
-        executor.shutdown()
-        node.destroy_node()
-        rclpy.shutdown()
+        # End our spin loop first (it runs any teardown still left with it on
+        # its way out), so destroy_node never overlaps a wait-set rebuild.
+        spin_stop.set()
+        try:
+            executor.wake()
+        except Exception:
+            pass
+        spin_thread.join(timeout=5.0)
+        if spin_thread.is_alive():
+            # still inside a teardown on its way out: destroying the node now
+            # would race it — leave it to process exit
+            node.get_logger().error("spin thread did not stop within 5 s; skipping node teardown")
+        else:
+            executor.shutdown()
+            node.destroy_node()
+            # SIGINT already shut the context down via rclpy's handler
+            rclpy.try_shutdown()
 
 
 if __name__ == "__main__":
