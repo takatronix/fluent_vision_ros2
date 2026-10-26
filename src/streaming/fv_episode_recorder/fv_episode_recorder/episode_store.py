@@ -109,6 +109,10 @@ class EpisodeMeta:
     #                          "enabled": bool}}
     controller_at_start: Optional[dict[str, Any]] = None
     controller_at_end: Optional[dict[str, Any]] = None
+    # The recorder itself failed during the episode (e.g. {"kind": "spin_dead",
+    # "requested_outcome": "success", ...}: its ROS executor stopped, videos
+    # are missing). Such an episode is stored as failed, never as a success.
+    recorder_error: Optional[dict[str, Any]] = None
 
 
 class EpisodeStore:

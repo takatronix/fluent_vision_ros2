@@ -151,6 +151,24 @@ def build_app(
     return app
 
 
+def _spin_refusal(app) -> Optional[web.Response]:
+    """503 when the ROS executor no longer dispatches callbacks (spin loop
+    gave up or ended): a new episode would get no camera frames."""
+    spin_state = app.get("spin_state")
+    if spin_state is None or spin_state.healthy():
+        return None
+    snap = spin_state.snapshot()
+    LOG.error("episode refused: recorder executor is not spinning (%s)",
+              snap.get("exit_reason") or snap.get("last_error"))
+    return web.json_response(
+        {"error": "recorder_spin_dead", "code": "EPISODE_RECORDER_SPIN_DEAD",
+         "detail": "fv_episode_recorder's ROS executor stopped: camera frames would not be "
+                   "recorded. Restart fv_episode_recorder.",
+         "spin": snap},
+        status=503,
+    )
+
+
 async def _healthz(request: web.Request) -> web.Response:
     store: EpisodeStore = request.app["store"]
     camera_pool: CameraWriterPool = request.app["camera_pool"]
@@ -160,8 +178,9 @@ async def _healthz(request: web.Request) -> web.Response:
     if spin_state is not None:
         spin = spin_state.snapshot()
         payload["spin"] = spin
-        if not spin["alive"]:
-            # the HTTP API answers but no camera callback runs: videos would be empty
+        if not spin["healthy"]:
+            # the HTTP API answers but no camera callback runs: videos would be
+            # empty, so new episodes are refused (see _spin_refusal)
             payload["status"] = "degraded"
     if store.active is not None:
         meta = store.active
@@ -360,6 +379,10 @@ async def _start_episode(request: web.Request) -> web.Response:
             {"error": "conflict", "detail": f"episode {store.active.episode_id} is already active"},
             status=409,
         )
+
+    refused = _spin_refusal(request.app)
+    if refused is not None:
+        return refused
 
     # Refuse recording while a replay is running — the reverse of the guard in
     # _replay_start — so the two runners don't fight over /tf and joint_cmd
@@ -573,6 +596,29 @@ async def _stop_episode(request: web.Request) -> web.Response:
     # a depth-only episode has no mp4 writers so is_active() is False but
     # the placeholders must still come out for the play modal.
     camera_summaries: list[dict] = camera_pool.stop_all()
+    teardown_pending = list(getattr(camera_pool, "teardown_pending", None) or []) + \
+        list(getattr(depth_pool, "teardown_pending", None) or [])
+    if teardown_pending:
+        LOG.error("episode %s: subscriptions not torn down yet (executor busy): %s",
+                  episode_id, teardown_pending)
+
+    # The executor stopped dispatching callbacks (spin loop gave up / ended):
+    # the videos stop wherever it died, so this is not a successful episode.
+    outcome = req.outcome
+    recorder_error: Optional[dict] = None
+    spin_state = request.app.get("spin_state")
+    if spin_state is not None and not spin_state.healthy() and outcome != "discard":
+        snap = spin_state.snapshot()
+        recorder_error = {
+            "kind": "spin_dead",
+            "detail": "ROS executor stopped during the episode: camera videos are missing or cut short",
+            "requested_outcome": req.outcome,
+            "spin_exit_reason": snap.get("exit_reason"),
+            "spin_last_error": snap.get("last_error"),
+        }
+        if outcome == "success":
+            outcome = "abort"  # → state "failed"; never stored as a success
+        LOG.error("episode %s saved as failed: %s", episode_id, recorder_error)
     frame_count_per_camera: dict[str, int] = {}
     video_size_bytes = 0
     for cs in camera_summaries:
@@ -584,7 +630,9 @@ async def _stop_episode(request: web.Request) -> web.Response:
     mm: MarkerManager = request.app["marker_manager"]
     pending_markers = mm.flush(episode_id)
 
-    meta, ep_dir = store.stop_active(req.outcome)
+    meta, ep_dir = store.stop_active(outcome)
+    if recorder_error is not None:
+        meta.recorder_error = recorder_error
     # Update meta with bag size + split_count + camera summaries + markers
     meta.bag_split_count = int(bag_summary.get("split_count", 0))
     if camera_summaries:
@@ -605,7 +653,7 @@ async def _stop_episode(request: web.Request) -> web.Response:
     store._write_meta(ep_dir, meta)  # noqa: SLF001 — local helper, store is single owner
 
     # If discard, blow away the dir entirely
-    if req.outcome == "discard":
+    if outcome == "discard":
         shutil.rmtree(ep_dir, ignore_errors=True)
         LOG.info("episode discarded and dir removed: %s", episode_id)
 
@@ -622,10 +670,13 @@ async def _stop_episode(request: web.Request) -> web.Response:
         bag_size_bytes=int(bag_summary.get("size_bytes", 0)),
         video_size_bytes=video_size_bytes,
         manifest_pending=True,
+        outcome=meta.outcome,
+        recorder_error=recorder_error,
+        teardown_pending=teardown_pending,
     )
     LOG.info(
         "episode stopped: %s outcome=%s duration=%.1fs bag=%d video=%d frames=%s",
-        episode_id, req.outcome, resp.duration_s,
+        episode_id, outcome, resp.duration_s,
         resp.bag_size_bytes, resp.video_size_bytes, frame_count_per_camera,
     )
     return web.json_response(resp.model_dump(), status=200)
@@ -1290,6 +1341,9 @@ async def _batch_start(request: web.Request) -> web.Response:
             {"error": "batch_already_running", "current": runner.state.to_dict() if runner.state else None},
             status=409,
         )
+    refused = _spin_refusal(request.app)
+    if refused is not None:
+        return refused
 
     # Run the existing start/stop handlers in-process — keeps a single
     # code path (preflight, profile resolution, mux snapshot, lock).
