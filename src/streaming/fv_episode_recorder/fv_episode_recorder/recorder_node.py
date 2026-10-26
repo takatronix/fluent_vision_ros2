@@ -293,10 +293,16 @@ def main(args=None):
             executor.wake()
         except Exception:
             pass
-        spin_thread.join(timeout=3.0)
-        executor.shutdown()
-        node.destroy_node()
-        rclpy.shutdown()
+        spin_thread.join(timeout=5.0)
+        if spin_thread.is_alive():
+            # still inside a teardown on its way out: destroying the node now
+            # would race it — leave it to process exit
+            node.get_logger().error("spin thread did not stop within 5 s; skipping node teardown")
+        else:
+            executor.shutdown()
+            node.destroy_node()
+            # SIGINT already shut the context down via rclpy's handler
+            rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

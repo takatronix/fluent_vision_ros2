@@ -200,6 +200,30 @@ def test_requests_handed_over_while_the_exit_drain_runs_are_not_lost():
     assert destroy_on_executor(_Node(ex), c, logger=_Log()) == "direct" and len(c.threads) == 1
 
 
+def test_closed_but_still_alive_spin_thread_means_direct():
+    ex = _ThreadExecutor.__new__(_ThreadExecutor)    # spin thread that lingers after its loop
+    ex._q = queue.Queue(); ex.gate = threading.Event(); ex.gate.set(); ex.before_task = None
+    ex._stop = threading.Event(); ex.state = SpinState()
+    linger = threading.Event()
+
+    def _target():
+        spin_forever(ex._spin_once, lambda: not ex._stop.is_set(), state=ex.state,
+                     logger=_Log(), retry_sleep_s=0.0)
+        linger.wait(5)
+    ex.thread = threading.Thread(target=_target, daemon=True)
+    attach(ex, ex.thread, ex.state)
+    ex.thread.start()
+    ex._stop.set()
+    assert _wait(lambda: ex.state._closed)
+    assert ex.thread.is_alive()
+    d = _Destroy()
+    t0 = time.monotonic()
+    assert destroy_on_executor(_Node(ex), d, timeout_s=2.0, logger=_Log()) == "direct"
+    assert time.monotonic() - t0 < 0.5 and d.threads == [threading.current_thread()]
+    assert ex._q.empty()                          # nothing handed to the finished executor
+    linger.set(); ex.thread.join(timeout=2)
+
+
 def test_direct_only_once_the_spin_thread_has_ended():
     ex = _ThreadExecutor(); ex.stop()
     d = _Destroy()
