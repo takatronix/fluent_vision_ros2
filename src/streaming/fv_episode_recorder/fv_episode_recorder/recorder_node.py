@@ -221,9 +221,11 @@ def main(args=None):
     # no "success" while it is not spinning); subscription teardown is routed
     # to this thread via executor_guard.destroy_on_executor.
     spin_state = SpinState()
+    spin_stop = threading.Event()
     spin_thread = threading.Thread(
         target=spin_forever,
-        args=(lambda: executor.spin_once(timeout_sec=0.5), rclpy.ok),
+        args=(lambda: executor.spin_once(timeout_sec=0.5),
+              lambda: rclpy.ok() and not spin_stop.is_set()),
         kwargs={"state": spin_state, "logger": node.get_logger()},
         daemon=True, name="fv-recorder-spin")
     attach(executor, spin_thread, spin_state)
@@ -284,6 +286,14 @@ def main(args=None):
         node.get_logger().info("shutdown requested")
     finally:
         loop.run_until_complete(runner.cleanup())
+        # End our spin loop first (it runs any teardown still left with it on
+        # its way out), so destroy_node never overlaps a wait-set rebuild.
+        spin_stop.set()
+        try:
+            executor.wake()
+        except Exception:
+            pass
+        spin_thread.join(timeout=3.0)
         executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()

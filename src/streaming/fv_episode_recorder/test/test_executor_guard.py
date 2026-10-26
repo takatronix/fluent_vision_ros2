@@ -180,6 +180,26 @@ def test_spin_exit_runs_what_is_still_pending_exactly_once():
     assert len(d.threads) == 1
 
 
+def test_requests_handed_over_while_the_exit_drain_runs_are_not_lost():
+    ex = _ThreadExecutor()
+    ex.gate.clear()
+    release_a = threading.Event()
+    a = _Destroy(block=release_a)
+    assert destroy_on_executor(_Node(ex), a, timeout_s=0.05, poll_s=0.005, logger=_Log()) == "pending"
+    ex._stop.set(); ex.gate.set()               # loop ends; its exit drain starts on A and blocks
+    assert a.started.wait(2)
+    b = _Destroy()
+    assert destroy_on_executor(_Node(ex), b, timeout_s=0.05, poll_s=0.005, logger=_Log()) == "pending"
+    assert b.threads == []                      # spin thread still alive: not run here
+    release_a.set()
+    ex.thread.join(timeout=2)
+    assert not ex.thread.is_alive()
+    assert a.threads == [ex.thread] and b.threads == [ex.thread]   # the same drain took B
+    assert ex.state._add_pending(_DestroyRequest(lambda: None)) is False   # closed after the drain
+    c = _Destroy()
+    assert destroy_on_executor(_Node(ex), c, logger=_Log()) == "direct" and len(c.threads) == 1
+
+
 def test_direct_only_once_the_spin_thread_has_ended():
     ex = _ThreadExecutor(); ex.stop()
     d = _Destroy()

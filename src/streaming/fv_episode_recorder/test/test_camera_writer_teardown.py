@@ -146,3 +146,24 @@ def test_pool_teardown_goes_to_the_executor_and_a_busy_one_leaves_it_pending(tmp
     time.sleep(0.05)
     assert len(node.destroyed) == 2 and all(th is ex.thread for _, th in node.destroyed)
     assert ex.state.snapshot()["pending_destroys"] == 0
+
+
+def test_depth_republisher_failing_unsubscribe_still_destroys_the_publisher(ex):
+    from fv_episode_recorder.depth_republisher import _DepthRepublisher
+
+    class _N(_Node):
+        def create_publisher(self, *args, **kwargs):
+            return object()
+
+        def destroy_subscription(self, sub):
+            raise RuntimeError("already gone")
+
+        def destroy_publisher(self, pub):
+            self.destroyed.append((pub, threading.current_thread()))
+    node = _N(ex)
+    r = _DepthRepublisher(name="d", raw_topic="/d/depth", node=node)
+    r.start()
+    pub = r.pub
+    assert r.stop() == "executor"
+    assert node.destroyed == [(pub, ex.thread)]
+    assert r.sub is None and r.pub is None

@@ -85,6 +85,7 @@ class SpinState:
         self.thread: Optional[threading.Thread] = None
         self._pending: set[_DestroyRequest] = set()
         self._pending_lock = threading.Lock()
+        self._closed = False  # the exiting spin loop has run its last pending destroy
 
     def thread_ended(self) -> bool:
         """True only once the spin thread has really finished (it can no
@@ -114,9 +115,14 @@ class SpinState:
             "pending_destroys": pending,
         }
 
-    def _add_pending(self, req: _DestroyRequest) -> None:
+    def _add_pending(self, req: _DestroyRequest) -> bool:
+        """False once the exiting spin loop has stopped taking requests (it
+        will not touch the wait set again: the caller may destroy directly)."""
         with self._pending_lock:
+            if self._closed:
+                return False
             self._pending.add(req)
+            return True
 
     def _drop_pending(self, req: _DestroyRequest) -> None:
         with self._pending_lock:
@@ -124,12 +130,17 @@ class SpinState:
 
     def _run_pending_on_exit(self, logger: Any) -> None:
         """The spin loop is ending: nobody else will run the destroys left
-        with the executor, so run them on this (the spin) thread."""
-        with self._pending_lock:
-            pending, self._pending = list(self._pending), set()
-        for req in pending:
-            if req.run("spin_exit") and req.error is not None:
-                logger.warning(f"pending destroy raised at spin exit: {req.error!r}")
+        with the executor, so run them on this (the spin) thread — including
+        ones handed over while these run — then stop taking requests."""
+        while True:
+            with self._pending_lock:
+                if not self._pending:
+                    self._closed = True
+                    return
+                pending, self._pending = list(self._pending), set()
+            for req in pending:
+                if req.run("spin_exit") and req.error is not None:
+                    logger.warning(f"pending destroy raised at spin exit: {req.error!r}")
 
 
 def attach(executor: Any, thread: threading.Thread, state: SpinState) -> None:
@@ -224,8 +235,8 @@ def destroy_on_executor(
     if state is not None and (threading.current_thread() is state.thread or state.thread_ended()):
         return _here()
 
-    if state is not None:
-        state._add_pending(req)
+    if state is not None and not state._add_pending(req):
+        return _here()  # the spin loop already ran its last pending destroy and is ending
     try:
         executor.create_task(req.run, "executor")
     except Exception as exc:  # noqa: BLE001 — e.g. executor already shut down

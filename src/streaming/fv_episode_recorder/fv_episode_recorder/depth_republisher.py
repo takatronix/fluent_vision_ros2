@@ -76,10 +76,16 @@ class _DepthRepublisher:
             frames = self._frame_count
 
         def _destroy() -> None:
-            if sub is not None:
-                self.node.destroy_subscription(sub)
-            if pub is not None:
-                self.node.destroy_publisher(pub)
+            # each on its own: a failing unsubscribe must not leak the publisher
+            for kind, ent, fn in (("subscription", sub, self.node.destroy_subscription),
+                                  ("publisher", pub, self.node.destroy_publisher)):
+                if ent is None:
+                    continue
+                try:
+                    fn(ent)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("depth republish: destroy %s failed (%s): %s",
+                                kind, self.raw_topic, exc)
         where = "none"
         if sub is not None or pub is not None:
             try:
