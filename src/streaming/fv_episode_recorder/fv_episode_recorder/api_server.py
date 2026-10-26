@@ -156,6 +156,13 @@ async def _healthz(request: web.Request) -> web.Response:
     camera_pool: CameraWriterPool = request.app["camera_pool"]
     marker_manager: MarkerManager = request.app["marker_manager"]
     payload = {"status": "ok", "active_episode": None}
+    spin_state = request.app.get("spin_state")
+    if spin_state is not None:
+        spin = spin_state.snapshot()
+        payload["spin"] = spin
+        if not spin["alive"]:
+            # the HTTP API answers but no camera callback runs: videos would be empty
+            payload["status"] = "degraded"
     if store.active is not None:
         meta = store.active
         active_markers = [

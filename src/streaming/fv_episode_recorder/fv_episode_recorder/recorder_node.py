@@ -34,6 +34,7 @@ from .api_server import build_app
 from .bag_recorder import BagRecorder
 from .event_bridge import EventMarkerBridge
 from .camera_writer import CameraWriterPool
+from .executor_guard import SpinState, spin_forever
 from .depth_republisher import DepthRepublisherPool
 from .episode_store import EpisodeStore
 from .marker_manager import MarkerManager
@@ -214,7 +215,17 @@ def main(args=None):
     # to 0 fps under MultiThreadedExecutor).
     executor = SingleThreadedExecutor()
     executor.add_node(node)
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    # Survive rclpy's entity-destruction race instead of dying silently
+    # (every later episode would be written with 0 video frames). The spin
+    # state is exposed on /healthz; subscription teardown is routed to this
+    # thread via executor_guard.destroy_on_executor.
+    spin_state = SpinState()
+    spin_thread = threading.Thread(
+        target=spin_forever,
+        args=(lambda: executor.spin_once(timeout_sec=0.5), rclpy.ok),
+        kwargs={"state": spin_state, "logger": node.get_logger()},
+        daemon=True, name="fv-recorder-spin")
+    executor._fv_spin_thread = spin_thread  # type: ignore[attr-defined]
     spin_thread.start()
 
     # aiohttp loop in main thread
@@ -235,6 +246,7 @@ def main(args=None):
     except Exception:
         pass
 
+    app["spin_state"] = spin_state
     runner = web.AppRunner(app)
     loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, node.host, node.port)
