@@ -78,6 +78,16 @@ FvAudioOutputNode::FvAudioOutputNode()
   // 再生完了通知 publisher
   playback_done_pub_ = this->create_publisher<fv_audio::msg::PlaybackDone>(
     "audio/output/playback_done", 10);
+  {
+    // 自分の印 (playback_done の publisher の gid)。fv_tts はこれを宛先にしたフレームを出し、この知らせで鳴り終わりを確かめる
+    static const char * kHex = "0123456789abcdef";
+    const rmw_gid_t & gid = playback_done_pub_->get_gid();
+    own_gid_hex_.clear();
+    for (size_t i = 0; i < RMW_GID_STORAGE_SIZE; ++i) {
+      own_gid_hex_.push_back(kHex[(gid.data[i] >> 4) & 0x0F]);
+      own_gid_hex_.push_back(kHex[gid.data[i] & 0x0F]);
+    }
+  }
 
   // 一時停止完了通知 publisher
   paused_pub_ = this->create_publisher<std_msgs::msg::Empty>(
@@ -458,6 +468,21 @@ void FvAudioOutputNode::handleFrame(const fv_audio::msg::AudioFrame::SharedPtr m
     return;
   }
 
+  // 宛先つきのフレーム (frame_id の末尾が "@to=<publisher gid の 16 進>"): 自分宛てでなければ鳴らさない。
+  // fv_tts は 1 つの出力だけに鳴らさせ、その出力の playback_done で鳴り終わりを確かめる (ほかの出力が同じ音を遅れて
+  // 鳴らすと「鳴り終わった」が嘘になる)。宛先の無いフレーム (効果音など) は今までどおり
+  {
+    static const std::string kTo = "@to=";
+    const std::string & fid = msg->header.frame_id;
+    const auto at = fid.rfind(kTo);
+    if (at != std::string::npos && fid.compare(at + kTo.size(), std::string::npos, own_gid_hex_) != 0) {
+      RCLCPP_DEBUG_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "Dropping frame addressed to another output: %s", fid.c_str());
+      return;
+    }
+  }
+
   // Barge-in 後の古いフレームをフィルタリング
   {
     std::lock_guard<std::mutex> lock(stop_time_mutex_);
@@ -537,6 +562,8 @@ void FvAudioOutputNode::handleStop(const std_msgs::msg::Empty::SharedPtr /*msg*/
   // ALSA バッファをドロップ（即座に停止）
   {
     std::lock_guard<std::mutex> lock(pcm_mutex_);
+    // 捨てる前に (同じロックの中で) 数を進める: 再生中のフレームの drain の後の確かめが必ずこれを見る
+    drop_gen_.fetch_add(1);
     if (pcm_handle_) {
       const int drop_result = snd_pcm_drop(pcm_handle_);
       const int prepare_result = snd_pcm_prepare(pcm_handle_);
@@ -675,6 +702,8 @@ void FvAudioOutputNode::playbackThread()
         has_frame = true;
       }
     }
+    // このフレームを取った時の「stop が捨てた回数」(完了の知らせの前に変わっていれば、途中を捨てられた)
+    const uint64_t drop_gen_at_start = drop_gen_.load();
 
     if (has_frame && !queued_frame.data.empty()) {
       const float master_volume = volume_.load();
@@ -685,6 +714,7 @@ void FvAudioOutputNode::playbackThread()
       size_t bytes_written = 0;
       uint8_t * data_ptr = queued_frame.data.data();
       bool interrupted = false;
+      bool device_lost = false;    // 書き始めた後に装置を失った (バッファの中の音が消えた): このフレームは欠けたかもしれない
 
       // チャンク単位で書き込み（停止/一時停止の応答性向上）
       while (bytes_written < total_bytes && running_.load()) {
@@ -695,6 +725,9 @@ void FvAudioOutputNode::playbackThread()
         }
 
         if (!deviceIsOpen()) {
+          if (bytes_written > 0) {
+            device_lost = true;
+          }
           if (!config_.reconnect_enabled) {
             interrupted = true;
             break;
@@ -741,6 +774,9 @@ void FvAudioOutputNode::playbackThread()
 
         if (result < 0) {
           RCLCPP_ERROR(this->get_logger(), "snd_pcm_writei failed: %s", snd_strerror(result));
+          if (bytes_written > 0) {
+            device_lost = true;
+          }
           closeDevice();
           if (!config_.reconnect_enabled) {
             interrupted = true;
@@ -772,6 +808,8 @@ void FvAudioOutputNode::playbackThread()
         // Discrete cues can be shorter than the ALSA buffer. Optionally wait
         // until the hardware has consumed the complete frame before reporting
         // completion or accepting an interrupting cue.
+        bool drain_ok = true;
+        bool dropped_by_stop = false;
         if (config_.drain_after_frame) {
           int drain_result = 0;
           int prepare_result = 0;
@@ -788,6 +826,11 @@ void FvAudioOutputNode::playbackThread()
             } else {
               drain_result = -ENODEV;
             }
+            // drain と同じロックの中で: その前に stop がバッファを捨てていれば (このフレームの音の一部が消えた) 数が違う。
+            // drain の後の stop は、もう鳴り終えた後なので数えなくてよい
+            if (drop_gen_.load() != drop_gen_at_start) {
+              dropped_by_stop = true;
+            }
           }
           if (drain_result < 0) {
             RCLCPP_WARN(
@@ -798,12 +841,28 @@ void FvAudioOutputNode::playbackThread()
               this->get_logger(), "snd_pcm_prepare after drain failed: %s",
               snd_strerror(prepare_result));
           }
+          // 鳴らし切った (drain が成功した) か。失敗 (装置が消えた等) なら false
+          drain_ok = drain_result >= 0 && prepare_result >= 0;
+        }
+        if (!config_.drain_after_frame && drop_gen_.load() != drop_gen_at_start) {
+          dropped_by_stop = true;              // drain しない時は、知らせを出す直前に見る
+        }
+        // 途中で装置を失わず、stop に捨てられず、全部書き (drain するなら drain も成功): このフレームは欠けていない
+        const bool complete = !device_lost && drain_ok && !dropped_by_stop;
+        if (!complete) {
+          RCLCPP_WARN(this->get_logger(), "Playback done but incomplete (device lost=%d, drain ok=%d, dropped by stop=%d)",
+            device_lost ? 1 : 0, drain_ok ? 1 : 0, dropped_by_stop ? 1 : 0);
         }
         RCLCPP_INFO(this->get_logger(), "Playback done, publishing notification");
         fv_audio::msg::PlaybackDone done_msg;
         done_msg.header = queued_frame.header;
         done_msg.request_id = queued_frame.header.frame_id;
         done_msg.epoch = queued_frame.epoch;
+        done_msg.complete = complete;
+        done_msg.drained = complete && config_.drain_after_frame;
+        // どの出力の知らせかを受け手が ROS graph (endpoint_gid) と照合できるように、自分の publisher の gid を載せる
+        const rmw_gid_t & gid = playback_done_pub_->get_gid();
+        done_msg.publisher_gid.assign(gid.data, gid.data + RMW_GID_STORAGE_SIZE);
         playback_done_pub_->publish(done_msg);
       }
     } else {

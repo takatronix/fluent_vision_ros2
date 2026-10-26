@@ -99,6 +99,9 @@ private:
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr resume_sub_;
   rclcpp::Service<fv_audio_output::srv::PlayFile>::SharedPtr play_file_srv_;
   rclcpp::Publisher<fv_audio::msg::PlaybackDone>::SharedPtr playback_done_pub_;
+  // playback_done の publisher の gid (16 進)。frame_id の末尾が "@to=<これ>" のフレームだけが自分宛て
+  // (宛先の無いフレームは今までどおり鳴らす。別の出力宛てのフレームは鳴らさない)
+  std::string own_gid_hex_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr paused_pub_;  // 一時停止完了通知
 
   std::atomic<float> volume_{1.0F};
@@ -113,6 +116,9 @@ private:
   // stop 世代（epoch）。
   // stop を受けたらインクリメントし、古い epoch のフレームは破棄する。
   std::atomic<uint32_t> current_epoch_{1};
+  // stop が ALSA のバッファを捨てた回数 (pcm_mutex_ の中で進める)。再生スレッドはフレームを取った時の値と、drain (または
+  // 知らせを出す直前) の値を比べ、違えば「途中を捨てられた」= complete=false にする
+  std::atomic<uint64_t> drop_gen_{0};
 };
 
 }  // namespace fv_audio_output

@@ -231,11 +231,29 @@ def discover_cameras(profile: dict[str, Any]) -> list[dict[str, Any]]:
             entry["kind"] = str(c["kind"])
         # depth_lossy (10-bit-luma HEVC) + raw-Image color knobs. Passed
         # through untyped; CameraWriterPool validates and fails loud.
-        for key in ("d_min", "d_max", "cq", "depth_scale_mm", "fps", "raw"):
+        # camera_info_topic (optional): CameraWriterPool captures the first
+        # sensor_msgs/CameraInfo into meta.json cameras[].camera_info.
+        for key in ("d_min", "d_max", "cq", "depth_scale_mm", "fps", "raw",
+                    "camera_info_topic"):
             if c.get(key) is not None:
                 entry[key] = c[key]
         out.append(entry)
     return out
+
+
+def discover_bag_options(profile: dict[str, Any]) -> dict[str, Optional[str]]:
+    """Optional rosbag2 storage selection from profile.episode_recorder.
+
+    Keys: ``bag_storage`` ("sqlite3" default | "mcap") and
+    ``bag_storage_preset`` (e.g. "zstd_fast", mcap only). Missing keys → None
+    so BagRecorder keeps its default (sqlite3, exactly as before)."""
+    er = (profile or {}).get("episode_recorder") or {}
+    storage = er.get("bag_storage")
+    preset = er.get("bag_storage_preset")
+    return {
+        "storage": str(storage).strip().lower() if storage else None,
+        "storage_preset": str(preset).strip() if preset else None,
+    }
 
 
 def discover_episode_recorder_config(profile: dict[str, Any]) -> dict[str, Any]:

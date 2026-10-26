@@ -18,7 +18,11 @@
   <exec_depend>fv_audio</exec_depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>pyopenjtalk</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
 
   <member_of_group>rosidl_interface_packages</member_of_group>
 
