@@ -67,11 +67,26 @@ inline bool sof_dimensions(const uint8_t* d, size_t n, int& width, int& height) 
   return false;
 }
 
-// SOI〜最後の EOI までの長さ (EOI の後の詰め物は数えない)。切れていれば 0。
+// SOI〜主画像の EOI までの長さ。APP セグメント (EXIF のサムネイルも JPEG で EOI を持つ) は長さで読み飛ばし、
+// 最初の SOS より後で最後の FF D9 を探す。無ければ 0 (切れている)。
 // 切れた JPEG を nvjpegdec に入れるとプラグインの中で落ちる (aspa2 実測) ので、専用回路には揃った物だけ渡す。
+// 構造検査なので、中身が壊れた物まで全部は弾けない。
 inline size_t complete_length(const uint8_t* d, size_t n) {
   if (n < 4 || d[0] != 0xFF || d[1] != 0xD8) return 0;
-  for (size_t i = n; i >= 2; --i) if (d[i-2] == 0xFF && d[i-1] == 0xD9) return i;
+  size_t i = 2, sos = 0;
+  while (i + 4 <= n) {
+    if (d[i] != 0xFF) return 0;
+    const uint8_t marker = d[i+1];
+    if (marker == 0xFF) { ++i; continue; }
+    if (marker == 0xD8 || (marker >= 0xD0 && marker <= 0xD7) || marker == 0x01) { i += 2; continue; }
+    if (marker == 0xD9) return 0;
+    const size_t len = (size_t(d[i+2]) << 8) | d[i+3];
+    if (len < 2 || i + 2 + len > n) return 0;
+    if (marker == 0xDA) { sos = i + 2 + len; break; }
+    i += 2 + len;
+  }
+  if (sos == 0) return 0;
+  for (size_t k = n; k >= sos + 2; --k) if (d[k-2] == 0xFF && d[k-1] == 0xD9) return k;
   return 0;
 }
 
@@ -116,8 +131,9 @@ inline void bgr_to_i420_full(const cv::Mat& bgr, uint8_t* dst) {
         *yo[k] = uint8_t((77*r + 150*g + 29*b + 128) >> 8);
         sr += r; sg += g; sb += b;
       }
-      u[x/2] = uint8_t(((-43*sr - 85*sg + 128*sb + 512) >> 10) + 128);
-      v[x/2] = uint8_t(((128*sr - 107*sg - 21*sb + 512) >> 10) + 128);
+      // 純青 (B=255) の U、純赤の V は 256 になるので飽和させる (uint8_t にそのまま入れると 0 に巻き戻る)
+      u[x/2] = clamp8(((-43*sr - 85*sg + 128*sb + 512) >> 10) + 128);
+      v[x/2] = clamp8(((128*sr - 107*sg - 21*sb + 512) >> 10) + 128);
     }
   }
 }
@@ -133,9 +149,17 @@ inline bool gst_ready(std::string* why) {
     // libgstnvjpeg.so は libnvmm_jpeg.so の jpeg_* (libjpeg-9f + Tegra) を呼ぶ。このプロセスには OpenCV 経由で
     // libjpeg.so.8 も居て同じ名前の jpeg_* が先に見えるため、普通に読み込むと nvjpegdec が落ちる (aspa2 で確認)。
     // 先に RTLD_DEEPBIND で読んでおくと両 .so が自分の依存先の jpeg_* を使う。
+    // ハンドルはプロセスが終わるまで持ったまま (閉じない)。両方読めなければ専用回路は使わない
+    // (nvjpegdec の factory だけ見つかっても、衝突したまま使うと落ちる)
     const int flags = RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND;
-    for (const char* p : {"libnvmm_jpeg.so", "/usr/lib/aarch64-linux-gnu/nvidia/libnvmm_jpeg.so"}) if (dlopen(p, flags)) break;
-    for (const char* p : {"/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvjpeg.so", "libgstnvjpeg.so"}) if (dlopen(p, flags)) break;
+    bool have_nvmm = false, have_plugin = false;
+    for (const char* p : {"libnvmm_jpeg.so", "/usr/lib/aarch64-linux-gnu/nvidia/libnvmm_jpeg.so"}) if (dlopen(p, flags)) { have_nvmm = true; break; }
+    for (const char* p : {"/usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstnvjpeg.so", "libgstnvjpeg.so"}) if (dlopen(p, flags)) { have_plugin = true; break; }
+    if (!have_nvmm || !have_plugin) {
+      const char* e = dlerror();
+      reason = std::string("NVJPG libraries not loadable (libnvmm_jpeg/libgstnvjpeg): ") + (e ? e : "not found");
+      return;
+    }
     GError* err = nullptr;
     if (!gst_init_check(nullptr, nullptr, &err)) {
       reason = std::string("gst_init failed: ") + (err ? err->message : "?");
@@ -160,7 +184,12 @@ struct SyncPipeline {
   GstAppSink* sink = nullptr;
   int failures = 0;
   std::string error;
+  SyncPipeline() = default;
+  SyncPipeline(const SyncPipeline&) = delete;
+  SyncPipeline& operator=(const SyncPipeline&) = delete;
   ~SyncPipeline() { teardown(); }
+  // 注意: gst_element_set_state(NULL) に時間の上限は無い。プラグインの停止処理が詰まれば戻らない
+  // (aspa2 では応答しない時も戻った)。「必ず CPU に戻る」を保証するには別プロセス化が要る (未実装)
   void teardown() {
     if (pipeline) {
       gst_element_set_state(pipeline, GST_STATE_NULL);
@@ -215,8 +244,7 @@ struct SyncPipeline {
       error = "no output within " + std::to_string(kPullTimeoutMs) + " ms (" + bus_error() + ")";
       ++failures; return nullptr;
     }
-    failures = 0;
-    return sample;
+    return sample;   // failures は呼ぶ側が中身まで確かめてから 0 に戻す
   }
 };
 }  // namespace detail
@@ -335,6 +363,7 @@ private:
       i420_full_to_bgr(planes, strides, rw, rh, bgr);
       gst_video_frame_unmap(&frame);
       ok = true;
+      pipe_.failures = 0;
     } else {
       gchar* c = caps ? gst_caps_to_string(caps) : nullptr;
       pipe_.error = std::string("unexpected output ") + (c ? c : "(no caps)");
@@ -403,7 +432,7 @@ private:
     }
     GstBuffer* in = gst_buffer_new_allocate(nullptr, size_t(w)*h*3/2, nullptr);
     GstMapInfo map;
-    if (!gst_buffer_map(in, &map, GST_MAP_WRITE)) { gst_buffer_unref(in); if (error) *error = "cannot map input"; return false; }
+    if (!gst_buffer_map(in, &map, GST_MAP_WRITE)) { gst_buffer_unref(in); ++pipe_.failures; if (error) *error = "cannot map input"; return false; }
     bgr_to_i420_full(bgr, map.data);
     gst_buffer_unmap(in, &map);
     GstSample* sample = pipe_.roundtrip(in);
@@ -413,8 +442,10 @@ private:
     if (buf && gst_buffer_map(buf, &map, GST_MAP_READ)) {
       out.assign(map.data, map.data + map.size);
       gst_buffer_unmap(buf, &map);
-      ok = out.size() > 4 && out[0] == 0xFF && out[1] == 0xD8;
-      if (!ok) { pipe_.error = "output is not a JPEG"; ++pipe_.failures; }
+      int ow = 0, oh = 0;
+      ok = sof_dimensions(out.data(), out.size(), ow, oh) && ow == w && oh == h && complete_length(out.data(), out.size()) == out.size();
+      if (!ok) { pipe_.error = "output is not a complete JPEG of " + std::to_string(w) + "x" + std::to_string(h); ++pipe_.failures; }
+      else pipe_.failures = 0;
     } else { pipe_.error = "cannot map output"; ++pipe_.failures; }
     gst_sample_unref(sample);
     if (!ok && error) *error = pipe_.error;
