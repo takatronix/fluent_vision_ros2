@@ -136,6 +136,7 @@ void FVUSBCameraNode::loadParameters()
         }
         camera_config_.rotation = rot;
     }
+    camera_config_.hw_jpeg = this->declare_parameter("camera.hw_jpeg", true);
     
     // Stream settings
     stream_config_.color_enabled = 
@@ -440,6 +441,7 @@ void FVUSBCameraNode::processingLoop()
         const bool wanted =
             (color_pub_ && color_pub_->get_subscription_count() > 0) ||
             (color_compressed_pub_ && color_compressed_pub_->get_subscription_count() > 0);
+        if (!jpeg_encoder_) jpeg_encoder_ = std::make_unique<fluent::hwjpeg::Encoder>(camera_config_.hw_jpeg);
         if (!(wanted ? camera_.read(frame) : camera_.grab())) {
             read_fail_streak += 1;
             if (read_fail_streak == 1 || read_fail_streak % 50 == 0) {
@@ -574,8 +576,13 @@ void FVUSBCameraNode::publishFrame(const cv::Mat& frame)
 {
     auto stamp = this->now();
     
-    // Publish color image
-    if (stream_config_.color_enabled && color_pub_) {
+    if (!hw_jpeg_logged_ && jpeg_encoder_) {
+        hw_jpeg_logged_ = true;
+        RCLCPP_INFO(this->get_logger(), "JPEG: encode=%s%s%s", jpeg_encoder_->backend(),
+                    jpeg_encoder_->hardware_error().empty() ? "" : " / ", jpeg_encoder_->hardware_error().c_str());
+    }
+    // Publish color image — 生の Image (1080p で 6 MB/枚) は購読者がいる時だけ作る (2026-10-29)
+    if (stream_config_.color_enabled && color_pub_ && color_pub_->get_subscription_count() > 0) {
         auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", frame).toImageMsg();
         msg->header.stamp = stamp;
         msg->header.frame_id = tf_config_.optical_frame;
@@ -586,11 +593,9 @@ void FVUSBCameraNode::publishFrame(const cv::Mat& frame)
     if (camera_info_config_.enable_compressed_topics && stream_config_.compressed_enabled && color_compressed_pub_) {
         if (color_compressed_pub_->get_subscription_count() > 0) {
             std::vector<uchar> jpeg_data;
-            std::vector<int> params = {
-                cv::IMWRITE_JPEG_QUALITY,
-                std::max(1, std::min(100, camera_info_config_.compressed_quality))
-            };
-            if (cv::imencode(".jpg", frame, jpeg_data, params)) {
+            // 専用回路 (NVJPG) で作る。無い機・落ちた時は中で OpenCV に戻る
+            if (!jpeg_encoder_) jpeg_encoder_ = std::make_unique<fluent::hwjpeg::Encoder>(camera_config_.hw_jpeg);
+            if (jpeg_encoder_->encode(frame, camera_info_config_.compressed_quality, jpeg_data)) {
                 sensor_msgs::msg::CompressedImage cmsg;
                 cmsg.header.stamp = stamp;
                 cmsg.header.frame_id = tf_config_.optical_frame;

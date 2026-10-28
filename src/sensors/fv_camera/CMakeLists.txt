@@ -18,6 +18,17 @@ find_package(std_srvs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(fluent_lib REQUIRED)
+# JPEG の専用回路 (Jetson の NVJPG) は GStreamer の nvjpegdec/nvjpegenc 越し (fluent_lib/hw_jpeg.hpp)。
+# 開発機に GStreamer が無ければ OpenCV だけで組む (実行時にも要素が無ければ OpenCV に戻る)。
+find_package(PkgConfig QUIET)
+set(FV_HW_JPEG_GST OFF)
+if(PkgConfig_FOUND)
+  pkg_check_modules(FV_GST IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+  if(FV_GST_FOUND)
+    set(FV_HW_JPEG_GST ON)
+  endif()
+endif()
+message(STATUS "fv_camera: hardware JPEG via GStreamer: ${FV_HW_JPEG_GST}")
 
 # Generate services
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -57,6 +68,10 @@ ament_target_dependencies(fv_camera_node
 target_link_libraries(fv_camera_node
   ${OpenCV_LIBS}
 )
+if(FV_HW_JPEG_GST)
+  target_compile_definitions(fv_camera_node PRIVATE FLUENT_HW_JPEG_GST=1)
+  target_link_libraries(fv_camera_node PkgConfig::FV_GST ${CMAKE_DL_LIBS})
+endif()
 
 
 

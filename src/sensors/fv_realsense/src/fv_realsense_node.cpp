@@ -336,6 +336,8 @@ void FVDepthCameraNode::loadParameters()
         this->declare_parameter("camera_info.enable_compressed_topics", true);
     camera_info_config_.compressed_quality = 
         this->declare_parameter("camera_info.compressed_quality", 85);
+    // JPEG を作るを Jetson の専用回路 (NVJPG) に任せる (2026-10-29)。無い機・落ちた時は OpenCV に戻る
+    hw_jpeg_ = this->declare_parameter("camera.hw_jpeg", true);
     camera_info_config_.enable_depth_compressed = 
         this->declare_parameter("camera_info.enable_depth_compressed", false);
 
@@ -1631,28 +1633,40 @@ void FVDepthCameraNode::queueFramesForPublish(
         }
         drawHUD(bgr_image);
         
-        auto color_msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", bgr_image).toImageMsg();
-        color_msg->header.stamp = now;
-        color_msg->header.frame_id = tf_config_.color_optical_frame;
+        // 生の Image (720p で 2.7 MB/枚) と JPEG は、それぞれ購読者がいる時だけ作る (2026-10-29)。
+        // 件数 (color_pub_count_) は購読者が居なくても数える: 統計はカメラが生きている事を見ている
+        // (生を出す時は publishBundle が数える。出さない時はここで数える)
+        const bool raw_wanted = color_pub_->get_subscription_count() > 0;
+        const bool compressed_wanted = camera_info_config_.enable_compressed_topics && color_compressed_pub_ &&
+                                       color_compressed_pub_->get_subscription_count() > 0;
+        std_msgs::msg::Header color_header;
+        color_header.stamp = now;
+        color_header.frame_id = tf_config_.color_optical_frame;
         
-        // Publish compressed color
-        if (camera_info_config_.enable_compressed_topics && color_compressed_pub_) {
-            // Create compressed image message
+        // Publish compressed color — 専用回路 (NVJPG)、無ければ OpenCV。この関数で color を作るのは
+        // color の処理スレッドだけ (depth の処理スレッドは include_color_messages=false) なので jpeg_encoder_ は 1 スレッドから
+        if (compressed_wanted) {
+            if (!jpeg_encoder_) {
+                jpeg_encoder_ = std::make_unique<fluent::hwjpeg::Encoder>(hw_jpeg_);
+                RCLCPP_INFO(this->get_logger(), "JPEG: encode=%s%s%s", jpeg_encoder_->backend(),
+                            jpeg_encoder_->hardware_error().empty() ? "" : " / ", jpeg_encoder_->hardware_error().c_str());
+            }
             auto compressed_msg = std::make_unique<sensor_msgs::msg::CompressedImage>();
-            compressed_msg->header = color_msg->header;
+            compressed_msg->header = color_header;
             compressed_msg->format = "jpeg";
-            
-            // Compress the image
-            std::vector<int> compression_params;
-            compression_params.push_back(cv::IMWRITE_JPEG_QUALITY);
-            compression_params.push_back(camera_info_config_.compressed_quality);
-            
-            cv::imencode(".jpg", bgr_image, compressed_msg->data, compression_params);
-            
-            bundle.color_compressed = std::move(compressed_msg);
+            if (jpeg_encoder_->encode(bgr_image, camera_info_config_.compressed_quality, compressed_msg->data)) {
+                bundle.color_compressed = std::move(compressed_msg);
+            } else {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "⚠️ JPEG を作れない");
+            }
         }
 
-        bundle.color = std::make_unique<sensor_msgs::msg::Image>(std::move(*color_msg));
+        if (raw_wanted) {
+            auto color_msg = cv_bridge::CvImage(color_header, "bgr8", bgr_image).toImageMsg();
+            bundle.color = std::make_unique<sensor_msgs::msg::Image>(std::move(*color_msg));
+        } else {
+            color_pub_count_.fetch_add(1, std::memory_order_relaxed);
+        }
 
         if (cache_latest_frames_enabled_) {
             try {

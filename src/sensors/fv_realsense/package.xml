@@ -38,6 +38,9 @@
   <depend>geometry_msgs</depend>  <!-- 幾何学メッセージ型 -->
   <depend>std_srvs</depend>  <!-- 標準サービス型 -->
   <depend>fluent_lib</depend>  <!-- FluentVision共通ユーティリティ -->
+  <!-- JPEG の専用回路 (NVJPG) は GStreamer 越し。無い環境では OpenCV だけで組める -->
+  <depend>libgstreamer1.0-dev</depend>
+  <depend>libgstreamer-plugins-base1.0-dev</depend>
 
   <!-- ===== インターフェース生成依存関係 ===== -->
   <build_depend>rosidl_default_generators</build_depend>  <!-- インターフェース生成 -->
