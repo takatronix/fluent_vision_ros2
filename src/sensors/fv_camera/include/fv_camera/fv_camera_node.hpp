@@ -9,6 +9,7 @@
 #include <std_srvs/srv/trigger.hpp>
 
 #include <fluent_lib/cv_bridge_compat.hpp>
+#include <fluent_lib/hw_jpeg.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <memory>
@@ -59,6 +60,8 @@ private:
         // Folded from camera.rotation + rotate_180 at load; 90/270 swap the
         // published width/height (portrait use, e.g. gripper close-up cam).
         int rotation = 0;
+        // JPEG を作る (圧縮トピック) を Jetson の専用回路 (NVJPG) に任せる。無い機・落ちた時は OpenCV に戻る
+        bool hw_jpeg = true;
     };
 
     struct StreamConfig
@@ -113,6 +116,9 @@ private:
     // OpenCV camera
     cv::VideoCapture camera_;
     cv::Mat current_frame_;
+    // JPEG の専用回路 (fluent_lib/hw_jpeg.hpp)。processing_thread_ だけが触る
+    std::unique_ptr<fluent::hwjpeg::Encoder> jpeg_encoder_;
+    bool hw_jpeg_logged_ = false;
     std::mutex frame_mutex_;
     bool idle_logged_ = false;   // no subscribers → grab() without decode (logged once per transition)
 
