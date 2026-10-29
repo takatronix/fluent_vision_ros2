@@ -1,4 +1,5 @@
 #include "fv_camera/fv_camera_node.hpp"
+#include "fv_camera/jpeg_encode.hpp"
 #include "fv_camera/srv/get_camera_info.hpp"
 #include "fv_camera/srv/set_camera_settings.hpp"
 
@@ -595,7 +596,8 @@ void FVUSBCameraNode::publishFrame(const cv::Mat& frame)
             std::vector<uchar> jpeg_data;
             // 専用回路 (NVJPG) で作る。無い機・落ちた時は中で OpenCV に戻る
             if (!jpeg_encoder_) jpeg_encoder_ = std::make_unique<fluent::hwjpeg::Encoder>(camera_config_.hw_jpeg);
-            if (jpeg_encoder_->encode(frame, camera_info_config_.compressed_quality, jpeg_data)) {
+            // 作るのは最適化して組む別のファイル (jpeg_encode.cpp) で
+            if (fv_camera::encode_jpeg(*jpeg_encoder_, frame, camera_info_config_.compressed_quality, jpeg_data)) {
                 sensor_msgs::msg::CompressedImage cmsg;
                 cmsg.header.stamp = stamp;
                 cmsg.header.frame_id = tf_config_.optical_frame;

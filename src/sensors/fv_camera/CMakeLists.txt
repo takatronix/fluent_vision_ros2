@@ -46,7 +46,14 @@ include_directories(
 # Create executables
 add_executable(fv_camera_node
   src/fv_camera_node.cpp
+  src/jpeg_encode.cpp
 )
+# JPEG を作る自前の画素ループ (fluent_lib/hw_jpeg.hpp、BGR→I420) のファイルだけ最適化 (-O3、Release と同じ) して組む。機体の colcon build は build type を
+# 付けず、このパッケージは最適化なし (-O0) になる (aspa2 2026-10-30: 1080x1920 を作る CPU 19.1 ms、-O3 で 3.4 ms・-O2 で 5.4 ms、OpenCV 9.2 ms)。
+# パッケージ全体の build type は変えない (撮影スレッドと設定サービスの間の前からの競合を、最適化で表に出さないため)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(src/jpeg_encode.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+endif()
 
 add_executable(list_cameras_node
   src/list_cameras_node.cpp
