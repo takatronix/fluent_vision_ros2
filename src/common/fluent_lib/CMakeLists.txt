@@ -94,6 +94,20 @@ if(FLUENT_HAS_FREETYPE)
 endif()
 
 # Install headers
+# JPEG の専用回路 (hw_jpeg.hpp) の確かめ道具。GStreamer があれば専用回路と OpenCV を比べ、無ければ OpenCV だけ
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(FL_GST IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+endif()
+add_executable(hw_jpeg_check tools/hw_jpeg_check.cpp)
+target_include_directories(hw_jpeg_check PRIVATE include ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(hw_jpeg_check ${OpenCV_LIBS})
+if(FL_GST_FOUND)
+  target_compile_definitions(hw_jpeg_check PRIVATE FLUENT_HW_JPEG_GST=1)
+  target_link_libraries(hw_jpeg_check PkgConfig::FL_GST ${CMAKE_DL_LIBS})
+endif()
+install(TARGETS hw_jpeg_check DESTINATION lib/${PROJECT_NAME})
+
 install(DIRECTORY include/
   DESTINATION include/
 )

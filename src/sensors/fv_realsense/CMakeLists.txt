@@ -136,6 +136,13 @@ endif()
 # RealSense SDKが見つかった場合のみ続行
 message(STATUS "RealSense SDK found. Building fv_realsense package.")
 find_package(fluent_lib REQUIRED)                     # Fluent Lib (cv_bridge_compat)
+# JPEG の専用回路 (Jetson の NVJPG) は GStreamer 越し (fluent_lib/hw_jpeg.hpp)。無ければ OpenCV だけ
+set(FV_HW_JPEG_GST OFF)
+pkg_check_modules(FV_GST IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+if(FV_GST_FOUND)
+  set(FV_HW_JPEG_GST ON)
+endif()
+message(STATUS "fv_realsense: hardware JPEG via GStreamer: ${FV_HW_JPEG_GST}")
 find_package(pcl_conversions REQUIRED)                # PCL-ROS2変換
 find_package(pcl_ros REQUIRED)                        # PCL ROS2統合
 find_package(image_transport REQUIRED)                # 画像転送ライブラリ
@@ -205,6 +212,10 @@ else()
 endif()
 if(GDAL_FOUND)
   target_link_libraries(fv_realsense_node GDAL::GDAL)
+endif()
+if(FV_HW_JPEG_GST)
+  target_compile_definitions(fv_realsense_node PRIVATE FLUENT_HW_JPEG_GST=1)
+  target_link_libraries(fv_realsense_node PkgConfig::FV_GST ${CMAKE_DL_LIBS})
 endif()
 
 # ===== シンプルノードの依存関係リンク（最小限） =====

@@ -14,6 +14,7 @@
 #include <librealsense2/rs.hpp>
 #endif
 #include <fluent_lib/cv_bridge_compat.hpp>
+#include <fluent_lib/hw_jpeg.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 
@@ -138,6 +139,9 @@ private:
 
     // RealSense members
     std::unique_ptr<rs2::context> ctx_;
+    // JPEG の専用回路 (fluent_lib/hw_jpeg.hpp)。フレームの処理スレッドだけが触る
+    std::unique_ptr<fluent::hwjpeg::Encoder> jpeg_encoder_;
+    bool hw_jpeg_ = true;
     rs2::device device_;
 
     // Sensor-based streaming (preferred: decouple color/depth without wait_for_frames)

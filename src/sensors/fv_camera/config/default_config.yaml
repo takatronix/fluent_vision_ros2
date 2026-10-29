@@ -24,6 +24,8 @@ fv_camera:
       hue: -1
       gain: -1
       exposure: -1
+      # JPEG (compressed topic) on the Jetson NVJPG engine via GStreamer nvjpegenc; falls back to OpenCV when unavailable
+      hw_jpeg: true
     
     # Stream settings
     streams:
