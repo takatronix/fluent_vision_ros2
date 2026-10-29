@@ -137,6 +137,50 @@ CycloneDDSを使うprocessは16 MiBのsend bufferを要求します。
 - **圧縮設定**: JPEG品質、圧縮トピック有効/無効
 - **TF設定**: フレーム名、変換パラメータ
 - **サービス設定**: get_distance/get_camera_info/set_mode
+- **露出 / ゲイン / ホワイトバランス** (`color.*` / `depth.*`、下記)
+- **点群の間引き・レート** (`pointcloud.decimation` / `pointcloud.publish_hz`)
+
+### 露出固定モード (`color.*` / `depth.*`)
+
+センサごと (color = RGB、depth = ステレオモジュール) に自動露出の ON/OFF と固定値を持てます。
+起動時 (yaml) にも、稼働中 (`ros2 param set`) にも効きます。
+
+```yaml
+    color:
+      auto_exposure: true        # false で固定モード
+      exposure: -1               # 固定値 (デバイス単位: D4xx RGB は 1 = 100 µs、ステレオは µs)。-1 = 触らない
+      gain: -1                   # -1 = 触らない
+      auto_white_balance: true
+      white_balance: -1          # Kelvin。-1 = 触らない
+      auto_exposure_priority: -1 # RGB のみ。0 = 暗所でも fps を落とさない / 1 = 露出優先 / -1 = デバイス既定
+    depth:
+      auto_exposure: true
+      exposure: -1
+      gain: -1
+```
+
+- 単位 (2026-10-30 D435i / D405 実測): RGB の `exposure` は **100 µs 単位** (330 = 33 ms = 30 fps の上限。
+  それより大きい値は fps が落ちる: 1000 → 10 fps、3300 → 3 fps)。ステレオモジュール (D405 の color も
+  ここ) は **µs** (33000 = 33 ms)。`gain` はデバイス単位 (RGB 0..128、ステレオ 16..248)。
+- `auto_exposure: false` で `exposure` / `gain` が -1 のときは、直前フレームのメタデータ
+  (ACTUAL_EXPOSURE / GAIN_LEVEL) から**その時点の自動露出の値を取って固定**しようとします。
+  ただし D4xx のファームウェアは自動露出の結果を制御値に書き戻さず、プラットフォームによっては
+  メタデータも既定値しか返しません (Jetson Thor + D435i RGB で確認: 166/64 固定、D405 は gain が 0)。
+  そのためロック後 1.5 秒で画像の平均輝度を比較し、**30 % 以上変わったら WARN** を出します
+  (`🔒 color exposure lock changed the image brightness …`)。この WARN が出る環境では
+  `exposure` / `gain` を明示してください (タイルを見ながら `ros2 param set` で合わせ、yaml に書く)。
+  固定した値はログ `🔒 color exposure locked: exposure=… gain=…` に出ます。
+- 稼働中の切替: `ros2 param set /<node> color.auto_exposure false` (固定) / `true` (自動)。
+- D405 は color と depth が同じイメージャなので `color.*` だけが効き、`depth.*` は無視されます (起動ログに出ます)。
+- 値域はセンサごとに違うので範囲外は clamp して警告します (`rs-enumerate-devices -o` で確認できます)。
+
+### 点群 (`streams.pointcloud_enabled`)
+
+- librealsense の `rs2::pointcloud` で depth → 3D 化し、RGB へのテクスチャ対応付けで色を付けます
+  (RGB と depth が別センサの D415 / D435 系でも色がずれません)。**点群の frame_id は `tf.depth_optical_frame`** です
+  (D405 のように同一イメージャなら color と同じ名前にしてください)。
+- 購読者がいる間だけ計算・配信します。`pointcloud.decimation` (既定 2 = 縦横 1/2 間引き) と
+  `pointcloud.publish_hz` (既定 0 = 毎フレーム) で負荷を抑えられます。
 
 ## トピック
 

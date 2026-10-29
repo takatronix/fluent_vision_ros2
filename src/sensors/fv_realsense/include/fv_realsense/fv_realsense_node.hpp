@@ -2,6 +2,8 @@
 #define FV_DEPTH_CAMERA_NODE_HPP
 
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
+#include <vector>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -340,8 +342,43 @@ private:
     float min_distance_m_ = 0.1f;
     float max_distance_m_ = 3.0f;
 
+    // ---- Sensor option control (exposure / gain / white balance) ----
+    // One block per sensor (color.* / depth.*), applied when the sensors are
+    // opened and again live through the parameter callback, so an operator
+    // can switch a camera between auto and locked exposure at runtime
+    // (`ros2 param set /<node> color.auto_exposure false`). -1 = leave the
+    // device value alone; with auto_exposure=false and exposure/gain=-1 the
+    // sensor is frozen at whatever auto-exposure last settled on.
+    struct SensorOptionConfig
+    {
+        bool auto_exposure = true;
+        int exposure = -1;               // device units (see README)
+        int gain = -1;
+        bool auto_white_balance = true;  // color sensors only
+        int white_balance = -1;          // Kelvin, color sensors only
+        int auto_exposure_priority = -1; // -1 keep / 0 off / 1 on (RGB only)
+    };
+    SensorOptionConfig color_options_;
+    SensorOptionConfig depth_options_;
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
+
+    // Point cloud throttling (pointcloud.decimation / pointcloud.publish_hz).
+    std::atomic<int> pointcloud_decimation_{2};
+    std::atomic<double> pointcloud_publish_hz_{0.0};
+    std::atomic<int64_t> last_pointcloud_pub_ns_{0};
+    // librealsense projection block: vertices in the depth frame + texture
+    // coordinates into the color image (handles the color/depth extrinsics).
+    rs2::pointcloud rs_pointcloud_;
+
     // Methods
     void loadParameters();
+    void loadSensorOptionParameters();
+    bool applyOption(rs2::sensor& sensor, rs2_option opt, float value, const char* label);
+    void applySensorOptions(bool is_color);
+    double meanBrightnessOfLatest(bool is_color);
+    void scheduleLockBrightnessCheck(bool is_color, double before);
+    rclcpp::TimerBase::SharedPtr lock_verify_timer_;
+    rcl_interfaces::msg::SetParametersResult onParametersSet(const std::vector<rclcpp::Parameter>& params);
     bool initializeRealSense();
     bool selectCamera();
     bool startSensors();

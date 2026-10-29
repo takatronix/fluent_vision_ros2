@@ -54,6 +54,11 @@ FVDepthCameraNode::FVDepthCameraNode(const std::string& node_name)
         // ===== Step 1: パラメータの読み込み =====
         RCLCPP_INFO(this->get_logger(), "📋 Step 1: Loading parameters...");
         loadParameters();
+        // Live parameter updates (exposure lock, point cloud throttling).
+        // Registered after loadParameters() so the initial declare_parameter
+        // calls do not round-trip through the callback.
+        param_cb_handle_ = this->add_on_set_parameters_callback(
+            std::bind(&FVDepthCameraNode::onParametersSet, this, std::placeholders::_1));
         
         // ===== Step 2: RealSenseの初期化（shared_from_thisより前） =====
         RCLCPP_INFO(this->get_logger(), "📷 Step 2: Initializing RealSense...");
@@ -412,6 +417,7 @@ void FVDepthCameraNode::loadParameters()
     // Point cloud clipping distances (if provided in YAML under pointcloud.*)
     min_distance_m_ = this->declare_parameter("pointcloud.min_distance", 0.1);
     max_distance_m_ = this->declare_parameter("pointcloud.max_distance", 3.0);
+    loadSensorOptionParameters();
 
     // Cache latest frames for service/callback access (avoid calling wait_for_frames in services)
     cache_latest_frames_enabled_ = this->declare_parameter("cache_latest_frames.enabled", false);
@@ -762,14 +768,18 @@ bool FVDepthCameraNode::startSensors() {
             profiles.push_back(color_profile_);
             profiles.push_back(depth_profile_);
             color_sensor_.open(profiles);
+            applySensorOptions(true);
+            applySensorOptions(false);  // no-op + notice: shared imager
             color_sensor_.start(dispatch_cb);
         } else {
             if (stream_config_.color_enabled) {
                 color_sensor_.open(std::vector<rs2::stream_profile>{color_profile_});
+                applySensorOptions(true);
                 color_sensor_.start(dispatch_cb);
             }
             if (stream_config_.depth_enabled) {
                 depth_sensor_.open(std::vector<rs2::stream_profile>{depth_profile_});
+                applySensorOptions(false);
                 depth_sensor_.start(dispatch_cb);
             }
         }
@@ -1952,81 +1962,374 @@ std::unique_ptr<sensor_msgs::msg::PointCloud2> FVDepthCameraNode::buildPointClou
     const rs2::frame& color_frame,
     const rs2::frame& depth_frame)
 {
-    RCLCPP_DEBUG(this->get_logger(), "🔍 buildPointCloud called");
-    
     // Point cloud requires both color and depth frames
     if (!color_frame || !depth_frame) {
-        RCLCPP_WARN(this->get_logger(), "⚠️ Missing frames - color: %s, depth: %s", 
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "⚠️ buildPointCloud: missing frames - color: %s, depth: %s",
             color_frame ? "✅" : "❌", depth_frame ? "✅" : "❌");
         return nullptr;
     }
-    
-    // Check if publisher is valid
     if (!pointcloud_pub_) {
-        RCLCPP_ERROR(this->get_logger(), "❌ Point cloud publisher is null!");
+        RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "❌ Point cloud publisher is null!");
         return nullptr;
     }
-    
-    // Check publisher status
-    size_t sub_count = pointcloud_pub_->get_subscription_count();
-    RCLCPP_DEBUG(this->get_logger(), "📊 Point cloud publisher - subscribers: %zu", sub_count);
-    
-    // Create point cloud
+    // Skip the projection entirely while nobody listens (it is the most
+    // expensive per-frame step and the cloud is a pull-style consumer topic).
+    if (pointcloud_pub_->get_subscription_count() == 0) {
+        return nullptr;
+    }
+    // Optional rate limit (pointcloud.publish_hz, 0 = every frame).
+    const double publish_hz = pointcloud_publish_hz_.load(std::memory_order_relaxed);
+    if (publish_hz > 0.0) {
+        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t min_dt_ns = static_cast<int64_t>(1e9 / publish_hz);
+        if (now_ns - last_pointcloud_pub_ns_.load(std::memory_order_relaxed) < min_dt_ns) {
+            return nullptr;
+        }
+        last_pointcloud_pub_ns_.store(now_ns, std::memory_order_relaxed);
+    }
+
+    // Use librealsense's projection: vertices in the DEPTH sensor frame plus
+    // per-vertex texture coordinates into the COLOR image, computed from the
+    // device's own intrinsics/extrinsics. Indexing the color image with the
+    // depth pixel (the previous implementation) is only right when both
+    // streams come from the same imager (D405); on D415/D435(i) the RGB
+    // sensor is a separate camera with a different FOV and a ~15 mm
+    // baseline, which painted neighbouring objects with the wrong colors.
+    rs2::points points;
+    try {
+        rs_pointcloud_.map_to(color_frame);
+        points = rs_pointcloud_.calculate(depth_frame);
+    } catch (const rs2::error& e) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "⚠️ rs2::pointcloud failed: %s", e.what());
+        return nullptr;
+    }
+    const auto depth_vp = depth_frame.get_profile().as<rs2::video_stream_profile>();
+    const auto color_vf = color_frame.as<rs2::video_frame>();
+    if (!depth_vp || !color_vf) {
+        return nullptr;
+    }
+    const int dw = depth_vp.width();
+    const int dh = depth_vp.height();
+    const int cw = color_vf.get_width();
+    const int ch = color_vf.get_height();
+    if (static_cast<size_t>(dw) * static_cast<size_t>(dh) != points.size()) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+            "⚠️ rs2::pointcloud returned %zu vertices for a %dx%d depth frame",
+            points.size(), dw, dh);
+        return nullptr;
+    }
+    const rs2::vertex* verts = points.get_vertices();
+    const rs2::texture_coordinate* tex = points.get_texture_coordinates();
+    const uint8_t* color_data = static_cast<const uint8_t*>(color_frame.get_data());
+    const int color_stride = color_vf.get_stride_in_bytes();
+    const bool color_is_rgb = (color_vf.get_profile().format() == RS2_FORMAT_RGB8);
+    const int step = std::max(1, pointcloud_decimation_.load(std::memory_order_relaxed));
+
     pcl::PointCloud<pcl::PointXYZRGB> cloud;
-    
-    // Get color and depth data
-    cv::Mat color_image(cv::Size(color_intrinsics_.width, color_intrinsics_.height), 
-                       CV_8UC3, (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
-    cv::Mat depth_image(cv::Size(depth_intrinsics_.width, depth_intrinsics_.height), 
-                       CV_16UC1, (void*)depth_frame.get_data(), cv::Mat::AUTO_STEP);
-    
-    RCLCPP_DEBUG(this->get_logger(), "📐 Images - color: %dx%d, depth: %dx%d", 
-        color_image.cols, color_image.rows, depth_image.cols, depth_image.rows);
-    
-    // Convert to point cloud
-    int valid_points = 0;
+    cloud.points.reserve(static_cast<size_t>(dw / step + 1) * static_cast<size_t>(dh / step + 1));
     int skipped_points = 0;
-    for (int y = 0; y < depth_intrinsics_.height; y += 2) {
-        for (int x = 0; x < depth_intrinsics_.width; x += 2) {
-            float depth = depth_image.at<uint16_t>(y, x) * depth_scale_;
-            // Apply clipping based on configured distances
-            if (depth > min_distance_m_ && depth < max_distance_m_) {
-                float pixel[2] = {static_cast<float>(x), static_cast<float>(y)};
-                float point[3];
-                
-                rs2_deproject_pixel_to_point(point, &depth_intrinsics_, pixel, depth);
-                
-                pcl::PointXYZRGB pcl_point;
-                pcl_point.x = point[0];
-                pcl_point.y = point[1];
-                pcl_point.z = point[2];
-                
-                // Get color
-                cv::Vec3b color = color_image.at<cv::Vec3b>(y, x);
-                pcl_point.r = color[2];
-                pcl_point.g = color[1];
-                pcl_point.b = color[0];
-                
-                cloud.points.push_back(pcl_point);
-                valid_points++;
-            } else {
+    for (int y = 0; y < dh; y += step) {
+        for (int x = 0; x < dw; x += step) {
+            const size_t i = static_cast<size_t>(y) * static_cast<size_t>(dw) + static_cast<size_t>(x);
+            const rs2::vertex& v = verts[i];
+            // z == 0 marks an invalid depth sample; clip to the configured range.
+            if (!(v.z > min_distance_m_ && v.z < max_distance_m_)) {
                 skipped_points++;
+                continue;
             }
+            pcl::PointXYZRGB pcl_point;
+            pcl_point.x = v.x;
+            pcl_point.y = v.y;
+            pcl_point.z = v.z;
+            const int px = static_cast<int>(tex[i].u * static_cast<float>(cw) + 0.5f);
+            const int py = static_cast<int>(tex[i].v * static_cast<float>(ch) + 0.5f);
+            if (px >= 0 && px < cw && py >= 0 && py < ch) {
+                const uint8_t* cpx = color_data + static_cast<size_t>(py) * static_cast<size_t>(color_stride)
+                                     + static_cast<size_t>(px) * 3u;
+                if (color_is_rgb) {
+                    pcl_point.r = cpx[0]; pcl_point.g = cpx[1]; pcl_point.b = cpx[2];
+                } else {
+                    pcl_point.r = cpx[2]; pcl_point.g = cpx[1]; pcl_point.b = cpx[0];
+                }
+            } else {
+                // Outside the color FOV (the depth FOV is wider on D4xx):
+                // keep the geometry, paint it neutral grey.
+                pcl_point.r = pcl_point.g = pcl_point.b = 128;
+            }
+            cloud.points.push_back(pcl_point);
         }
     }
-    
-    RCLCPP_DEBUG(this->get_logger(), "☁️ Point cloud - valid: %d, skipped: %d, total: %zu", 
-        valid_points, skipped_points, cloud.points.size());
-    
+    RCLCPP_DEBUG(this->get_logger(), "☁️ Point cloud - valid: %zu, skipped: %d",
+        cloud.points.size(), skipped_points);
+
     cloud.width = cloud.points.size();
     cloud.height = 1;
     cloud.is_dense = false;
-    
+
     auto cloud_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
     pcl::toROSMsg(cloud, *cloud_msg);
     cloud_msg->header.stamp = rclcpp::Clock(RCL_SYSTEM_TIME).now();
-    cloud_msg->header.frame_id = tf_config_.color_optical_frame;
+    // rs2::pointcloud vertices are expressed in the depth sensor's optical
+    // frame (identical to the color frame on D405, a separate frame on D4xx
+    // with an RGB module — declare it in tf.depth_optical_frame / URDF).
+    cloud_msg->header.frame_id = tf_config_.depth_optical_frame;
     return cloud_msg;
+}
+
+// ---------------------------------------------------------------------------
+// Sensor options (exposure / gain / white balance) + point cloud throttling
+// ---------------------------------------------------------------------------
+void FVDepthCameraNode::loadSensorOptionParameters()
+{
+    auto load = [this](const std::string& prefix, SensorOptionConfig& cfg, bool color) {
+        cfg.auto_exposure = this->declare_parameter(prefix + ".auto_exposure", true);
+        cfg.exposure = static_cast<int>(this->declare_parameter(prefix + ".exposure", -1));
+        cfg.gain = static_cast<int>(this->declare_parameter(prefix + ".gain", -1));
+        if (color) {
+            cfg.auto_white_balance = this->declare_parameter(prefix + ".auto_white_balance", true);
+            cfg.white_balance = static_cast<int>(this->declare_parameter(prefix + ".white_balance", -1));
+            cfg.auto_exposure_priority =
+                static_cast<int>(this->declare_parameter(prefix + ".auto_exposure_priority", -1));
+        }
+    };
+    load("color", color_options_, true);
+    load("depth", depth_options_, false);
+    pointcloud_decimation_.store(
+        std::max(1, static_cast<int>(this->declare_parameter("pointcloud.decimation", 2))));
+    pointcloud_publish_hz_.store(
+        std::max(0.0, this->declare_parameter("pointcloud.publish_hz", 0.0)));
+    RCLCPP_INFO(this->get_logger(),
+        "🎛️ color: auto_exposure=%s exposure=%d gain=%d auto_wb=%s wb=%d ae_priority=%d | "
+        "depth: auto_exposure=%s exposure=%d gain=%d | pointcloud: decimation=%d publish_hz=%.1f",
+        color_options_.auto_exposure ? "on" : "off", color_options_.exposure, color_options_.gain,
+        color_options_.auto_white_balance ? "on" : "off", color_options_.white_balance,
+        color_options_.auto_exposure_priority,
+        depth_options_.auto_exposure ? "on" : "off", depth_options_.exposure, depth_options_.gain,
+        pointcloud_decimation_.load(), pointcloud_publish_hz_.load());
+}
+
+bool FVDepthCameraNode::applyOption(rs2::sensor& sensor, rs2_option opt, float value, const char* label)
+{
+    if (!sensor.supports(opt)) {
+        RCLCPP_WARN(this->get_logger(), "🎛️ %s: option %s is not supported by this sensor — ignored",
+            label, rs2_option_to_string(opt));
+        return false;
+    }
+    try {
+        const auto range = sensor.get_option_range(opt);
+        const float clamped = std::min(std::max(value, range.min), range.max);
+        if (clamped != value) {
+            RCLCPP_WARN(this->get_logger(), "🎛️ %s: %s=%g is outside %g..%g — clamped to %g",
+                label, rs2_option_to_string(opt), value, range.min, range.max, clamped);
+        }
+        sensor.set_option(opt, clamped);
+        return true;
+    } catch (const rs2::error& e) {
+        RCLCPP_ERROR(this->get_logger(), "🎛️ %s: failed to set %s=%g: %s",
+            label, rs2_option_to_string(opt), value, e.what());
+        return false;
+    }
+}
+
+void FVDepthCameraNode::applySensorOptions(bool is_color)
+{
+    rs2::sensor& sensor = is_color ? color_sensor_ : depth_sensor_;
+    const SensorOptionConfig& cfg = is_color ? color_options_ : depth_options_;
+    const char* label = is_color ? "color" : "depth";
+    if (!sensor) {
+        return;
+    }
+    const bool same_sensor =
+        color_sensor_ && depth_sensor_ && (color_sensor_.get() == depth_sensor_.get());
+    if (!is_color && same_sensor) {
+        // D405: color and depth come from the same imager, so there is only
+        // one exposure. color.* owns it; say so if depth.* asked for something.
+        if (!cfg.auto_exposure || cfg.exposure >= 0 || cfg.gain >= 0) {
+            RCLCPP_WARN(this->get_logger(),
+                "🎛️ depth.* ignored: color and depth share one imager on this device — use color.*");
+        }
+        return;
+    }
+    if (cfg.auto_exposure) {
+        applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.0f, label);
+    } else {
+        // "Lock here": with exposure/gain = -1 we freeze the sensor at what
+        // auto-exposure is using *right now*. The D4xx firmware does NOT
+        // copy the AE result into the exposure/gain controls (disabling AE
+        // leaves them at their defaults — observed 2026-10-30: 166/64 on the
+        // D435i RGB, 33000/16 on the D405), so the current values have to
+        // come from the last frame's metadata (ACTUAL_EXPOSURE / GAIN_LEVEL,
+        // same units as the controls). Explicit parameter values win.
+        float lock_exposure = cfg.exposure >= 0 ? static_cast<float>(cfg.exposure) : -1.0f;
+        float lock_gain = cfg.gain >= 0 ? static_cast<float>(cfg.gain) : -1.0f;
+        const char* source = "from parameters";
+        // Brightness before the lock — verified against the image 1.5 s later
+        // so a lock that silently changed the exposure is reported, not hidden.
+        const double brightness_before = is_color ? meanBrightnessOfLatest(true) : -1.0;
+        if (lock_exposure < 0.0f || lock_gain < 0.0f) {
+            rs2::frame f;
+            {
+                std::lock_guard<std::mutex> lk(latest_frame_mutex_);
+                f = is_color ? latest_color_frame_ : latest_depth_frame_;
+            }
+            float meta_exposure = -1.0f;
+            float meta_gain = -1.0f;
+            if (f) {
+                try {
+                    if (f.supports_frame_metadata(RS2_FRAME_METADATA_ACTUAL_EXPOSURE)) {
+                        meta_exposure = static_cast<float>(f.get_frame_metadata(RS2_FRAME_METADATA_ACTUAL_EXPOSURE));
+                    }
+                    if (f.supports_frame_metadata(RS2_FRAME_METADATA_GAIN_LEVEL)) {
+                        meta_gain = static_cast<float>(f.get_frame_metadata(RS2_FRAME_METADATA_GAIN_LEVEL));
+                    }
+                } catch (const rs2::error& e) {
+                    RCLCPP_WARN(this->get_logger(), "🎛️ %s: frame metadata read failed: %s", label, e.what());
+                }
+            }
+            if (lock_exposure < 0.0f) lock_exposure = meta_exposure;
+            if (lock_gain < 0.0f) lock_gain = meta_gain;
+            if (meta_exposure >= 0.0f || meta_gain >= 0.0f) {
+                source = "held at the current auto-exposure value (frame metadata)";
+            } else {
+                // Fail loud: no frame yet (startup) or no UVC metadata on this
+                // platform. The sensor is still switched to manual, but at the
+                // device's stored value — give exposure/gain explicitly.
+                RCLCPP_WARN(this->get_logger(),
+                    "🎛️ %s: cannot read the current auto-exposure value (%s) — "
+                    "auto-exposure is OFF at the device's stored exposure/gain. "
+                    "Set %s.exposure / %s.gain explicitly to lock a known value.",
+                    label, f ? "frame metadata unsupported" : "no frame received yet", label, label);
+                source = "device stored value (current AE value unavailable)";
+            }
+        }
+        applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0.0f, label);
+        if (lock_exposure >= 0.0f) {
+            applyOption(sensor, RS2_OPTION_EXPOSURE, lock_exposure, label);
+        }
+        if (lock_gain >= 0.0f) {
+            applyOption(sensor, RS2_OPTION_GAIN, lock_gain, label);
+        }
+        try {
+            const float e = sensor.supports(RS2_OPTION_EXPOSURE) ? sensor.get_option(RS2_OPTION_EXPOSURE) : -1.0f;
+            const float g = sensor.supports(RS2_OPTION_GAIN) ? sensor.get_option(RS2_OPTION_GAIN) : -1.0f;
+            RCLCPP_INFO(this->get_logger(), "🔒 %s exposure locked: exposure=%g gain=%g (%s)",
+                label, e, g, source);
+        } catch (const rs2::error& e) {
+            RCLCPP_WARN(this->get_logger(), "🎛️ %s: could not read back exposure/gain: %s", label, e.what());
+        }
+        scheduleLockBrightnessCheck(is_color, brightness_before);
+    }
+    if (is_color) {
+        if (cfg.auto_exposure_priority >= 0 && sensor.supports(RS2_OPTION_AUTO_EXPOSURE_PRIORITY)) {
+            applyOption(sensor, RS2_OPTION_AUTO_EXPOSURE_PRIORITY,
+                        cfg.auto_exposure_priority ? 1.0f : 0.0f, label);
+        }
+        if (sensor.supports(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE)) {
+            if (cfg.auto_white_balance) {
+                applyOption(sensor, RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, 1.0f, label);
+            } else {
+                applyOption(sensor, RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, 0.0f, label);
+                if (cfg.white_balance >= 0) {
+                    applyOption(sensor, RS2_OPTION_WHITE_BALANCE, static_cast<float>(cfg.white_balance), label);
+                }
+            }
+        }
+    }
+}
+
+double FVDepthCameraNode::meanBrightnessOfLatest(bool is_color)
+{
+    rs2::frame f;
+    {
+        std::lock_guard<std::mutex> lk(latest_frame_mutex_);
+        f = is_color ? latest_color_frame_ : latest_depth_frame_;
+    }
+    if (!f) {
+        return -1.0;
+    }
+    const auto vf = f.as<rs2::video_frame>();
+    if (!vf || vf.get_bytes_per_pixel() != 3) {
+        return -1.0;  // only meaningful for 8-bit color images
+    }
+    const cv::Mat img(vf.get_height(), vf.get_width(), CV_8UC3,
+                      const_cast<void*>(vf.get_data()), static_cast<size_t>(vf.get_stride_in_bytes()));
+    return cv::mean(img)[1];  // green channel ≈ luma
+}
+
+void FVDepthCameraNode::scheduleLockBrightnessCheck(bool is_color, double before)
+{
+    if (!is_color || before < 0.0) {
+        return;
+    }
+    // One-shot: compare the image 1.5 s after the lock with the image before
+    // it. A lock that preserved the auto-exposure value keeps the brightness;
+    // a large jump means the device did not report its real AE value.
+    lock_verify_timer_ = this->create_wall_timer(std::chrono::milliseconds(1500), [this, before]() {
+        if (lock_verify_timer_) {
+            lock_verify_timer_->cancel();
+        }
+        const double after = meanBrightnessOfLatest(true);
+        if (after < 0.0) {
+            return;
+        }
+        const double ratio = after / std::max(1.0, before);
+        if (ratio < 0.7 || ratio > 1.4) {
+            RCLCPP_WARN(this->get_logger(),
+                "🔒 color exposure lock changed the image brightness (mean %.1f → %.1f). The device did not "
+                "report its real auto-exposure value on this platform — set color.exposure / color.gain "
+                "explicitly (adjust while watching the camera tile) to lock a known exposure.",
+                before, after);
+        } else {
+            RCLCPP_INFO(this->get_logger(),
+                "🔒 color exposure lock verified: mean brightness %.1f → %.1f", before, after);
+        }
+    });
+}
+
+rcl_interfaces::msg::SetParametersResult FVDepthCameraNode::onParametersSet(
+    const std::vector<rclcpp::Parameter>& params)
+{
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+    bool color_changed = false;
+    bool depth_changed = false;
+    try {
+        for (const auto& p : params) {
+            const std::string& n = p.get_name();
+            if (n == "color.auto_exposure") { color_options_.auto_exposure = p.as_bool(); color_changed = true; }
+            else if (n == "color.exposure") { color_options_.exposure = static_cast<int>(p.as_int()); color_changed = true; }
+            else if (n == "color.gain") { color_options_.gain = static_cast<int>(p.as_int()); color_changed = true; }
+            else if (n == "color.auto_white_balance") { color_options_.auto_white_balance = p.as_bool(); color_changed = true; }
+            else if (n == "color.white_balance") { color_options_.white_balance = static_cast<int>(p.as_int()); color_changed = true; }
+            else if (n == "color.auto_exposure_priority") { color_options_.auto_exposure_priority = static_cast<int>(p.as_int()); color_changed = true; }
+            else if (n == "depth.auto_exposure") { depth_options_.auto_exposure = p.as_bool(); depth_changed = true; }
+            else if (n == "depth.exposure") { depth_options_.exposure = static_cast<int>(p.as_int()); depth_changed = true; }
+            else if (n == "depth.gain") { depth_options_.gain = static_cast<int>(p.as_int()); depth_changed = true; }
+            else if (n == "pointcloud.decimation") {
+                const int v = static_cast<int>(p.as_int());
+                if (v < 1) { result.successful = false; result.reason = "pointcloud.decimation must be >= 1"; return result; }
+                pointcloud_decimation_.store(v);
+            }
+            else if (n == "pointcloud.publish_hz") {
+                const double v = p.as_double();
+                if (v < 0.0) { result.successful = false; result.reason = "pointcloud.publish_hz must be >= 0"; return result; }
+                pointcloud_publish_hz_.store(v);
+            }
+        }
+    } catch (const rclcpp::ParameterTypeException& e) {
+        result.successful = false;
+        result.reason = e.what();
+        return result;
+    }
+    if (sensors_started_) {
+        if (color_changed) applySensorOptions(true);
+        if (depth_changed) applySensorOptions(false);
+    }
+    return result;
 }
 
 cv::Mat FVDepthCameraNode::createDepthColormap(const rs2::frame& depth_frame)
