@@ -1255,8 +1255,7 @@ void FVDepthCameraNode::publishBundle(PublishBundle&& bundle)
     bool published = false;
     if (bundle.color) {
         color_pub_->publish(std::move(bundle.color));
-        color_pub_count_.fetch_add(1, std::memory_order_relaxed);
-        published = true;
+        published = true;               // 件数 color_pub_count_ は queueFramesForPublish が数える (処理した色フレーム)
     }
     if (bundle.color_compressed) {
         color_compressed_pub_->publish(std::move(bundle.color_compressed));
@@ -1634,8 +1633,9 @@ void FVDepthCameraNode::queueFramesForPublish(
         drawHUD(bgr_image);
         
         // 生の Image (720p で 2.7 MB/枚) と JPEG は、それぞれ購読者がいる時だけ作る (2026-10-29)。
-        // 件数 (color_pub_count_) は購読者が居なくても数える: 統計はカメラが生きている事を見ている
-        // (生を出す時は publishBundle が数える。出さない時はここで数える)
+        // 件数 (color_pub_count_) は「処理した色フレーム」としてここだけで数える: 購読者が居なくても・
+        // publish の待ち行列で捨てても数える (統計はカメラが生きている事を見ている。publishBundle では数えない)
+        color_pub_count_.fetch_add(1, std::memory_order_relaxed);
         const bool raw_wanted = color_pub_->get_subscription_count() > 0;
         const bool compressed_wanted = camera_info_config_.enable_compressed_topics && color_compressed_pub_ &&
                                        color_compressed_pub_->get_subscription_count() > 0;
@@ -1664,8 +1664,6 @@ void FVDepthCameraNode::queueFramesForPublish(
         if (raw_wanted) {
             auto color_msg = cv_bridge::CvImage(color_header, "bgr8", bgr_image).toImageMsg();
             bundle.color = std::make_unique<sensor_msgs::msg::Image>(std::move(*color_msg));
-        } else {
-            color_pub_count_.fetch_add(1, std::memory_order_relaxed);
         }
 
         if (cache_latest_frames_enabled_) {
