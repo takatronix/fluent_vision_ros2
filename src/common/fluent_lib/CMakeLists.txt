@@ -106,6 +106,10 @@ if(FL_GST_FOUND)
   target_compile_definitions(hw_jpeg_check PRIVATE FLUENT_HW_JPEG_GST=1)
   target_link_libraries(hw_jpeg_check PkgConfig::FL_GST ${CMAKE_DL_LIBS})
 endif()
+# 道具は使う側と同じく画素ループを最適化して測る (機体の colcon build は build type を付けず、最適化なしだと専用回路の方が重く見える)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(tools/hw_jpeg_check.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+endif()
 install(TARGETS hw_jpeg_check DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY include/
