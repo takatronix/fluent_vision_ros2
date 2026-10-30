@@ -37,6 +37,21 @@ set(REALSENSE2_LIBRARIES "")
 # 方法0: CMake config (正規)。ros-jazzy-librealsense2 は
 # /opt/ros/<distro>/lib/<arch>/cmake/realsense2/ に config を置く
 # (lib 本体も <arch> サブディレクトリ側 — 方法2 の固定パスには載らない)。
+# 同じ版のSDKが ~/.local と /usr/local に共存する機体では、ユーザー側configを
+# 拾うとビルド時と実行時で別librealsenseになり得る。librealsense内蔵FastCDRと
+# ROS 2 FastCDRのABIが衝突し、rmw participant生成時に即死するため、システム側
+# configを先に固定する。明示された realsense2_DIR は尊重する。
+if(NOT realsense2_DIR)
+  foreach(_rs2_config_dir
+      "/opt/ros/$ENV{ROS_DISTRO}/lib/${CMAKE_LIBRARY_ARCHITECTURE}/cmake/realsense2"
+      "/usr/local/lib/cmake/realsense2")
+    if(EXISTS "${_rs2_config_dir}/realsense2Config.cmake")
+      set(realsense2_DIR "${_rs2_config_dir}" CACHE PATH
+          "Preferred RealSense SDK CMake config")
+      break()
+    endif()
+  endforeach()
+endif()
 find_package(realsense2 CONFIG QUIET)
 if(realsense2_FOUND)
   set(REALSENSE2_FOUND TRUE)
@@ -59,7 +74,7 @@ if(NOT REALSENSE2_FOUND AND REALSENSE2_PKG_FOUND)
   set(REALSENSE2_INCLUDE_DIRS ${REALSENSE2_PKG_INCLUDE_DIRS})
   set(REALSENSE2_LIBRARIES ${REALSENSE2_PKG_LIBRARIES})
   message(STATUS "Found RealSense SDK via pkg-config")
-else()
+elseif(NOT REALSENSE2_FOUND)
   # 方法2: 直接ライブラリを検索
   find_library(REALSENSE2_LIB
     NAMES realsense2 librealsense2
@@ -121,6 +136,13 @@ endif()
 # RealSense SDKが見つかった場合のみ続行
 message(STATUS "RealSense SDK found. Building fv_realsense package.")
 find_package(fluent_lib REQUIRED)                     # Fluent Lib (cv_bridge_compat)
+# JPEG の専用回路 (Jetson の NVJPG) は GStreamer 越し (fluent_lib/hw_jpeg.hpp)。無ければ OpenCV だけ
+set(FV_HW_JPEG_GST OFF)
+pkg_check_modules(FV_GST IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
+if(FV_GST_FOUND)
+  set(FV_HW_JPEG_GST ON)
+endif()
+message(STATUS "fv_realsense: hardware JPEG via GStreamer: ${FV_HW_JPEG_GST}")
 find_package(pcl_conversions REQUIRED)                # PCL-ROS2変換
 find_package(pcl_ros REQUIRED)                        # PCL ROS2統合
 find_package(image_transport REQUIRED)                # 画像転送ライブラリ
@@ -155,7 +177,14 @@ endif()
 # ===== 実行ファイル作成 =====
 add_executable(fv_realsense_node
   src/fv_realsense_node.cpp  # メインRealSenseノード
+  src/jpeg_encode.cpp        # JPEG を作る所だけ (下で -O3)
 )
+# JPEG を作る自前の画素ループ (fluent_lib/hw_jpeg.hpp、BGR→I420) のファイルだけ最適化 (-O3、Release と同じ) して組む。機体の colcon build は build type を
+# 付けず、このパッケージは最適化なし (-O0) になる (aspa2・aspa3 2026-10-30。fv_camera で 1080x1920 を作る CPU 19.1 ms、-O3 で 3.4 ms)。
+# パッケージ全体の build type は変えない (fv_camera と同じ)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(src/jpeg_encode.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+endif()
 
 
 
@@ -191,6 +220,10 @@ endif()
 if(GDAL_FOUND)
   target_link_libraries(fv_realsense_node GDAL::GDAL)
 endif()
+if(FV_HW_JPEG_GST)
+  target_compile_definitions(fv_realsense_node PRIVATE FLUENT_HW_JPEG_GST=1)
+  target_link_libraries(fv_realsense_node PkgConfig::FV_GST ${CMAKE_DL_LIBS})
+endif()
 
 # ===== シンプルノードの依存関係リンク（最小限） =====
 
@@ -215,6 +248,11 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}  # インストール先：share/fv_realsense/
 )
 
+install(PROGRAMS
+  scripts/fv-uvcvideo
+  DESTINATION bin
+)
+
 # ヘッダーファイルのインストール
 install(DIRECTORY include/
   DESTINATION include/       # インストール先：include/
@@ -224,6 +262,11 @@ install(DIRECTORY include/
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)                    # 自動リントツール
   ament_lint_auto_find_test_dependencies()                  # テスト依存関係検索
+
+  add_test(
+    NAME test_fv_uvcvideo
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test/test_fv_uvcvideo.sh
+  )
 endif()
 
 # ===== パッケージエクスポート設定 =====

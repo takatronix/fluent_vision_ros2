@@ -32,6 +32,30 @@ fv_realsense:
       depth_colormap_enabled: false
       sync_enabled: true            # 深度・カラー同期有効
     
+    # Exposure / gain / white balance per sensor (color = RGB, depth = stereo
+    # module). auto_exposure: false = fixed-exposure mode; exposure/gain -1
+    # = "lock here": exposure/gain are steered until the image is as bright
+    # as just before the lock (frame rate kept). Explicit values win. Can be
+    # changed at runtime with `ros2 param set`. See README (露出固定モード).
+    color:
+      auto_exposure: true
+      exposure: -1
+      gain: -1
+      auto_white_balance: true
+      white_balance: -1
+      auto_exposure_priority: -1
+    depth:
+      auto_exposure: true
+      exposure: -1
+      gain: -1
+
+    # Point cloud (streams.pointcloud_enabled): computed only while subscribed.
+    pointcloud:
+      min_distance: 0.1
+      max_distance: 3.0
+      decimation: 2        # 1 = every depth pixel, 2 = 1/4 of the points
+      publish_hz: 0.0      # 0 = every frame
+
     # Camera info and compression
     camera_info:
       enable_camera_info: false

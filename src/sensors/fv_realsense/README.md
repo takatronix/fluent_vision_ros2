@@ -62,6 +62,71 @@ ros2 launch fv_realsense fv_realsense_launch.py \
     config_file:=/path/to/custom_config.yaml
 ```
 
+### 4. D405のUSB転送バッファを拡張する
+
+D405のcolorとdepthを同時に30 FPSで使用すると、標準`uvcvideo`のUSB転送要求数ではフレームが欠損する場合があります。
+
+`fv-uvcvideo`は、実行中のカーネルと一致するソースおよびビルドツリーを検証し、`UVC_URBS=32`の任意モジュールを導入します。
+
+Jetson Linux R38.4ではNVIDIA公式ソースを使用します。
+
+通常のUbuntuでは、実行中カーネルと同一バージョンの`linux-headers`および`linux-source`をAPTで自動解決します。
+
+```bash
+sudo fv-uvcvideo install --reload
+fv-uvcvideo status
+```
+
+D405の欠番改善を実機で確認した環境はJetson Linux R38.4です。
+
+通常のUbuntu 24.04では、arm64とx86_64の標準`6.8.0-138-generic`カーネル用モジュールについて、ビルド、互換性検証および導入を確認しています。
+
+これら以外の環境では確認プロンプトを表示し、`y`を選んだ場合だけ厳密なソース、ビルドおよびモジュール互換性検証を実行します。
+
+非対話環境から未検証の構成を試す場合は、`--allow-unsupported`を明示します。
+
+Jetson Linux R38.4以外のL4T（R38.2、R39.xなど）や、`linux-source`のversionが一致しない派生カーネル（`-aws`、`-oem`など）では、実行中カーネルと一致するbuild treeとUVCソースを明示します。
+
+```bash
+sudo fv-uvcvideo install --allow-unsupported \
+    --kernel-build /usr/src/linux-headers-$(uname -r) \
+    --kernel-source /path/to/kernel-source --reload
+```
+
+導入は失敗時に自動で巻き戻ります（退避したoverrideの復元、導入記録の削除、`depmod`）。導入後は`depmod`が本モジュールを選択したことを`modinfo -n`で確認し、別のoverrideが優先される場合はエラーになります。
+
+元のモジュールへ戻す場合は、次を実行します。
+
+```bash
+sudo fv-uvcvideo uninstall --reload
+```
+
+署名強制が有効な環境では、登録済みのUbuntu Machine Owner Keyを使用します。
+
+鍵を明示する場合は、`--signing-key`と`--signing-cert`を同時に指定します。
+
+設計と検証条件は[`docs/design/fv_realsense_d405_streaming.ja.md`](../../../docs/design/fv_realsense_d405_streaming.ja.md)に記載しています。
+
+### 5. DDS socket bufferを設定する
+
+大容量画像をDDSで送受信するホストでは、socket buffer上限を設定します。
+
+```bash
+source <workspace>/install/setup.bash
+sudo "$(command -v setup_dds_receive_buffer.sh)"
+sudo "$(command -v setup_dds_send_buffer.sh)"
+```
+
+CycloneDDSを使うprocessは16 MiBのsend bufferを要求します。
+
+```xml
+<Internal>
+  <SocketSendBufferSize min="16 MiB" max="16 MiB"/>
+</Internal>
+```
+
+設定後にDDS processを再起動します。
+
 ## 設定
 
 `config/default_config.yaml`で以下の設定が可能です：
@@ -72,6 +137,50 @@ ros2 launch fv_realsense fv_realsense_launch.py \
 - **圧縮設定**: JPEG品質、圧縮トピック有効/無効
 - **TF設定**: フレーム名、変換パラメータ
 - **サービス設定**: get_distance/get_camera_info/set_mode
+- **露出 / ゲイン / ホワイトバランス** (`color.*` / `depth.*`、下記)
+- **点群の間引き・レート** (`pointcloud.decimation` / `pointcloud.publish_hz`)
+
+### 露出固定モード (`color.*` / `depth.*`)
+
+センサごと (color = RGB、depth = ステレオモジュール) に自動露出の ON/OFF と固定値を持てます。
+起動時 (yaml) にも、稼働中 (`ros2 param set`) にも効きます。
+
+```yaml
+    color:
+      auto_exposure: true        # false で固定モード
+      exposure: -1               # 固定値 (デバイス単位: D4xx RGB は 1 = 100 µs、ステレオは µs)。-1 = 触らない
+      gain: -1                   # -1 = 触らない
+      auto_white_balance: true
+      white_balance: -1          # Kelvin。-1 = 触らない
+      auto_exposure_priority: -1 # RGB のみ。0 = 暗所でも fps を落とさない / 1 = 露出優先 / -1 = デバイス既定
+    depth:
+      auto_exposure: true
+      exposure: -1
+      gain: -1
+```
+
+- 単位 (2026-10-30 D435i / D405 実測): RGB の `exposure` は **100 µs 単位** (330 = 33 ms = 30 fps の上限。
+  それより大きい値は fps が落ちる: 1000 → 10 fps、3300 → 3 fps)。ステレオモジュール (D405 の color も
+  ここ) は **µs** (33000 = 33 ms)。`gain` はデバイス単位 (RGB 0..128、ステレオ 16..248)。
+- `auto_exposure: false` で `exposure` / `gain` が -1 のときは **「今の明るさのまま固定」** します。
+  自動露出を切った後、画像の平均輝度が固定直前と同じになるまで露出時間 (fps を落とさない上限まで) と
+  ゲインを数ステップで合わせます (約 0.5〜6 秒)。D4xx のファームウェアは自動露出の結果を制御値に
+  書き戻さず、メタデータも既定値しか返さない環境がある (Jetson Thor + D435i RGB で確認) ため、
+  画像そのものを見て合わせる方式にしています。暗い場所で露出・ゲインが上限に張り付いたまま合わせ
+  きれないときは WARN を出します。
+- 固定した値はログ `🔒 color exposure locked: exposure=… gain=… (brightness 目標 → 結果)` に出ます。
+  毎回同じ値で固定したいときは、その数値を `exposure` / `gain` に書きます (明示値はそのまま適用)。
+- 稼働中の切替: `ros2 param set /<node> color.auto_exposure false` (固定) / `true` (自動)。
+- D405 は color と depth が同じイメージャなので `color.*` だけが効き、`depth.*` は無視されます (起動ログに出ます)。
+- 値域はセンサごとに違うので範囲外は clamp して警告します (`rs-enumerate-devices -o` で確認できます)。
+
+### 点群 (`streams.pointcloud_enabled`)
+
+- librealsense の `rs2::pointcloud` で depth → 3D 化し、RGB へのテクスチャ対応付けで色を付けます
+  (RGB と depth が別センサの D415 / D435 系でも色がずれません)。**点群の frame_id は `tf.depth_optical_frame`** です
+  (D405 のように同一イメージャなら color と同じ名前にしてください)。
+- 購読者がいる間だけ計算・配信します。`pointcloud.decimation` (既定 2 = 縦横 1/2 間引き) と
+  `pointcloud.publish_hz` (既定 0 = 毎フレーム) で負荷を抑えられます。
 
 ## トピック
 
@@ -186,6 +295,16 @@ lsusb | grep RealSense
 sudo cat /etc/udev/rules.d/99-realsense-libusb.rules
 ```
 
+### D405のフレームが欠損する
+
+```bash
+fv-uvcvideo status
+```
+
+`Fluent Vision override: installed`と`UVC URBs: 32`が表示されることを確認します。
+
+`install`が「uvcvideoはすでに読み込まれている」と警告した場合は、カメラ利用プロセスを停止して`--reload`付きで再実行するか、OSを再起動します。
+
 ### ビルドエラー
 
 ```bash
@@ -199,4 +318,4 @@ colcon build --packages-select fv_realsense
 
 ## ライセンス
 
-MIT License 
+MIT License
