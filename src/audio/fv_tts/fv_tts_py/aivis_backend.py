@@ -23,6 +23,7 @@
 import http.client
 import io
 import json
+import socket
 import threading
 import time
 import urllib.error
@@ -125,6 +126,13 @@ class AivisBackend:
         return pcm, int(sample_rate), int(channels), int(bit_depth)
 
 
+def _cut(sock) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
 class _DeadlineBackend(AivisBackend):
     """1 文ぶんの期限つきの AivisBackend (別の機械のエンジン用)。接続は connect_s、全体は budget_s まで。転送 (3xx) は追わない。"""
 
@@ -133,32 +141,42 @@ class _DeadlineBackend(AivisBackend):
         self._deadline = time.monotonic() + float(budget_s)
         self._connect_s = float(connect_s)
 
-    def _post(self, path: str, data: bytes, headers: dict) -> bytes:
+    def _request(self, method: str, path: str, data=None, headers=None) -> bytes:
         parts = urllib.parse.urlsplit(self.url)
         cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
         conn = cls(parts.hostname, parts.port, timeout=min(self._connect_s, self._remaining()))
+        watchdog = None
         try:
             conn.connect()
             sock = conn.sock               # conn.sock は答えの終わりで None になる
+            # socket の時間切れは 1 回の読みごとなので、少しずつ届く時 (ヘッダーも) は期限で socket を切る
+            watchdog = threading.Timer(self._remaining(), _cut, args=(sock,))
+            watchdog.daemon = True
+            watchdog.start()
             sock.settimeout(self._remaining())
-            conn.request("POST", parts.path + path, body=data, headers=headers)
+            conn.request(method, parts.path + path, body=data, headers=headers or {})
             resp = conn.getresponse()
             if resp.status != 200:
                 raise AivisError(f"{path.split('?')[0]} HTTP {resp.status} ({self.url})")
             chunks = []
-            while not resp.isclosed():     # socket の時間切れは 1 回の読みごとなので、少しずつ届く時は全体の期限をここで見る
-                sock.settimeout(self._remaining())
-                chunk = resp.read1(65536)   # read は全部そろうまで待つので期限を見られない
+            while not resp.isclosed():
+                chunk = resp.read1(65536)
                 if not chunk:
                     break
                 chunks.append(chunk)
+            self._remaining()              # 切られて途中で終わった答えを成功にしない
             return b"".join(chunks)
         except AivisError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise AivisUnreachable(f"{self.url}: {exc}") from exc
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             conn.close()
+
+    def _post(self, path: str, data: bytes, headers: dict) -> bytes:
+        return self._request("POST", path, data, headers)
 
     def _remaining(self) -> float:
         left = self._deadline - time.monotonic()
@@ -237,8 +255,7 @@ class AivisRouter:
         found = ""
         for url in self.urls:
             try:
-                with urllib.request.urlopen(f"{url}/version", timeout=self._probe_s) as resp:
-                    resp.read()
+                _DeadlineBackend(url, self._probe_s, self._probe_s)._request("GET", "/version")
                 found = url
                 break
             except Exception:  # noqa: BLE001 — 返らなければ次の入口

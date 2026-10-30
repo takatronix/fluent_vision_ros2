@@ -2,6 +2,7 @@
 import importlib.util
 import io
 import json
+import socket
 import sys
 import threading
 import time
@@ -292,3 +293,68 @@ def test_router_local_failure_is_raised(engines):
     router._url = remote
     with pytest.raises(ab.AivisUnreachable):
         router.synthesize("一", 1)
+
+
+def _raw_server(script):
+    """接続ごとに script(conn) を走らせる生の TCP サーバー。"""
+    srv = socket.create_server(("127.0.0.1", 0))
+
+    def run():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=script, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=run, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.getsockname()[1]}"
+
+
+def _dribble(conn):
+    """ヘッダーを少しずつ送り続ける (socket の時間切れにかからない)。"""
+    try:
+        conn.recv(4096)
+        conn.sendall(b"HTTP/1.1 200 OK\r\n")
+        for i in range(200):
+            conn.sendall(f"X-A{i}: 1\r\n".encode())
+            time.sleep(0.03)
+    except OSError:
+        pass
+
+
+def test_router_budget_cuts_trickling_headers(engines):
+    local, _ = engines()
+    srv, remote = _raw_server(_dribble)
+    router, _ran = _router(local, [remote], budget_s=0.2, budget_per_char_s=0.0)
+    router._url = remote
+    t0 = time.monotonic()
+    assert router.synthesize("一", 1)[0]
+    assert time.monotonic() - t0 < 1.0 and router.last_source == "local" and router._url == ""
+    srv.close()
+
+
+def test_router_probe_is_cut_by_its_deadline(engines):
+    """確かめが終わらないと以後の確かめが始まらない: 確かめにも全体の期限。"""
+    local, _ = engines()
+    srv, remote = _raw_server(_dribble)
+    router, _ran = _router(local, [remote], probe_s=0.2)
+    t0 = time.monotonic()
+    router.synthesize("一", 1)
+    assert time.monotonic() - t0 < 1.0 and not router._probing and router._url == ""
+    srv.close()
+
+
+def test_short_answer_cut_by_the_deadline_is_not_success():
+    """期限で切られて途中で終わった答えを、成功の空の音にしない。"""
+    def half(conn):
+        try:
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabc")
+            time.sleep(1.0)
+        except OSError:
+            pass
+    srv, url = _raw_server(half)
+    with pytest.raises(ab.AivisUnreachable):
+        ab._DeadlineBackend(url, 0.2, 0.2)._request("GET", "/version")
+    srv.close()
