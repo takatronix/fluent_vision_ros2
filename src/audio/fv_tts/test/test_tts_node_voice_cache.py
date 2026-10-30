@@ -1140,3 +1140,27 @@ def test_frames_are_addressed_to_the_single_output_only(node):
     node.outputs = 2                                      # 出力が 1 つでない: 宛先なし (どれが鳴らしても unknown)
     node.speak_text("宛先なしの文です。", "", 8.0)
     assert "@to=" not in node.play_pub.frames[-1].header.frame_id
+
+
+def test_route_setting_reaches_the_router_and_keepalive_warms_both(node):
+    """viewer の aivis_route で再起動なしに切り替わる。温めは router の warm (この機械の声の読込も保つ)。"""
+    seen = []
+
+    class Router:
+        def set_enabled(self, on):
+            seen.append(("route", on))
+
+        def warm(self, text, speaker, query):
+            seen.append(("warm", text, speaker))
+
+        def synthesize(self, *a, **k):
+            raise AssertionError("温めは warm で")
+
+    node.vc_backend = Router()
+    node._apply_voice_settings({"aivis_route": "local"})
+    node._apply_voice_settings({"aivis_route": "remote"})
+    node._apply_voice_settings({"aivis_route": "moon"})      # 知らない値は無視
+    assert seen == [("route", False), ("route", True)]
+    node._keepalive_now("試験")
+    node._vc_pool.shutdown(wait=True)
+    assert seen[-1][0] == "warm" and seen[-1][2] == node.vc_speaker

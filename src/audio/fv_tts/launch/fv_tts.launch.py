@@ -27,6 +27,9 @@ def _aivis_url_default() -> str:
 # (2026-10-24)。待つ長さは ASPA_TTS_AIVIS_TIMEOUT。
 _VOICE_CACHE_ARGS = [
     # (launch arg / ROS param, env var, default, type, description)
+    ('aivis_remote_urls', 'ASPA_AIVIS_REMOTE_URLS', '', str,
+     'AivisSpeech Engines on other machines, tried first (comma separated); falls back to aivis_url when '
+     'unreachable or slow ("" = this machine only; the viewer setting aivis_route=local also turns it off)'),
     ('aivis_speaker', 'ASPA_AIVIS_SPEAKER', '1310138977', int,
      'AivisSpeech style id (1310138977 = male (default), 135718976 = female; the viewer overrides it)'),
     ('aivis_speed', 'ASPA_TTS_AIVIS_SPEED', '1.3', float,

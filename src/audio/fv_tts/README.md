@@ -21,6 +21,9 @@
 - `aivis_url`: AivisSpeech Engine の URL。`""` = 未設定 (engine=aivis なら `http://127.0.0.1:10101`)。
   launch の既定値は環境変数 `ASPA_AIVIS_URL` (旧名 `ASPA_VOICEVOX_URL` も読むが、廃止予定のログを出す)。
   **engine=pyopenjtalk でも URL が設定されていれば**、viewer の設定で再起動なしに AivisSpeech へ切り替えられる
+- `aivis_remote_urls`: 先に使う別の機械のエンジン (コンマ区切り、例 `http://100.127.14.64:10101`)。`""` = 使わない。
+  接続 0.25 秒・1 文 約 1 秒の短い期限で試し、届かない・遅い時はその文から `aivis_url` で作り、30 秒〜10 分は裏の確かめ
+  (`/version`) だけで試し直す。viewer の設定 `aivis_route=local` で再起動なしに止まる。両方に同じ話者 (同じ版のモデル) を入れること
 - `aivis_speaker`: スタイル ID。`1310138977` = 男 (既定)、`135718976` = 女。viewer の設定で切り替わる
 - `aivis_speed`: 話す速さ (speedScale、既定 1.3 = 少し速め、0.5〜2.0)。viewer の設定 `aivis_speed` で切り替わる
 - `aivis_timeout_s`: 1 文の合成をここまで待つ (既定 15 秒)。超えたらその発話は飛ばす (合成はそのまま続けて、
