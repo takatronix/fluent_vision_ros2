@@ -35,7 +35,7 @@ from std_msgs.msg import Bool, Empty, String
 from fv_audio.msg import AudioFrame, PlaybackDone
 from fv_tts.srv import Speak
 
-from fv_tts_py.aivis_backend import DEFAULT_URL as AIVIS_DEFAULT_URL, AivisBackend, AivisUnreachable
+from fv_tts_py.aivis_backend import DEFAULT_URL as AIVIS_DEFAULT_URL, AivisBackend, AivisRouter, AivisUnreachable
 from fv_tts_py import voice_cache as vc
 from fv_tts_py.playback_track import PlaybackTracker
 
@@ -184,6 +184,9 @@ class FvTtsNode(Node):
         # engine=pyopenjtalk でも設定されていれば、viewer の設定 (tts_engine=aivis)
         # で再起動なしに AivisSpeech へ切り替えられるよう準備しておく。
         self.declare_parameter("aivis_url", "")
+        # 先に使う別の機械のエンジン (コンマ区切り、順に確かめる)。届かない・遅い時は aivis_url へ自動で戻す。"" = 使わない。
+        # viewer の設定 aivis_route=local で再起動なしに止められる
+        self.declare_parameter("aivis_remote_urls", "")
         self.declare_parameter("aivis_speaker", AIVIS_MALE)  # 男 (既定)。女は 135718976
         # 話す速さ (AivisSpeech の speedScale)。viewer の設定 aivis_speed で変わる
         self.declare_parameter("aivis_speed", AIVIS_DEFAULT_SPEED)
@@ -388,6 +391,10 @@ class FvTtsNode(Node):
         url = self.aivis_url or AIVIS_DEFAULT_URL
         self.vc_backend = AivisBackend(
             url, timeout=float(self.get_parameter("voice_cache_timeout_s").value))
+        remote = [u for u in str(self.get_parameter("aivis_remote_urls").value or "").split(",") if u.strip()]
+        if remote:
+            self.vc_backend = AivisRouter(self.vc_backend, remote, log=lambda m: self.get_logger().info(m))
+            self.get_logger().info(f"AivisSpeech: 先に {', '.join(remote)} を使い、だめなら {url} へ戻す")
         max_mb = int(self.get_parameter("voice_cache_max_mb").value)
         cache_dir = str(self.get_parameter("voice_cache_dir").value)
         self.voice_store = vc.VoiceCacheStore(cache_dir, max_mb * 1024 * 1024)
@@ -514,7 +521,11 @@ class FvTtsNode(Node):
         def run() -> None:
             t0 = time.monotonic()
             try:
-                self._render_voice("", KEEPALIVE_TEXT, None, job)
+                warm = getattr(self.vc_backend, "warm", None)
+                if warm is not None:
+                    warm(KEEPALIVE_TEXT, job["speaker"], job["query"])
+                else:
+                    self._render_voice("", KEEPALIVE_TEXT, None, job)
             except Exception as exc:  # pylint: disable=broad-except
                 self.get_logger().warn(f"AivisSpeech の温め ({why}) に失敗: {exc}")
                 return
@@ -742,7 +753,8 @@ class FvTtsNode(Node):
 
     def _apply_voice_settings(self, obj: Dict) -> None:
         """viewer の設定: tts_engine (aivis|openai → AivisSpeech、pyopenjtalk → Open JTalk)、
-        aivis_speaker で男/女、aivis_speed で速さ。選択は AivisSpeech の準備ができていなくても保つ。"""
+        aivis_speaker で男/女、aivis_speed で速さ、aivis_route (remote|local) で声を作る場所。
+        選択は AivisSpeech の準備ができていなくても保つ。"""
         engine = str(obj.get("tts_engine", "") or "").strip().lower()
         switched = False
         if engine:
@@ -758,6 +770,10 @@ class FvTtsNode(Node):
                     "(aivis_url 未設定か準備に失敗)。アナウンスは読み上げできません (別の声では喋りません)")
         if self.voice_store is None:
             return
+        route = str(obj.get("aivis_route", "") or "").strip().lower()
+        set_route = getattr(self.vc_backend, "set_enabled", None)
+        if route in ("remote", "local") and set_route is not None:
+            set_route(route == "remote")
         changed = False
         with self._cfg_lock:
             if "aivis_speed" in obj:

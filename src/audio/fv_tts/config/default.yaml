@@ -6,6 +6,8 @@ fv_tts:
     engine: "pyopenjtalk"
     # AivisSpeech Engine の URL。"" = 未設定 (engine=aivis なら http://127.0.0.1:10101)
     aivis_url: ""
+    # 先に使う別の機械のエンジン (コンマ区切り)。届かない・遅い時は aivis_url へ自動で戻す。"" = 使わない
+    aivis_remote_urls: ""
     aivis_speaker: 1310138977      # 男 (女は 135718976)。viewer の設定で切り替わる
     aivis_speed: 1.3               # 少し速め (speedScale)。viewer の設定 aivis_speed で切り替わる
     aivis_timeout_s: 15.0          # 1 文の合成をここまで待つ。超えたら飛ばす
