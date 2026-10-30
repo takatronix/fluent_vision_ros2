@@ -521,7 +521,7 @@ class FvTtsNode(Node):
         def run() -> None:
             t0 = time.monotonic()
             try:
-                warm = getattr(self.vc_backend, "warm", None)
+                warm = getattr(getattr(self, "vc_backend", None), "warm", None)
                 if warm is not None:
                     warm(KEEPALIVE_TEXT, job["speaker"], job["query"])
                 else:
@@ -771,7 +771,7 @@ class FvTtsNode(Node):
         if self.voice_store is None:
             return
         route = str(obj.get("aivis_route", "") or "").strip().lower()
-        set_route = getattr(self.vc_backend, "set_enabled", None)
+        set_route = getattr(getattr(self, "vc_backend", None), "set_enabled", None)
         if route in ("remote", "local") and set_route is not None:
             set_route(route == "remote")
         changed = False
