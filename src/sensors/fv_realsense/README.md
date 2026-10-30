@@ -162,14 +162,14 @@ CycloneDDSを使うprocessは16 MiBのsend bufferを要求します。
 - 単位 (2026-10-30 D435i / D405 実測): RGB の `exposure` は **100 µs 単位** (330 = 33 ms = 30 fps の上限。
   それより大きい値は fps が落ちる: 1000 → 10 fps、3300 → 3 fps)。ステレオモジュール (D405 の color も
   ここ) は **µs** (33000 = 33 ms)。`gain` はデバイス単位 (RGB 0..128、ステレオ 16..248)。
-- `auto_exposure: false` で `exposure` / `gain` が -1 のときは、直前フレームのメタデータ
-  (ACTUAL_EXPOSURE / GAIN_LEVEL) から**その時点の自動露出の値を取って固定**しようとします。
-  ただし D4xx のファームウェアは自動露出の結果を制御値に書き戻さず、プラットフォームによっては
-  メタデータも既定値しか返しません (Jetson Thor + D435i RGB で確認: 166/64 固定、D405 は gain が 0)。
-  そのためロック後 1.5 秒で画像の平均輝度を比較し、**30 % 以上変わったら WARN** を出します
-  (`🔒 color exposure lock changed the image brightness …`)。この WARN が出る環境では
-  `exposure` / `gain` を明示してください (タイルを見ながら `ros2 param set` で合わせ、yaml に書く)。
-  固定した値はログ `🔒 color exposure locked: exposure=… gain=…` に出ます。
+- `auto_exposure: false` で `exposure` / `gain` が -1 のときは **「今の明るさのまま固定」** します。
+  自動露出を切った後、画像の平均輝度が固定直前と同じになるまで露出時間 (fps を落とさない上限まで) と
+  ゲインを数ステップで合わせます (約 0.5〜6 秒)。D4xx のファームウェアは自動露出の結果を制御値に
+  書き戻さず、メタデータも既定値しか返さない環境がある (Jetson Thor + D435i RGB で確認) ため、
+  画像そのものを見て合わせる方式にしています。暗い場所で露出・ゲインが上限に張り付いたまま合わせ
+  きれないときは WARN を出します。
+- 固定した値はログ `🔒 color exposure locked: exposure=… gain=… (brightness 目標 → 結果)` に出ます。
+  毎回同じ値で固定したいときは、その数値を `exposure` / `gain` に書きます (明示値はそのまま適用)。
 - 稼働中の切替: `ros2 param set /<node> color.auto_exposure false` (固定) / `true` (自動)。
 - D405 は color と depth が同じイメージャなので `color.*` だけが効き、`depth.*` は無視されます (起動ログに出ます)。
 - 値域はセンサごとに違うので範囲外は clamp して警告します (`rs-enumerate-devices -o` で確認できます)。

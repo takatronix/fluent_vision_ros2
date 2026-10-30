@@ -376,8 +376,30 @@ private:
     bool applyOption(rs2::sensor& sensor, rs2_option opt, float value, const char* label);
     void applySensorOptions(bool is_color);
     double meanBrightnessOfLatest(bool is_color);
-    void scheduleLockBrightnessCheck(bool is_color, double before);
-    rclcpp::TimerBase::SharedPtr lock_verify_timer_;
+    // Brightness-matched exposure lock: after auto-exposure is switched off,
+    // steer exposure/gain (exposure first, capped to keep the frame rate) until
+    // the image is as bright as it was just before the lock. Needed because the
+    // D4xx firmware does not hand the auto-exposure result back to the controls
+    // and frame metadata often reports the stored value instead.
+    struct LockMatchState
+    {
+        bool active = false;
+        double target = -1.0;
+        double start = -1.0;
+        int step = 0;
+        int settle = 0;   // ticks to wait after a change before measuring again
+        float exposure = 0.0f;
+        float gain = 0.0f;
+        float exp_min = 1.0f;
+        float exp_max = 1.0f;
+        float gain_min = 0.0f;
+        float gain_max = 0.0f;
+    };
+    LockMatchState lock_match_;
+    rclcpp::TimerBase::SharedPtr lock_match_timer_;
+    void startBrightnessMatchedLock(double target);
+    void lockMatchStep();
+    void cancelBrightnessMatchedLock();
     rcl_interfaces::msg::SetParametersResult onParametersSet(const std::vector<rclcpp::Parameter>& params);
     bool initializeRealSense();
     bool selectCamera();

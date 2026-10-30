@@ -34,7 +34,8 @@ fv_realsense:
     
     # Exposure / gain / white balance per sensor (color = RGB, depth = stereo
     # module). auto_exposure: false = fixed-exposure mode; exposure/gain -1
-    # = keep the value auto-exposure last settled on ("lock here"). Can be
+    # = "lock here": exposure/gain are steered until the image is as bright
+    # as just before the lock (frame rate kept). Explicit values win. Can be
     # changed at runtime with `ros2 param set`. See README (露出固定モード).
     color:
       auto_exposure: true

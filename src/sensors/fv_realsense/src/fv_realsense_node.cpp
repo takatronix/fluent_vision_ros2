@@ -2155,73 +2155,39 @@ void FVDepthCameraNode::applySensorOptions(bool is_color)
         return;
     }
     if (cfg.auto_exposure) {
+        if (is_color) cancelBrightnessMatchedLock();
         applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.0f, label);
+    } else if (cfg.exposure < 0 && cfg.gain < 0 && is_color) {
+        // "Lock here": keep the look auto-exposure has right now. The current
+        // brightness is the target; exposure/gain are steered to it after AE
+        // is switched off (see startBrightnessMatchedLock).
+        const double target = meanBrightnessOfLatest(true);
+        if (target < 0.0) {
+            applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0.0f, label);
+            RCLCPP_WARN(this->get_logger(),
+                "🔒 %s: no color frame yet — auto-exposure is OFF at the device's stored "
+                "exposure/gain. Lock again once the image is live, or set %s.exposure / %s.gain.",
+                label, label, label);
+        } else {
+            startBrightnessMatchedLock(target);
+        }
     } else {
-        // "Lock here": with exposure/gain = -1 we freeze the sensor at what
-        // auto-exposure is using *right now*. The D4xx firmware does NOT
-        // copy the AE result into the exposure/gain controls (disabling AE
-        // leaves them at their defaults — observed 2026-10-30: 166/64 on the
-        // D435i RGB, 33000/16 on the D405), so the current values have to
-        // come from the last frame's metadata (ACTUAL_EXPOSURE / GAIN_LEVEL,
-        // same units as the controls). Explicit parameter values win.
-        float lock_exposure = cfg.exposure >= 0 ? static_cast<float>(cfg.exposure) : -1.0f;
-        float lock_gain = cfg.gain >= 0 ? static_cast<float>(cfg.gain) : -1.0f;
-        const char* source = "from parameters";
-        // Brightness before the lock — verified against the image 1.5 s later
-        // so a lock that silently changed the exposure is reported, not hidden.
-        const double brightness_before = is_color ? meanBrightnessOfLatest(true) : -1.0;
-        if (lock_exposure < 0.0f || lock_gain < 0.0f) {
-            rs2::frame f;
-            {
-                std::lock_guard<std::mutex> lk(latest_frame_mutex_);
-                f = is_color ? latest_color_frame_ : latest_depth_frame_;
-            }
-            float meta_exposure = -1.0f;
-            float meta_gain = -1.0f;
-            if (f) {
-                try {
-                    if (f.supports_frame_metadata(RS2_FRAME_METADATA_ACTUAL_EXPOSURE)) {
-                        meta_exposure = static_cast<float>(f.get_frame_metadata(RS2_FRAME_METADATA_ACTUAL_EXPOSURE));
-                    }
-                    if (f.supports_frame_metadata(RS2_FRAME_METADATA_GAIN_LEVEL)) {
-                        meta_gain = static_cast<float>(f.get_frame_metadata(RS2_FRAME_METADATA_GAIN_LEVEL));
-                    }
-                } catch (const rs2::error& e) {
-                    RCLCPP_WARN(this->get_logger(), "🎛️ %s: frame metadata read failed: %s", label, e.what());
-                }
-            }
-            if (lock_exposure < 0.0f) lock_exposure = meta_exposure;
-            if (lock_gain < 0.0f) lock_gain = meta_gain;
-            if (meta_exposure >= 0.0f || meta_gain >= 0.0f) {
-                source = "held at the current auto-exposure value (frame metadata)";
-            } else {
-                // Fail loud: no frame yet (startup) or no UVC metadata on this
-                // platform. The sensor is still switched to manual, but at the
-                // device's stored value — give exposure/gain explicitly.
-                RCLCPP_WARN(this->get_logger(),
-                    "🎛️ %s: cannot read the current auto-exposure value (%s) — "
-                    "auto-exposure is OFF at the device's stored exposure/gain. "
-                    "Set %s.exposure / %s.gain explicitly to lock a known value.",
-                    label, f ? "frame metadata unsupported" : "no frame received yet", label, label);
-                source = "device stored value (current AE value unavailable)";
-            }
-        }
+        if (is_color) cancelBrightnessMatchedLock();
         applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0.0f, label);
-        if (lock_exposure >= 0.0f) {
-            applyOption(sensor, RS2_OPTION_EXPOSURE, lock_exposure, label);
+        if (cfg.exposure >= 0) {
+            applyOption(sensor, RS2_OPTION_EXPOSURE, static_cast<float>(cfg.exposure), label);
         }
-        if (lock_gain >= 0.0f) {
-            applyOption(sensor, RS2_OPTION_GAIN, lock_gain, label);
+        if (cfg.gain >= 0) {
+            applyOption(sensor, RS2_OPTION_GAIN, static_cast<float>(cfg.gain), label);
         }
         try {
             const float e = sensor.supports(RS2_OPTION_EXPOSURE) ? sensor.get_option(RS2_OPTION_EXPOSURE) : -1.0f;
             const float g = sensor.supports(RS2_OPTION_GAIN) ? sensor.get_option(RS2_OPTION_GAIN) : -1.0f;
-            RCLCPP_INFO(this->get_logger(), "🔒 %s exposure locked: exposure=%g gain=%g (%s)",
-                label, e, g, source);
+            RCLCPP_INFO(this->get_logger(), "🔒 %s exposure locked: exposure=%g gain=%g (from parameters)",
+                label, e, g);
         } catch (const rs2::error& e) {
             RCLCPP_WARN(this->get_logger(), "🎛️ %s: could not read back exposure/gain: %s", label, e.what());
         }
-        scheduleLockBrightnessCheck(is_color, brightness_before);
     }
     if (is_color) {
         if (cfg.auto_exposure_priority >= 0 && sensor.supports(RS2_OPTION_AUTO_EXPOSURE_PRIORITY)) {
@@ -2260,34 +2226,159 @@ double FVDepthCameraNode::meanBrightnessOfLatest(bool is_color)
     return cv::mean(img)[1];  // green channel ≈ luma
 }
 
-void FVDepthCameraNode::scheduleLockBrightnessCheck(bool is_color, double before)
+void FVDepthCameraNode::cancelBrightnessMatchedLock()
 {
-    if (!is_color || before < 0.0) {
+    if (lock_match_timer_) {
+        lock_match_timer_->cancel();
+        lock_match_timer_.reset();
+    }
+    lock_match_.active = false;
+}
+
+void FVDepthCameraNode::startBrightnessMatchedLock(double target)
+{
+    cancelBrightnessMatchedLock();
+    rs2::sensor& sensor = color_sensor_;
+    if (!sensor || !sensor.supports(RS2_OPTION_EXPOSURE) || !sensor.supports(RS2_OPTION_GAIN)) {
+        applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0.0f, "color");
+        RCLCPP_WARN(this->get_logger(), "🔒 color: exposure/gain not controllable — auto-exposure OFF only");
         return;
     }
-    // One-shot: compare the image 1.5 s after the lock with the image before
-    // it. A lock that preserved the auto-exposure value keeps the brightness;
-    // a large jump means the device did not report its real AE value.
-    lock_verify_timer_ = this->create_wall_timer(std::chrono::milliseconds(1500), [this, before]() {
-        if (lock_verify_timer_) {
-            lock_verify_timer_->cancel();
+    LockMatchState st;
+    st.active = true;
+    st.target = target;
+    try {
+        const auto er = sensor.get_option_range(RS2_OPTION_EXPOSURE);
+        const auto gr = sensor.get_option_range(RS2_OPTION_GAIN);
+        // Exposure units differ per sensor: the D4xx RGB module counts 100 µs,
+        // the stereo module (D405 color) counts µs. Cap the exposure to 95 % of
+        // the frame period so the lock never lowers the frame rate.
+        const std::string sname = sensor.get_info(RS2_CAMERA_INFO_NAME);
+        const double unit_us = (sname.find("RGB") != std::string::npos) ? 100.0 : 1.0;
+        const double fps = std::max(1, camera_config_.color_fps);
+        const float fps_cap = static_cast<float>(0.95 * (1e6 / fps) / unit_us);
+        st.exp_min = er.min;
+        st.exp_max = std::max(er.min, std::min(er.max, fps_cap));
+        st.gain_min = gr.min;
+        st.gain_max = gr.max;
+        // Start from what the frame metadata claims AE is using (right on some
+        // platforms), else from the stored controls; the loop corrects either.
+        float e0 = -1.0f, g0 = -1.0f;
+        rs2::frame f;
+        {
+            std::lock_guard<std::mutex> lk(latest_frame_mutex_);
+            f = latest_color_frame_;
         }
-        const double after = meanBrightnessOfLatest(true);
-        if (after < 0.0) {
-            return;
+        if (f) {
+            if (f.supports_frame_metadata(RS2_FRAME_METADATA_ACTUAL_EXPOSURE)) {
+                e0 = static_cast<float>(f.get_frame_metadata(RS2_FRAME_METADATA_ACTUAL_EXPOSURE));
+            }
+            if (f.supports_frame_metadata(RS2_FRAME_METADATA_GAIN_LEVEL)) {
+                g0 = static_cast<float>(f.get_frame_metadata(RS2_FRAME_METADATA_GAIN_LEVEL));
+            }
         }
-        const double ratio = after / std::max(1.0, before);
-        if (ratio < 0.7 || ratio > 1.4) {
-            RCLCPP_WARN(this->get_logger(),
-                "🔒 color exposure lock changed the image brightness (mean %.1f → %.1f). The device did not "
-                "report its real auto-exposure value on this platform — set color.exposure / color.gain "
-                "explicitly (adjust while watching the camera tile) to lock a known exposure.",
-                before, after);
-        } else {
+        if (!(e0 > 0.0f)) e0 = sensor.get_option(RS2_OPTION_EXPOSURE);
+        if (!(g0 >= gr.min && g0 <= gr.max)) g0 = sensor.get_option(RS2_OPTION_GAIN);
+        st.exposure = std::min(std::max(e0, st.exp_min), st.exp_max);
+        st.gain = std::min(std::max(g0, st.gain_min), st.gain_max);
+    } catch (const rs2::error& e) {
+        RCLCPP_WARN(this->get_logger(), "🔒 color: cannot read exposure/gain ranges: %s", e.what());
+        applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0.0f, "color");
+        return;
+    }
+    applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 0.0f, "color");
+    applyOption(sensor, RS2_OPTION_EXPOSURE, st.exposure, "color");
+    applyOption(sensor, RS2_OPTION_GAIN, st.gain, "color");
+    st.start = target;
+    lock_match_ = st;
+    RCLCPP_INFO(this->get_logger(),
+        "🔒 color exposure lock: matching the current brightness %.1f (start exposure=%g gain=%g, "
+        "exposure ≤ %g to keep %d fps)", target, st.exposure, st.gain, st.exp_max, camera_config_.color_fps);
+    lock_match_timer_ = this->create_wall_timer(std::chrono::milliseconds(250),
+        std::bind(&FVDepthCameraNode::lockMatchStep, this));
+}
+
+void FVDepthCameraNode::lockMatchStep()
+{
+    LockMatchState& st = lock_match_;
+    if (!st.active) {
+        return;
+    }
+    // The RGB module needs a few hundred ms (USB control round-trip + a few
+    // frames) before a new exposure/gain shows in the image, so measure only
+    // after the previous change had time to land.
+    if (st.settle > 0) {
+        st.settle--;
+        return;
+    }
+    const double b = meanBrightnessOfLatest(true);
+    if (b < 0.0) {
+        return;
+    }
+    st.step++;
+    const double ratio = st.target / std::max(1.0, b);
+    const bool done = std::fabs(ratio - 1.0) <= 0.10;
+    const int kMaxSteps = 12;  // ≥ 500 ms each → ~6 s
+    if (done || st.step > kMaxSteps) {
+        cancelBrightnessMatchedLock();
+        if (done) {
             RCLCPP_INFO(this->get_logger(),
-                "🔒 color exposure lock verified: mean brightness %.1f → %.1f", before, after);
+                "🔒 color exposure locked: exposure=%g gain=%g (brightness %.1f → %.1f, %d steps)",
+                st.exposure, st.gain, st.target, b, st.step);
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                "🔒 color exposure locked but brightness not matched: exposure=%g gain=%g "
+                "(target %.1f, now %.1f; limits exposure %g..%g gain %g..%g). Adjust the light or set "
+                "color.exposure / color.gain.",
+                st.exposure, st.gain, st.target, b, st.exp_min, st.exp_max, st.gain_min, st.gain_max);
         }
-    });
+        return;
+    }
+    // One step toward the target, at most 4x per step. Steer with the exposure
+    // time (brightness is linear in it) and keep the starting gain; the gain
+    // only moves when the exposure is pinned — at the frame-rate cap (too dark)
+    // or at its minimum (too bright). The D4xx RGB gain is not linear, which
+    // made a gain-first loop stall short of the target.
+    const double r = std::min(4.0, std::max(0.25, ratio));
+    float e = st.exposure;
+    float g = st.gain;
+    const double want_e = static_cast<double>(e) * r;
+    if (want_e > st.exp_max) {
+        e = st.exp_max;
+        g = static_cast<float>(std::min<double>(st.gain_max,
+            std::max<double>(g, st.gain_min + 1.0f) * (want_e / std::max(1e-3f, st.exp_max))));
+    } else if (want_e < st.exp_min) {
+        e = st.exp_min;
+        g = static_cast<float>(std::max<double>(st.gain_min, g * (want_e / std::max(1e-3f, st.exp_min))));
+    } else {
+        e = static_cast<float>(want_e);
+    }
+    e = std::min(std::max(std::round(e), st.exp_min), st.exp_max);
+    g = std::min(std::max(std::round(g), st.gain_min), st.gain_max);
+    if (e == st.exposure && g == st.gain) {
+        // Pinned at a limit (dark scene: longest exposure that keeps the frame
+        // rate + max gain; or the reverse). This is also where auto-exposure
+        // itself sits in that light, so it is a valid lock — report it as such.
+        cancelBrightnessMatchedLock();
+        if (std::fabs(ratio - 1.0) <= 0.25) {
+            RCLCPP_INFO(this->get_logger(),
+                "🔒 color exposure locked at the %s limit: exposure=%g gain=%g (brightness %.1f → %.1f)",
+                ratio > 1.0 ? "bright" : "dark", st.exposure, st.gain, st.target, b);
+        } else {
+            RCLCPP_WARN(this->get_logger(),
+                "🔒 color exposure locked at the %s limit: exposure=%g gain=%g but the image is %s "
+                "(target %.1f, now %.1f). Change the lighting or set color.exposure / color.gain.",
+                ratio > 1.0 ? "bright" : "dark", st.exposure, st.gain,
+                ratio > 1.0 ? "darker than before the lock" : "brighter than before the lock", st.target, b);
+        }
+        return;
+    }
+    rs2::sensor& sensor = color_sensor_;
+    if (e != st.exposure) applyOption(sensor, RS2_OPTION_EXPOSURE, e, "color");
+    if (g != st.gain) applyOption(sensor, RS2_OPTION_GAIN, g, "color");
+    st.exposure = e;
+    st.gain = g;
+    st.settle = 1;
 }
 
 rcl_interfaces::msg::SetParametersResult FVDepthCameraNode::onParametersSet(
