@@ -165,8 +165,12 @@ class _DeadlineBackend(AivisBackend):
                     break
                 chunks.append(chunk)
             self._remaining()              # 切られて途中で終わった答えを成功にしない
-            return b"".join(chunks)
-        except AivisError:
+            data = b"".join(chunks)
+            want = resp.getheader("Content-Length")
+            if want is not None and want.isdigit() and int(want) != len(data):
+                raise AivisUnreachable(f"{self.url}: 答えが途中で切れた ({len(data)}/{want})")
+            return data
+        except AivisError:         # AivisUnreachable も
             raise
         except Exception as exc:  # noqa: BLE001
             raise AivisUnreachable(f"{self.url}: {exc}") from exc

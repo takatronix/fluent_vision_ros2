@@ -358,3 +358,28 @@ def test_short_answer_cut_by_the_deadline_is_not_success():
     with pytest.raises(ab.AivisUnreachable):
         ab._DeadlineBackend(url, 0.2, 0.2)._request("GET", "/version")
     srv.close()
+
+
+def test_truncated_answer_falls_back_instead_of_playing_half(engines):
+    """Content-Length に足りないまま切れた答え (回線断): 欠けた声を鳴らさず、この機械で作り直す。"""
+    wav = _wav()
+
+    def cut(conn):
+        try:
+            req = conn.recv(4096)
+            if req.startswith(b"POST /audio_query"):
+                body = b"{}"
+            else:
+                body = wav
+            head = f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            conn.sendall(head + body[:100])
+        finally:
+            conn.close()
+
+    local, lcalls = engines()
+    srv, remote = _raw_server(cut)
+    router, _ran = _router(local, [remote])
+    router._url = remote
+    pcm, *_ = router.synthesize("一", 1)
+    assert len(pcm) == 882 and router.last_source == "local" and len(_posts(lcalls)) == 1
+    srv.close()
