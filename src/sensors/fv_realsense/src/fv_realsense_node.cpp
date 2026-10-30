@@ -2157,6 +2157,21 @@ void FVDepthCameraNode::applySensorOptions(bool is_color)
     if (cfg.auto_exposure) {
         if (is_color) cancelBrightnessMatchedLock();
         applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.0f, label);
+        // Restore the gain. On the D4xx RGB module auto-exposure only drives the
+        // exposure time; the gain stays at whatever was last set by hand and the
+        // device keeps it across node restarts. A gain left at max by a lock made
+        // "auto" come back washed out. Explicit gain wins; otherwise the sensor's
+        // default (nominal) gain.
+        if (sensor.supports(RS2_OPTION_GAIN)) {
+            try {
+                const float g = cfg.gain >= 0 ? static_cast<float>(cfg.gain)
+                                              : sensor.get_option_range(RS2_OPTION_GAIN).def;
+                applyOption(sensor, RS2_OPTION_GAIN, g, label);
+                RCLCPP_INFO(this->get_logger(), "🔓 %s auto-exposure ON (gain=%g)", label, g);
+            } catch (const rs2::error& e) {
+                RCLCPP_WARN(this->get_logger(), "🎛️ %s: could not restore gain: %s", label, e.what());
+            }
+        }
     } else if (cfg.exposure < 0 && cfg.gain < 0 && is_color) {
         // "Lock here": keep the look auto-exposure has right now. The current
         // brightness is the target; exposure/gain are steered to it after AE
@@ -2278,7 +2293,13 @@ void FVDepthCameraNode::startBrightnessMatchedLock(double target)
             }
         }
         if (!(e0 > 0.0f)) e0 = sensor.get_option(RS2_OPTION_EXPOSURE);
-        if (!(g0 >= gr.min && g0 <= gr.max)) g0 = sensor.get_option(RS2_OPTION_GAIN);
+        // Start from the sensor's default (nominal) gain, not the metadata /
+        // stored gain: on the D435i RGB those report the stored maximum (128),
+        // and steering only the exposure from there locked bright scenes at
+        // max gain + a very short exposure (noisy). Exposure is steered first;
+        // the gain moves only when the exposure is pinned.
+        (void)g0;
+        g0 = gr.def;
         st.exposure = std::min(std::max(e0, st.exp_min), st.exp_max);
         st.gain = std::min(std::max(g0, st.gain_min), st.gain_max);
     } catch (const rs2::error& e) {
@@ -2363,12 +2384,12 @@ void FVDepthCameraNode::lockMatchStep()
         if (std::fabs(ratio - 1.0) <= 0.25) {
             RCLCPP_INFO(this->get_logger(),
                 "🔒 color exposure locked at the %s limit: exposure=%g gain=%g (brightness %.1f → %.1f)",
-                ratio > 1.0 ? "bright" : "dark", st.exposure, st.gain, st.target, b);
+                ratio > 1.0 ? "max (dark scene)" : "min (bright scene)", st.exposure, st.gain, st.target, b);
         } else {
             RCLCPP_WARN(this->get_logger(),
                 "🔒 color exposure locked at the %s limit: exposure=%g gain=%g but the image is %s "
                 "(target %.1f, now %.1f). Change the lighting or set color.exposure / color.gain.",
-                ratio > 1.0 ? "bright" : "dark", st.exposure, st.gain,
+                ratio > 1.0 ? "max (dark scene)" : "min (bright scene)", st.exposure, st.gain,
                 ratio > 1.0 ? "darker than before the lock" : "brighter than before the lock", st.target, b);
         }
         return;
