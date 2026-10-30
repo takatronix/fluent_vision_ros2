@@ -148,7 +148,7 @@ class _DeadlineBackend(AivisBackend):
             chunks = []
             while not resp.isclosed():     # socket の時間切れは 1 回の読みごとなので、少しずつ届く時は全体の期限をここで見る
                 sock.settimeout(self._remaining())
-                chunk = resp.read(65536)
+                chunk = resp.read1(65536)   # read は全部そろうまで待つので期限を見られない
                 if not chunk:
                     break
                 chunks.append(chunk)
