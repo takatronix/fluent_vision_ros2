@@ -2156,21 +2156,35 @@ void FVDepthCameraNode::applySensorOptions(bool is_color)
     }
     if (cfg.auto_exposure) {
         if (is_color) cancelBrightnessMatchedLock();
-        applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.0f, label);
-        // Restore the gain. On the D4xx RGB module auto-exposure only drives the
-        // exposure time; the gain stays at whatever was last set by hand and the
-        // device keeps it across node restarts. A gain left at max by a lock made
-        // "auto" come back washed out. Explicit gain wins; otherwise the sensor's
-        // default (nominal) gain.
+        // Restore the gain FIRST, then enable auto-exposure. On the D4xx RGB
+        // module auto-exposure only drives the exposure time and the gain stays
+        // at whatever was last set by hand (kept by the device across node
+        // restarts), so a gain left at max made "auto" come back washed out.
+        // On the stereo module (D405 color, D4xx depth) writing GAIN/EXPOSURE
+        // switches auto-exposure OFF, so the gain must be written before AE is
+        // turned on — the reverse order left the D405 in manual at a stored
+        // 2 µs exposure (black image) while the parameter said auto.
+        // Explicit gain wins; otherwise the sensor's default (nominal) gain.
+        float restored_gain = -1.0f;
         if (sensor.supports(RS2_OPTION_GAIN)) {
             try {
-                const float g = cfg.gain >= 0 ? static_cast<float>(cfg.gain)
+                restored_gain = cfg.gain >= 0 ? static_cast<float>(cfg.gain)
                                               : sensor.get_option_range(RS2_OPTION_GAIN).def;
-                applyOption(sensor, RS2_OPTION_GAIN, g, label);
-                RCLCPP_INFO(this->get_logger(), "🔓 %s auto-exposure ON (gain=%g)", label, g);
+                applyOption(sensor, RS2_OPTION_GAIN, restored_gain, label);
             } catch (const rs2::error& e) {
                 RCLCPP_WARN(this->get_logger(), "🎛️ %s: could not restore gain: %s", label, e.what());
             }
+        }
+        applyOption(sensor, RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.0f, label);
+        try {
+            const float ae = sensor.get_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE);
+            if (ae < 0.5f) {
+                RCLCPP_ERROR(this->get_logger(), "🔓 %s: auto-exposure did not turn on (device reports %g)", label, ae);
+            } else {
+                RCLCPP_INFO(this->get_logger(), "🔓 %s auto-exposure ON (gain=%g)", label, restored_gain);
+            }
+        } catch (const rs2::error& e) {
+            RCLCPP_WARN(this->get_logger(), "🎛️ %s: could not read back auto-exposure: %s", label, e.what());
         }
     } else if (cfg.exposure < 0 && cfg.gain < 0 && is_color) {
         // "Lock here": keep the look auto-exposure has right now. The current
