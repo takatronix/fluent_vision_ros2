@@ -8,6 +8,7 @@
  */
 
 #include "fv_realsense/fv_realsense_node.hpp"
+#include "fv_realsense/jpeg_encode.hpp"
 #include "fv_realsense/srv/get_distance.hpp"
 #include "fv_realsense/srv/get_camera_info.hpp"
 #include "fv_realsense/srv/set_mode.hpp"
@@ -1664,7 +1665,8 @@ void FVDepthCameraNode::queueFramesForPublish(
             auto compressed_msg = std::make_unique<sensor_msgs::msg::CompressedImage>();
             compressed_msg->header = color_header;
             compressed_msg->format = "jpeg";
-            if (jpeg_encoder_->encode(bgr_image, camera_info_config_.compressed_quality, compressed_msg->data)) {
+            // 作るのは最適化して組む別のファイル (jpeg_encode.cpp) で
+            if (fv_realsense::encode_jpeg(*jpeg_encoder_, bgr_image, camera_info_config_.compressed_quality, compressed_msg->data)) {
                 bundle.color_compressed = std::move(compressed_msg);
             } else {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "⚠️ JPEG を作れない");

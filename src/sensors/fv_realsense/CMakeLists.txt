@@ -177,7 +177,14 @@ endif()
 # ===== 実行ファイル作成 =====
 add_executable(fv_realsense_node
   src/fv_realsense_node.cpp  # メインRealSenseノード
+  src/jpeg_encode.cpp        # JPEG を作る所だけ (下で -O3)
 )
+# JPEG を作る自前の画素ループ (fluent_lib/hw_jpeg.hpp、BGR→I420) のファイルだけ最適化 (-O3、Release と同じ) して組む。機体の colcon build は build type を
+# 付けず、このパッケージは最適化なし (-O0) になる (aspa2・aspa3 2026-10-30。fv_camera で 1080x1920 を作る CPU 19.1 ms、-O3 で 3.4 ms)。
+# パッケージ全体の build type は変えない (fv_camera と同じ)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(src/jpeg_encode.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+endif()
 
 
 
