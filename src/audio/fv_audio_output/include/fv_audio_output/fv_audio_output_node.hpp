@@ -38,6 +38,9 @@ struct OutputConfig
   size_t qos_depth = 10;
   bool qos_reliable = true;
   bool drain_after_frame = false;
+  // drain_after_frame でも止めずに続けて流すフレーム (header.frame_id がこの中の名前)。0.1 s ごとに切って送ってくる
+  // 連続の音 (aspa_sonar_sound) 用: フレームごとに drain すると ALSA が period の端まで無音を足し、音が切れ切れになる
+  std::vector<std::string> stream_frame_ids;
   bool reconnect_enabled = true;
   uint32_t reconnect_interval_ms = 1000;
   std::string mixer_card;

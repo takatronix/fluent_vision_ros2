@@ -128,6 +128,8 @@ void FvAudioOutputNode::loadParameters()
   this->declare_parameter<int>(
     "audio.start_threshold_frames", static_cast<int>(default_start_threshold_frames));
   this->declare_parameter<bool>("audio.drain_after_frame", default_drain_after_frame);
+  this->declare_parameter<std::vector<std::string>>(
+    "audio.stream_frame_ids", std::vector<std::string>{});
   this->declare_parameter<bool>("audio.reconnect.enabled", default_reconnect_enabled);
   this->declare_parameter<int>(
     "audio.reconnect.interval_ms", static_cast<int>(default_reconnect_interval_ms));
@@ -166,6 +168,11 @@ void FvAudioOutputNode::loadParameters()
   config_.start_threshold_frames = static_cast<uint32_t>(
     std::max<int64_t>(0, start_threshold_param));
   config_.drain_after_frame = this->get_parameter("audio.drain_after_frame").as_bool();
+  config_.stream_frame_ids = this->get_parameter("audio.stream_frame_ids").as_string_array();
+  // 空の名前は数えない (YAML で空のリストを書けない時の置き石 [""] を許す)
+  config_.stream_frame_ids.erase(
+    std::remove(config_.stream_frame_ids.begin(), config_.stream_frame_ids.end(), std::string()),
+    config_.stream_frame_ids.end());
   config_.reconnect_enabled = this->get_parameter("audio.reconnect.enabled").as_bool();
   const int64_t reconnect_interval_param =
     this->get_parameter("audio.reconnect.interval_ms").as_int();
@@ -203,12 +210,12 @@ void FvAudioOutputNode::loadParameters()
 
   RCLCPP_INFO(this->get_logger(),
     "Output config: device=%s volume=%.2f rate=%uHz channels=%u bits=%u queue=%zu "
-    "chunk=%ums start_threshold=%u drain_after_frame=%s qos_depth=%zu reliable=%s "
+    "chunk=%ums start_threshold=%u drain_after_frame=%s stream_frame_ids=%zu qos_depth=%zu reliable=%s "
     "reconnect=%s/%ums mixer=%s/%s/%d%%",
     config_.device_id.c_str(), config_.volume, config_.sample_rate,
     config_.channels, config_.bit_depth,
     config_.max_queue_frames, config_.chunk_duration_ms, config_.start_threshold_frames,
-    config_.drain_after_frame ? "true" : "false", config_.qos_depth,
+    config_.drain_after_frame ? "true" : "false", config_.stream_frame_ids.size(), config_.qos_depth,
     config_.qos_reliable ? "true" : "false",
     config_.reconnect_enabled ? "true" : "false", config_.reconnect_interval_ms,
     config_.mixer_card.empty() ? "disabled" : config_.mixer_card.c_str(),
@@ -704,6 +711,12 @@ void FvAudioOutputNode::playbackThread()
     }
     // このフレームを取った時の「stop が捨てた回数」(完了の知らせの前に変わっていれば、途中を捨てられた)
     const uint64_t drop_gen_at_start = drop_gen_.load();
+    // 続けて流すフレーム (audio.stream_frame_ids) は drain しない: 次のフレームが ALSA のバッファの中で切れ目なくつながる。
+    // 最後のフレームの後はバッファが空になって止まる (XRUN、全部鳴り終えている)。次の書き込みの prepare で始め直す
+    const bool stream_frame = has_frame && std::find(
+      config_.stream_frame_ids.begin(), config_.stream_frame_ids.end(),
+      queued_frame.header.frame_id) != config_.stream_frame_ids.end();
+    const bool drain_this_frame = config_.drain_after_frame && !stream_frame;
 
     if (has_frame && !queued_frame.data.empty()) {
       const float master_volume = volume_.load();
@@ -752,7 +765,12 @@ void FvAudioOutputNode::playbackThread()
         }
 
         if (result == -EPIPE) {
-          RCLCPP_WARN(this->get_logger(), "XRUN detected, preparing device");
+          if (stream_frame) {
+            // 続けて流す音の合間 (前の音を鳴らし終えて止まっていた) か、フレームが間に合わなかった時。合間は毎回なので静かに
+            RCLCPP_DEBUG(this->get_logger(), "XRUN before a stream frame, preparing device");
+          } else {
+            RCLCPP_WARN(this->get_logger(), "XRUN detected, preparing device");
+          }
           int prepare_result = -ENODEV;
           {
             std::lock_guard<std::mutex> lock(pcm_mutex_);
@@ -810,7 +828,7 @@ void FvAudioOutputNode::playbackThread()
         // completion or accepting an interrupting cue.
         bool drain_ok = true;
         bool dropped_by_stop = false;
-        if (config_.drain_after_frame) {
+        if (drain_this_frame) {
           int drain_result = 0;
           int prepare_result = 0;
           {
@@ -844,7 +862,7 @@ void FvAudioOutputNode::playbackThread()
           // 鳴らし切った (drain が成功した) か。失敗 (装置が消えた等) なら false
           drain_ok = drain_result >= 0 && prepare_result >= 0;
         }
-        if (!config_.drain_after_frame && drop_gen_.load() != drop_gen_at_start) {
+        if (!drain_this_frame && drop_gen_.load() != drop_gen_at_start) {
           dropped_by_stop = true;              // drain しない時は、知らせを出す直前に見る
         }
         // 途中で装置を失わず、stop に捨てられず、全部書き (drain するなら drain も成功): このフレームは欠けていない
@@ -853,13 +871,17 @@ void FvAudioOutputNode::playbackThread()
           RCLCPP_WARN(this->get_logger(), "Playback done but incomplete (device lost=%d, drain ok=%d, dropped by stop=%d)",
             device_lost ? 1 : 0, drain_ok ? 1 : 0, dropped_by_stop ? 1 : 0);
         }
-        RCLCPP_INFO(this->get_logger(), "Playback done, publishing notification");
+        if (stream_frame) {
+          RCLCPP_DEBUG(this->get_logger(), "Stream frame written, publishing notification");
+        } else {
+          RCLCPP_INFO(this->get_logger(), "Playback done, publishing notification");
+        }
         fv_audio::msg::PlaybackDone done_msg;
         done_msg.header = queued_frame.header;
         done_msg.request_id = queued_frame.header.frame_id;
         done_msg.epoch = queued_frame.epoch;
         done_msg.complete = complete;
-        done_msg.drained = complete && config_.drain_after_frame;
+        done_msg.drained = complete && drain_this_frame;
         // どの出力の知らせかを受け手が ROS graph (endpoint_gid) と照合できるように、自分の publisher の gid を載せる
         const rmw_gid_t & gid = playback_done_pub_->get_gid();
         done_msg.publisher_gid.assign(gid.data, gid.data + RMW_GID_STORAGE_SIZE);

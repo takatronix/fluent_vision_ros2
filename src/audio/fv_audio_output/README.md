@@ -21,6 +21,10 @@ ros2 run fv_audio_output fv_audio_output_node --ros-args --params-file install/f
   バッファの半分、1は短い通知音を即時開始します。
 - `audio.drain_after_frame`: trueなら各AudioFrameを実デバイスが再生し終わるまで待ってから
   完了通知を出します。離散cue/TTS向けで、連続ストリームではfalseを使用します。
+- `audio.stream_frame_ids`: `drain_after_frame=true` でも drain せずに続けて流すフレームの名前
+  (`AudioFrame.header.frame_id`) の一覧。短いフレームに切って送ってくる連続の音 (例: `aspa_sonar_sound` の 0.1 s の枠) 用。
+  フレームごとに drain すると ALSA が period の端まで無音を足し (4800 サンプルの枠が 8192 サンプル = 171 ms になる)、
+  音が切れ切れになってプチプチ鳴ります。これらのフレームの完了通知は書き込んだ時点で出て、`drained=false` です。
 - `audio.reconnect.enabled`, `audio.reconnect.interval_ms`: USBスピーカー切断時にALSAを
   閉じて再接続を待ち、復帰後に未再生部分から再開します。起動時に機器がなくても待機します。
 - `audio.mixer.card`, `audio.mixer.control`, `audio.mixer.volume_percent`: USB再列挙で
