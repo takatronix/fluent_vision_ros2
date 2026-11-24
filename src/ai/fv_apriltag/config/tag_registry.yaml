@@ -53,7 +53,14 @@ allocations:
              mid-field posts): DISTINCT id per point, taught into map
              once, then fixed. 110 = A, 111 = B, ... labels follow" }
   - { ids: [120, 199], class: domain_reserved }
-  - { ids: [200, 299], class: project_reserved,
+  - { ids: [200, 229], class: container_box, tag_mm: 75,
+      note: "kitting-cell container boxes (2026-11-21): one DISTINCT id
+             per box because boxes move between shelf and bench.
+             204-221 = boxes 01-18, 222-229 = spares, 200-203 reserved
+             for the cell's fixtures. 75 mm nominal = 60 mm black edge,
+             one tag per box centred on the short (270 x 96) face that
+             faces the robot" }
+  - { ids: [230, 299], class: project_reserved,
       note: "per-project extension band (co-hosted stacks allocate
              their own ids here)" }
   - { ids: [300, 317], class: cube60_faces,  tag_mm: 50,

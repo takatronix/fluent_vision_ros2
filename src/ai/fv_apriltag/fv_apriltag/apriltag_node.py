@@ -1,7 +1,10 @@
-"""AprilTag detection node (Python, pupil-apriltags backend).
+"""AprilTag detection node (Python).
 
-One instance per camera. Subscribes to image + camera_info, runs
-detection, publishes:
+One instance per camera. The detector is one of two backends
+(``detector_backends.py``): pupil-apriltags (AprilTag 3) or OpenCV ArUco
+with the AprilTag dictionaries (for hosts without the pupil wheel, e.g.
+aarch64 containers). Both report AprilTag's corner / pose conventions.
+Subscribes to image + camera_info, runs detection, publishes:
 - apriltag_msgs/AprilTagDetectionArray on ~/detections
 - geometry_msgs/PoseArray on ~/poses (camera-frame tag poses)
 - sensor_msgs/Image on ~/image_annotated (overlay) if enabled
@@ -30,6 +33,7 @@ from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
 
+from .detector_backends import BACKEND_CHOICES, BackendUnavailable, create_backend
 from .tag_registry import TagRegistryError, TagSizeRegistry, TagSizeResolver
 
 
@@ -68,6 +72,11 @@ class ApriltagNode(Node):
         super().__init__('apriltag_node')
 
         self.declare_parameter('family', 'tag36h11')
+        # Detector backend: auto (pupil-apriltags when importable, else
+        # OpenCV ArUco), pupil, opencv. The choice is logged at startup;
+        # 'pupil' on a host without the wheel is a fatal error, never a
+        # silent swap.
+        self.declare_parameter('backend', 'auto')
         self.declare_parameter('nthreads', 2)
         self.declare_parameter('quad_decimate', 2.0)
         self.declare_parameter('quad_sigma', 0.0)
@@ -137,25 +146,30 @@ class ApriltagNode(Node):
             raise RuntimeError('invalid AprilTag size configuration') from exc
         self._missing_size_ids = set()
 
+        backend_name = self.get_parameter(
+            'backend'
+        ).get_parameter_value().string_value.strip().lower() or 'auto'
         try:
-            from pupil_apriltags import Detector
-        except ImportError as exc:
-            self.get_logger().fatal(
-                f'pupil_apriltags not available: {exc}. '
-                'Install via `pip3 install pupil-apriltags` (handled by '
-                'container entrypoint).'
+            self._backend, backend_reason = create_backend(
+                backend_name, self.family,
+                nthreads=int(self.get_parameter('nthreads').value),
+                quad_decimate=float(self.get_parameter('quad_decimate').value),
+                quad_sigma=float(self.get_parameter('quad_sigma').value),
+                refine_edges=int(self.get_parameter('refine_edges').value),
+                decode_sharpening=float(
+                    self.get_parameter('decode_sharpening').value
+                ),
             )
-            raise
-
-        self._detector = Detector(
-            families=self.family,
-            nthreads=int(self.get_parameter('nthreads').value),
-            quad_decimate=float(self.get_parameter('quad_decimate').value),
-            quad_sigma=float(self.get_parameter('quad_sigma').value),
-            refine_edges=int(self.get_parameter('refine_edges').value),
-            decode_sharpening=float(
-                self.get_parameter('decode_sharpening').value
-            ),
+        except BackendUnavailable as exc:
+            self.get_logger().fatal(
+                f'AprilTag backend {backend_name!r} cannot run here: {exc} '
+                f'(choices: {BACKEND_CHOICES})'
+            )
+            raise RuntimeError('AprilTag detector backend unavailable') from exc
+        self.backend_name = self._backend.name
+        self.get_logger().info(
+            f'AprilTag backend: {self.backend_name} ({backend_reason}) — '
+            f'{self._backend.describe()}'
         )
 
         self._bridge = CvBridge()
@@ -244,6 +258,7 @@ class ApriltagNode(Node):
 
         self.get_logger().info(
             f'apriltag_node started family={self.family} '
+            f'backend={self.backend_name} '
             f'tag_size_mode={self._tag_size_resolver.mode_description()} '
             f'tag_registry={registry_path} '
             f'pose_reference_size={self._pose_reference_size}m '
@@ -307,7 +322,8 @@ class ApriltagNode(Node):
     def _on_param_update(self, params):
         from rcl_interfaces.msg import SetParametersResult
         for p in params:
-            if p.name in ('family', 'tag_registry', 'tag_size', 'tag_sizes'):
+            if p.name in ('family', 'backend', 'tag_registry', 'tag_size',
+                          'tag_sizes'):
                 return SetParametersResult(
                     successful=False,
                     reason=f'{p.name} is startup-only; restart the profile',
@@ -356,15 +372,12 @@ class ApriltagNode(Node):
             float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
         )
 
-        # pupil-apriltags accepts one tag_size per call. Rotation is size
+        # Both backends take one tag_size per call. Rotation is size
         # invariant and translation is linear in tag_size, so estimate at a
         # validated reference size and rescale per ID below.
         t_detect_start = time.perf_counter()
-        detections = self._detector.detect(
-            gray,
-            estimate_tag_pose=True,
-            camera_params=camera_params,
-            tag_size=self._pose_reference_size,
+        detections = self._backend.detect(
+            gray, camera_params, self._pose_reference_size,
         )
         detect_ms = (time.perf_counter() - t_detect_start) * 1000.0
 
@@ -396,7 +409,7 @@ class ApriltagNode(Node):
             atd.centre = ATPoint(
                 x=float(det.center[0]), y=float(det.center[1])
             )
-            # pupil-apriltags returns corners in (x, y), 4 points
+            # corners: (x, y) x 4 in AprilTag order (see detector_backends)
             for i in range(4):
                 atd.corners[i] = ATPoint(
                     x=float(det.corners[i][0]),
@@ -491,6 +504,7 @@ class ApriltagNode(Node):
         if now - self._last_stats_log_t > 1.0:
             self._last_stats_log_t = now
             stats = {
+                'backend': self.backend_name,
                 'detect_ms': round(detect_ms, 2),
                 'detect_ms_avg': round(
                     sum(self._detect_ms_window) / max(1, len(self._detect_ms_window)),
