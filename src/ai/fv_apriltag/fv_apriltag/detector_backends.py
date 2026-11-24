@@ -7,7 +7,7 @@ Two backends produce the same :class:`TagDetection` records so that
     pupil-apriltags (AprilTag 3). Preferred where the wheel exists
     (x86_64 containers).
 ``opencv``
-    ``cv2.aruco`` with the ``DICT_APRILTAG_*`` dictionaries plus
+    ``cv2.aruco`` with the ``DICT_APRILTAG_36h11`` dictionary plus
     ``solvePnP(IPPE_SQUARE)``. For hosts where pupil-apriltags cannot be
     installed (aarch64 containers). Nothing is picked silently: the node
     logs which backend runs, and ``backend: pupil`` fails loudly when the
@@ -26,18 +26,28 @@ consumers see no difference:
 * ``homography``: maps tag coordinates ``(-1,-1) -> p0``, ``(1,-1) -> p1``,
   ``(1,1) -> p2``, ``(-1,1) -> p3`` (apriltag's ``det->H``; note the
   y-up convention of the homography, unlike the pose frame).
+* ``decision_margin`` / ``hamming``: the OpenCV backend re-reads the data
+  bits through the homography the way ``quad_decode()`` in apriltag.c
+  does (linear grey models fitted on the black border and the white quiet
+  ring, per-bit threshold at their midpoint, margin = min of the mean
+  white and mean black distances) and counts the bits that differ from
+  the dictionary codeword. So ``min_decision_margin`` keeps its meaning
+  across backends (parity asserted in ``test/test_detector_backends.py``
+  where pupil is importable).
 
 OpenCV's ``DICT_APRILTAG_36h11`` canonical marker image is the official
 apriltag-imgs image rotated by 180 degrees (checked bit for bit over ids
-0-115 and asserted in ``test/test_detector_backends.py``). ArUco lists
-the corners clockwise from the top-left of *its* canonical orientation,
-``[TL', TR', BR', BL']``, which on the real tag is ``[BR, BL, TL, TR]``.
-Hence AprilTag order = ``aruco[[1, 0, 3, 2]]`` (:data:`ARUCO_TO_APRILTAG`).
+0-115 and asserted in the tests). ArUco lists the corners clockwise from
+the top-left of *its* canonical orientation, ``[TL', TR', BR', BL']``,
+which on the real tag is ``[BR, BL, TL, TR]``. Hence AprilTag order =
+``aruco[[1, 0, 3, 2]]`` (:data:`ARUCO_TO_APRILTAG`). Only tag36h11 is
+offered on the OpenCV backend because that relation was verified for
+tag36h11 only.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -56,11 +66,11 @@ HOMOGRAPHY_CORNERS_XY = np.array(
     [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], dtype=np.float32
 )
 
+#: family -> (OpenCV dictionary attribute, data cells per side). Only the
+#: families whose canonical-orientation relation to apriltag-imgs was
+#: verified are listed (see module docstring).
 _OPENCV_FAMILIES = {
-    'tag16h5': 'DICT_APRILTAG_16h5',
-    'tag25h9': 'DICT_APRILTAG_25h9',
-    'tag36h10': 'DICT_APRILTAG_36h10',
-    'tag36h11': 'DICT_APRILTAG_36h11',
+    'tag36h11': ('DICT_APRILTAG_36h11', 6),
 }
 #: Bits AprilTag 3 corrects by default (``apriltag_detector_add_family``).
 _APRILTAG_DEFAULT_BITS_CORRECTED = 2
@@ -136,54 +146,92 @@ class PupilBackend:
         return out
 
 
-def _aruco_detect_fn(family: str, quad_decimate: float, quad_sigma: float
-                     ) -> Tuple[Callable[[np.ndarray], tuple], int]:
-    """Build a ``gray -> (corners, ids, rejected)`` callable for the host's
-    OpenCV (4.6 ``detectMarkers`` API or 4.7+ ``ArucoDetector``)."""
-    aruco = getattr(cv2, 'aruco', None)
-    if aruco is None:
-        raise BackendUnavailable('cv2.aruco is missing (opencv-contrib needed)')
-    try:
-        dictionary_id = getattr(aruco, _OPENCV_FAMILIES[family])
-    except KeyError as exc:
-        raise BackendUnavailable(
-            f'family {family!r} has no OpenCV ArUco dictionary '
-            f'(supported: {sorted(_OPENCV_FAMILIES)})'
-        ) from exc
+class _ArucoApi:
+    """The host's ArUco entry points (OpenCV 4.6 module functions or 4.7+ classes)."""
 
-    def _setup(params, dictionary) -> None:
+    def __init__(self, family: str, quad_decimate: float, quad_sigma: float) -> None:
+        aruco = getattr(cv2, 'aruco', None)
+        if aruco is None:
+            raise BackendUnavailable('cv2.aruco is missing (opencv-contrib needed)')
+        try:
+            dict_attr, self.data_cells = _OPENCV_FAMILIES[family]
+        except KeyError as exc:
+            raise BackendUnavailable(
+                f'family {family!r} is not offered on the OpenCV backend '
+                f'(verified: {sorted(_OPENCV_FAMILIES)})'
+            ) from exc
+        try:
+            dictionary_id = getattr(aruco, dict_attr)
+            if hasattr(aruco, 'ArucoDetector'):                  # OpenCV >= 4.7
+                self.dictionary = aruco.getPredefinedDictionary(dictionary_id)
+                params = aruco.DetectorParameters()
+                self._setup(aruco, params)
+                detector = aruco.ArucoDetector(self.dictionary, params)
+                self.detect = detector.detectMarkers
+            else:                                                # OpenCV 4.6 and older
+                self.dictionary = aruco.Dictionary_get(dictionary_id)
+                params = aruco.DetectorParameters_create()
+                self._setup(aruco, params)
+                dictionary = self.dictionary
+                self.detect = lambda gray: aruco.detectMarkers(gray, dictionary, parameters=params)
+            self._marker_image = getattr(aruco, 'generateImageMarker', None) or aruco.drawMarker
+            self._codewords = {}
+            self.marker_size = int(self.dictionary.markerSize)
+            if self.marker_size != self.data_cells:
+                raise BackendUnavailable(
+                    f'{dict_attr}: markerSize {self.marker_size} != {self.data_cells} data cells')
+            self.codeword_bits(0)                                # exercise the bit decoder once
+        except BackendUnavailable:
+            raise
+        except (AttributeError, cv2.error, TypeError, ValueError) as exc:
+            raise BackendUnavailable(
+                f'this OpenCV build ({cv2.__version__}) lacks the ArUco AprilTag '
+                f'support fv_apriltag needs: {exc}'
+            ) from exc
+
+    def _setup(self, aruco, params) -> None:
         # AprilTag 2 quad extraction + refinement inside ArUco: the only mode
         # that honours the quad_decimate / quad_sigma knobs of the pupil path.
         params.cornerRefinementMethod = aruco.CORNER_REFINE_APRILTAG
-        params.aprilTagQuadDecimate = float(quad_decimate)
-        params.aprilTagQuadSigma = float(quad_sigma)
-        # tag36h11 has a 1-cell black border.
-        params.markerBorderBits = 1
-        # Correct at most the bits AprilTag 3 corrects by default, so a
-        # noisy quad is rejected the same way on both backends.
-        max_bits = int(dictionary.maxCorrectionBits)
-        if max_bits > 0:
-            params.errorCorrectionRate = min(
-                float(params.errorCorrectionRate),
-                _APRILTAG_DEFAULT_BITS_CORRECTED / max_bits,
-            )
+        params.aprilTagQuadDecimate = float(self._quad_decimate)
+        params.aprilTagQuadSigma = float(self._quad_sigma)
+        params.markerBorderBits = 1                              # tag36h11: 1-cell black border
+        # Correct exactly the bits AprilTag 3 corrects by default (2), so a
+        # noisy quad is accepted / rejected the same way on both backends.
+        # OpenCV's predefined APRILTAG dictionaries ship with
+        # maxCorrectionBits = 0 (4.6 and 4.11 alike), i.e. no correction at
+        # all; the attribute is writable and ArUco uses
+        # int(errorCorrectionRate * maxCorrectionBits).
+        self.dictionary.maxCorrectionBits = _APRILTAG_DEFAULT_BITS_CORRECTED
+        params.errorCorrectionRate = 1.0
 
-    if hasattr(aruco, 'ArucoDetector'):          # OpenCV >= 4.7
-        dictionary = aruco.getPredefinedDictionary(dictionary_id)
-        params = aruco.DetectorParameters()
-        _setup(params, dictionary)
-        detector = aruco.ArucoDetector(dictionary, params)
-        return detector.detectMarkers, int(dictionary.maxCorrectionBits)
-    dictionary = aruco.Dictionary_get(dictionary_id)   # OpenCV 4.6 and older
-    params = aruco.DetectorParameters_create()
-    _setup(params, dictionary)
-    return (lambda gray: aruco.detectMarkers(gray, dictionary, parameters=params),
-            int(dictionary.maxCorrectionBits))
+    def __new__(cls, family: str, quad_decimate: float, quad_sigma: float):
+        self = super().__new__(cls)
+        self._quad_decimate = quad_decimate
+        self._quad_sigma = quad_sigma
+        return self
+
+    def codeword_bits(self, tag_id: int) -> np.ndarray:
+        """Data bits of ``tag_id`` as apriltag-imgs shows them (top row first, 1 = white).
+
+        Taken from the dictionary's own marker image (the same source the
+        tests compare with apriltag-imgs) rather than from ``bytesList``,
+        whose packing is not the same across OpenCV versions.
+        """
+        if tag_id not in self._codewords:
+            side = self.marker_size + 2                      # 1-cell black border
+            image = np.asarray(self._marker_image(self.dictionary, int(tag_id), side, 1))
+            if image.shape != (side, side):
+                raise ValueError(f'unexpected marker image shape {image.shape}')
+            bits = (image[1:-1, 1:-1] > 127).astype(np.uint8)
+            # OpenCV's canonical image is the apriltag-imgs image rotated by 180°.
+            self._codewords[tag_id] = np.rot90(bits, 2)
+        return self._codewords[tag_id]
 
 
-def _sample(gray: np.ndarray, H: np.ndarray, uv: np.ndarray) -> np.ndarray:
-    """Bilinear samples of ``gray`` at tag coordinates ``uv`` (N, 2) via ``H``.
-    Points outside the image come back as NaN."""
+def _sample(gray: np.ndarray, H: np.ndarray, uv: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Bilinear samples of ``gray`` at tag coordinates ``uv`` (N, 2) via ``H``,
+    plus the pixel positions. Points outside the image come back as NaN."""
     pts = np.column_stack([uv, np.ones(len(uv))]) @ H.T
     xy = pts[:, :2] / pts[:, 2:3]
     h, w = gray.shape[:2]
@@ -196,40 +244,62 @@ def _sample(gray: np.ndarray, H: np.ndarray, uv: np.ndarray) -> np.ndarray:
             cv2.INTER_LINEAR,
         )
         out[inside] = sampled.reshape(-1)
-    return out
+    return out, xy
 
 
-def decision_margin_from_image(gray: np.ndarray, H: np.ndarray,
-                               data_cells: int = 6) -> float:
-    """Approximate AprilTag's ``decision_margin`` for a decoded quad.
+class _GrayModel:
+    """Least-squares plane ``v = a*u + b*v' + c`` over tag coordinates (apriltag's graymodel)."""
 
-    AprilTag reports the mean distance of each data bit's intensity from the
-    local black/white decision threshold (grey levels, 0-255). Here the
-    threshold is the midpoint between the black border cells and the white
-    quiet-ring cells (those inside the image), sampled through the quad's
-    homography ``H`` (tag coordinates [-1, 1] span the black square).
+    def __init__(self, uv: np.ndarray, values: np.ndarray) -> None:
+        ok = np.isfinite(values)
+        self.n = int(ok.sum())
+        if self.n >= 3:
+            A = np.column_stack([uv[ok], np.ones(self.n)])
+            self.coef, *_ = np.linalg.lstsq(A, values[ok], rcond=None)
+        elif self.n > 0:
+            self.coef = np.array([0.0, 0.0, float(np.mean(values[ok]))])
+        else:
+            self.coef = None
+
+    def at(self, uv: np.ndarray) -> np.ndarray:
+        return np.column_stack([uv, np.ones(len(uv))]) @ self.coef
+
+
+def read_bits(gray: np.ndarray, H: np.ndarray, data_cells: int) -> Tuple[np.ndarray, float]:
+    """Decode the data cells through ``H`` like apriltag.c ``quad_decode()``.
+
+    Returns the bit matrix (top row first, 1 = white) and the decision
+    margin: grey models are fitted on the black border cells and the white
+    quiet-ring cells (those inside the image); each data bit is compared
+    with the midpoint of the two models at its own position; the margin is
+    the smaller of the mean white distance and the mean black distance
+    (counts start at 1 as in apriltag.c). Tag coordinates: [-1, 1] spans
+    the black square, +v is up (apriltag's homography convention).
     """
     n = data_cells + 2
     centres = -1.0 + (2.0 * np.arange(n) + 1.0) / n
-    uu, vv = np.meshgrid(centres, centres)
-    is_border = (uu == centres[0]) | (uu == centres[-1]) | (vv == centres[0]) | (vv == centres[-1])
-    grid = np.column_stack([uu.ravel(), vv.ravel()])
-    values = _sample(gray, H, grid)
-    border = values[is_border.ravel()]
-    data = values[~is_border.ravel()]
-    ring_c = 1.0 + 1.0 / n
-    ring = np.array([[u, -ring_c] for u in centres] + [[u, ring_c] for u in centres]
-                    + [[-ring_c, v] for v in centres] + [[ring_c, v] for v in centres])
-    white = _sample(gray, H, ring)
-    white = white[np.isfinite(white)]
-    data = data[np.isfinite(data)]
-    border = border[np.isfinite(border)]
-    if data.size == 0 or border.size == 0:
-        return 0.0
-    black_level = float(np.mean(border))
-    white_level = float(np.mean(white)) if white.size else float(np.max(data))
-    threshold = 0.5 * (black_level + white_level)
-    return float(np.mean(np.abs(data - threshold)))
+    ring = 1.0 + 1.0 / n
+    border_uv = np.array([[u, v] for u in centres for v in (centres[0], centres[-1])]
+                         + [[u, v] for v in centres[1:-1] for u in (centres[0], centres[-1])])
+    ring_uv = np.array([[u, v] for u in centres for v in (-ring, ring)]
+                       + [[u, v] for v in centres for u in (-ring, ring)])
+    black = _GrayModel(border_uv, _sample(gray, H, border_uv)[0])
+    white = _GrayModel(ring_uv, _sample(gray, H, ring_uv)[0])
+    # data cells, top row first: v runs from +1 down to -1
+    rows = centres[1:-1][::-1]
+    cols = centres[1:-1]
+    data_uv = np.array([[u, v] for v in rows for u in cols])
+    values, _ = _sample(gray, H, data_uv)
+    bits = np.zeros(len(data_uv), dtype=np.uint8)
+    if black.coef is None or white.coef is None or not np.isfinite(values).all():
+        return bits.reshape(data_cells, data_cells), 0.0
+    threshold = 0.5 * (black.at(data_uv) + white.at(data_uv))
+    diff = values - threshold
+    is_white = diff > 0
+    bits[is_white] = 1
+    white_score = float(diff[is_white].sum()) / (1 + int(is_white.sum()))
+    black_score = float((-diff[~is_white]).sum()) / (1 + int((~is_white).sum()))
+    return bits.reshape(data_cells, data_cells), float(min(white_score, black_score))
 
 
 class OpenCvArucoBackend:
@@ -241,20 +311,18 @@ class OpenCvArucoBackend:
                  quad_sigma: float = 0.0, refine_edges: int = 1,
                  decode_sharpening: float = 0.25) -> None:
         self.family = family
-        self._detect, self._max_correction_bits = _aruco_detect_fn(
-            family, quad_decimate, quad_sigma)
+        self._api = _ArucoApi(family, quad_decimate, quad_sigma)
         self._ignored = {'nthreads': nthreads, 'refine_edges': refine_edges,
                          'decode_sharpening': decode_sharpening}
 
     def describe(self) -> str:
-        return (f'OpenCV {cv2.__version__} ArUco {_OPENCV_FAMILIES[self.family]} '
-                f'+ solvePnP(IPPE_SQUARE); not applied: {self._ignored}; '
-                f'hamming is not reported (-1), decision_margin is '
-                f'approximated from the quad')
+        return (f'OpenCV {cv2.__version__} ArUco {_OPENCV_FAMILIES[self.family][0]} '
+                f'+ solvePnP(IPPE_SQUARE); bits re-read through the homography for '
+                f'decision_margin / hamming; not applied: {self._ignored}')
 
     def detect(self, gray: np.ndarray, camera_params: Sequence[float],
                tag_size: float) -> List[TagDetection]:
-        quads, ids, _rejected = self._detect(gray)
+        quads, ids, _rejected = self._api.detect(gray)
         if ids is None or len(ids) == 0:
             return []
         fx, fy, cx, cy = (float(v) for v in camera_params)
@@ -273,10 +341,12 @@ class OpenCvArucoBackend:
             if not ok:
                 continue
             R, _ = cv2.Rodrigues(rvec)
+            bits, margin = read_bits(gray, H, self._api.data_cells)
+            hamming = int(np.count_nonzero(bits != self._api.codeword_bits(int(tag_id))))
             out.append(TagDetection(
                 tag_id=int(tag_id),
-                hamming=-1,
-                decision_margin=decision_margin_from_image(gray, H),
+                hamming=hamming,
+                decision_margin=margin,
                 center=centre,
                 corners=corners,
                 homography=H,

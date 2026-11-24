@@ -237,10 +237,10 @@ positive `tag_size` parameter is an explicit homogeneous-size override;
 unknown or reserved IDs without a size do not produce a pose or TF.
 The detector backend is selected with the `backend` parameter (`auto` /
 `pupil` / `opencv`): `pupil` is pupil-apriltags (AprilTag 3), `opencv` is
-`cv2.aruco` with the AprilTag dictionaries for hosts where the pupil wheel
-does not exist (aarch64 containers). Both report AprilTag's corner order and
-tag→camera pose, so TF consumers do not see the difference; `auto` logs which
-one runs.
+`cv2.aruco` with the AprilTag dictionary for hosts where the pupil wheel
+does not exist (aarch64 containers; tag36h11 only). Both report AprilTag's
+corner order, tag→camera pose, decision margin and hamming, so consumers do
+not see the difference; `auto` logs which one runs.
 Printable tag sheets, cube kits, and 3D-printable mounts live in [`docs/印刷物/`](docs/印刷物/).
 
 </details>

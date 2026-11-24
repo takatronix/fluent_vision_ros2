@@ -23,7 +23,7 @@ def test_repository_registry_uses_black_edge_sizes():
         for tag_id in id_range:
             assert registry.size_for(tag_id) == pytest.approx(0.120)
     # 200 band: kitting-cell container boxes, 75 mm nominal = 60 mm black edge
-    for tag_id in range(200, 230):
+    for tag_id in range(204, 230):
         assert registry.size_for(tag_id) == pytest.approx(0.060)
 
 
@@ -43,6 +43,8 @@ def test_reserved_unknown_and_legacy_ids_have_no_active_size():
     assert registry.size_for(60) is None
     assert registry.size_for(120) is None
     assert registry.size_for(230) is None       # project_reserved starts after the boxes
+    for tag_id in range(200, 204):              # cell fixtures: reserved, not printed
+        assert registry.size_for(tag_id) is None
     assert registry.size_for(999) is None
 
 

@@ -235,8 +235,8 @@ stage.boxes(detections).color(Color::Teal).smoothing(0.2f);
 [`src/ai/fv_apriltag/config/tag_registry.yaml`](src/ai/fv_apriltag/config/tag_registry.yaml)（公称 `tag_mm` × 0.8）から解決します。
 正の `tag_size` パラメータは明示的な一律サイズ上書き。サイズ未登録の未知・予約IDは姿勢もTFも出しません。
 検出器は `backend` パラメータ（`auto` / `pupil` / `opencv`）で選びます。`pupil` は pupil-apriltags（AprilTag 3）、
-`opencv` は pupil の wheel が無いホスト（aarch64 コンテナ）向けの `cv2.aruco`（AprilTag 辞書）です。
-どちらも AprilTag の角の順番とタグ→カメラの姿勢で出すので、TF を使う側に違いはありません。`auto` はどちらを使ったかをログに出します。
+`opencv` は pupil の wheel が無いホスト（aarch64 コンテナ）向けの `cv2.aruco`（AprilTag 辞書、tag36h11 のみ）です。
+どちらも AprilTag の角の順番・タグ→カメラの姿勢・decision margin・hamming で出すので、使う側に違いはありません。`auto` はどちらを使ったかをログに出します。
 印刷用タグシート・キューブキット・3Dプリントマウントは [`docs/印刷物/`](docs/印刷物/) にあります。
 
 </details>

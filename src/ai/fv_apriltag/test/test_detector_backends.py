@@ -69,12 +69,19 @@ def _project(points_tag: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray
 
 
 def render(tag_id: int, R: np.ndarray, t: np.ndarray, tag_size: float = TAG_SIZE,
-           black: int = 0, white: int = 255) -> np.ndarray:
+           black: int = 0, white: int = 255, flip_bits=(), gradient: float = 0.0) -> np.ndarray:
     """Upright apriltag-imgs artwork of ``tag_id`` placed at (R, t) in the camera
-    frame, projected onto a mid-grey canvas. Tag x right, y down, z into the tag."""
+    frame, projected onto a mid-grey canvas. Tag x right, y down, z into the tag.
+    ``flip_bits`` inverts data cells (row, col); ``gradient`` darkens the artwork
+    linearly from left to right by that fraction (uneven lighting)."""
     bitmap = tag_bitmap(TAG36H11_CODES[tag_id]).astype(np.float64) / 255.0
-    art = (black + bitmap * (white - black)).astype(np.uint8)
+    for row, col in flip_bits:
+        bitmap[2 + row, 2 + col] = 1.0 - bitmap[2 + row, 2 + col]
+    art = (black + bitmap * (white - black)).astype(np.float64)
     art = cv2.resize(art, (200, 200), interpolation=cv2.INTER_NEAREST)
+    if gradient:
+        art = art * (1.0 - gradient * np.linspace(0.0, 1.0, 200)[None, :])
+    art = np.clip(art, 0, 255).astype(np.uint8)
     half = tag_size * 5.0 / 8.0                      # 10 cells incl. the quiet ring
     tag_xy = np.array([[-half, -half], [half, -half], [half, half], [-half, half]])
     dst = _project(np.column_stack([tag_xy, np.zeros(4)]), R, t).astype(np.float32)
@@ -115,7 +122,7 @@ def test_upright_tag_facing_the_camera_has_identity_rotation(backend, tag_id):
     bl, br, tr, tl = det.corners
     assert bl[0] < br[0] and tl[0] < tr[0]
     assert bl[1] > tl[1] and br[1] > tr[1]
-    assert det.hamming == -1 and det.decision_margin > 60.0
+    assert det.hamming == 0 and det.decision_margin > 60.0
 
 
 def test_tilted_tag_pose_and_corners_match_the_projection(backend):
@@ -152,6 +159,23 @@ def test_decision_margin_falls_with_contrast(backend):
     assert 10.0 < washed.decision_margin < crisp.decision_margin / 2.0
 
 
+def test_hamming_counts_the_bits_that_differ_from_the_codeword(backend):
+    t = np.array([0.0, 0.0, 0.40])
+    clean = backend.detect(render(204, np.eye(3), t), CAMERA, TAG_SIZE)[0]
+    one = backend.detect(render(204, np.eye(3), t, flip_bits=[(2, 3)]), CAMERA, TAG_SIZE)[0]
+    two = backend.detect(render(204, np.eye(3), t, flip_bits=[(0, 0), (5, 5)]), CAMERA, TAG_SIZE)[0]
+    assert (clean.tag_id, one.tag_id, two.tag_id) == (204, 204, 204)
+    assert (clean.hamming, one.hamming, two.hamming) == (0, 1, 2)
+    # more errors than AprilTag 3 corrects by default are not decoded
+    assert backend.detect(render(204, np.eye(3), t, flip_bits=[(0, 0), (2, 3), (5, 5)]), CAMERA, TAG_SIZE) == []
+
+
+def test_only_verified_families_are_offered_on_opencv():
+    for family in ('tag16h5', 'tag25h9', 'tag36h10', 'tag41h12'):
+        with pytest.raises(BackendUnavailable):
+            OpenCvArucoBackend(family)
+
+
 def test_corner_permutation_is_the_documented_one():
     assert ARUCO_TO_APRILTAG == (1, 0, 3, 2)
     assert np.array_equal(TAG_CORNERS_XY, [[-1, 1], [1, 1], [1, -1], [-1, -1]])
@@ -178,17 +202,26 @@ def test_auto_picks_a_backend_and_says_why():
         assert backend_obj.name == 'pupil'
 
 
-def test_opencv_agrees_with_pupil_when_both_are_available():
+@pytest.mark.parametrize('case', [
+    dict(R=_rotation([0, 0, 1], 25.0) @ _rotation([1, 0, 0], -35.0), t=[0.03, -0.02, 0.42]),
+    dict(R=np.eye(3), t=[0.0, 0.0, 0.30], black=40, white=200),                   # low contrast
+    dict(R=_rotation([0, 1, 0], 30.0), t=[-0.05, 0.04, 0.50], gradient=0.5),      # uneven lighting
+    dict(R=_rotation([0, 0, 1], -60.0), t=[0.13, 0.09, 0.40]),                    # off-centre, rolled
+    dict(R=np.eye(3), t=[0.0, 0.0, 0.40], flip_bits=[(1, 4)]),                   # one corrected bit
+])
+def test_opencv_agrees_with_pupil_when_both_are_available(case):
     pytest.importorskip('pupil_apriltags')
     pupil, _ = create_backend('pupil', 'tag36h11', quad_decimate=1.0)
     opencv = OpenCvArucoBackend('tag36h11', quad_decimate=1.0)
-    R = _rotation([0, 0, 1], 25.0) @ _rotation([1, 0, 0], -35.0)
-    t = np.array([0.03, -0.02, 0.42])
-    gray = render(204, R, t)
+    case = dict(case)
+    R, t = case.pop('R'), np.array(case.pop('t'))
+    gray = render(204, R, t, **case)
     (a,) = pupil.detect(gray, CAMERA, TAG_SIZE)
     (b,) = opencv.detect(gray, CAMERA, TAG_SIZE)
     assert a.tag_id == b.tag_id == 204
+    assert a.hamming == b.hamming
     assert np.allclose(a.corners, b.corners, atol=0.75)
     assert _angle_deg(a.pose_R, b.pose_R) < 1.0
     assert np.allclose(a.pose_t, b.pose_t, atol=0.003)
-    assert abs(a.decision_margin - b.decision_margin) < 0.35 * a.decision_margin
+    # same decode metric (quad_decode's grey models), so the 50.0 gate means the same thing
+    assert b.decision_margin == pytest.approx(a.decision_margin, rel=0.15, abs=3.0)

@@ -148,7 +148,7 @@ class ApriltagNode(Node):
 
         backend_name = self.get_parameter(
             'backend'
-        ).get_parameter_value().string_value.strip().lower() or 'auto'
+        ).get_parameter_value().string_value
         try:
             self._backend, backend_reason = create_backend(
                 backend_name, self.family,
