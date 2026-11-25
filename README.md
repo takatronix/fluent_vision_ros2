@@ -217,7 +217,7 @@ The node-graph-based predecessor (schema `fluent.scene/v1alpha1`) now lives in [
 | `fv_object_mask_generator` | UNet semantic segmentation (OpenVINO) |
 | `fv_3d_detector` | 3D OBB / shape / colour / distance from masks + point clouds |
 | `fv_color_detector` | HSV colour detection with depth distance (C++) |
-| `fv_apriltag` | AprilTag detection + cube-bundle pose (pupil-apriltags) |
+| `fv_apriltag` | AprilTag detection + cube-bundle pose (pupil-apriltags, or OpenCV ArUco on hosts without the wheel) |
 | `fv_depth_anything` | Depth Anything V3 monocular depth (ONNX / TensorRT) |
 | `fv_depth_features` | HHA encoder, surface normals, RGBD fusion (C++) |
 | `fv_lingbot_depth` | LingBot-Depth refinement & point cloud generation |
@@ -235,6 +235,12 @@ The node-graph-based predecessor (schema `fluent.scene/v1alpha1`) now lives in [
 [`src/ai/fv_apriltag/config/tag_registry.yaml`](src/ai/fv_apriltag/config/tag_registry.yaml) (nominal `tag_mm` × 0.8). A
 positive `tag_size` parameter is an explicit homogeneous-size override;
 unknown or reserved IDs without a size do not produce a pose or TF.
+The detector backend is selected with the `backend` parameter (`auto` /
+`pupil` / `opencv`): `pupil` is pupil-apriltags (AprilTag 3), `opencv` is
+`cv2.aruco` with the AprilTag dictionary for hosts where the pupil wheel
+does not exist (aarch64 containers; tag36h11 only). Both report AprilTag's
+corner order, tag→camera pose, decision margin and hamming, so consumers do
+not see the difference; `auto` logs which one runs.
 Printable tag sheets, cube kits, and 3D-printable mounts live in [`docs/印刷物/`](docs/印刷物/).
 
 </details>

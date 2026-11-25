@@ -53,9 +53,21 @@ allocations:
              mid-field posts): DISTINCT id per point, taught into map
              once, then fixed. 110 = A, 111 = B, ... labels follow" }
   - { ids: [120, 199], class: domain_reserved }
-  - { ids: [200, 299], class: project_reserved,
+  - { ids: [200, 203], class: cell_fixture_reserved,
+      note: "kitting cell: kept free for the cell's fixtures (bench /
+             shelf calibration). Not printed, no size, no pose" }
+  - { ids: [204, 229], class: container_box, tag_mm: 75,
+      note: "kitting-cell container boxes (2026-11-21): one DISTINCT id
+             per box because boxes move between shelf and bench.
+             204-221 = boxes 01-18, 222-229 = printed spares for new
+             boxes. 75 mm nominal = 60 mm black edge, one tag per box
+             centred on the short (270 x 96) face that faces the robot.
+             Taken from the 200-299 project band: no co-hosted stack
+             had allocated 200-229 when this was carved out
+             (2026-11-24); their extensions continue at 230+" }
+  - { ids: [230, 299], class: project_reserved,
       note: "per-project extension band (co-hosted stacks allocate
-             their own ids here)" }
+             their own ids here; 200-229 are taken, see above)" }
   - { ids: [300, 317], class: cube60_faces,  tag_mm: 50,
       note: "cube_kit cube60_a..c faces, top/front/right/back/left/
              bottom from base ids 300/306/312" }

@@ -217,7 +217,7 @@ stage.boxes(detections).color(Color::Teal).smoothing(0.2f);
 | `fv_object_mask_generator` | UNet セマンティックセグメンテーション（OpenVINO） |
 | `fv_3d_detector` | マスク＋点群から3D OBB / 形状 / 色 / 距離 |
 | `fv_color_detector` | HSV色検出＋深度距離（C++） |
-| `fv_apriltag` | AprilTag検出＋キューブバンドル姿勢（pupil-apriltags） |
+| `fv_apriltag` | AprilTag検出＋キューブバンドル姿勢（pupil-apriltags。wheel の無いホストでは OpenCV ArUco） |
 | `fv_depth_anything` | Depth Anything V3 単眼深度（ONNX / TensorRT） |
 | `fv_depth_features` | HHAエンコーダ・法線・RGBD融合（C++） |
 | `fv_lingbot_depth` | LingBot-Depth 深度リファイン＆点群生成 |
@@ -234,6 +234,9 @@ stage.boxes(detections).color(Color::Teal).smoothing(0.2f);
 `fv_apriltag` は各IDの物理サイズ（黒枠実寸）を
 [`src/ai/fv_apriltag/config/tag_registry.yaml`](src/ai/fv_apriltag/config/tag_registry.yaml)（公称 `tag_mm` × 0.8）から解決します。
 正の `tag_size` パラメータは明示的な一律サイズ上書き。サイズ未登録の未知・予約IDは姿勢もTFも出しません。
+検出器は `backend` パラメータ（`auto` / `pupil` / `opencv`）で選びます。`pupil` は pupil-apriltags（AprilTag 3）、
+`opencv` は pupil の wheel が無いホスト（aarch64 コンテナ）向けの `cv2.aruco`（AprilTag 辞書、tag36h11 のみ）です。
+どちらも AprilTag の角の順番・タグ→カメラの姿勢・decision margin・hamming で出すので、使う側に違いはありません。`auto` はどちらを使ったかをログに出します。
 印刷用タグシート・キューブキット・3Dプリントマウントは [`docs/印刷物/`](docs/印刷物/) にあります。
 
 </details>
